@@ -1,0 +1,12 @@
+{
+    "movescu_executable_path": "D:\\dcmget\\dcmtk\\bin\\movescu.exe",
+    "access_numbers_file_path": "D:\\dcmget\\access.txt",
+    "dicom_destination_folder": "D:\\Dicom\\Dest",
+    "pacs_server_ip": "127.0.0.1",
+    "pacs_server_port": "8104",
+    "application_entity_title": "v172-16-254-91",
+    "called_ae_title": "pacs91",
+    "calling_ae_title": "v172-16-254-91",
+    "network_port": "6666",
+    "max_log_file_size_bytes": 104857600
+}
