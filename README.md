@@ -35,7 +35,7 @@
 - `network_port`: 网络端口。
 - `max_log_file_size_bytes`: 日志文件的最大大小（字节）。
 
-## 部署方式
+## 部署方式（命令行）
 
 1. 确保 Python 环境已安装在您的系统上。
 
@@ -52,6 +52,22 @@
    ```
 
 ![image-20231208143936988](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312081439012.png)
+
+## UI界面编译
+
+```sh
+pip install pyqt5
+pip install pyinstaller
+pyinstaller --onefile --windowed DICOM_download_ui.py
+```
+
+- 编译完成后运行里面的exe程序即可
+
+
+
+![界面截图](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312100954786.png)
+
+
 
 ## 注意事项
 

@@ -8,5 +8,5 @@
     "called_ae_title": "pacs91",
     "calling_ae_title": "v172-16-254-91",
     "network_port": "6666",
-    "max_log_file_size_bytes": 104857600
+    "max_log_file_size_bytes": "104857600"
 }
