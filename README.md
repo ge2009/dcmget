@@ -53,6 +53,14 @@
 
 ![image-20231208143936988](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312081439012.png)
 
+6. 可以直接运行带QT界面的程序
+
+`python DICOM_download_ui.py`
+
+
+
+
+
 ## UI界面编译
 
 ```sh
@@ -65,7 +73,7 @@ pyinstaller --onefile --windowed DICOM_download_ui.py
 
 
 
-![界面截图](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312100954786.png)
+![image-20231210101939972](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312101019002.png)
 
 
 
