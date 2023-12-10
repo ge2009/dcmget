@@ -2,6 +2,7 @@ import sys
 import subprocess
 import os
 import json
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QGroupBox, QFormLayout
 
 def load_config(json_path):
@@ -23,6 +24,8 @@ class DICOMDownloadApp(QWidget):
 
     def initUI(self):
         layout = QVBoxLayout()
+        # 设置窗口图标
+        self.setWindowIcon(QIcon('logo.png'))  # 替换为你的图标文件路径
         configGroup = QGroupBox("Configuration Settings")
         formLayout = QFormLayout()
 
