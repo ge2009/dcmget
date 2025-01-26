@@ -43,7 +43,7 @@
 
 3. 根据您的环境和需求，编辑 `config.json` 文件。
 
-4. 修改要批量下载的access文件，里面传入访问号格式如图![](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312081130385.png)
+4. 修改要批量下载的access文件，里面传入访问号格式如图![下载进度](http://qiniu.v2ex.com.cn/upload2022/202312081439012.png)
 
 5. 运行脚本：
 
@@ -51,7 +51,7 @@
    python DICOM_download_script.py
    ```
 
-![image-20231208143936988](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312081439012.png)
+(http://qiniu.v2ex.com.cn/upload2022/202312081440110.png)
 
 6. 可以直接运行带QT界面的程序
 
@@ -73,7 +73,7 @@ pyinstaller --onefile --windowed DICOM_download_ui.py
 
 
 
-![image-20231210101939972](https://image-1256178063.cos.ap-shanghai.myqcloud.com/upload2022/202312101019002.png)
+![实际使用效果](http://qiniu.v2ex.com.cn/upload2022/202312091825375.png) 
 
 
 
