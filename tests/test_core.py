@@ -68,7 +68,8 @@ def test_dcmtk_commands_use_storescp_move_destination_and_argument_arrays(tmp_pa
         str(tmp_path),
     ]
     assert store[-1] == "11112"
-    assert "--fork" in store
+    expected_mode = "--single-process" if core.os.name == "nt" else "--fork"
+    assert expected_mode in store
     assert move == [
         str(tools.movescu),
         "-v",
