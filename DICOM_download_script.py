@@ -1,56 +1,72 @@
-"""
-DICOM Get Script
-Version: 1.0
-Date: 2023-12-08
-Description: This script is used to download DICOM files from a PACS server based on access numbers listed in a text file.
-"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+from pathlib import Path
+
+from dcmget.config import load_accessions, load_config
+from dcmget.core import DcmtkResolver, DownloadRunner, preflight
 
 
-import subprocess
-import os
-import json
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-def get_log_file(base_path, max_size):
-    """获取合适的日志文件，如果当前日志文件超过设定大小则创建新的日志文件"""
-    log_index = 1
-    while True:
-        log_file = os.path.join(base_path, f'download_log_{log_index}.txt')
-        if not os.path.exists(log_file) or os.path.getsize(log_file) < max_size:
-            return log_file
-        log_index += 1
 
-def download_dicom(access_number, destination_path, config):
-    specific_dest_path = os.path.join(destination_path, access_number)
-    if not os.path.exists(specific_dest_path):
-        os.makedirs(specific_dest_path)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="DcmGet 2.0 DICOM 批量下载工具")
+    parser.add_argument(
+        "--config",
+        default=str(PROJECT_ROOT / "config.json"),
+        help="配置文件路径（默认：项目目录/config.json）",
+    )
+    parser.add_argument("--accessions", help="覆盖配置中的检查号 TXT 文件路径")
+    return parser
 
-    movescu_path = config['movescu_executable_path']
-    command = f"{movescu_path} -v -d -aet {config['application_entity_title']} -aec {config['called_ae_title']} -aem {config['calling_ae_title']} --port {config['network_port']} -od {specific_dest_path} {config['pacs_server_ip']} {config['pacs_server_port']} -S -k QueryRetrieveLevel=STUDY -k 0008,0050={access_number}"
-    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return result.stdout.decode('utf-8', 'ignore'), result.stderr.decode('utf-8', 'ignore')
 
-def main(txt_file, destination_path, config):
-    with open(txt_file, 'r', encoding='utf-8') as file:
-        access_numbers = file.readlines()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        config = load_config(args.config)
+        accession_path = args.accessions or config.access_numbers_file_path
+        parsed = load_accessions(accession_path)
+    except (OSError, ValueError) as exc:
+        print(f"配置或检查号文件错误：{exc}", file=sys.stderr)
+        return 1
 
-    for i, access_number in enumerate(access_numbers, 1):
-        access_number = access_number.strip()
-        print(f"Downloading DICOM for access number: {access_number} ({i}/{len(access_numbers)})")
-        stdout, stderr = download_dicom(access_number, destination_path, config)
+    if not parsed.values:
+        print("检查号列表为空。", file=sys.stderr)
+        return 1
 
-        # 获取合适的日志文件
-        log_file_path = get_log_file(destination_path, config['max_log_file_size_bytes'])
-        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-            log_file.write(f"Access Number: {access_number}\n")
-            log_file.write("Output:\n")
-            log_file.write(stdout + "\n")
-            if stderr:
-                log_file.write("Error:\n")
-                log_file.write(stderr + "\n")
-            log_file.write("-" * 50 + "\n")
+    check = preflight(config, DcmtkResolver(PROJECT_ROOT))
+    for name, ok, message in check.checks:
+        marker = "通过" if ok else "失败"
+        print(f"[{marker}] {name}：{message}")
+    if not check.ok or check.tools is None:
+        return 1
+
+    runner = DownloadRunner(
+        config,
+        check.tools,
+        log_callback=lambda source, message, _level: print(f"[{source}] {message}"),
+        state_callback=lambda state: print(f"[状态] {state}"),
+        progress_callback=lambda index, total, result: print(
+            f"[{index}/{total}] {result.accession}：{result.status.value}，{result.file_count} 个文件"
+        ),
+    )
+
+    def cancel(_signum: int, _frame: object) -> None:
+        runner.request_cancel()
+
+    signal.signal(signal.SIGINT, cancel)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, cancel)
+
+    try:
+        return runner.run(parsed.values).exit_code
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        print(f"下载启动失败：{exc}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    with open('config.json', 'r', encoding='utf-8') as file:
-        config = json.load(file)
-
-    main(config['access_numbers_file_path'], config['dicom_destination_folder'], config)
+    raise SystemExit(main())

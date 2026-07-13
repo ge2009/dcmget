@@ -1,0 +1,622 @@
+from __future__ import annotations
+
+import hashlib
+import locale
+import logging
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Callable, Iterable
+
+from .config import AppConfig
+
+
+class AccessionStatus(str, Enum):
+    WAITING = "等待"
+    DOWNLOADING = "下载中"
+    COMPLETED = "完成"
+    NO_DATA = "无数据"
+    PARTIAL = "部分成功"
+    FAILED = "失败"
+    CANCELLED = "已取消"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPaths:
+    movescu: Path
+    storescp: Path
+    bin_dir: Path
+    version: str
+    storescp_help: str = ""
+
+    @property
+    def supports_fork(self) -> bool:
+        return "--fork" in self.storescp_help and os.name != "nt"
+
+
+@dataclass(slots=True)
+class AccessionResult:
+    accession: str
+    status: AccessionStatus
+    file_count: int = 0
+    duration_seconds: float = 0.0
+    message: str = ""
+    output_directory: str = ""
+
+
+@dataclass(slots=True)
+class BatchSummary:
+    results: list[AccessionResult] = field(default_factory=list)
+    cancelled: bool = False
+    staging_directory: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        if self.cancelled:
+            return 130
+        if any(r.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL} for r in self.results):
+            return 2
+        return 0
+
+    @property
+    def failed_accessions(self) -> list[str]:
+        return [
+            result.accession
+            for result in self.results
+            if result.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
+        ]
+
+
+@dataclass(slots=True)
+class PreflightResult:
+    tools: ToolPaths | None
+    errors: dict[str, str]
+    checks: list[tuple[str, bool, str]]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors and self.tools is not None
+
+
+LogCallback = Callable[[str, str, str], None]
+StateCallback = Callable[[str], None]
+ProgressCallback = Callable[[int, int, AccessionResult], None]
+
+
+class DcmtkResolver:
+    def __init__(self, project_root: str | Path | None = None):
+        self.project_root = Path(project_root or Path.cwd()).resolve()
+
+    def resolve(self, configured_dir: str = "") -> ToolPaths:
+        for bin_dir in self._candidate_directories(configured_dir):
+            result = self._from_directory(bin_dir)
+            if result:
+                return result
+
+        movescu = shutil.which(self._tool_name("movescu"))
+        storescp = shutil.which(self._tool_name("storescp"))
+        if movescu and storescp:
+            return self._probe(Path(movescu), Path(storescp))
+
+        raise FileNotFoundError(
+            "未找到 movescu 和 storescp。请在设置中选择 DCMTK bin 目录，"
+            "或先运行对应系统的部署脚本。"
+        )
+
+    def _candidate_directories(self, configured_dir: str) -> Iterable[Path]:
+        seen: set[Path] = set()
+        candidates: list[Path] = []
+        if configured_dir:
+            configured = Path(configured_dir).expanduser()
+            candidates.append(configured.parent if configured.is_file() else configured)
+
+        runtime = self.project_root / ".runtime" / "dcmtk"
+        platform_key = current_platform_key()
+        platform_runtime = runtime / platform_key
+        candidates.extend(
+            [
+                platform_runtime / "bin",
+                platform_runtime,
+                runtime / "bin",
+                self.project_root / "dcmtk" / "bin",
+            ]
+        )
+        if platform_runtime.exists():
+            candidates[2:2] = platform_runtime.glob("*/bin")
+
+        for candidate in candidates:
+            try:
+                normalized = candidate.resolve()
+            except OSError:
+                normalized = candidate
+            if normalized not in seen:
+                seen.add(normalized)
+                yield normalized
+
+    def _from_directory(self, directory: Path) -> ToolPaths | None:
+        movescu = directory / self._tool_name("movescu")
+        storescp = directory / self._tool_name("storescp")
+        if movescu.is_file() and storescp.is_file():
+            try:
+                return self._probe(movescu, storescp)
+            except (OSError, subprocess.SubprocessError):
+                return None
+        return None
+
+    def _probe(self, movescu: Path, storescp: Path) -> ToolPaths:
+        version_text = _run_probe([str(movescu), "--version"])
+        storescp_version = _run_probe([str(storescp), "--version"])
+        help_text = _run_probe([str(storescp), "--help"], allow_nonzero=True)
+        version = _parse_version(version_text) or _parse_version(storescp_version) or "未知"
+        return ToolPaths(movescu, storescp, movescu.parent, version, help_text)
+
+    @staticmethod
+    def _tool_name(name: str) -> str:
+        return f"{name}.exe" if os.name == "nt" else name
+
+
+def current_platform_key() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "windows":
+        return "windows-x86_64"
+    if system == "darwin":
+        return "macos-arm64" if machine in {"arm64", "aarch64"} else "macos-x86_64"
+    if system == "linux":
+        return "linux-x86_64" if machine in {"x86_64", "amd64"} else f"linux-{machine}"
+    return f"{system}-{machine}"
+
+
+def build_storescp_command(config: AppConfig, tools: ToolPaths, staging: Path) -> list[str]:
+    command = [
+        str(tools.storescp),
+        "-v",
+        "-aet",
+        config.storage_ae_title,
+        "+xa",
+        "-od",
+        str(staging),
+    ]
+    if tools.supports_fork:
+        command.append("--fork")
+    else:
+        command.append("--single-process")
+    command.append(str(config.storage_port))
+    return command
+
+
+def build_movescu_command(config: AppConfig, tools: ToolPaths, accession: str) -> list[str]:
+    return [
+        str(tools.movescu),
+        "-v",
+        "--no-port",
+        "-aet",
+        config.calling_ae_title,
+        "-aec",
+        config.pacs_ae_title,
+        "-aem",
+        config.storage_ae_title,
+        config.pacs_server_ip,
+        str(config.pacs_server_port),
+        "-S",
+        "-k",
+        "QueryRetrieveLevel=STUDY",
+        "-k",
+        f"0008,0050={accession}",
+    ]
+
+
+def preflight(config: AppConfig, resolver: DcmtkResolver) -> PreflightResult:
+    errors = config.validate()
+    checks: list[tuple[str, bool, str]] = []
+
+    tools: ToolPaths | None = None
+    try:
+        tools = resolver.resolve(config.dcmtk_bin_dir)
+        checks.append(("DCMTK 工具", True, f"已就绪，版本 {tools.version}"))
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+        errors["dcmtk_bin_dir"] = str(exc)
+        checks.append(("DCMTK 工具", False, str(exc)))
+
+    destination = Path(config.dicom_destination_folder).expanduser()
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        probe = destination / ".dcmget-write-test"
+        probe.touch(exist_ok=True)
+        probe.unlink()
+        checks.append(("保存目录", True, "目录可写"))
+    except OSError as exc:
+        message = f"保存目录不可写：{exc}"
+        errors["dicom_destination_folder"] = message
+        checks.append(("保存目录", False, message))
+
+    if "storage_port" not in errors:
+        available = is_port_available(config.storage_port)
+        message = "端口可用" if available else f"端口 {config.storage_port} 已被占用"
+        checks.append(("接收端口", available, message))
+        if not available:
+            errors["storage_port"] = message
+
+    checks.append(
+        (
+            "PACS 配置",
+            not any(key in errors for key in ("pacs_server_ip", "pacs_server_port", "pacs_ae_title")),
+            f"{config.pacs_server_ip}:{config.pacs_server_port} / {config.pacs_ae_title}",
+        )
+    )
+    return PreflightResult(tools, errors, checks)
+
+
+def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if os.name == "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+class DownloadRunner:
+    def __init__(
+        self,
+        config: AppConfig,
+        tools: ToolPaths,
+        log_callback: LogCallback | None = None,
+        state_callback: StateCallback | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ):
+        self.config = config
+        self.tools = tools
+        self.log_callback = log_callback or (lambda _source, _message, _level: None)
+        self.state_callback = state_callback or (lambda _state: None)
+        self.progress_callback = progress_callback or (lambda _index, _total, _result: None)
+        self._cancel = threading.Event()
+        self._process_lock = threading.Lock()
+        self._current_process: subprocess.Popen[str] | None = None
+        self._storescp_process: subprocess.Popen[str] | None = None
+        self._logger = self._build_file_logger()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        self._emit("应用", "正在停止当前任务…", "warning")
+        with self._process_lock:
+            process = self._current_process
+        if process:
+            _terminate_process(process)
+        storescp = self._storescp_process
+        if storescp:
+            _terminate_process(storescp)
+
+    def run(self, accessions: Iterable[str]) -> BatchSummary:
+        values = list(accessions)
+        destination = Path(self.config.dicom_destination_folder).expanduser().resolve()
+        staging_root = destination / ".dcmget-staging"
+        staging = staging_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        staging.mkdir(parents=True, exist_ok=False)
+        summary = BatchSummary(staging_directory=str(staging))
+
+        self.state_callback("starting_receiver")
+        try:
+            self._start_storescp(staging)
+            self.state_callback("downloading")
+            for index, accession in enumerate(values, 1):
+                if self._cancel.is_set():
+                    summary.cancelled = True
+                    self._append_cancelled(summary, values[index - 1 :])
+                    break
+
+                result = self._download_one(accession, staging, index, len(values))
+                summary.results.append(result)
+                self.progress_callback(index, len(values), result)
+
+                if result.status == AccessionStatus.CANCELLED:
+                    summary.cancelled = True
+                    self._append_cancelled(summary, values[index:])
+                    break
+        finally:
+            self.state_callback("stopping")
+            self._stop_storescp()
+            self._cleanup_staging(staging)
+            self._close_file_logger()
+
+        if summary.cancelled:
+            self.state_callback("cancelled")
+        elif summary.exit_code == 2:
+            self.state_callback("partial")
+        else:
+            self.state_callback("completed")
+        return summary
+
+    def _start_storescp(self, staging: Path) -> None:
+        command = build_storescp_command(self.config, self.tools, staging)
+        self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
+        process = self._popen(command)
+        self._storescp_process = process
+        self._start_reader(process, "storescp")
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                return
+            if process.poll() is not None:
+                raise RuntimeError(f"storescp 启动失败，退出码 {process.returncode}")
+            if _port_is_listening(self.config.storage_port):
+                self._emit("storescp", f"已监听端口 {self.config.storage_port}", "success")
+                return
+            time.sleep(0.1)
+        _terminate_process(process)
+        raise TimeoutError(f"storescp 未能在端口 {self.config.storage_port} 就绪")
+
+    def _download_one(
+        self, accession: str, staging: Path, index: int, total: int
+    ) -> AccessionResult:
+        started = time.monotonic()
+        before = _files_in(staging)
+        command = build_movescu_command(self.config, self.tools, accession)
+        self._emit("movescu", f"开始检查号 {accession}", "info")
+        self._emit("movescu", _display_command(command), "debug")
+
+        process = self._popen(command)
+        with self._process_lock:
+            self._current_process = process
+        reader = self._start_reader(process, "movescu")
+        last_received = -1
+        try:
+            while process.poll() is None:
+                if self._cancel.is_set():
+                    _terminate_process(process)
+                    break
+                received = len(_files_in(staging) - before)
+                if received != last_received:
+                    last_received = received
+                    self.progress_callback(
+                        index,
+                        total,
+                        AccessionResult(
+                            accession,
+                            AccessionStatus.DOWNLOADING,
+                            file_count=received,
+                            duration_seconds=time.monotonic() - started,
+                            message="正在接收 DICOM 文件",
+                        ),
+                    )
+                time.sleep(0.1)
+            return_code = process.wait()
+            reader.join(timeout=2)
+        finally:
+            with self._process_lock:
+                self._current_process = None
+
+        new_files = sorted(_files_in(staging) - before)
+        output_directory = Path(self.config.dicom_destination_folder).expanduser() / safe_accession_dir(accession)
+        moved = _move_files(new_files, output_directory)
+        duration = time.monotonic() - started
+
+        if self._cancel.is_set():
+            status = AccessionStatus.CANCELLED
+            message = "用户已取消"
+        elif return_code == 0 and moved:
+            status = AccessionStatus.COMPLETED
+            message = f"收到 {len(moved)} 个文件"
+        elif return_code == 0:
+            status = AccessionStatus.NO_DATA
+            message = "C-MOVE 完成，但未收到文件"
+        elif moved:
+            status = AccessionStatus.PARTIAL
+            message = f"movescu 退出码 {return_code}，已保留 {len(moved)} 个文件"
+        else:
+            status = AccessionStatus.FAILED
+            message = f"movescu 退出码 {return_code}，未收到文件"
+
+        level = "success" if status == AccessionStatus.COMPLETED else (
+            "warning" if status in {AccessionStatus.NO_DATA, AccessionStatus.PARTIAL, AccessionStatus.CANCELLED} else "error"
+        )
+        self._emit("movescu", f"{accession}：{message}", level)
+        return AccessionResult(
+            accession=accession,
+            status=status,
+            file_count=len(moved),
+            duration_seconds=duration,
+            message=message,
+            output_directory=str(output_directory) if moved else "",
+        )
+
+    def _popen(self, command: list[str]) -> subprocess.Popen[str]:
+        kwargs: dict[str, object] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": locale.getpreferredencoding(False) or "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+            "env": _dcmtk_environment(self.tools),
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        return subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
+
+    def _start_reader(self, process: subprocess.Popen[str], source: str) -> threading.Thread:
+        def read_output() -> None:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                text = line.rstrip()
+                if text:
+                    level = "error" if text.startswith(("E:", "F:")) else "info"
+                    self._emit(source, text, level)
+
+        thread = threading.Thread(target=read_output, name=f"{source}-output", daemon=True)
+        thread.start()
+        return thread
+
+    def _stop_storescp(self) -> None:
+        process = self._storescp_process
+        self._storescp_process = None
+        if process and process.poll() is None:
+            _terminate_process(process)
+            self._emit("storescp", "接收器已停止", "info")
+
+    def _cleanup_staging(self, staging: Path) -> None:
+        remaining = _files_in(staging)
+        if remaining:
+            self._emit("应用", f"暂存目录仍有 {len(remaining)} 个文件：{staging}", "warning")
+            return
+        try:
+            staging.rmdir()
+            staging.parent.rmdir()
+        except OSError:
+            pass
+
+    def _append_cancelled(self, summary: BatchSummary, accessions: Iterable[str]) -> None:
+        for accession in accessions:
+            summary.results.append(
+                AccessionResult(accession, AccessionStatus.CANCELLED, message="任务尚未开始")
+            )
+
+    def _emit(self, source: str, message: str, level: str) -> None:
+        self.log_callback(source, message, level)
+        log_level = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "success": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }.get(level, logging.INFO)
+        self._logger.log(log_level, "[%s] %s", source, message)
+
+    def _build_file_logger(self) -> logging.Logger:
+        destination = Path(self.config.dicom_destination_folder).expanduser()
+        log_dir = destination / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(f"dcmget.runner.{id(self)}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = RotatingFileHandler(
+            log_dir / "dcmget.log",
+            maxBytes=self.config.max_log_file_size_bytes,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        return logger
+
+    def _close_file_logger(self) -> None:
+        for handler in list(self._logger.handlers):
+            handler.close()
+            self._logger.removeHandler(handler)
+
+
+def safe_accession_dir(accession: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", accession.strip()).strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        cleaned = "accession"
+    if cleaned != accession.strip():
+        digest = hashlib.sha1(accession.encode("utf-8")).hexdigest()[:8]
+        cleaned = f"{cleaned}-{digest}"
+    return cleaned[:120]
+
+
+def _run_probe(command: list[str], allow_nonzero: bool = False) -> str:
+    kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": locale.getpreferredencoding(False) or "utf-8",
+        "errors": "replace",
+        "timeout": 10,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    result = subprocess.run(command, **kwargs)  # type: ignore[arg-type]
+    if result.returncode and not allow_nonzero:
+        raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+    return "\n".join(part for part in (result.stdout, result.stderr) if part)
+
+
+def _parse_version(text: str) -> str:
+    match = re.search(r"\bv(\d+\.\d+(?:\.\d+)?)\b", text)
+    return match.group(1) if match else ""
+
+
+def _port_is_listening(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _files_in(directory: Path) -> set[Path]:
+    if not directory.exists():
+        return set()
+    return {path for path in directory.rglob("*") if path.is_file()}
+
+
+def _move_files(files: Iterable[Path], destination: Path) -> list[Path]:
+    moved: list[Path] = []
+    values = list(files)
+    if not values:
+        return moved
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in values:
+        target = destination / source.name
+        os.replace(source, target)
+        moved.append(target)
+    return moved
+
+
+def _dcmtk_environment(tools: ToolPaths) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PATH"] = str(tools.bin_dir) + os.pathsep + env.get("PATH", "")
+    share_root = tools.bin_dir.parent / "share"
+    if share_root.exists():
+        dictionaries = list(share_root.glob("dcmtk-*/dicom.dic")) + list(share_root.glob("dicom.dic"))
+        if dictionaries:
+            env.setdefault("DCMDICTPATH", str(dictionaries[0]))
+    return env
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+
+
+def _display_command(command: list[str]) -> str:
+    return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)

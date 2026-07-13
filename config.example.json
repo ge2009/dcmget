@@ -5,9 +5,9 @@
   "dicom_destination_folder": "Dicom/Dest",
   "pacs_server_ip": "127.0.0.1",
   "pacs_server_port": 8104,
-  "calling_ae_title": "v172-16-254-91",
-  "pacs_ae_title": "pacs91",
-  "storage_ae_title": "v172-16-254-91",
+  "calling_ae_title": "MOVESCU",
+  "pacs_ae_title": "ANY-SCP",
+  "storage_ae_title": "MOVESCU",
   "storage_port": 6666,
   "max_log_file_size_bytes": 104857600
 }

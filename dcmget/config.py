@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+@dataclass(slots=True)
+class AppConfig:
+    config_version: int = 2
+    dcmtk_bin_dir: str = ""
+    access_numbers_file_path: str = "access.txt"
+    dicom_destination_folder: str = "Dicom"
+    pacs_server_ip: str = "127.0.0.1"
+    pacs_server_port: int = 8104
+    calling_ae_title: str = "MOVESCU"
+    pacs_ae_title: str = "ANY-SCP"
+    storage_ae_title: str = "MOVESCU"
+    storage_port: int = 6666
+    max_log_file_size_bytes: int = 104_857_600
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "AppConfig":
+        data = dict(raw)
+        is_legacy = int(data.get("config_version", 1) or 1) < 2
+
+        if is_legacy:
+            legacy_move_destination = data.get("calling_ae_title", "MOVESCU")
+            data = {
+                "config_version": 2,
+                "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
+                "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
+                "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
+                "pacs_server_ip": data.get("pacs_server_ip", "127.0.0.1"),
+                "pacs_server_port": data.get("pacs_server_port", 8104),
+                "calling_ae_title": data.get("application_entity_title", "MOVESCU"),
+                "pacs_ae_title": data.get("called_ae_title", "ANY-SCP"),
+                "storage_ae_title": legacy_move_destination,
+                "storage_port": data.get("network_port", 6666),
+                "max_log_file_size_bytes": data.get(
+                    "max_log_file_size_bytes", 104_857_600
+                ),
+            }
+
+        defaults = cls()
+        values = {
+            field: data.get(field, getattr(defaults, field))
+            for field in asdict(defaults)
+        }
+        values["config_version"] = 2
+        values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
+        values["storage_port"] = _as_int(values["storage_port"], 6666)
+        values["max_log_file_size_bytes"] = _as_int(
+            values["max_log_file_size_bytes"], 104_857_600
+        )
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def validate(self) -> dict[str, str]:
+        errors: dict[str, str] = {}
+        required = {
+            "dicom_destination_folder": "请选择 DICOM 保存目录",
+            "pacs_server_ip": "请输入 PACS 服务器地址",
+            "calling_ae_title": "请输入本机调用 AE Title",
+            "pacs_ae_title": "请输入 PACS AE Title",
+            "storage_ae_title": "请输入接收 AE Title",
+        }
+        for field, message in required.items():
+            if not str(getattr(self, field)).strip():
+                errors[field] = message
+
+        for field in ("calling_ae_title", "pacs_ae_title", "storage_ae_title"):
+            value = str(getattr(self, field)).strip()
+            if len(value) > 16:
+                errors[field] = "AE Title 最多 16 个字符"
+
+        if not 1 <= self.pacs_server_port <= 65535:
+            errors["pacs_server_port"] = "端口必须在 1 到 65535 之间"
+        if not 1 <= self.storage_port <= 65535:
+            errors["storage_port"] = "端口必须在 1 到 65535 之间"
+        if self.max_log_file_size_bytes < 1024:
+            errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
+        return errors
+
+
+@dataclass(frozen=True, slots=True)
+class AccessionParseResult:
+    values: list[str]
+    blank_count: int
+    duplicate_count: int
+
+
+def parse_accessions(lines: str | Iterable[str]) -> AccessionParseResult:
+    source = lines.splitlines() if isinstance(lines, str) else list(lines)
+    values: list[str] = []
+    seen: set[str] = set()
+    blank_count = 0
+    duplicate_count = 0
+
+    for raw in source:
+        value = str(raw).strip()
+        if not value:
+            blank_count += 1
+            continue
+        if value in seen:
+            duplicate_count += 1
+            continue
+        seen.add(value)
+        values.append(value)
+
+    return AccessionParseResult(values, blank_count, duplicate_count)
+
+
+def load_accessions(path: str | Path) -> AccessionParseResult:
+    with Path(path).expanduser().open("r", encoding="utf-8-sig") as handle:
+        return parse_accessions(handle.readlines())
+
+
+def load_config(path: str | Path) -> AppConfig:
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        return AppConfig()
+    with config_path.open("r", encoding="utf-8-sig") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件根节点必须是 JSON 对象")
+    return AppConfig.from_dict(raw)
+
+
+def save_config(path: str | Path, config: AppConfig) -> None:
+    config_path = Path(path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(config.to_dict(), handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    temporary.replace(config_path)
+
+
+def _legacy_dcmtk_dir(value: Any) -> str:
+    if not value:
+        return ""
+    path = Path(str(value))
+    return str(path.parent if path.suffix.lower() == ".exe" or path.name == "movescu" else path)
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

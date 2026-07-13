@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcmget"
+version = "2.0.0"
+description = "Cross-platform DCMTK C-MOVE download workstation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyQt5>=5.15.10,<5.16", "PyQt5-Qt5==5.15.17"]
+
+[project.scripts]
+dcmget = "DICOM_download_script:main"
+dcmget-ui = "DICOM_download_ui:main"
+
+[tool.setuptools]
+packages = ["dcmget"]
+py-modules = ["DICOM_download_script", "DICOM_download_ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["integration: requires local DCMTK and opens loopback DICOM ports"]
