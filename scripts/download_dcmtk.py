@@ -6,6 +6,7 @@ import hashlib
 import os
 import platform
 import shutil
+import sys
 import tarfile
 import time
 import urllib.error
@@ -163,6 +164,9 @@ def install(project_root: Path, key: str, force: bool = False) -> Path:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="下载并安装 OFFIS DCMTK 3.7.0")
     parser.add_argument("--platform", choices=sorted(PACKAGES), default=platform_key())
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
