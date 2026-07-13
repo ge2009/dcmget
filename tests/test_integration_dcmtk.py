@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import socket
+from pathlib import Path
 
 import pytest
 from pydicom.dataset import FileDataset, FileMetaDataset
@@ -49,7 +50,7 @@ def unused_port() -> int:
 @pytest.mark.integration
 def test_real_storescp_movescu_cstore_round_trip(tmp_path):
     try:
-        tools = DcmtkResolver(tmp_path).resolve()
+        tools = DcmtkResolver(Path(__file__).resolve().parents[1]).resolve()
     except FileNotFoundError:
         pytest.skip("本机未安装 movescu/storescp")
 
