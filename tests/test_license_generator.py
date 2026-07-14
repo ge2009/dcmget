@@ -17,6 +17,7 @@ def test_generator_script_can_run_directly_from_source_tree():
         [sys.executable, str(script), "--help"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
 
