@@ -101,8 +101,8 @@ jobs:
         run: |
           $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE" }
+          $install = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer failed with exit code $($install.ExitCode)" }
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
@@ -110,8 +110,8 @@ jobs:
           Start-Sleep -Seconds 8
           if ($process.HasExited) { throw "Installed DcmGet exited with code $($process.ExitCode)" }
           Stop-Process -Id $process.Id -Force
-          & "$installDir/unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "Uninstaller failed with exit code $LASTEXITCODE" }
+          $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
 
       - name: Finalize checksums
