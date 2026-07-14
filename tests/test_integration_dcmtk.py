@@ -122,6 +122,7 @@ def test_real_storescp_accepts_parallel_associations(tmp_path):
     )
     runner = DownloadRunner(config, tools)
     process = runner._popen(build_storescp_command(config, tools, tmp_path))
+    reader = runner._start_reader(process, "storescp")
 
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and is_port_available(storage_port):
@@ -151,6 +152,7 @@ def test_real_storescp_accepts_parallel_associations(tmp_path):
             time.sleep(0.05)
     finally:
         core._terminate_process(process)
+        reader.join(timeout=2)
         runner._close_file_logger()
 
     received = [path for path in tmp_path.glob("*.*") if path.is_file()]
