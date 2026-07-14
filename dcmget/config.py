@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+
+DEFAULT_DIRECTORY_TEMPLATE = "{PatientID}/{AccessionNumber}/{StudyInstanceUID}"
+DIRECTORY_TEMPLATES = (
+    DEFAULT_DIRECTORY_TEMPLATE,
+    "{AccessionNumber}/{StudyInstanceUID}",
+    "{PatientID}/{AccessionNumber}",
+    "{AccessionNumber}",
+    "{StudyInstanceUID}",
+)
+DIRECTORY_TEMPLATE_FIELDS = {"PatientID", "AccessionNumber", "StudyInstanceUID"}
 
 
 @dataclass(slots=True)
@@ -14,10 +26,11 @@ class AppConfig:
     dicom_destination_folder: str = "Dicom"
     pacs_server_ip: str = "127.0.0.1"
     pacs_server_port: int = 8104
-    calling_ae_title: str = "MOVESCU"
+    calling_ae_title: str = "DCMGET"
     pacs_ae_title: str = "ANY-SCP"
-    storage_ae_title: str = "MOVESCU"
+    storage_ae_title: str = "DCMGET"
     storage_port: int = 6666
+    directory_template: str = DEFAULT_DIRECTORY_TEMPLATE
     max_log_file_size_bytes: int = 104_857_600
 
     @classmethod
@@ -26,7 +39,7 @@ class AppConfig:
         is_legacy = int(data.get("config_version", 1) or 1) < 2
 
         if is_legacy:
-            legacy_move_destination = data.get("calling_ae_title", "MOVESCU")
+            legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
                 "config_version": 2,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
@@ -34,10 +47,11 @@ class AppConfig:
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
                 "pacs_server_ip": data.get("pacs_server_ip", "127.0.0.1"),
                 "pacs_server_port": data.get("pacs_server_port", 8104),
-                "calling_ae_title": data.get("application_entity_title", "MOVESCU"),
+                "calling_ae_title": data.get("application_entity_title", "DCMGET"),
                 "pacs_ae_title": data.get("called_ae_title", "ANY-SCP"),
                 "storage_ae_title": legacy_move_destination,
                 "storage_port": data.get("network_port", 6666),
+                "directory_template": DEFAULT_DIRECTORY_TEMPLATE,
                 "max_log_file_size_bytes": data.get(
                     "max_log_file_size_bytes", 104_857_600
                 ),
@@ -83,6 +97,22 @@ class AppConfig:
             errors["storage_port"] = "端口必须在 1 到 65535 之间"
         if self.max_log_file_size_bytes < 1024:
             errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
+        template = self.directory_template.strip().replace("\\", "/")
+        fields = set(re.findall(r"\{([^{}]+)\}", template))
+        without_placeholders = re.sub(
+            r"\{(?:PatientID|AccessionNumber|StudyInstanceUID)\}", "", template
+        )
+        if not template or not fields:
+            errors["directory_template"] = "目录模板至少包含一个 DICOM 字段"
+        elif fields - DIRECTORY_TEMPLATE_FIELDS:
+            unknown = "、".join(sorted(fields - DIRECTORY_TEMPLATE_FIELDS))
+            errors["directory_template"] = f"目录模板包含不支持的字段：{unknown}"
+        elif "{" in without_placeholders or "}" in without_placeholders:
+            errors["directory_template"] = "目录模板中的花括号不完整"
+        elif template.startswith("/") or re.match(r"^[A-Za-z]:", template) or any(
+            segment in {".", ".."} for segment in template.split("/")
+        ):
+            errors["directory_template"] = "目录模板不能使用绝对路径或上级目录"
         return errors
 
 

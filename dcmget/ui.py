@@ -8,6 +8,7 @@ from PyQt5.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSign
 from PyQt5.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -38,7 +39,14 @@ from PyQt5.QtWidgets import (
 )
 
 from . import __version__
-from .config import AppConfig, load_config, parse_accessions, save_config
+from .auth_ui import activate_gui, entitlement_text, prepare_download_entitlement
+from .config import (
+    AppConfig,
+    DIRECTORY_TEMPLATES,
+    load_config,
+    parse_accessions,
+    save_config,
+)
 from .core import (
     AccessionResult,
     AccessionStatus,
@@ -49,6 +57,7 @@ from .core import (
     ToolPaths,
     preflight,
 )
+from .licensing import consume_trial
 
 
 COLORS = {
@@ -155,11 +164,24 @@ class SettingsPage(QWidget):
         self.storage_ae_edit = QLineEdit()
         self.storage_ae_edit.setMaxLength(16)
         self.storage_port_spin = self._port_spin()
+        self.directory_template_combo = QComboBox()
+        self.directory_template_combo.setEditable(True)
+        self.directory_template_combo.addItems(DIRECTORY_TEMPLATES)
+        self.directory_template_combo.setToolTip(
+            "可组合 {PatientID}、{AccessionNumber}、{StudyInstanceUID}"
+        )
         self.log_size_spin = QSpinBox()
         self.log_size_spin.setRange(1, 4096)
         self.log_size_spin.setSuffix(" MB")
         receiver_form.addRow("接收 AE", self.storage_ae_edit)
         receiver_form.addRow("监听端口", self.storage_port_spin)
+        receiver_form.addRow("目录模板", self.directory_template_combo)
+        directory_hint = QLabel(
+            "可编辑组合：{PatientID}、{AccessionNumber}、{StudyInstanceUID}"
+        )
+        directory_hint.setObjectName("FieldHint")
+        directory_hint.setWordWrap(True)
+        receiver_form.addRow("", directory_hint)
         receiver_form.addRow("单个日志上限", self.log_size_spin)
 
         self.error_label = QLabel()
@@ -194,6 +216,7 @@ class SettingsPage(QWidget):
             "pacs_ae_title": self.pacs_ae_edit,
             "storage_ae_title": self.storage_ae_edit,
             "storage_port": self.storage_port_spin,
+            "directory_template": self.directory_template_combo,
             "max_log_file_size_bytes": self.log_size_spin,
         }
 
@@ -227,6 +250,7 @@ class SettingsPage(QWidget):
         self.pacs_ae_edit.setText(config.pacs_ae_title)
         self.storage_ae_edit.setText(config.storage_ae_title)
         self.storage_port_spin.setValue(config.storage_port)
+        self.directory_template_combo.setCurrentText(config.directory_template)
         self.log_size_spin.setValue(max(1, config.max_log_file_size_bytes // (1024 * 1024)))
         self.apply_errors({})
 
@@ -242,6 +266,7 @@ class SettingsPage(QWidget):
             pacs_ae_title=self.pacs_ae_edit.text().strip(),
             storage_ae_title=self.storage_ae_edit.text().strip(),
             storage_port=self.storage_port_spin.value(),
+            directory_template=self.directory_template_combo.currentText().strip(),
             max_log_file_size_bytes=self.log_size_spin.value() * 1024 * 1024,
         )
 
@@ -282,12 +307,20 @@ class DownloadWorker(QObject):
     progress = pyqtSignal(int, int, object)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
+    trial_consumed = pyqtSignal(str)
 
-    def __init__(self, config: AppConfig, tools: ToolPaths, accessions: list[str]):
+    def __init__(
+        self,
+        config: AppConfig,
+        tools: ToolPaths,
+        accessions: list[str],
+        consume_trial_on_ready: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.tools = tools
         self.accessions = accessions
+        self.consume_trial_on_ready = consume_trial_on_ready
         self.runner: DownloadRunner | None = None
         self.cancel_requested = False
 
@@ -300,6 +333,9 @@ class DownloadWorker(QObject):
                 log_callback=self.log.emit,
                 state_callback=self.state.emit,
                 progress_callback=self.progress.emit,
+                ready_callback=(
+                    self._consume_trial if self.consume_trial_on_ready else None
+                ),
             )
             if self.cancel_requested:
                 self.runner.request_cancel()
@@ -311,6 +347,10 @@ class DownloadWorker(QObject):
         self.cancel_requested = True
         if self.runner:
             self.runner.request_cancel()
+
+    def _consume_trial(self) -> None:
+        trial = consume_trial()
+        self.trial_consumed.emit(f"本次使用免费试用，剩余 {trial.remaining} 次")
 
 
 class DcmGetWindow(QMainWindow):
@@ -330,6 +370,9 @@ class DcmGetWindow(QMainWindow):
         self.settings_store = QSettings("DcmGet", "DcmGet2")
         self._log_panel_expanded = self.settings_store.value(
             "window/log_expanded", True, type=bool
+        )
+        self._task_form_expanded = self.settings_store.value(
+            "window/task_form_expanded", True, type=bool
         )
 
         self.setWindowTitle(f"DcmGet {__version__} - DICOM 下载工作台")
@@ -358,7 +401,7 @@ class DcmGetWindow(QMainWindow):
         self.pages.addWidget(self._build_task_page())
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
-        self.settings_page.back_requested.connect(lambda: self.pages.setCurrentIndex(0))
+        self.settings_page.back_requested.connect(self._cancel_settings)
         self.pages.addWidget(self.settings_page)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
@@ -386,6 +429,15 @@ class DcmGetWindow(QMainWindow):
         self.tool_status.setObjectName("StatusPill")
         self.tool_status.setProperty("status", "pending")
         layout.addWidget(self.tool_status)
+        self.entitlement_status = QLabel()
+        self.entitlement_status.setObjectName("StatusPill")
+        self._refresh_entitlement_status()
+        layout.addWidget(self.entitlement_status)
+        self.registration_button = QToolButton()
+        self.registration_button.setText("软件注册")
+        self.registration_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.registration_button.clicked.connect(self._show_activation)
+        layout.addWidget(self.registration_button)
         self.settings_button = QToolButton()
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -403,17 +455,29 @@ class DcmGetWindow(QMainWindow):
 
         input_card = QFrame()
         input_card.setObjectName("Card")
-        grid = QGridLayout(input_card)
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(10)
+        input_layout = QVBoxLayout(input_card)
+        input_header = QHBoxLayout()
         section = QLabel("新建下载任务")
         section.setObjectName("SectionTitle")
-        grid.addWidget(section, 0, 0, 1, 3)
-        grid.addWidget(QLabel("检查号"), 1, 0, Qt.AlignTop)
+        input_header.addWidget(section)
+        input_header.addStretch()
+        self.task_form_toggle_button = QToolButton()
+        self.task_form_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.task_form_toggle_button.setAccessibleName("展开或收起新建任务")
+        self.task_form_toggle_button.clicked.connect(self._toggle_task_form)
+        input_header.addWidget(self.task_form_toggle_button)
+        input_layout.addLayout(input_header)
+
+        self.task_form_body = QWidget()
+        grid = QGridLayout(self.task_form_body)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(10)
+        grid.addWidget(QLabel("检查号"), 0, 0, Qt.AlignTop)
         self.accession_edit = AccessionTextEdit()
         self.accession_edit.textChanged.connect(self._update_accession_preview)
         self.accession_edit.file_dropped.connect(self._load_accession_file)
-        grid.addWidget(self.accession_edit, 1, 1, 1, 2)
+        grid.addWidget(self.accession_edit, 0, 1, 1, 2)
         self.accession_button = QPushButton("选择 TXT")
         self.accession_button.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self.accession_button.clicked.connect(self._choose_accession_file)
@@ -423,16 +487,18 @@ class DcmGetWindow(QMainWindow):
         helper_row.addWidget(self.accession_button)
         helper_row.addWidget(self.accession_summary)
         helper_row.addStretch()
-        grid.addLayout(helper_row, 2, 1, 1, 2)
+        grid.addLayout(helper_row, 1, 1, 1, 2)
 
-        grid.addWidget(QLabel("保存目录"), 3, 0)
+        grid.addWidget(QLabel("保存目录"), 2, 0)
         self.destination_edit = QLineEdit()
         self.destination_edit.setAccessibleName("DICOM 保存目录")
-        grid.addWidget(self.destination_edit, 3, 1)
+        grid.addWidget(self.destination_edit, 2, 1)
         self.destination_button = QPushButton("选择目录")
         self.destination_button.clicked.connect(self._choose_destination)
-        grid.addWidget(self.destination_button, 3, 2)
+        grid.addWidget(self.destination_button, 2, 2)
         grid.setColumnStretch(1, 1)
+        input_layout.addWidget(self.task_form_body)
+        self._set_task_form_expanded(self._task_form_expanded)
         layout.addWidget(input_card)
 
         preflight_card = QFrame()
@@ -538,6 +604,26 @@ class DcmGetWindow(QMainWindow):
         self.settings_page.set_config(self.config)
         self.pages.setCurrentIndex(1)
 
+    def _cancel_settings(self) -> None:
+        self.settings_page.set_config(self.config)
+        self.pages.setCurrentIndex(0)
+
+    def _show_activation(self) -> None:
+        if self.worker:
+            return
+        if activate_gui(self):
+            self._refresh_entitlement_status()
+            self._append_log("授权", "软件注册成功", "success")
+
+    def _refresh_entitlement_status(self) -> None:
+        text = entitlement_text()
+        self.entitlement_status.setText(text)
+        self.entitlement_status.setProperty(
+            "status", "ok" if text.startswith("已注册") else "warning"
+        )
+        self.entitlement_status.style().unpolish(self.entitlement_status)
+        self.entitlement_status.style().polish(self.entitlement_status)
+
     def _save_settings(self, config: AppConfig) -> None:
         config.access_numbers_file_path = self.config.access_numbers_file_path
         config.dicom_destination_folder = self.destination_edit.text().strip()
@@ -630,7 +716,6 @@ class DcmGetWindow(QMainWindow):
             QMessageBox.warning(self, "没有检查号", "请选择 TXT 文件或粘贴检查号后再开始。")
             return
 
-        self.config = self.settings_page.config()
         self.config.access_numbers_file_path = self.config.access_numbers_file_path or "access.txt"
         self.config.dicom_destination_folder = self.destination_edit.text().strip()
         check = preflight(self.config, self.resolver)
@@ -643,6 +728,16 @@ class DcmGetWindow(QMainWindow):
                 self.pages.setCurrentIndex(1)
             return
 
+        entitled, use_trial, entitlement_message = prepare_download_entitlement(self)
+        if not entitled:
+            if entitlement_message:
+                self._append_log("授权", entitlement_message, "error")
+                QMessageBox.warning(self, "无法开始下载", entitlement_message)
+            return
+        if entitlement_message == "已完成软件注册":
+            self._refresh_entitlement_status()
+            self._append_log("授权", entitlement_message, "success")
+
         save_config(self.config_path, self.config)
         self.tools = check.tools
         self._populate_waiting_rows(accessions)
@@ -651,7 +746,12 @@ class DcmGetWindow(QMainWindow):
         self._set_running(True)
 
         thread = QThread(self)
-        worker = DownloadWorker(self.config, check.tools, list(accessions))
+        worker = DownloadWorker(
+            self.config,
+            check.tools,
+            list(accessions),
+            consume_trial_on_ready=use_trial,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.log.connect(self._append_log)
@@ -659,6 +759,7 @@ class DcmGetWindow(QMainWindow):
         worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
         worker.failed.connect(self._on_worker_failed)
+        worker.trial_consumed.connect(self._on_trial_consumed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -666,6 +767,10 @@ class DcmGetWindow(QMainWindow):
         self.worker_thread = thread
         self.worker = worker
         thread.start()
+
+    def _on_trial_consumed(self, message: str) -> None:
+        self._refresh_entitlement_status()
+        self._append_log("授权", message, "info")
 
     def _show_preflight(self, check: PreflightResult) -> None:
         for label, (name, ok, message) in zip(self.preflight_labels, check.checks):
@@ -684,6 +789,7 @@ class DcmGetWindow(QMainWindow):
         self.accession_button.setEnabled(not running)
         self.destination_button.setEnabled(not running)
         self.settings_button.setEnabled(not running)
+        self.registration_button.setEnabled(not running)
 
     def _on_worker_state(self, state: str) -> None:
         labels = {
@@ -839,6 +945,20 @@ class DcmGetWindow(QMainWindow):
             "收起日志" if self._log_panel_expanded else "展开日志"
         )
 
+    def _set_task_form_expanded(self, expanded: bool) -> None:
+        self._task_form_expanded = expanded
+        self.task_form_body.setVisible(expanded)
+        self.task_form_toggle_button.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.task_form_toggle_button.setText("收起" if expanded else "展开")
+        self.task_form_toggle_button.setToolTip(
+            "收起检查号和保存目录" if expanded else "展开新建任务输入"
+        )
+
+    def _toggle_task_form(self) -> None:
+        self._set_task_form_expanded(not self._task_form_expanded)
+
     def _restore_ui_state(self) -> None:
         geometry = self.settings_store.value("window/geometry")
         if geometry:
@@ -872,7 +992,11 @@ class DcmGetWindow(QMainWindow):
         self.settings_store.setValue("window/geometry", self.saveGeometry())
         self.settings_store.setValue("window/splitter", self.task_splitter.saveState())
         self.settings_store.setValue("window/log_expanded", self._log_panel_expanded)
+        self.settings_store.setValue(
+            "window/task_form_expanded", self._task_form_expanded
+        )
         self.settings_store.setValue("task/destination", self.destination_edit.text().strip())
+        self.settings_store.sync()
         event.accept()
 
 
@@ -901,18 +1025,19 @@ QLabel#ProgressText {{ color: {COLORS['muted']}; font-weight: 600; }}
 QLabel#ErrorText {{ color: {COLORS['danger']}; background: #FEF2F2; border: 1px solid #FECACA; padding: 9px; border-radius: 6px; }}
 QLabel#StatusPill, QLabel#CheckPill {{ padding: 6px 10px; border-radius: 12px; background: #F1F5F9; color: {COLORS['muted']}; }}
 QLabel#StatusPill[status="ok"], QLabel#CheckPill[status="ok"], QLabel#FieldHint[status="ok"] {{ background: #ECFDF5; color: {COLORS['success']}; }}
+QLabel#StatusPill[status="warning"] {{ background: #FFF7ED; color: {COLORS['warning']}; }}
 QLabel#StatusPill[status="error"], QLabel#CheckPill[status="error"], QLabel#FieldHint[status="error"] {{ background: #FEF2F2; color: {COLORS['danger']}; }}
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QTableWidget {{
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox, QTableWidget {{
     background: {COLORS['surface']};
     border: 1px solid {COLORS['border']};
     border-radius: 6px;
     selection-background-color: #BAE6FD;
     selection-color: {COLORS['text']};
 }}
-QLineEdit, QSpinBox {{ padding: 7px 9px; min-height: 20px; }}
+QLineEdit, QSpinBox, QComboBox {{ padding: 7px 9px; min-height: 20px; }}
 QPlainTextEdit, QTextEdit {{ padding: 8px; }}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QTableWidget:focus {{ border: 2px solid #38BDF8; }}
-QLineEdit[invalid="true"], QSpinBox[invalid="true"] {{ border: 2px solid {COLORS['danger']}; background: #FEF2F2; }}
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus, QTableWidget:focus {{ border: 2px solid #38BDF8; }}
+QLineEdit[invalid="true"], QSpinBox[invalid="true"], QComboBox[invalid="true"] {{ border: 2px solid {COLORS['danger']}; background: #FEF2F2; }}
 QPushButton, QToolButton {{
     background: {COLORS['surface']};
     border: 1px solid {COLORS['border']};

@@ -43,7 +43,7 @@ class ToolPaths:
 
     @property
     def supports_fork(self) -> bool:
-        return "--fork" in self.storescp_help and os.name != "nt"
+        return "--fork" in self.storescp_help
 
 
 @dataclass(slots=True)
@@ -93,6 +93,7 @@ class PreflightResult:
 LogCallback = Callable[[str, str, str], None]
 StateCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, AccessionResult], None]
+ReadyCallback = Callable[[], None]
 
 
 class DcmtkResolver:
@@ -186,6 +187,9 @@ def build_storescp_command(config: AppConfig, tools: ToolPaths, staging: Path) -
         "-aet",
         config.storage_ae_title,
         "+xa",
+        "+uf",
+        "-fe",
+        ".dcm",
         "-od",
         str(staging),
     ]
@@ -278,16 +282,21 @@ class DownloadRunner:
         log_callback: LogCallback | None = None,
         state_callback: StateCallback | None = None,
         progress_callback: ProgressCallback | None = None,
+        ready_callback: ReadyCallback | None = None,
     ):
         self.config = config
         self.tools = tools
         self.log_callback = log_callback or (lambda _source, _message, _level: None)
         self.state_callback = state_callback or (lambda _state: None)
         self.progress_callback = progress_callback or (lambda _index, _total, _result: None)
+        self.ready_callback = ready_callback or (lambda: None)
         self._cancel = threading.Event()
         self._process_lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
         self._storescp_process: subprocess.Popen[str] | None = None
+        self._storescp_abort_count = 0
+        self._movescu_pending_count = 0
         self._logger = self._build_file_logger()
 
     def request_cancel(self) -> None:
@@ -312,6 +321,8 @@ class DownloadRunner:
         self.state_callback("starting_receiver")
         try:
             self._start_storescp(staging)
+            if not self._cancel.is_set():
+                self.ready_callback()
             self.state_callback("downloading")
             for index, accession in enumerate(values, 1):
                 if self._cancel.is_set():
@@ -343,6 +354,8 @@ class DownloadRunner:
 
     def _start_storescp(self, staging: Path) -> None:
         command = build_storescp_command(self.config, self.tools, staging)
+        mode = "多进程并发（--fork）" if self.tools.supports_fork else "单进程兼容模式"
+        self._emit("storescp", f"接收模式：{mode}", "info")
         self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
         process = self._popen(command)
         self._storescp_process = process
@@ -366,6 +379,9 @@ class DownloadRunner:
     ) -> AccessionResult:
         started = time.monotonic()
         before = _files_in(staging)
+        with self._diagnostic_lock:
+            aborts_before = self._storescp_abort_count
+            self._movescu_pending_count = 0
         command = build_movescu_command(self.config, self.tools, accession)
         self._emit("movescu", f"开始检查号 {accession}", "info")
         self._emit("movescu", _display_command(command), "debug")
@@ -402,25 +418,56 @@ class DownloadRunner:
                 self._current_process = None
 
         new_files = sorted(_files_in(staging) - before)
-        output_directory = Path(self.config.dicom_destination_folder).expanduser() / safe_accession_dir(accession)
-        moved = _move_files(new_files, output_directory)
+        destination_root = Path(self.config.dicom_destination_folder).expanduser()
+        moved, rejected = _archive_dicom_files(
+            new_files,
+            destination_root,
+            self.config.directory_template,
+            accession,
+        )
+        output_directory = _common_output_directory(moved, destination_root)
         duration = time.monotonic() - started
+        with self._diagnostic_lock:
+            receiver_aborts = self._storescp_abort_count - aborts_before
+            pending_responses = self._movescu_pending_count
 
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
             message = "用户已取消"
+        elif return_code == 0 and moved and (receiver_aborts or rejected):
+            status = AccessionStatus.PARTIAL
+            details = []
+            if receiver_aborts:
+                details.append(f"{receiver_aborts} 个接收连接中止")
+            if rejected:
+                details.append(f"{len(rejected)} 个异常文件留在暂存目录")
+            message = f"收到 {len(moved)} 个文件，但" + "，".join(details)
         elif return_code == 0 and moved:
             status = AccessionStatus.COMPLETED
             message = f"收到 {len(moved)} 个文件"
+        elif return_code == 0 and (pending_responses or receiver_aborts or rejected):
+            status = AccessionStatus.FAILED
+            details = []
+            if pending_responses:
+                details.append(f"PACS 返回 {pending_responses} 次待处理响应")
+            if receiver_aborts:
+                details.append(f"{receiver_aborts} 个接收连接中止")
+            if rejected:
+                details.append(f"{len(rejected)} 个异常文件留在暂存目录")
+            message = "，".join(details) + "，未收到文件"
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
             message = "C-MOVE 完成，但未收到文件"
         elif moved:
             status = AccessionStatus.PARTIAL
             message = f"movescu 退出码 {return_code}，已保留 {len(moved)} 个文件"
+            if rejected:
+                message += f"，{len(rejected)} 个异常文件留在暂存目录"
         else:
             status = AccessionStatus.FAILED
             message = f"movescu 退出码 {return_code}，未收到文件"
+            if rejected:
+                message += f"，{len(rejected)} 个异常文件留在暂存目录"
 
         level = "success" if status == AccessionStatus.COMPLETED else (
             "warning" if status in {AccessionStatus.NO_DATA, AccessionStatus.PARTIAL, AccessionStatus.CANCELLED} else "error"
@@ -458,7 +505,22 @@ class DownloadRunner:
             for line in process.stdout:
                 text = line.rstrip()
                 if text:
-                    level = "error" if text.startswith(("E:", "F:")) else "info"
+                    with self._diagnostic_lock:
+                        if source == "storescp" and "Association Aborted" in text:
+                            self._storescp_abort_count += 1
+                        elif (
+                            source == "movescu"
+                            and "Received Move Response" in text
+                            and "(Pending)" in text
+                        ):
+                            self._movescu_pending_count += 1
+                    level = (
+                        "error"
+                        if text.startswith(("E:", "F:"))
+                        else "warning"
+                        if "Association Aborted" in text
+                        else "info"
+                    )
                     self._emit(source, text, level)
 
         thread = threading.Thread(target=read_output, name=f"{source}-output", daemon=True)
@@ -524,13 +586,7 @@ class DownloadRunner:
 
 
 def safe_accession_dir(accession: str) -> str:
-    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", accession.strip()).strip(" .")
-    if not cleaned or cleaned in {".", ".."}:
-        cleaned = "accession"
-    if cleaned != accession.strip():
-        digest = hashlib.sha1(accession.encode("utf-8")).hexdigest()[:8]
-        cleaned = f"{cleaned}-{digest}"
-    return cleaned[:120]
+    return _safe_path_component(accession, "accession")[:120]
 
 
 def _run_probe(command: list[str], allow_nonzero: bool = False) -> str:
@@ -566,17 +622,122 @@ def _files_in(directory: Path) -> set[Path]:
     return {path for path in directory.rglob("*") if path.is_file()}
 
 
-def _move_files(files: Iterable[Path], destination: Path) -> list[Path]:
+def _archive_dicom_files(
+    files: Iterable[Path],
+    destination_root: Path,
+    directory_template: str,
+    fallback_accession: str,
+) -> tuple[list[Path], list[Path]]:
+    from pydicom import dcmread
+    from pydicom.uid import UID
+
     moved: list[Path] = []
+    rejected: list[Path] = []
     values = list(files)
     if not values:
-        return moved
-    destination.mkdir(parents=True, exist_ok=True)
+        return moved, rejected
     for source in values:
-        target = destination / source.name
-        os.replace(source, target)
+        metadata = {
+            "PatientID": "UNKNOWN_PATIENT",
+            "AccessionNumber": fallback_accession or "UNKNOWN_ACCESSION",
+            "StudyInstanceUID": "UNKNOWN_STUDY",
+            "SOPInstanceUID": "",
+        }
+        try:
+            dataset = dcmread(
+                source,
+                stop_before_pixels=True,
+                force=True,
+                specific_tags=list(metadata),
+            )
+            for field in metadata:
+                value = str(getattr(dataset, field, "") or "").strip()
+                if value:
+                    metadata[field] = value
+            sop_instance_uid = UID(metadata["SOPInstanceUID"])
+            if not sop_instance_uid.is_valid:
+                raise ValueError("invalid SOP Instance UID")
+        except (OSError, ValueError):
+            rejected.append(source)
+            continue
+
+        destination = _render_directory_template(
+            destination_root,
+            directory_template,
+            {
+                field: value
+                for field, value in metadata.items()
+                if field != "SOPInstanceUID"
+            },
+        )
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            target = _unique_dicom_target(destination, source.name)
+            os.replace(source, target)
+        except OSError:
+            rejected.append(source)
+            continue
         moved.append(target)
-    return moved
+    return moved, rejected
+
+
+def _render_directory_template(
+    destination_root: Path,
+    template: str,
+    metadata: dict[str, str],
+) -> Path:
+    rendered = template.strip().replace("\\", "/")
+    rendered = re.sub(
+        r"\{(PatientID|AccessionNumber|StudyInstanceUID)\}",
+        lambda match: _safe_path_component(
+            metadata[match.group(1)], f"UNKNOWN_{match.group(1).upper()}"
+        ),
+        rendered,
+    )
+    components = [
+        _safe_path_component(component, "UNKNOWN")
+        for component in rendered.split("/")
+        if component.strip()
+    ]
+    return destination_root.joinpath(*(components or ["UNKNOWN"]))
+
+
+def _unique_dicom_target(destination: Path, source_name: str) -> Path:
+    base_name = source_name[:-4] if source_name.lower().endswith(".dcm") else source_name
+    safe_name = _safe_path_component(base_name, "dicom")[:180]
+    target = destination / f"{safe_name}.dcm"
+    index = 1
+    while target.exists():
+        target = destination / f"{safe_name}-{index}.dcm"
+        index += 1
+    return target
+
+
+def _safe_path_component(value: str, fallback: str) -> str:
+    source = str(value).strip()
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", source).strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        cleaned = fallback
+    reserved_stem = cleaned.split(".", 1)[0].upper()
+    if reserved_stem in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }:
+        cleaned = f"_{cleaned}"
+    if cleaned != source:
+        digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:8]
+        cleaned = f"{cleaned}-{digest}"
+    return cleaned[:180]
+
+
+def _common_output_directory(files: list[Path], fallback: Path) -> Path:
+    if not files:
+        return fallback
+    return Path(os.path.commonpath([str(path.parent) for path in files]))
 
 
 def _dcmtk_environment(tools: ToolPaths) -> dict[str, str]:
@@ -593,27 +754,28 @@ def _dcmtk_environment(tools: ToolPaths) -> dict[str, str]:
 def _terminate_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+        return
     try:
-        if os.name == "nt":
-            process.terminate()
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=3)
         return
     except (OSError, subprocess.TimeoutExpired):
         pass
 
     try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process.pid, signal.SIGKILL)
     except OSError:
         process.kill()
 

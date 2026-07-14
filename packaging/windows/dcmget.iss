@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.1.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -26,6 +26,7 @@ AppId={{40A584F5-1E96-4BA0-92DD-4543A404B586}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
+UninstallDisplayName={#AppName}
 AppPublisher=DcmGet contributors
 DefaultDirName={autopf}\DcmGet
 DefaultGroupName=DcmGet
@@ -44,6 +45,10 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
+UsePreviousAppDir=yes
+UsePreviousGroup=yes
+UsePreviousTasks=yes
+DisableDirPage=auto
 VersionInfoVersion={#AppVersion}.0
 VersionInfoProductName={#AppName}
 VersionInfoDescription=DcmGet 一键安装程序
@@ -54,6 +59,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
+
+[Dirs]
+Name: "{commonappdata}\DcmGet"; Permissions: users-modify; Flags: uninsneveruninstall
+
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

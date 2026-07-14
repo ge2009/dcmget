@@ -25,3 +25,7 @@ dcmtk/
 logs/
 .dcmget-staging/
 config.local.json
+trial.json
+*.lic
+.dcmget-license/
+**/ed25519-private.pem

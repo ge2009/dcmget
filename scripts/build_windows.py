@@ -173,7 +173,7 @@ def write_checksums() -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 DcmGet Windows EXE 发布物")
-    parser.add_argument("--version", default="2.0.0", type=validate_version)
+    parser.add_argument("--version", default="2.1.0", type=validate_version)
     parser.add_argument("--checksums-only", action="store_true")
     args = parser.parse_args()
     if not args.checksums_only:

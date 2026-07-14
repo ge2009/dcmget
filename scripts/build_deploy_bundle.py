@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ARCHIVE_NAME = f"dcmget-{VERSION}-source-deploy.zip"
 ROOT_FILES = (
     "DICOM_download_script.py",
@@ -21,7 +21,7 @@ ROOT_FILES = (
     "requirements-build.txt",
     "requirements.txt",
 )
-TREE_ROOTS = ("dcmget", "scripts", "packaging")
+TREE_ROOTS = ("dcmget", "scripts", "packaging", "tools")
 
 
 def digest(path: Path) -> str:

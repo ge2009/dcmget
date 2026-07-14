@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 import sys
 
-from dcmget.config import AppConfig, load_config, parse_accessions, save_config
+from dcmget.config import (
+    DEFAULT_DIRECTORY_TEMPLATE,
+    AppConfig,
+    load_config,
+    parse_accessions,
+    save_config,
+)
 from dcmget import runtime
 
 
@@ -51,6 +57,15 @@ def test_configuration_round_trip(tmp_path):
     assert not path.with_suffix(".json.tmp").exists()
 
 
+def test_new_configuration_uses_dcmget_receiver_and_metadata_layout():
+    config = AppConfig()
+
+    assert config.calling_ae_title == "DCMGET"
+    assert config.storage_ae_title == "DCMGET"
+    assert config.storage_port == 6666
+    assert config.directory_template == DEFAULT_DIRECTORY_TEMPLATE
+
+
 def test_validation_reports_required_and_invalid_values():
     config = AppConfig(
         pacs_server_ip="",
@@ -69,6 +84,18 @@ def test_validation_reports_required_and_invalid_values():
         "storage_port",
         "max_log_file_size_bytes",
     }
+
+
+def test_directory_template_rejects_unknown_fields_and_parent_paths():
+    unknown = AppConfig(directory_template="{PatientName}/{AccessionNumber}")
+    parent = AppConfig(directory_template="../{AccessionNumber}")
+    unmatched = AppConfig(directory_template="{PatientID}/{")
+    windows_absolute = AppConfig(directory_template="C:/data/{AccessionNumber}")
+
+    assert "directory_template" in unknown.validate()
+    assert "directory_template" in parent.validate()
+    assert "directory_template" in unmatched.validate()
+    assert "directory_template" in windows_absolute.validate()
 
 
 def test_frozen_runtime_uses_appdata_for_persistent_config(tmp_path, monkeypatch):

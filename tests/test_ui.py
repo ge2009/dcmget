@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import pytest
+from PyQt5.QtCore import QSettings, Qt
 from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import QMessageBox
 
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary
+import dcmget.ui as ui_module
 from dcmget.ui import DcmGetWindow
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch, tmp_path):
+    path = tmp_path / "ui-settings.ini"
+    monkeypatch.setattr(
+        ui_module,
+        "QSettings",
+        lambda *_args: QSettings(str(path), QSettings.IniFormat),
+    )
 
 
 def make_window(qtbot, tmp_path):
@@ -35,6 +48,20 @@ def test_settings_validation_is_inline(qtbot, tmp_path):
     assert page.pacs_host_edit.property("invalid") is True
     assert "PACS" in page.pacs_host_edit.toolTip()
     assert page.error_label.isVisible()
+
+
+def test_cancel_settings_discards_unsaved_directory_template(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    original = window.config.directory_template
+    window._show_settings()
+    window.settings_page.directory_template_combo.setCurrentText(
+        "{StudyInstanceUID}"
+    )
+
+    window._cancel_settings()
+
+    assert window.config.directory_template == original
+    assert window.settings_page.config().directory_template == original
 
 
 def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
@@ -78,6 +105,35 @@ def test_log_panel_can_be_collapsed_and_restored(qtbot, tmp_path):
 
     assert window._log_panel_expanded is not initial
     assert window.log_panel.isHidden() is initial
+
+
+def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.accession_edit.setPlainText("A001\nA002")
+    window.destination_edit.setText(str(tmp_path / "dicom"))
+
+    qtbot.mouseClick(window.task_form_toggle_button, Qt.LeftButton)
+
+    assert not window._task_form_expanded
+    assert window.task_form_body.isHidden()
+    assert window.task_form_toggle_button.text() == "展开"
+    assert window.task_form_toggle_button.arrowType() == Qt.RightArrow
+
+    qtbot.mouseClick(window.task_form_toggle_button, Qt.LeftButton)
+
+    assert window.accession_edit.toPlainText() == "A001\nA002"
+    assert window.destination_edit.text() == str(tmp_path / "dicom")
+
+
+def test_new_task_form_collapse_state_is_restored(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window._set_task_form_expanded(False)
+    window.close()
+
+    restored = make_window(qtbot, tmp_path)
+
+    assert not restored._task_form_expanded
+    assert restored.task_form_body.isHidden()
 
 
 def test_close_running_task_requests_cleanup(qtbot, tmp_path, monkeypatch):

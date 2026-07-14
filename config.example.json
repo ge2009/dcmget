@@ -5,9 +5,10 @@
   "dicom_destination_folder": "Dicom/Dest",
   "pacs_server_ip": "127.0.0.1",
   "pacs_server_port": 8104,
-  "calling_ae_title": "MOVESCU",
+  "calling_ae_title": "DCMGET",
   "pacs_ae_title": "ANY-SCP",
-  "storage_ae_title": "MOVESCU",
+  "storage_ae_title": "DCMGET",
   "storage_port": 6666,
+  "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
   "max_log_file_size_bytes": 104857600
 }

@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.0.0
+        default: 2.1.0
 
 permissions:
   contents: read
@@ -51,19 +51,15 @@ jobs:
       - name: Smoke test unpacked application
         shell: pwsh
         run: |
-          $process = Start-Process "build/windows/dist/DcmGet/DcmGet.exe" -PassThru
-          Start-Sleep -Seconds 8
-          if ($process.HasExited) { throw "DcmGet.exe exited during smoke test with code $($process.ExitCode)" }
-          Stop-Process -Id $process.Id -Force
+          $process = Start-Process "build/windows/dist/DcmGet/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Unpacked self-test failed with code $($process.ExitCode)" }
 
       - name: Smoke test portable application
         shell: pwsh
         run: |
           $portable = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe").Path
-          $process = Start-Process $portable -PassThru
-          Start-Sleep -Seconds 15
-          if ($process.HasExited) { throw "Portable DcmGet exited with code $($process.ExitCode)" }
-          Stop-Process -Id $process.Id -Force
+          $process = Start-Process $portable -ArgumentList "--self-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Portable self-test failed with code $($process.ExitCode)" }
 
       - name: Install Inno Setup
         shell: pwsh
@@ -93,26 +89,70 @@ jobs:
           $license = (Resolve-Path "LICENSE").Path
           $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
           $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
+          $fixture = (New-Item -ItemType Directory -Force "build/windows/upgrade-fixture").FullName
+          & $iscc "/DAppVersion=2.0.0" "/DSourceDir=$source" "/DReleaseDir=$fixture" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Upgrade fixture compilation failed with exit code $LASTEXITCODE" }
           & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
-      - name: Silent install and installed-app smoke test
+      - name: Silent install, in-place upgrade and uninstall test
         shell: pwsh
         run: |
+          $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.0.0-Setup-x64.exe").Path
           $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
-          $install = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Installer failed with exit code $($install.ExitCode)" }
+          $configDir = Join-Path $env:APPDATA "DcmGet"
+          $configPath = Join-Path $configDir "config.json"
+          $licensePath = Join-Path $configDir "license.lic"
+          $trialPath = Join-Path $configDir "trial.json"
+          $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
+          Remove-Item $configDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          $install = Start-Process $baseline -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Baseline installer failed with exit code $($install.ExitCode)" }
+          New-Item -ItemType Directory -Force $configDir | Out-Null
+          [IO.File]::WriteAllText($configPath, '{"config_version":2,"pacs_server_ip":"upgrade-preserve.invalid"}', [Text.UTF8Encoding]::new($false))
+          Set-Content $licensePath "upgrade-license-sentinel"
+          python -c "from dcmget.licensing import consume_trial; consume_trial()"
+          if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
+          Set-Content "$installDir/_internal/obsolete-upgrade-marker.txt" "remove-me"
+          $configHash = (Get-FileHash $configPath -Algorithm SHA256).Hash
+          $licenseHash = (Get-FileHash $licensePath -Algorithm SHA256).Hash
+          $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
+          $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
+
+          $upgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer failed with exit code $($upgrade.ExitCode)" }
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
-          $process = Start-Process "$installDir/DcmGet.exe" -PassThru
-          Start-Sleep -Seconds 8
-          if ($process.HasExited) { throw "Installed DcmGet exited with code $($process.ExitCode)" }
-          Stop-Process -Id $process.Id -Force
+          if (Test-Path "$installDir/_internal/obsolete-upgrade-marker.txt") { throw "Upgrade did not remove obsolete runtime files" }
+          if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Upgrade changed the existing user configuration" }
+          if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Upgrade changed the existing license" }
+          if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Upgrade changed the existing trial state" }
+          if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Upgrade changed the machine trial anchor" }
+
+          $uninstallRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          $records = @(Get-ChildItem $uninstallRoot | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "DcmGet" })
+          if ($records.Count -ne 1) { throw "Expected one DcmGet uninstall record, found $($records.Count)" }
+          if ($records[0].DisplayVersion -ne "${{ inputs.version }}") { throw "Installed version is $($records[0].DisplayVersion)" }
+          if ($records[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Upgrade changed the installation directory" }
+
+          $firewall = Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction Stop
+          $portFilter = $firewall | Get-NetFirewallPortFilter
+          if ($portFilter.Protocol -ne "TCP" -or $portFilter.LocalPort -notcontains "6666") { throw "Firewall rule does not allow TCP 6666" }
+
+          $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
           $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
+          if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Uninstall removed or changed the user configuration" }
+          if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Uninstall removed or changed the license" }
+          if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
+          if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the firewall rule behind" }
+          Remove-Item $configDir -Recurse -Force
 
       - name: Finalize checksums
         run: python scripts/build_windows.py --checksums-only

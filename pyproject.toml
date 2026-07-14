@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "2.0.0"
+version = "2.1.0"
 description = "Cross-platform DCMTK C-MOVE download workstation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "PyQt5>=5.15.10,<5.16",
   "PyQt5-Qt5==5.15.17; platform_system == 'Darwin'",
+  "cryptography>=44,<47",
+  "filelock>=3.16,<4",
+  "pydicom>=3.0,<4",
 ]
 
 [project.scripts]

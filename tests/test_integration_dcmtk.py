@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import time
 import socket
 from pathlib import Path
@@ -11,11 +12,18 @@ from pynetdicom import AE, evt
 from pynetdicom.sop_class import StudyRootQueryRetrieveInformationModelMove
 
 from dcmget.config import AppConfig
-from dcmget.core import AccessionStatus, DcmtkResolver, DownloadRunner
+from dcmget import core
+from dcmget.core import (
+    AccessionStatus,
+    DcmtkResolver,
+    DownloadRunner,
+    build_storescp_command,
+    is_port_available,
+)
 
 
-def sample_dataset(accession: str) -> FileDataset:
-    instance_uid = generate_uid()
+def sample_dataset(accession: str, instance_uid: str | None = None) -> FileDataset:
+    instance_uid = instance_uid or generate_uid()
     file_meta = FileMetaDataset()
     file_meta.MediaStorageSOPClassUID = CTImageStorage
     file_meta.MediaStorageSOPInstanceUID = instance_uid
@@ -89,6 +97,68 @@ def test_real_storescp_movescu_cstore_round_trip(tmp_path):
 
     assert summary.exit_code == 0
     assert summary.results[0].status == AccessionStatus.COMPLETED
-    received = list((tmp_path / "dicom" / accession).iterdir())
+    received = list((tmp_path / "dicom").rglob("*.dcm"))
     assert received
+    assert "DGM001" in received[0].parts
+    assert accession in received[0].parts
+    assert str(dataset.StudyInstanceUID) in received[0].parts
     assert received[0].read_bytes()[128:132] == b"DICM"
+
+
+@pytest.mark.integration
+def test_real_storescp_accepts_parallel_associations(tmp_path):
+    try:
+        tools = DcmtkResolver(Path(__file__).resolve().parents[1]).resolve()
+    except FileNotFoundError:
+        pytest.skip("本机未安装 movescu/storescp")
+    if not tools.supports_fork:
+        pytest.skip("当前 storescp 不支持多进程 association 接收")
+
+    storage_port = unused_port()
+    config = AppConfig(
+        dicom_destination_folder=str(tmp_path),
+        storage_ae_title="STORESCP",
+        storage_port=storage_port,
+    )
+    runner = DownloadRunner(config, tools)
+    process = runner._popen(build_storescp_command(config, tools, tmp_path))
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and is_port_available(storage_port):
+        if process.poll() is not None:
+            pytest.fail(f"storescp exited with code {process.returncode}")
+        time.sleep(0.05)
+
+    shared_instance_uid = generate_uid()
+
+    def send(index: int) -> int | None:
+        ae = AE(ae_title=f"SCU{index}")
+        ae.add_requested_context(CTImageStorage, ExplicitVRLittleEndian)
+        association = ae.associate("127.0.0.1", storage_port, ae_title="STORESCP")
+        if not association.is_established:
+            return None
+        status = association.send_c_store(
+            sample_dataset(f"PARALLEL{index:03d}", shared_instance_uid)
+        )
+        association.release()
+        return getattr(status, "Status", None)
+
+    try:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            statuses = list(pool.map(send, range(12)))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(list(tmp_path.glob("*.*"))) < 12:
+            time.sleep(0.05)
+    finally:
+        core._terminate_process(process)
+        runner._close_file_logger()
+
+    received = [path for path in tmp_path.glob("*.*") if path.is_file()]
+    assert statuses == [0x0000] * 12
+    assert len(received) == 12
+    assert all(path.suffix == ".dcm" for path in received)
+    assert all(path.read_bytes()[128:132] == b"DICM" for path in received)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not is_port_available(storage_port):
+        time.sleep(0.05)
+    assert is_port_available(storage_port)
