@@ -74,6 +74,15 @@ jobs:
           }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe was not installed" }
 
+      - name: Prepare Chinese installer language
+        shell: pwsh
+        run: |
+          $language = "build/windows/ChineseSimplified.isl"
+          Invoke-WebRequest "https://raw.githubusercontent.com/jrsoftware/issrc/929fc4e164798bd84fec385a1dc8a899a0d4a100/Files/Languages/ChineseSimplified.isl" -OutFile $language
+          $expected = "6753be2c5e2740d859900fd902824db2ec568da5c5b52486524c9762d778b0b0"
+          $actual = (Get-FileHash $language -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Chinese language file checksum mismatch: $actual" }
+
       - name: Build one-click installer
         shell: pwsh
         run: |
@@ -83,7 +92,8 @@ jobs:
           $icon = (Resolve-Path "build/windows/dcmget.ico").Path
           $license = (Resolve-Path "LICENSE").Path
           $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
-          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "packaging/windows/dcmget.iss"
+          $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
+          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
       - name: Silent install and installed-app smoke test

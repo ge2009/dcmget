@@ -13,6 +13,9 @@
 #ifndef LicenseFile
   #define LicenseFile "..\..\LICENSE"
 #endif
+#ifndef ChineseLanguageFile
+  #define ChineseLanguageFile "compiler:Languages\ChineseSimplified.isl"
+#endif
 
 #define AppName "DcmGet"
 #define AppExeName "DcmGet.exe"
@@ -46,7 +49,7 @@ VersionInfoProductName={#AppName}
 VersionInfoDescription=DcmGet 一键安装程序
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
