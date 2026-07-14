@@ -164,10 +164,10 @@ def write_checksums() -> Path:
     if not artifacts:
         raise FileNotFoundError("release/windows 中没有可校验的 Windows 发布物")
     output = RELEASE_ROOT / "SHA256SUMS.txt"
-    output.write_text(
-        "".join(f"{file_sha256(path)}  {path.name}\n" for path in artifacts),
-        encoding="ascii",
-    )
+    with output.open("w", encoding="ascii", newline="\n") as handle:
+        handle.write(
+            "".join(f"{file_sha256(path)}  {path.name}\n" for path in artifacts)
+        )
     return output
 
 
