@@ -18,9 +18,10 @@ ROOT_FILES = (
     "config.example.json",
     "logo.png",
     "pyproject.toml",
+    "requirements-build.txt",
     "requirements.txt",
 )
-TREE_ROOTS = ("dcmget", "scripts")
+TREE_ROOTS = ("dcmget", "scripts", "packaging")
 
 
 def digest(path: Path) -> str:

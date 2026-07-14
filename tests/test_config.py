@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 from dcmget.config import AppConfig, load_config, parse_accessions, save_config
+from dcmget import runtime
 
 
 def test_migrates_legacy_configuration(tmp_path):
@@ -67,3 +69,20 @@ def test_validation_reports_required_and_invalid_values():
         "storage_port",
         "max_log_file_size_bytes",
     }
+
+
+def test_frozen_runtime_uses_appdata_for_persistent_config(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    appdata = tmp_path / "appdata"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert runtime.resource_root() == bundle
+    assert runtime.default_config_path() == appdata / "DcmGet" / "config.json"
+    config_path = runtime.ensure_default_config()
+    config = load_config(config_path)
+    assert config_path.exists()
+    assert config.dicom_destination_folder == str(
+        Path.home() / "Documents" / "DcmGet" / "Dicom"
+    )

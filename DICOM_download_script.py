@@ -3,20 +3,20 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
-from pathlib import Path
 
 from dcmget.config import load_accessions, load_config
 from dcmget.core import DcmtkResolver, DownloadRunner, preflight
+from dcmget.runtime import ensure_default_config, resource_root
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DcmGet 2.0 DICOM 批量下载工具")
     parser.add_argument(
         "--config",
-        default=str(PROJECT_ROOT / "config.json"),
+        default=str(ensure_default_config()),
         help="配置文件路径（默认：项目目录/config.json）",
     )
     parser.add_argument("--accessions", help="覆盖配置中的检查号 TXT 文件路径")

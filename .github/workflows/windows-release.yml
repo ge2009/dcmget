@@ -1,0 +1,116 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version in X.Y.Z format
+        required: true
+        default: 2.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 EXE and installer
+    runs-on: windows-2025
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Restore DCMTK cache
+        uses: actions/cache@v4
+        with:
+          path: .runtime/dcmtk/windows-x86_64
+          key: dcmtk-3.7.0-windows-x86_64
+
+      - name: Prepare DCMTK
+        shell: pwsh
+        run: |
+          python scripts/download_dcmtk.py --platform windows-x86_64
+
+      - name: Build standalone and portable EXE
+        run: python scripts/build_windows.py --version "${{ inputs.version }}"
+
+      - name: Download VC++ Runtime for installer
+        shell: pwsh
+        run: Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile build/windows/vc_redist.x64.exe
+
+      - name: Smoke test unpacked application
+        shell: pwsh
+        run: |
+          $process = Start-Process "build/windows/dist/DcmGet/DcmGet.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($process.HasExited) { throw "DcmGet.exe exited during smoke test with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+
+      - name: Smoke test portable application
+        shell: pwsh
+        run: |
+          $portable = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe").Path
+          $process = Start-Process $portable -PassThru
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) { throw "Portable DcmGet exited with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe was not installed" }
+
+      - name: Build one-click installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $source = (Resolve-Path "build/windows/dist/DcmGet").Path
+          $release = (Resolve-Path "release/windows").Path
+          $icon = (Resolve-Path "build/windows/dcmget.ico").Path
+          $license = (Resolve-Path "LICENSE").Path
+          $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
+          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "packaging/windows/dcmget.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+      - name: Silent install and installed-app smoke test
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
+          $process = Start-Process "$installDir/DcmGet.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($process.HasExited) { throw "Installed DcmGet exited with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+          & "$installDir/unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "Uninstaller failed with exit code $LASTEXITCODE" }
+          if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
+
+      - name: Finalize checksums
+        run: python scripts/build_windows.py --checksums-only
+
+      - name: Upload Windows release
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-windows-x64
+          path: release/windows/*
+          if-no-files-found: error
+          retention-days: 30

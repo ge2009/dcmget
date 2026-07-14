@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from dcmget.ui import DcmGetWindow
+from dcmget.runtime import ensure_default_config, resource_root
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DcmGet 2.0 图形界面")
     parser.add_argument(
         "--config",
-        default=str(PROJECT_ROOT / "config.json"),
+        default=str(ensure_default_config()),
         help="配置文件路径",
     )
     return parser

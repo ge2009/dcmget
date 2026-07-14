@@ -7,9 +7,28 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 - Windows x64、macOS ARM64/x86_64、Linux x86_64
 - Python 3.10 或更高版本
 - 发布部署使用 DCMTK 3.7.0；代码兼容本机 DCMTK 3.6.9
-- 当前交付源码部署包，不包含 Windows EXE、Python 安装程序或 DCMTK 二进制
+- 提供源码部署包、Windows x64 便携版和一键安装器
 
 首次部署需要能访问 Python 包源与 [OFFIS DCMTK 下载源](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)。
+
+## Windows 一键安装
+
+Windows 发布物提供两种形式：
+
+- `DcmGet-2.0.0-Setup-x64.exe`：一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.0.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
+
+安装版不要求目标电脑预装 Python。用户配置保存在 `%APPDATA%\DcmGet\config.json`，默认下载目录为“文档\DcmGet\Dicom”；卸载程序不会删除这两处用户数据。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
+
+维护者可在 GitHub Actions 中手动运行 `Windows Release` 工作流，也可在 Windows x64 构建机执行：
+
+```powershell
+python -m pip install -r requirements-build.txt
+python scripts/download_dcmtk.py --platform windows-x86_64
+python scripts/build_windows.py --version 2.0.0
+```
+
+PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
 
 ## 快速部署
 
