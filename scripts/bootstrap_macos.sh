@@ -13,7 +13,7 @@ python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1
   echo "需要 Python 3.10 或更高版本。" >&2
   exit 1
 }
-python3 -m venv .venv
+python3 -m venv --clear .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python scripts/download_dcmtk.py

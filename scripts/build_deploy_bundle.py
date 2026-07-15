@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 ARCHIVE_NAME = f"dcmget-{VERSION}-source-deploy.zip"
 ROOT_FILES = (
     "DICOM_download_script.py",
@@ -20,6 +20,7 @@ ROOT_FILES = (
     "logo.png",
     "pyproject.toml",
     "requirements-build.txt",
+    "requirements-dev.txt",
     "requirements.txt",
 )
 TREE_ROOTS = ("dcmget", "scripts", "packaging", "tools")

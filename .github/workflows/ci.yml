@@ -70,8 +70,33 @@ jobs:
         if: matrix.dcmtk == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: dcmget-2.3.0-source-deploy
+          name: dcmget-2.4.0-source-deploy
           path: |
-            release/dcmget-2.3.0-source-deploy.zip
-            release/dcmget-2.3.0-source-deploy.zip.sha256
+            release/dcmget-2.4.0-source-deploy.zip
+            release/dcmget-2.4.0-source-deploy.zip.sha256
           if-no-files-found: error
+
+  minimum-python:
+    name: Python 3.10 minimum
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install source and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install .
+
+      - name: Verify minimum supported Python and UI startup
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest -q -m "not integration"
+          python DICOM_download_ui.py --ui-self-test --config "${{ runner.temp }}/dcmget-ui-self-test.json"

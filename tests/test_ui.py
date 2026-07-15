@@ -5,7 +5,7 @@ import threading
 import pytest
 from PyQt5.QtCore import QSettings, Qt
 from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtWidgets import QMessageBox, QTextBrowser
+from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTextBrowser
 
 from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
@@ -40,17 +40,52 @@ def test_paste_preview_deduplicates_and_updates_table(qtbot, tmp_path):
     assert window.task_table.item(1, 0).text() == "A002"
 
 
+def test_accession_editor_tab_moves_focus_to_next_control(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow)
+    window.accession_edit.setFocus()
+
+    qtbot.keyClick(window.accession_edit, Qt.Key_Tab)
+
+    assert QApplication.focusWidget() is window.accession_button
+
+
 def test_settings_validation_is_inline(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
     window.pages.setCurrentIndex(1)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow)
     page.pacs_host_edit.clear()
 
     page._save()
 
     assert page.pacs_host_edit.property("invalid") is True
     assert "PACS" in page.pacs_host_edit.toolTip()
+    assert "PACS" in page.pacs_host_edit.accessibleDescription()
     assert page.error_label.isVisible()
+    assert page.layout().indexOf(page.error_label) < page.layout().indexOf(
+        page.settings_scroll
+    )
+    assert page.pacs_host_edit.hasFocus()
+
+
+def test_settings_validation_scrolls_to_first_invalid_field(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.resize(1024, 720)
+    page = window.settings_page
+    window.pages.setCurrentIndex(1)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow)
+    page.directory_template_combo.clearEditText()
+    page.settings_scroll.verticalScrollBar().setValue(0)
+
+    page._save()
+
+    assert page.directory_template_combo.hasFocus()
+    assert page.settings_scroll.verticalScrollBar().value() > 0
+    assert "目录模板" in page.directory_template_combo.accessibleDescription()
 
 
 def test_cancel_settings_discards_unsaved_directory_template(qtbot, tmp_path):
@@ -118,8 +153,12 @@ def test_anonymization_settings_are_saved_and_reloaded(qtbot, tmp_path):
 def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window.accession_edit.setPlainText("A001")
+    window.last_summary = BatchSummary(
+        [AccessionResult("OLD", AccessionStatus.FAILED)]
+    )
 
     window._set_running(True)
+    assert window.last_summary is None
     assert window.accession_edit.isReadOnly()
     assert window.destination_edit.isReadOnly()
     assert not window.start_button.isEnabled()
@@ -179,11 +218,14 @@ def test_pause_button_requests_pause_and_resume(qtbot, tmp_path):
     qtbot.mouseClick(window.pause_button, Qt.LeftButton)
 
     assert worker.pauses == 1
-    assert window.pause_button.text() == "继续"
+    assert window.pause_button.text() == "取消暂停"
     assert "当前检查号完成后暂停" in window.progress_label.text()
 
+    window._on_worker_state("pause_pending")
+    assert window.pause_button.text() == "取消暂停"
     window._on_worker_state("paused")
     assert "已暂停" in window.progress_label.text()
+    assert window.pause_button.text() == "继续下载"
     qtbot.mouseClick(window.pause_button, Qt.LeftButton)
 
     assert worker.resumes == 1
@@ -247,8 +289,15 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog is not None
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
-    for version in ("2.3.0", "2.2.0", "2.1.0", "2.0.0", "1.0.0"):
+    for version in ("2.4.0", "2.3.0", "2.2.0", "2.1.0", "2.0.0", "1.0.0"):
         assert version in text
+    close_button = next(
+        button
+        for button in window.release_notes_dialog.findChildren(QPushButton)
+        if button.text() == "关闭"
+    )
+    qtbot.mouseClick(close_button, Qt.LeftButton)
+    assert not window.release_notes_dialog.isVisible()
 
 
 def test_retry_only_passes_failed_items(qtbot, tmp_path, monkeypatch):
@@ -277,6 +326,19 @@ def test_log_panel_can_be_collapsed_and_restored(qtbot, tmp_path):
     assert window.log_panel.isHidden() is initial
 
 
+def test_log_panel_defaults_collapsed_and_error_expands_it(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    assert not window._log_panel_expanded
+    assert window.log_panel.isHidden()
+
+    window._append_log("应用", "测试错误", "error")
+
+    assert window._log_panel_expanded
+    assert window.log_panel.isVisible()
+    assert window.log_toggle_button.text() == "收起日志"
+
+
 def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window.accession_edit.setPlainText("A001\nA002")
@@ -293,6 +355,30 @@ def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
 
     assert window.accession_edit.toPlainText() == "A001\nA002"
     assert window.destination_edit.text() == str(tmp_path / "dicom")
+
+
+def test_running_collapses_task_form_and_shows_summary(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    destination = str(tmp_path / "dicom")
+    window.accession_edit.setPlainText("A001\nA002")
+    window.destination_edit.setText(destination)
+
+    window._set_running(True)
+
+    assert window.task_form_body.isHidden()
+    assert window.task_form_summary.isVisible()
+    assert "2 个检查号" in window.task_form_summary.text()
+    assert destination in window.task_form_summary.toolTip()
+
+
+def test_finish_worker_uses_active_retry_batch_for_progress_range(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.current_accessions = ["A001", "A002", "A003", "A004"]
+    window._active_accessions = ["A002", "A004"]
+
+    window._finish_worker()
+
+    assert window.progress_bar.maximum() == 2
 
 
 def test_new_task_form_collapse_state_is_restored(qtbot, tmp_path):

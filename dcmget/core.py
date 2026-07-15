@@ -102,6 +102,11 @@ ReadyCallback = Callable[[], None]
 ArchiveErrorCallback = Callable[[Path, str], None]
 
 
+@dataclass(slots=True)
+class _MoveDiagnostics:
+    pending_responses: int = 0
+
+
 class DcmtkResolver:
     def __init__(self, project_root: str | Path | None = None):
         self.project_root = Path(project_root or Path.cwd()).resolve()
@@ -212,6 +217,10 @@ def build_movescu_command(config: AppConfig, tools: ToolPaths, accession: str) -
         str(tools.movescu),
         "-v",
         "--no-port",
+        "-to",
+        "30",
+        "-td",
+        "300",
         "-aet",
         config.calling_ae_title,
         "-aec",
@@ -304,7 +313,6 @@ class DownloadRunner:
         self._current_process: subprocess.Popen[str] | None = None
         self._storescp_process: subprocess.Popen[str] | None = None
         self._storescp_abort_count = 0
-        self._movescu_pending_count = 0
         self._logger = self._build_file_logger()
         self._anonymizer = (
             DicomAnonymizer(config.anonymization_profile)
@@ -443,7 +451,6 @@ class DownloadRunner:
         before = _files_in(staging)
         with self._diagnostic_lock:
             aborts_before = self._storescp_abort_count
-            self._movescu_pending_count = 0
         command = build_movescu_command(self.config, self.tools, accession)
 
         started_process = self._start_movescu_process(command)
@@ -454,21 +461,22 @@ class DownloadRunner:
                 message="用户已取消",
             )
         process, started = started_process
-        self._emit("movescu", f"开始检查号 {accession}", "info")
-        self._emit("movescu", _display_command(command), "debug")
-        reader = self._start_reader(process, "movescu")
-        last_received = -1
+        diagnostics = _MoveDiagnostics()
+        reader: threading.Thread | None = None
         last_received_bytes = 0
         last_sample_at = started
         try:
+            self._emit("movescu", f"开始检查号 {accession}", "info")
+            self._emit("movescu", _display_command(command), "debug")
+            reader = self._start_reader(process, "movescu", diagnostics)
             while process.poll() is None:
                 if self._cancel.is_set():
                     _terminate_process(process)
                     break
-                new_files = _files_in(staging) - before
-                received = len(new_files)
                 now = time.monotonic()
-                if received != last_received or now - last_sample_at >= 0.5:
+                if now - last_sample_at >= 0.5:
+                    new_files = _files_in(staging) - before
+                    received = len(new_files)
                     received_bytes = _total_file_size(new_files)
                     sample_seconds = now - last_sample_at
                     sample_speed = (
@@ -476,7 +484,6 @@ class DownloadRunner:
                         if sample_seconds > 0
                         else 0.0
                     )
-                    last_received = received
                     last_received_bytes = received_bytes
                     last_sample_at = now
                     self.progress_callback(
@@ -494,12 +501,20 @@ class DownloadRunner:
                     )
                 time.sleep(0.1)
             return_code = process.wait()
-            reader.join(timeout=2)
+            transfer_finished = time.monotonic()
         finally:
-            with self._process_lock:
-                self._current_process = None
+            try:
+                if process.poll() is None:
+                    _terminate_process(process)
+            finally:
+                try:
+                    if reader is not None:
+                        reader.join()
+                finally:
+                    with self._process_lock:
+                        if self._current_process is process:
+                            self._current_process = None
 
-        transfer_finished = time.monotonic()
         new_files = sorted(_files_in(staging) - before)
         received_bytes = _total_file_size(new_files)
         transfer_seconds = max(0.0, transfer_finished - started)
@@ -533,7 +548,7 @@ class DownloadRunner:
         duration = time.monotonic() - started
         with self._diagnostic_lock:
             receiver_aborts = self._storescp_abort_count - aborts_before
-            pending_responses = self._movescu_pending_count
+        pending_responses = diagnostics.pending_responses
 
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
@@ -620,7 +635,12 @@ class DownloadRunner:
             kwargs["start_new_session"] = True
         return subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
 
-    def _start_reader(self, process: subprocess.Popen[str], source: str) -> threading.Thread:
+    def _start_reader(
+        self,
+        process: subprocess.Popen[str],
+        source: str,
+        diagnostics: _MoveDiagnostics | None = None,
+    ) -> threading.Thread:
         def read_output() -> None:
             if process.stdout is None:
                 return
@@ -632,10 +652,11 @@ class DownloadRunner:
                             self._storescp_abort_count += 1
                         elif (
                             source == "movescu"
+                            and diagnostics is not None
                             and "Received Move Response" in text
                             and "(Pending)" in text
                         ):
-                            self._movescu_pending_count += 1
+                            diagnostics.pending_responses += 1
                     level = (
                         "error"
                         if text.startswith(("E:", "F:"))

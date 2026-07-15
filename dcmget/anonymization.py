@@ -4,10 +4,12 @@ import hashlib
 import hmac
 import os
 import secrets
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from filelock import FileLock
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
 from pydicom.uid import ImplicitVRLittleEndian, UID
@@ -412,22 +414,36 @@ def _shift_datetime(value: str, days: int) -> str:
 
 def _load_or_create_secret(path: Path | None = None) -> bytes:
     secret_path = path or ensure_application_state_dir() / "anonymization.key"
+    lock_path = secret_path.with_name(f".{secret_path.name}.lock")
     try:
         secret_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            descriptor = os.open(
-                secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-            )
-        except FileExistsError:
-            secret = secret_path.read_bytes()
-        else:
-            secret = secrets.token_bytes(32)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(secret)
-            try:
-                secret_path.chmod(0o600)
-            except OSError:
-                pass
+        with FileLock(str(lock_path)):
+            if secret_path.exists():
+                secret = secret_path.read_bytes()
+            else:
+                secret = secrets.token_bytes(32)
+                descriptor = -1
+                temporary_path: Path | None = None
+                try:
+                    descriptor, temporary_name = tempfile.mkstemp(
+                        prefix=f".{secret_path.name}.",
+                        suffix=".tmp",
+                        dir=secret_path.parent,
+                    )
+                    temporary_path = Path(temporary_name)
+                    handle = os.fdopen(descriptor, "wb")
+                    descriptor = -1
+                    with handle:
+                        handle.write(secret)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary_path, secret_path)
+                    temporary_path = None
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
     except OSError as exc:
         raise AnonymizationError(f"无法读取或创建匿名密钥：{exc}") from exc
     if len(secret) < 32:

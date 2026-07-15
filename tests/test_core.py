@@ -79,6 +79,10 @@ def test_dcmtk_commands_use_storescp_move_destination_and_argument_arrays(tmp_pa
         str(tools.movescu),
         "-v",
         "--no-port",
+        "-to",
+        "30",
+        "-td",
+        "300",
         "-aet",
         "CALLING",
         "-aec",
@@ -598,6 +602,8 @@ def test_live_speed_updates_when_one_received_file_keeps_growing(tmp_path, monke
                 _write_minimal_dicom(staging / "CT.1", "1.2.3.21")
                 return None
             if cls.polls == 2:
+                return None
+            if cls.polls == 3:
                 with (staging / "CT.1").open("ab") as handle:
                     handle.write(b"\0" * 1024)
                 return None
@@ -608,7 +614,7 @@ def test_live_speed_updates_when_one_received_file_keeps_growing(tmp_path, monke
             return 0
 
     class Clock:
-        monotonic = Mock(side_effect=[10.0, 10.1, 10.7, 11.0, 11.2])
+        monotonic = Mock(side_effect=[10.0, 10.1, 10.6, 11.2, 11.4, 11.5])
 
         @staticmethod
         def sleep(_seconds):
@@ -626,6 +632,149 @@ def test_live_speed_updates_when_one_received_file_keeps_growing(tmp_path, monke
     assert downloading[1].received_bytes > downloading[0].received_bytes
     assert downloading[1].speed_bytes_per_second > 0
     assert result.status == AccessionStatus.COMPLETED
+
+
+def test_live_speed_scans_staging_only_every_half_second(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    progress: list[AccessionResult] = []
+    runner = DownloadRunner(
+        config,
+        tools,
+        progress_callback=lambda _index, _total, result: progress.append(result),
+    )
+    files_in = Mock(return_value=set())
+
+    class Process:
+        stdout = iter(())
+        polls = 0
+
+        @classmethod
+        def poll(cls):
+            cls.polls += 1
+            return None if cls.polls <= 6 else 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    class Clock:
+        monotonic = Mock(
+            side_effect=[10.0, 10.1, 10.2, 10.3, 10.4, 10.49, 10.5, 10.6, 10.7]
+        )
+
+        @staticmethod
+        def sleep(_seconds):
+            return None
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+    monkeypatch.setattr(core, "_files_in", files_in)
+    monkeypatch.setattr(core, "time", Clock())
+
+    result = runner._download_one("SAMPLED001", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert files_in.call_count == 3  # initial snapshot, one live sample, final snapshot
+    assert len(progress) == 1
+    assert result.status == AccessionStatus.NO_DATA
+
+
+def test_progress_callback_failure_terminates_movescu_and_joins_reader(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+
+    def fail_progress(_index, _total, _result):
+        raise RuntimeError("progress failed")
+
+    runner = DownloadRunner(config, tools, progress_callback=fail_progress)
+    reader = Mock()
+
+    class Process:
+        stdout = iter(())
+        alive = True
+
+        @classmethod
+        def poll(cls):
+            return None if cls.alive else 0
+
+    process = Process()
+
+    def terminate(target):
+        assert target is process
+        Process.alive = False
+
+    class Clock:
+        monotonic = Mock(side_effect=[10.0, 10.5])
+
+        @staticmethod
+        def sleep(_seconds):
+            return None
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: process)
+    monkeypatch.setattr(runner, "_start_reader", Mock(return_value=reader))
+    terminate_process = Mock(side_effect=terminate)
+    monkeypatch.setattr(core, "_terminate_process", terminate_process)
+    monkeypatch.setattr(core, "time", Clock())
+
+    with pytest.raises(RuntimeError, match="progress failed"):
+        runner._download_one("CALLBACK001", staging, 1, 1)
+    runner._close_file_logger()
+
+    terminate_process.assert_called_once_with(process)
+    reader.join.assert_called_once_with()
+    assert runner._current_process is None
+
+
+def test_movescu_pending_diagnostics_are_isolated_per_process(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+
+    class Process:
+        stdout = iter(())
+
+        def __init__(self, has_pending: bool):
+            self.has_pending = has_pending
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    processes = [Process(True), Process(False)]
+    monkeypatch.setattr(runner, "_popen", Mock(side_effect=processes))
+
+    def start_reader(process, source, diagnostics):
+        assert source == "movescu"
+        reader = Mock()
+
+        def finish_reading():
+            if process.has_pending:
+                diagnostics.pending_responses += 1
+
+        reader.join.side_effect = finish_reading
+        return reader
+
+    monkeypatch.setattr(runner, "_start_reader", start_reader)
+
+    first = runner._download_one("PENDING001", staging, 1, 2)
+    second = runner._download_one("EMPTY002", staging, 2, 2)
+    runner._close_file_logger()
+
+    assert first.status == AccessionStatus.FAILED
+    assert "1 次待处理响应" in first.message
+    assert second.status == AccessionStatus.NO_DATA
 
 
 def test_windows_process_cleanup_kills_the_full_process_tree(monkeypatch):

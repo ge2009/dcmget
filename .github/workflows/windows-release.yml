@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.3.0
+        default: 2.4.0
 
 permissions:
   contents: read
@@ -51,8 +51,13 @@ jobs:
       - name: Smoke test unpacked application
         shell: pwsh
         run: |
-          $process = Start-Process "build/windows/dist/DcmGet/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
+          $exe = "build/windows/dist/DcmGet/DcmGet.exe"
+          $process = Start-Process $exe -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Unpacked self-test failed with code $($process.ExitCode)" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $config = Join-Path $env:RUNNER_TEMP "dcmget-unpacked-ui-self-test.json"
+          $ui = Start-Process $exe -ArgumentList @("--ui-self-test", "--config", $config) -Wait -PassThru
+          if ($ui.ExitCode -ne 0) { throw "Unpacked UI self-test failed with code $($ui.ExitCode)" }
 
       - name: Smoke test portable application
         shell: pwsh
@@ -60,6 +65,10 @@ jobs:
           $portable = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe").Path
           $process = Start-Process $portable -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Portable self-test failed with code $($process.ExitCode)" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $config = Join-Path $env:RUNNER_TEMP "dcmget-portable-ui-self-test.json"
+          $ui = Start-Process $portable -ArgumentList @("--ui-self-test", "--config", $config) -Wait -PassThru
+          if ($ui.ExitCode -ne 0) { throw "Portable UI self-test failed with code $($ui.ExitCode)" }
 
       - name: Install Inno Setup
         shell: pwsh
@@ -157,10 +166,35 @@ jobs:
       - name: Finalize checksums
         run: python scripts/build_windows.py --checksums-only
 
-      - name: Upload Windows release
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: DcmGet-${{ inputs.version }}-windows-x64
-          path: release/windows/*
+          name: DcmGet-${{ inputs.version }}-Setup-x64
+          path: |
+            release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe
+            release/windows/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
+
+      - name: Upload Windows portable application
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Portable-x64
+          path: |
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe
+            release/windows/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload Windows standalone archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Windows-x64-ZIP
+          path: |
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip
+            release/windows/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

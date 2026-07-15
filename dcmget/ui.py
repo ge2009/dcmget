@@ -109,8 +109,9 @@ class ReleaseNotesDialog(QDialog):
         browser.setMarkdown(notes)
         browser.setAccessibleName("版本更新内容")
         layout.addWidget(browser, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(self.close)
+        buttons = QDialogButtonBox()
+        close_button = buttons.addButton("关闭", QDialogButtonBox.RejectRole)
+        close_button.clicked.connect(self.close)
         layout.addWidget(buttons)
 
 
@@ -120,6 +121,7 @@ class AccessionTextEdit(QPlainTextEdit):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setTabChangesFocus(True)
         self.setPlaceholderText("每行一个检查号；也可以拖入 TXT 文件")
         self.setMinimumHeight(92)
         self.setAccessibleName("检查号输入")
@@ -166,9 +168,15 @@ class SettingsPage(QWidget):
         title_row.addStretch()
         outer.addLayout(title_row)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        self.error_label = QLabel()
+        self.error_label.setObjectName("ErrorText")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        outer.addWidget(self.error_label)
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setSpacing(16)
@@ -252,19 +260,13 @@ class SettingsPage(QWidget):
             self._update_anonymization_state
         )
 
-        self.error_label = QLabel()
-        self.error_label.setObjectName("ErrorText")
-        self.error_label.setWordWrap(True)
-        self.error_label.hide()
-
         content_layout.addWidget(dcmtk_card)
         content_layout.addWidget(pacs_card)
         content_layout.addWidget(receiver_card)
         content_layout.addWidget(anonymization_card)
-        content_layout.addWidget(self.error_label)
         content_layout.addStretch()
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
+        self.settings_scroll.setWidget(content)
+        outer.addWidget(self.settings_scroll, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -374,11 +376,20 @@ class SettingsPage(QWidget):
             message = errors.get(field, "")
             widget.setProperty("invalid", bool(message))
             widget.setToolTip(message)
+            widget.setAccessibleDescription(message)
             widget.style().unpolish(widget)
             widget.style().polish(widget)
         messages = list(dict.fromkeys(errors.values()))
         self.error_label.setText("\n".join(messages))
         self.error_label.setVisible(bool(messages))
+        if errors:
+            first_invalid = next(
+                (widget for field, widget in self._field_widgets.items() if field in errors),
+                None,
+            )
+            if first_invalid is not None:
+                self.settings_scroll.ensureWidgetVisible(first_invalid, 0, 24)
+                first_invalid.setFocus(Qt.OtherFocusReason)
 
     def set_dcmtk_status(self, text: str, ok: bool) -> None:
         self.dcmtk_hint.setText(text)
@@ -486,10 +497,11 @@ class DcmGetWindow(QMainWindow):
         self._closing_after_cancel = False
         self._pause_requested = False
         self.current_accessions: list[str] = []
+        self._active_accessions: list[str] = []
         self.row_by_accession: dict[str, int] = {}
         self.settings_store = QSettings("DcmGet", "DcmGet2")
         self._log_panel_expanded = self.settings_store.value(
-            "window/log_expanded", True, type=bool
+            "window/log_expanded", False, type=bool
         )
         self._task_form_expanded = self.settings_store.value(
             "window/task_form_expanded", True, type=bool
@@ -585,6 +597,12 @@ class DcmGetWindow(QMainWindow):
         section = QLabel("新建下载任务")
         section.setObjectName("SectionTitle")
         input_header.addWidget(section)
+        self.task_form_summary = QLabel()
+        self.task_form_summary.setObjectName("FieldHint")
+        self.task_form_summary.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
+        input_header.addWidget(self.task_form_summary, 1)
         input_header.addStretch()
         self.task_form_toggle_button = QToolButton()
         self.task_form_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -617,6 +635,7 @@ class DcmGetWindow(QMainWindow):
         grid.addWidget(QLabel("保存目录"), 2, 0)
         self.destination_edit = QLineEdit()
         self.destination_edit.setAccessibleName("DICOM 保存目录")
+        self.destination_edit.textChanged.connect(self._update_task_form_summary)
         grid.addWidget(self.destination_edit, 2, 1)
         self.destination_button = QPushButton("选择目录")
         self.destination_button.clicked.connect(self._choose_destination)
@@ -835,6 +854,7 @@ class DcmGetWindow(QMainWindow):
         self.accession_summary.setText(
             f"有效 {len(parsed.values)} · 空行 {parsed.blank_count} · 重复 {parsed.duplicate_count}"
         )
+        self._update_task_form_summary()
         if self.worker:
             return
         self._populate_waiting_rows(parsed.values)
@@ -852,7 +872,9 @@ class DcmGetWindow(QMainWindow):
     def _start_download(self, override: list[str] | None = None) -> None:
         if self.worker:
             return
-        accessions = override or self.current_accessions
+        accessions = list(
+            override if override is not None else self.current_accessions
+        )
         if not accessions:
             self._append_log("应用", "请先导入至少一个检查号", "error")
             QMessageBox.warning(self, "没有检查号", "请选择 TXT 文件或粘贴检查号后再开始。")
@@ -882,16 +904,17 @@ class DcmGetWindow(QMainWindow):
 
         save_config(self.config_path, self.config)
         self.tools = check.tools
-        self._populate_waiting_rows(accessions)
+        self._active_accessions = accessions
+        self._populate_waiting_rows(self._active_accessions)
         self.progress_bar.setValue(0)
-        self.progress_label.setText(f"准备下载 0/{len(accessions)}")
+        self.progress_label.setText(f"准备下载 0/{len(self._active_accessions)}")
         self._set_running(True)
 
         thread = QThread(self)
         worker = DownloadWorker(
             self.config,
             check.tools,
-            list(accessions),
+            list(self._active_accessions),
             consume_trial_on_ready=use_trial,
         )
         worker.moveToThread(thread)
@@ -923,9 +946,13 @@ class DcmGetWindow(QMainWindow):
             label.style().polish(label)
 
     def _set_running(self, running: bool) -> None:
+        if running:
+            self.last_summary = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.pause_button.setEnabled(running)
+        if running:
+            self._set_task_form_expanded(False)
         if not running:
             self._pause_requested = False
             self.pause_button.setText("暂停")
@@ -949,6 +976,10 @@ class DcmGetWindow(QMainWindow):
             "cancelled": "任务已取消",
         }
         self.progress_label.setText(labels.get(state, state))
+        if state == "pause_pending" and self._pause_requested:
+            self.pause_button.setText("取消暂停")
+        elif state == "paused" and self._pause_requested:
+            self.pause_button.setText("继续下载")
         if state in {"starting_receiver", "stopping"}:
             self.progress_bar.setRange(0, 0)
         elif state == "downloading" and self.progress_bar.maximum() == 0:
@@ -1029,7 +1060,7 @@ class DcmGetWindow(QMainWindow):
     def _finish_worker(self) -> None:
         self.worker = None
         self.worker_thread = None
-        self.progress_bar.setRange(0, max(1, len(self.current_accessions)))
+        self.progress_bar.setRange(0, max(1, len(self._active_accessions)))
         self._set_running(False)
 
     def _stop_download(self) -> None:
@@ -1058,7 +1089,7 @@ class DcmGetWindow(QMainWindow):
             self.worker.request_resume()
         else:
             self._pause_requested = True
-            self.pause_button.setText("继续")
+            self.pause_button.setText("取消暂停")
             self.progress_label.setText("当前检查号完成后暂停…")
             self.worker.request_pause()
 
@@ -1069,6 +1100,8 @@ class DcmGetWindow(QMainWindow):
                 self._start_download(failed)
 
     def _append_log(self, source: str, message: str, level: str) -> None:
+        if level == "error" and not self._log_panel_expanded:
+            self._set_log_panel_expanded(True)
         colors = {
             "debug": COLORS["muted"],
             "info": COLORS["text"],
@@ -1113,15 +1146,33 @@ class DcmGetWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def _toggle_log_panel(self) -> None:
-        self._log_panel_expanded = not self._log_panel_expanded
-        self.log_panel.setVisible(self._log_panel_expanded)
+        self._set_log_panel_expanded(not self._log_panel_expanded)
+
+    def _set_log_panel_expanded(self, expanded: bool) -> None:
+        self._log_panel_expanded = expanded
+        self.log_panel.setVisible(expanded)
         self.log_toggle_button.setText(
-            "收起日志" if self._log_panel_expanded else "展开日志"
+            "收起日志" if expanded else "展开日志"
+        )
+
+    def _update_task_form_summary(self) -> None:
+        destination = self.destination_edit.text().strip()
+        display_destination = destination or "未选择保存目录"
+        if len(display_destination) > 48:
+            display_destination = "…" + display_destination[-47:]
+        count = len(self.current_accessions)
+        self.task_form_summary.setText(
+            f"{count} 个检查号 · 保存到 {display_destination}"
+        )
+        self.task_form_summary.setToolTip(
+            f"{count} 个检查号\n保存到：{destination or '未选择保存目录'}"
         )
 
     def _set_task_form_expanded(self, expanded: bool) -> None:
         self._task_form_expanded = expanded
         self.task_form_body.setVisible(expanded)
+        self._update_task_form_summary()
+        self.task_form_summary.setVisible(not expanded)
         self.task_form_toggle_button.setArrowType(
             Qt.DownArrow if expanded else Qt.RightArrow
         )

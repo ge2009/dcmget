@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 
 from dcmget import __version__
-from dcmget.auth_ui import authorize_gui
+from dcmget.auth_ui import DailyPasswordDialog, authorize_gui
 from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
@@ -21,13 +21,14 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.3 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.4 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
         help="配置文件路径",
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ui-self-test", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -74,16 +75,43 @@ def run_self_test(config_path: str) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.self_test:
-        return run_self_test(args.config)
+def create_application() -> QApplication:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("DcmGet")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(APP_STYLESHEET)
+    return app
+
+
+def run_ui_self_test(config_path: str) -> int:
+    app = create_application()
+    login = DailyPasswordDialog()
+    login.show()
+    app.processEvents()
+    if not login.isVisible():
+        raise RuntimeError("登录窗口未能显示")
+    login.close()
+
+    window = DcmGetWindow(config_path, PROJECT_ROOT)
+    window.show()
+    app.processEvents()
+    if not window.isVisible() or window.centralWidget() is None:
+        raise RuntimeError("主窗口未能显示")
+    window.close()
+    app.processEvents()
+    print(f"DcmGet {__version__} UI self-test OK")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.self_test:
+        return run_self_test(args.config)
+    if args.ui_self_test:
+        return run_ui_self_test(args.config)
+    app = create_application()
     if not authorize_gui():
         return 1
     window = DcmGetWindow(args.config, PROJECT_ROOT)

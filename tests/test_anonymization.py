@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from pydicom import dcmread
@@ -8,11 +10,90 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.sequence import Sequence
 from pydicom.uid import ComprehensiveSRStorage, CTImageStorage, ExplicitVRLittleEndian
 
-from dcmget import core
-from dcmget.anonymization import AnonymizationError, DicomAnonymizer
+from dcmget import anonymization, core
+from dcmget.anonymization import (
+    AnonymizationError,
+    DicomAnonymizer,
+    _load_or_create_secret,
+)
 
 
 SECRET = b"dcmget-test-anonymization-key-32b"
+
+
+def test_anonymization_secret_first_creation_is_serialized(tmp_path):
+    path = tmp_path / "state" / "anonymization.key"
+    workers = 16
+    barrier = Barrier(workers)
+
+    def load_secret(_index):
+        barrier.wait()
+        return _load_or_create_secret(path)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        secrets = list(pool.map(load_secret, range(workers)))
+
+    assert len(set(secrets)) == 1
+    assert len(secrets[0]) == 32
+    assert path.read_bytes() == secrets[0]
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_anonymization_secret_replace_failure_leaves_clean_retry(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state" / "anonymization.key"
+    real_replace = anonymization.os.replace
+
+    def fail_replace(_source, _destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(anonymization.os, "replace", fail_replace)
+    with pytest.raises(AnonymizationError, match="replace failed"):
+        _load_or_create_secret(path)
+
+    assert not path.exists()
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+    monkeypatch.setattr(anonymization.os, "replace", real_replace)
+    secret = _load_or_create_secret(path)
+    assert path.read_bytes() == secret
+    assert len(secret) == 32
+
+
+def test_anonymization_secret_interruption_leaves_no_target_or_temporary_file(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state" / "anonymization.key"
+
+    def interrupt_fsync(_descriptor):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(anonymization.os, "fsync", interrupt_fsync)
+    with pytest.raises(KeyboardInterrupt):
+        _load_or_create_secret(path)
+
+    assert not path.exists()
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_anonymization_secret_keeps_valid_existing_key(tmp_path):
+    path = tmp_path / "anonymization.key"
+    existing = b"existing-anonymization-key-value!"
+    path.write_bytes(existing)
+
+    assert _load_or_create_secret(path) == existing
+    assert path.read_bytes() == existing
+
+
+def test_anonymization_secret_rejects_existing_short_key(tmp_path):
+    path = tmp_path / "anonymization.key"
+    path.write_bytes(b"short")
+
+    with pytest.raises(AnonymizationError, match="匿名密钥文件无效"):
+        _load_or_create_secret(path)
+
+    assert path.read_bytes() == b"short"
 
 
 def test_basic_profile_removes_common_identity_and_private_tags():

@@ -8,7 +8,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
 if ($LASTEXITCODE -ne 0) { throw "需要 Python 3.10 或更高版本。" }
 
-python -m venv .venv
+python -m venv --clear .venv
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 & .\.venv\Scripts\python.exe scripts\download_dcmtk.py
