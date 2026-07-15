@@ -57,6 +57,8 @@ class AccessionResult:
     duration_seconds: float = 0.0
     message: str = ""
     output_directory: str = ""
+    received_bytes: int = 0
+    speed_bytes_per_second: float = 0.0
 
 
 @dataclass(slots=True)
@@ -295,6 +297,8 @@ class DownloadRunner:
         self.progress_callback = progress_callback or (lambda _index, _total, _result: None)
         self.ready_callback = ready_callback or (lambda: None)
         self._cancel = threading.Event()
+        self._pause_condition = threading.Condition()
+        self._pause_requested = False
         self._process_lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
@@ -310,6 +314,8 @@ class DownloadRunner:
 
     def request_cancel(self) -> None:
         self._cancel.set()
+        with self._pause_condition:
+            self._pause_condition.notify_all()
         self._emit("应用", "正在停止当前任务…", "warning")
         with self._process_lock:
             process = self._current_process
@@ -318,6 +324,23 @@ class DownloadRunner:
         storescp = self._storescp_process
         if storescp:
             _terminate_process(storescp)
+
+    def request_pause(self) -> None:
+        with self._pause_condition:
+            if self._cancel.is_set() or self._pause_requested:
+                return
+            self._pause_requested = True
+        self.state_callback("pause_pending")
+        self._emit("应用", "将在当前检查号完成后暂停", "warning")
+
+    def request_resume(self) -> None:
+        with self._pause_condition:
+            if not self._pause_requested:
+                return
+            self._pause_requested = False
+            self._pause_condition.notify_all()
+        self.state_callback("downloading")
+        self._emit("应用", "任务已继续", "info")
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
@@ -344,6 +367,10 @@ class DownloadRunner:
                     summary.cancelled = True
                     self._append_cancelled(summary, values[index - 1 :])
                     break
+                if not self._wait_if_paused():
+                    summary.cancelled = True
+                    self._append_cancelled(summary, values[index - 1 :])
+                    break
 
                 result = self._download_one(accession, staging, index, len(values))
                 summary.results.append(result)
@@ -366,6 +393,27 @@ class DownloadRunner:
         else:
             self.state_callback("completed")
         return summary
+
+    def _wait_if_paused(self) -> bool:
+        with self._pause_condition:
+            if not self._pause_requested:
+                if self._cancel.is_set():
+                    return False
+                return True
+
+        self.state_callback("paused")
+        self._emit("应用", "任务已暂停，DICOM 接收器保持监听", "warning")
+        with self._pause_condition:
+            while self._pause_requested and not self._cancel.is_set():
+                receiver = self._storescp_process
+                if receiver is not None and receiver.poll() is not None:
+                    raise RuntimeError(
+                        f"暂停期间 storescp 意外退出，退出码 {receiver.returncode}"
+                    )
+                self._pause_condition.wait(timeout=0.2)
+            if self._cancel.is_set():
+                return False
+            return True
 
     def _start_storescp(self, staging: Path) -> None:
         command = build_storescp_command(self.config, self.tools, staging)
@@ -392,28 +440,45 @@ class DownloadRunner:
     def _download_one(
         self, accession: str, staging: Path, index: int, total: int
     ) -> AccessionResult:
-        started = time.monotonic()
         before = _files_in(staging)
         with self._diagnostic_lock:
             aborts_before = self._storescp_abort_count
             self._movescu_pending_count = 0
         command = build_movescu_command(self.config, self.tools, accession)
+
+        started_process = self._start_movescu_process(command)
+        if started_process is None:
+            return AccessionResult(
+                accession,
+                AccessionStatus.CANCELLED,
+                message="用户已取消",
+            )
+        process, started = started_process
         self._emit("movescu", f"开始检查号 {accession}", "info")
         self._emit("movescu", _display_command(command), "debug")
-
-        process = self._popen(command)
-        with self._process_lock:
-            self._current_process = process
         reader = self._start_reader(process, "movescu")
         last_received = -1
+        last_received_bytes = 0
+        last_sample_at = started
         try:
             while process.poll() is None:
                 if self._cancel.is_set():
                     _terminate_process(process)
                     break
-                received = len(_files_in(staging) - before)
-                if received != last_received:
+                new_files = _files_in(staging) - before
+                received = len(new_files)
+                now = time.monotonic()
+                if received != last_received or now - last_sample_at >= 0.5:
+                    received_bytes = _total_file_size(new_files)
+                    sample_seconds = now - last_sample_at
+                    sample_speed = (
+                        max(0, received_bytes - last_received_bytes) / sample_seconds
+                        if sample_seconds > 0
+                        else 0.0
+                    )
                     last_received = received
+                    last_received_bytes = received_bytes
+                    last_sample_at = now
                     self.progress_callback(
                         index,
                         total,
@@ -421,8 +486,10 @@ class DownloadRunner:
                             accession,
                             AccessionStatus.DOWNLOADING,
                             file_count=received,
-                            duration_seconds=time.monotonic() - started,
+                            duration_seconds=now - started,
                             message="正在接收 DICOM 文件",
+                            received_bytes=received_bytes,
+                            speed_bytes_per_second=sample_speed,
                         ),
                     )
                 time.sleep(0.1)
@@ -432,7 +499,13 @@ class DownloadRunner:
             with self._process_lock:
                 self._current_process = None
 
+        transfer_finished = time.monotonic()
         new_files = sorted(_files_in(staging) - before)
+        received_bytes = _total_file_size(new_files)
+        transfer_seconds = max(0.0, transfer_finished - started)
+        average_speed = (
+            received_bytes / transfer_seconds if transfer_seconds > 0 else 0.0
+        )
         destination_root = Path(self.config.dicom_destination_folder).expanduser()
 
         def record_archive_error(_source: Path, message: str) -> None:
@@ -511,7 +584,25 @@ class DownloadRunner:
             duration_seconds=duration,
             message=message,
             output_directory=str(output_directory) if moved else "",
+            received_bytes=received_bytes,
+            speed_bytes_per_second=average_speed,
         )
+
+    def _start_movescu_process(
+        self, command: list[str]
+    ) -> tuple[subprocess.Popen[str], float] | None:
+        while True:
+            with self._pause_condition:
+                if self._cancel.is_set():
+                    return None
+                if not self._pause_requested:
+                    started = time.monotonic()
+                    process = self._popen(command)
+                    with self._process_lock:
+                        self._current_process = process
+                    return process, started
+            if not self._wait_if_paused():
+                return None
 
     def _popen(self, command: list[str]) -> subprocess.Popen[str]:
         kwargs: dict[str, object] = {
@@ -665,6 +756,16 @@ def _files_in(directory: Path) -> set[Path]:
     if not directory.exists():
         return set()
     return {path for path in directory.rglob("*") if path.is_file()}
+
+
+def _total_file_size(files: Iterable[Path]) -> int:
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _archive_dicom_files(

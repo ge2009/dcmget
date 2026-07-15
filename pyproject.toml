@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "2.2.0"
+version = "2.3.0"
 description = "Cross-platform DCMTK C-MOVE download workstation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,9 @@ dcmget-ui = "DICOM_download_ui:main"
 [tool.setuptools]
 packages = ["dcmget"]
 py-modules = ["DICOM_download_script", "DICOM_download_ui"]
+
+[tool.setuptools.package-data]
+dcmget = ["CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

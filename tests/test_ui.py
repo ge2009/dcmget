@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 from PyQt5.QtCore import QSettings, Qt
 from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QTextBrowser
 
-from dcmget.core import AccessionResult, AccessionStatus, BatchSummary
+from dcmget.config import AppConfig
+from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
 import dcmget.ui as ui_module
-from dcmget.ui import DcmGetWindow
+from dcmget.ui import DcmGetWindow, DownloadWorker
 
 
 @pytest.fixture(autouse=True)
@@ -121,12 +124,131 @@ def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
     assert window.destination_edit.isReadOnly()
     assert not window.start_button.isEnabled()
     assert window.stop_button.isEnabled()
+    assert window.pause_button.isEnabled()
 
-    result = AccessionResult("A001", AccessionStatus.COMPLETED, 3, 1.25, "收到 3 个文件")
+    result = AccessionResult(
+        "A001",
+        AccessionStatus.COMPLETED,
+        3,
+        1.25,
+        "收到 3 个文件",
+        received_bytes=3 * 1024 * 1024,
+        speed_bytes_per_second=1.5 * 1024 * 1024,
+    )
     window._on_worker_progress(1, 1, result)
     assert window.progress_bar.value() == 1
     assert window.task_table.item(0, 1).text() == "完成"
     assert window.task_table.item(0, 2).text() == "3"
+    assert window.task_table.horizontalHeaderItem(3).text() == "速度"
+    assert window.task_table.item(0, 3).text() == "1.5 MB/s"
+    assert window.task_table.item(0, 4).text() == "1.2s"
+    assert "1.5 MB/s" in window.progress_label.text()
+
+
+@pytest.mark.parametrize(
+    ("bytes_per_second", "expected"),
+    [
+        (0, "—"),
+        (512, "512 B/s"),
+        (1536, "1.5 KB/s"),
+        (2.5 * 1024 * 1024, "2.5 MB/s"),
+        (3 * 1024 * 1024 * 1024, "3.0 GB/s"),
+    ],
+)
+def test_transfer_speed_formatting(bytes_per_second, expected):
+    assert ui_module.format_transfer_rate(bytes_per_second) == expected
+
+
+def test_pause_button_requests_pause_and_resume(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    class Worker:
+        pauses = 0
+        resumes = 0
+
+        def request_pause(self):
+            self.pauses += 1
+
+        def request_resume(self):
+            self.resumes += 1
+
+    worker = Worker()
+    window.worker = worker  # type: ignore[assignment]
+    window._set_running(True)
+
+    qtbot.mouseClick(window.pause_button, Qt.LeftButton)
+
+    assert worker.pauses == 1
+    assert window.pause_button.text() == "继续"
+    assert "当前检查号完成后暂停" in window.progress_label.text()
+
+    window._on_worker_state("paused")
+    assert "已暂停" in window.progress_label.text()
+    qtbot.mouseClick(window.pause_button, Qt.LeftButton)
+
+    assert worker.resumes == 1
+    assert window.pause_button.text() == "暂停"
+    window.worker = None
+    window._set_running(False)
+
+
+def test_worker_does_not_lose_resume_during_startup(monkeypatch, tmp_path):
+    pause_entered = threading.Event()
+    allow_pause = threading.Event()
+    resumed = threading.Event()
+    instance = []
+
+    class Runner:
+        def __init__(self, *_args, **_kwargs):
+            self.paused = False
+            instance.append(self)
+
+        def request_pause(self):
+            pause_entered.set()
+            assert allow_pause.wait(2)
+            self.paused = True
+
+        def request_resume(self):
+            self.paused = False
+            resumed.set()
+
+        def run(self, _accessions):
+            assert resumed.wait(2)
+            return BatchSummary()
+
+    monkeypatch.setattr(ui_module, "DownloadRunner", Runner)
+    worker = DownloadWorker(
+        AppConfig(dicom_destination_folder=str(tmp_path)),
+        ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
+        ["A001"],
+    )
+    worker.request_pause()
+    run_thread = threading.Thread(target=worker.run, daemon=True)
+    run_thread.start()
+    assert pause_entered.wait(2)
+
+    resume_thread = threading.Thread(target=worker.request_resume, daemon=True)
+    resume_thread.start()
+    allow_pause.set()
+    resume_thread.join(2)
+    run_thread.join(2)
+
+    assert not run_thread.is_alive()
+    assert resumed.is_set()
+    assert not worker.pause_requested
+    assert not instance[0].paused
+
+
+def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    qtbot.mouseClick(window.release_notes_button, Qt.LeftButton)
+
+    assert window.release_notes_dialog is not None
+    assert window.release_notes_dialog.isVisible()
+    text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
+    for version in ("2.3.0", "2.2.0", "2.1.0", "2.0.0", "1.0.0"):
+        assert version in text
 
 
 def test_retry_only_passes_failed_items(qtbot, tmp_path, monkeypatch):

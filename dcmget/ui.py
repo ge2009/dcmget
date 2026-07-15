@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import os
+import threading
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
@@ -10,6 +11,8 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -31,6 +34,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -62,6 +66,7 @@ from .core import (
     preflight,
 )
 from .licensing import consume_trial
+from .release_notes import load_release_notes
 
 
 COLORS = {
@@ -76,6 +81,37 @@ COLORS = {
     "muted": "#475569",
     "border": "#CBD5E1",
 }
+
+
+def format_transfer_rate(bytes_per_second: float) -> str:
+    if bytes_per_second <= 0:
+        return "—"
+    value = float(bytes_per_second)
+    units = ("B/s", "KB/s", "MB/s", "GB/s", "TB/s")
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    return f"{value:.0f} {unit}" if unit == "B/s" else f"{value:.1f} {unit}"
+
+
+class ReleaseNotesDialog(QDialog):
+    def __init__(self, notes: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"DcmGet {__version__} 版本说明")
+        self.setMinimumSize(680, 520)
+        layout = QVBoxLayout(self)
+        title = QLabel(f"DcmGet {__version__} 版本说明")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        browser = QTextBrowser()
+        browser.setMarkdown(notes)
+        browser.setAccessibleName("版本更新内容")
+        layout.addWidget(browser, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
 
 
 class AccessionTextEdit(QPlainTextEdit):
@@ -386,11 +422,13 @@ class DownloadWorker(QObject):
         self.consume_trial_on_ready = consume_trial_on_ready
         self.runner: DownloadRunner | None = None
         self.cancel_requested = False
+        self.pause_requested = False
+        self._control_lock = threading.Lock()
 
     @pyqtSlot()
     def run(self) -> None:
         try:
-            self.runner = DownloadRunner(
+            runner = DownloadRunner(
                 self.config,
                 self.tools,
                 log_callback=self.log.emit,
@@ -400,16 +438,33 @@ class DownloadWorker(QObject):
                     self._consume_trial if self.consume_trial_on_ready else None
                 ),
             )
-            if self.cancel_requested:
-                self.runner.request_cancel()
-            self.finished.emit(self.runner.run(self.accessions))
+            with self._control_lock:
+                self.runner = runner
+                if self.cancel_requested:
+                    runner.request_cancel()
+                elif self.pause_requested:
+                    runner.request_pause()
+            self.finished.emit(runner.run(self.accessions))
         except Exception as exc:  # keep worker failures visible in the UI
             self.failed.emit(str(exc))
 
     def request_cancel(self) -> None:
-        self.cancel_requested = True
-        if self.runner:
-            self.runner.request_cancel()
+        with self._control_lock:
+            self.cancel_requested = True
+            if self.runner:
+                self.runner.request_cancel()
+
+    def request_pause(self) -> None:
+        with self._control_lock:
+            self.pause_requested = True
+            if self.runner:
+                self.runner.request_pause()
+
+    def request_resume(self) -> None:
+        with self._control_lock:
+            self.pause_requested = False
+            if self.runner:
+                self.runner.request_resume()
 
     def _consume_trial(self) -> None:
         trial = consume_trial()
@@ -427,7 +482,9 @@ class DcmGetWindow(QMainWindow):
         self.worker: DownloadWorker | None = None
         self.worker_thread: QThread | None = None
         self.last_summary: BatchSummary | None = None
+        self.release_notes_dialog: ReleaseNotesDialog | None = None
         self._closing_after_cancel = False
+        self._pause_requested = False
         self.current_accessions: list[str] = []
         self.row_by_accession: dict[str, int] = {}
         self.settings_store = QSettings("DcmGet", "DcmGet2")
@@ -501,6 +558,11 @@ class DcmGetWindow(QMainWindow):
         self.registration_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.registration_button.clicked.connect(self._show_activation)
         layout.addWidget(self.registration_button)
+        self.release_notes_button = QToolButton()
+        self.release_notes_button.setText("版本说明")
+        self.release_notes_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.release_notes_button.clicked.connect(self._show_release_notes)
+        layout.addWidget(self.release_notes_button)
         self.settings_button = QToolButton()
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -592,6 +654,10 @@ class DcmGetWindow(QMainWindow):
             "收起日志" if self._log_panel_expanded else "展开日志"
         )
         self.log_toggle_button.clicked.connect(self._toggle_log_panel)
+        self.pause_button = QPushButton("暂停")
+        self.pause_button.setEnabled(False)
+        self.pause_button.setToolTip("当前检查号完成后暂停；继续时从下一项接着下载")
+        self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button = QPushButton("停止")
         self.stop_button.setObjectName("DangerButton")
         self.stop_button.setEnabled(False)
@@ -602,6 +668,7 @@ class DcmGetWindow(QMainWindow):
         self.start_button.clicked.connect(self._start_download)
         action_row.addWidget(self.retry_button)
         action_row.addWidget(self.log_toggle_button)
+        action_row.addWidget(self.pause_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self.start_button)
         layout.addLayout(action_row)
@@ -613,8 +680,10 @@ class DcmGetWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
 
         self.task_splitter = QSplitter(Qt.Vertical)
-        self.task_table = QTableWidget(0, 5)
-        self.task_table.setHorizontalHeaderLabels(["检查号", "状态", "文件数", "耗时", "详情"])
+        self.task_table = QTableWidget(0, 6)
+        self.task_table.setHorizontalHeaderLabels(
+            ["检查号", "状态", "文件数", "速度", "耗时", "详情"]
+        )
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.task_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.task_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -624,7 +693,8 @@ class DcmGetWindow(QMainWindow):
         self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.task_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.task_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.task_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.task_table.doubleClicked.connect(self._open_selected_result)
         self.task_splitter.addWidget(self.task_table)
         self.log_panel = self._build_log_panel()
@@ -677,6 +747,15 @@ class DcmGetWindow(QMainWindow):
         if activate_gui(self):
             self._refresh_entitlement_status()
             self._append_log("授权", "软件注册成功", "success")
+
+    def _show_release_notes(self) -> None:
+        if self.release_notes_dialog is None:
+            self.release_notes_dialog = ReleaseNotesDialog(
+                load_release_notes(self.project_root), self
+            )
+        self.release_notes_dialog.show()
+        self.release_notes_dialog.raise_()
+        self.release_notes_dialog.activateWindow()
 
     def _refresh_entitlement_status(self) -> None:
         text = entitlement_text()
@@ -846,6 +925,10 @@ class DcmGetWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.pause_button.setEnabled(running)
+        if not running:
+            self._pause_requested = False
+            self.pause_button.setText("暂停")
         self.retry_button.setEnabled(False if running else bool(self.last_summary and self.last_summary.failed_accessions))
         self.accession_edit.setReadOnly(running)
         self.destination_edit.setReadOnly(running)
@@ -858,6 +941,8 @@ class DcmGetWindow(QMainWindow):
         labels = {
             "starting_receiver": "正在启动 DICOM 接收器…",
             "downloading": "接收器已就绪，正在下载…",
+            "pause_pending": "当前检查号完成后暂停…",
+            "paused": "任务已暂停，接收器保持监听",
             "stopping": "正在停止后台进程…",
             "completed": "任务已完成",
             "partial": "任务完成，部分检查号失败",
@@ -873,8 +958,12 @@ class DcmGetWindow(QMainWindow):
         self.progress_bar.setRange(0, total)
         completed = index - 1 if result.status == AccessionStatus.DOWNLOADING else index
         self.progress_bar.setValue(completed)
+        speed = format_transfer_rate(result.speed_bytes_per_second)
+        speed_text = f" · {speed}" if speed != "—" else ""
+        pause_text = " · 当前项完成后暂停" if self._pause_requested else ""
         self.progress_label.setText(
-            f"{index}/{total} · {result.accession} · {result.status.value} · {result.file_count} 个文件"
+            f"{index}/{total} · {result.accession} · {result.status.value} · "
+            f"{result.file_count} 个文件{speed_text}{pause_text}"
         )
         self._set_result_row(result)
 
@@ -906,9 +995,14 @@ class DcmGetWindow(QMainWindow):
         status_item.setData(Qt.UserRole, result.output_directory)
         self.task_table.setItem(target_row, 1, status_item)
         self.task_table.setItem(target_row, 2, QTableWidgetItem(str(result.file_count)))
+        self.task_table.setItem(
+            target_row,
+            3,
+            QTableWidgetItem(format_transfer_rate(result.speed_bytes_per_second)),
+        )
         duration = f"{result.duration_seconds:.1f}s" if result.duration_seconds else "—"
-        self.task_table.setItem(target_row, 3, QTableWidgetItem(duration))
-        self.task_table.setItem(target_row, 4, QTableWidgetItem(result.message or "等待处理"))
+        self.task_table.setItem(target_row, 4, QTableWidgetItem(duration))
+        self.task_table.setItem(target_row, 5, QTableWidgetItem(result.message or "等待处理"))
 
     def _on_worker_finished(self, summary: BatchSummary) -> None:
         self.last_summary = summary
@@ -950,8 +1044,23 @@ class DcmGetWindow(QMainWindow):
         )
         if answer == QMessageBox.Yes:
             self.stop_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
             self.progress_label.setText("正在停止…")
             self.worker.request_cancel()
+
+    def _toggle_pause(self) -> None:
+        if not self.worker:
+            return
+        if self._pause_requested:
+            self._pause_requested = False
+            self.pause_button.setText("暂停")
+            self.progress_label.setText("正在继续下载…")
+            self.worker.request_resume()
+        else:
+            self._pause_requested = True
+            self.pause_button.setText("继续")
+            self.progress_label.setText("当前检查号完成后暂停…")
+            self.worker.request_pause()
 
     def _retry_failed(self) -> None:
         if self.last_summary:
@@ -1048,6 +1157,7 @@ class DcmGetWindow(QMainWindow):
                 event.ignore()
                 return
             self._closing_after_cancel = True
+            self.pause_button.setEnabled(False)
             self.worker.request_cancel()
             if self.worker_thread:
                 self.worker_thread.finished.connect(self.close)

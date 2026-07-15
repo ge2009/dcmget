@@ -1,6 +1,8 @@
-# DcmGet 2.2
+# DcmGet 2.3
 
 DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `storescp` 接收器，再由 `movescu` 逐个提交检查号，收到的文件按可配置的 DICOM 元数据目录归档。界面和命令行共用同一套配置、预检、进程管理和下载核心。
+
+各版本新增内容见 [CHANGELOG.md](CHANGELOG.md)，也可以在主界面点击“版本说明”查看。
 
 ## 支持范围
 
@@ -15,8 +17,8 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 Windows 发布物提供两种形式：
 
-- `DcmGet-2.2.0-Setup-x64.exe`：一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.2.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
+- `DcmGet-2.3.0-Setup-x64.exe`：一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.3.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。默认下载目录为“文档\DcmGet\Dicom”。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
@@ -25,7 +27,7 @@ Windows 发布物提供两种形式：
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.2.0
+python scripts/build_windows.py --version 2.3.0
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
@@ -90,8 +92,9 @@ Linux 桌面环境若缺少 Qt 运行库，请按发行版安装常用的 XCB/Op
 2. 在任务主页选择或拖入 TXT，也可以直接粘贴多行检查号；空行会忽略，重复项会按首次出现顺序去重。
 3. 选择保存目录，确认预检中的 DCMTK、目录和接收端口均通过。
 4. 在设置中选择或编辑目录模板。默认按 `PatientID/AccessionNumber/StudyInstanceUID` 组织，也可选择检查号、Study UID 等较短组合。
-5. 点击“开始下载”。所有归档文件统一以 `.dcm` 结尾；普通模式日志位于 `保存目录/logs/`，匿名模式日志改存应用私有状态目录。
-6. 部分失败时可点击“重试失败项”。停止或退出不会删除已收到的文件。
+5. 点击“开始下载”。任务详情会显示每个检查号的文件数、实际接收速度和耗时。所有归档文件统一以 `.dcm` 结尾；普通模式日志位于 `保存目录/logs/`，匿名模式日志改存应用私有状态目录。
+6. 点击“暂停”后，程序会先安全完成并归档当前检查号，再暂停启动下一项；点击“继续”即可处理剩余检查号。`storescp` 在暂停期间保持监听。
+7. 部分失败时可点击“重试失败项”。停止或退出不会删除已收到的文件。
 
 ## 下载后匿名处理
 
@@ -154,6 +157,8 @@ DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.j
 每批任务使用独立暂存目录。普通模式暂存在保存目录下的 `.dcmget-staging`；匿名模式暂存在应用私有状态目录。程序确认 `storescp` 已监听后再执行 `movescu --no-port`。每条 C-MOVE 完成后读取 DICOM 元数据，按设置中的目录模板归档并补充 `.dcm` 后缀；关键元数据缺失时使用安全占位值，无法归属或匿名失败的暂存文件会保留并写入日志。
 
 当当前 DCMTK 的 `storescp --help` 包含 `--fork` 时，Windows、macOS 和 Linux 都会启用每个 association 一个子进程的并发接收模式；旧版工具不支持时才回退单进程。若 PACS 已返回待处理响应或接收连接被中止但没有落盘文件，任务会标记为失败而不是“无数据”，并可通过“重试失败项”再次执行。
+
+速度按暂存目录中实际收到的原始 DICOM 字节计算；任务进行中显示采样速度，单个检查号结束后显示其平均传输速度。匿名转换和最终归档耗时不会计入网络下载速度。
 
 - “接收端口已占用”：关闭占用程序或在设置中更换端口，并同步 PACS 的 Move Destination。
 - 修改默认接收端口 `6666` 后：Windows 需由管理员同步修改入站防火墙规则。

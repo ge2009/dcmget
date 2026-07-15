@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -261,6 +262,174 @@ def test_cancel_terminates_current_movescu(tmp_path, monkeypatch):
     terminate.assert_called_once_with(process)
 
 
+def test_pause_waits_between_accessions_and_resume_continues(tmp_path, monkeypatch):
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    states: list[str] = []
+    first_started = threading.Event()
+    finish_first = threading.Event()
+    second_started = threading.Event()
+    paused = threading.Event()
+    receiver = Mock()
+    receiver.poll.return_value = None
+    receiver_starts = 0
+
+    def record_state(state: str) -> None:
+        states.append(state)
+        if state == "paused":
+            paused.set()
+
+    runner = DownloadRunner(config, tools, state_callback=record_state)
+
+    def start_receiver(_staging):
+        nonlocal receiver_starts
+        receiver_starts += 1
+        runner._storescp_process = receiver
+
+    monkeypatch.setattr(runner, "_start_storescp", start_receiver)
+    monkeypatch.setattr(runner, "_stop_storescp", lambda: None)
+
+    def download_one(accession, _staging, _index, _total):
+        assert runner._storescp_process is receiver
+        if accession == "A001":
+            first_started.set()
+            assert finish_first.wait(2)
+        else:
+            second_started.set()
+        return AccessionResult(accession, AccessionStatus.COMPLETED)
+
+    monkeypatch.setattr(runner, "_download_one", download_one)
+    result: list[BatchSummary] = []
+    thread = threading.Thread(
+        target=lambda: result.append(runner.run(["A001", "A002"])), daemon=True
+    )
+    thread.start()
+    assert first_started.wait(2)
+
+    runner.request_pause()
+    finish_first.set()
+
+    assert paused.wait(2)
+    assert not second_started.wait(0.1)
+    runner.request_resume()
+    assert second_started.wait(2)
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert [item.accession for item in result[0].results] == ["A001", "A002"]
+    assert receiver_starts == 1
+    assert "pause_pending" in states
+    assert "paused" in states
+
+
+def test_pause_in_start_boundary_does_not_launch_movescu(tmp_path, monkeypatch):
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    first_gate_passed = threading.Event()
+    release_boundary = threading.Event()
+    paused = threading.Event()
+    process_started = threading.Event()
+
+    def record_state(state: str) -> None:
+        if state == "paused":
+            paused.set()
+
+    runner = DownloadRunner(config, tools, state_callback=record_state)
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    original_wait = runner._wait_if_paused
+    gate_calls = 0
+
+    def wait_at_boundary():
+        nonlocal gate_calls
+        result = original_wait()
+        gate_calls += 1
+        if gate_calls == 1:
+            first_gate_passed.set()
+            assert release_boundary.wait(2)
+        return result
+
+    class Process:
+        stdout = iter(())
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    def start_process(_command):
+        process_started.set()
+        return Process()
+
+    monkeypatch.setattr(runner, "_wait_if_paused", wait_at_boundary)
+    monkeypatch.setattr(runner, "_popen", start_process)
+    result: list[BatchSummary] = []
+    thread = threading.Thread(
+        target=lambda: result.append(runner.run(["A001"])), daemon=True
+    )
+    thread.start()
+    assert first_gate_passed.wait(2)
+
+    runner.request_pause()
+    release_boundary.set()
+
+    assert paused.wait(2)
+    assert not process_started.wait(0.1)
+    runner.request_resume()
+    assert process_started.wait(2)
+    thread.join(2)
+    assert not thread.is_alive()
+    assert result[0].results[0].status == AccessionStatus.NO_DATA
+
+
+def test_cancel_wakes_a_paused_runner(tmp_path, monkeypatch):
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    paused = threading.Event()
+    runner = DownloadRunner(
+        config,
+        tools,
+        state_callback=lambda state: paused.set() if state == "paused" else None,
+    )
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    runner.request_pause()
+    result: list[BatchSummary] = []
+    thread = threading.Thread(
+        target=lambda: result.append(runner.run(["A001"])), daemon=True
+    )
+    thread.start()
+    assert paused.wait(2)
+
+    runner.request_cancel()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert result[0].cancelled
+    assert result[0].results[0].status == AccessionStatus.CANCELLED
+
+
+def test_paused_runner_fails_if_storescp_exits(tmp_path):
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+
+    class Receiver:
+        returncode = 9
+
+        @staticmethod
+        def poll():
+            return 9
+
+    runner._storescp_process = Receiver()  # type: ignore[assignment]
+    runner.request_pause()
+
+    with pytest.raises(RuntimeError, match="暂停期间 storescp 意外退出"):
+        runner._wait_if_paused()
+    runner._close_file_logger()
+
+
 def test_ready_callback_is_not_called_when_storescp_fails(tmp_path, monkeypatch):
     config = AppConfig(dicom_destination_folder=str(tmp_path))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
@@ -364,6 +533,99 @@ def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
     assert result.status == AccessionStatus.PARTIAL
     assert result.file_count == 1
     assert "接收连接中止" in result.message
+
+
+def test_download_result_uses_received_bytes_and_transfer_time_for_speed(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+
+    class Process:
+        stdout = iter(())
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            _write_minimal_dicom(staging / "CT.1", "1.2.3.20")
+            return 0
+
+    class Clock:
+        monotonic = Mock(side_effect=[10.0, 12.0, 13.0])
+
+        @staticmethod
+        def sleep(_seconds):
+            return None
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+    monkeypatch.setattr(core, "time", Clock())
+
+    result = runner._download_one("SPEED001", staging, 1, 1)
+    runner._close_file_logger()
+
+    archived = next((tmp_path / "dicom").rglob("*.dcm"))
+    assert result.received_bytes == archived.stat().st_size
+    assert result.speed_bytes_per_second == pytest.approx(result.received_bytes / 2)
+    assert result.duration_seconds == pytest.approx(3.0)
+
+
+def test_live_speed_updates_when_one_received_file_keeps_growing(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    progress: list[AccessionResult] = []
+    runner = DownloadRunner(
+        config,
+        tools,
+        progress_callback=lambda _index, _total, result: progress.append(result),
+    )
+
+    class Process:
+        stdout = iter(())
+        polls = 0
+
+        @classmethod
+        def poll(cls):
+            cls.polls += 1
+            if cls.polls == 1:
+                _write_minimal_dicom(staging / "CT.1", "1.2.3.21")
+                return None
+            if cls.polls == 2:
+                with (staging / "CT.1").open("ab") as handle:
+                    handle.write(b"\0" * 1024)
+                return None
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    class Clock:
+        monotonic = Mock(side_effect=[10.0, 10.1, 10.7, 11.0, 11.2])
+
+        @staticmethod
+        def sleep(_seconds):
+            return None
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+    monkeypatch.setattr(core, "time", Clock())
+
+    result = runner._download_one("GROWING001", staging, 1, 1)
+    runner._close_file_logger()
+
+    downloading = [item for item in progress if item.status == AccessionStatus.DOWNLOADING]
+    assert len(downloading) == 2
+    assert downloading[0].file_count == downloading[1].file_count == 1
+    assert downloading[1].received_bytes > downloading[0].received_bytes
+    assert downloading[1].speed_bytes_per_second > 0
+    assert result.status == AccessionStatus.COMPLETED
 
 
 def test_windows_process_cleanup_kills_the_full_process_tree(monkeypatch):

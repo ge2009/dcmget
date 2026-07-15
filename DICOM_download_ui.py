@@ -12,6 +12,7 @@ from dcmget.auth_ui import authorize_gui
 from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
+from dcmget.release_notes import load_release_notes
 from dcmget.ui import APP_STYLESHEET, DcmGetWindow
 from dcmget.runtime import ensure_default_config, resource_root
 
@@ -20,7 +21,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.2 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.3 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -41,6 +42,8 @@ def run_self_test(config_path: str) -> int:
 
     load_config(config_path)
     trial_status()
+    if f"## {__version__}" not in load_release_notes(PROJECT_ROOT):
+        raise RuntimeError("版本说明文件缺失或与程序版本不一致")
     public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM)
     if not isinstance(public_key, Ed25519PublicKey):
         raise RuntimeError("授权公钥类型错误")

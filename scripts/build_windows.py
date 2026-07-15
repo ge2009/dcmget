@@ -18,10 +18,30 @@ RELEASE_ROOT = ROOT / "release" / "windows"
 PLATFORM_RUNTIME = ROOT / ".runtime" / "dcmtk" / "windows-x86_64"
 
 
+def source_version() -> str:
+    text = (ROOT / "dcmget" / "__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*["\'](\d+\.\d+\.\d+)["\']', text, re.MULTILINE)
+    if not match:
+        raise RuntimeError("无法从 dcmget/__init__.py 读取版本号")
+    return match.group(1)
+
+
+APP_VERSION = source_version()
+
+
 def validate_version(value: str) -> str:
     if not re.fullmatch(r"\d+\.\d+\.\d+", value):
         raise argparse.ArgumentTypeError("版本必须采用 X.Y.Z 格式")
     return value
+
+
+def validate_release_version(value: str) -> str:
+    version = validate_version(value)
+    if version != APP_VERSION:
+        raise argparse.ArgumentTypeError(
+            f"发布版本 {version} 与源码版本 {APP_VERSION} 不一致"
+        )
+    return version
 
 
 def version_tuple(version: str) -> tuple[int, int, int, int]:
@@ -106,6 +126,8 @@ def pyinstaller_args(
         "--add-data",
         f"{ROOT / 'README.md'}:.",
         "--add-data",
+        f"{ROOT / 'CHANGELOG.md'}:.",
+        "--add-data",
         f"{ROOT / 'LICENSE'}:.",
         "--add-data",
         f"{ROOT / 'THIRD_PARTY_NOTICES.md'}:.",
@@ -173,7 +195,9 @@ def write_checksums() -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 DcmGet Windows EXE 发布物")
-    parser.add_argument("--version", default="2.2.0", type=validate_version)
+    parser.add_argument(
+        "--version", default=APP_VERSION, type=validate_release_version
+    )
     parser.add_argument("--checksums-only", action="store_true")
     args = parser.parse_args()
     if not args.checksums_only:
