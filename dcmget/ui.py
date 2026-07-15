@@ -8,6 +8,7 @@ from PyQt5.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSign
 from PyQt5.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -41,6 +42,8 @@ from PyQt5.QtWidgets import (
 from . import __version__
 from .auth_ui import activate_gui, entitlement_text, prepare_download_entitlement
 from .config import (
+    ANONYMIZATION_PROFILE_OPTIONS,
+    DEFAULT_ANONYMIZATION_PROFILE,
     AppConfig,
     DIRECTORY_TEMPLATES,
     load_config,
@@ -55,6 +58,7 @@ from .core import (
     DownloadRunner,
     PreflightResult,
     ToolPaths,
+    log_directory,
     preflight,
 )
 from .licensing import consume_trial
@@ -119,7 +123,7 @@ class SettingsPage(QWidget):
         back.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
         back.setToolTip("返回任务主页")
         back.clicked.connect(self.back_requested)
-        title = QLabel("连接与接收设置")
+        title = QLabel("连接、接收与匿名设置")
         title.setObjectName("PageTitle")
         title_row.addWidget(back)
         title_row.addWidget(title)
@@ -184,6 +188,34 @@ class SettingsPage(QWidget):
         receiver_form.addRow("", directory_hint)
         receiver_form.addRow("单个日志上限", self.log_size_spin)
 
+        anonymization_card, anonymization_form = self._card("下载后匿名处理")
+        self.anonymization_enabled_checkbox = QCheckBox(
+            "归档前自动处理 DICOM 元数据"
+        )
+        self.anonymization_profile_combo = QComboBox()
+        self.anonymization_profile_combo.setAccessibleName("匿名方案")
+        for profile_id, label, _description in ANONYMIZATION_PROFILE_OPTIONS:
+            self.anonymization_profile_combo.addItem(label, profile_id)
+        self.anonymization_profile_hint = QLabel()
+        self.anonymization_profile_hint.setObjectName("FieldHint")
+        self.anonymization_profile_hint.setWordWrap(True)
+        self.anonymization_warning = QLabel(
+            "归档成功后不保留原始副本。仅处理 DICOM 元数据，不会清除像素中烧录的文字、人脸特征，"
+            "研究/严格方案会拒绝已标记的烧录或可识别视觉特征，以及 PDF、SR、图形标注、缩略图和叠加层。"
+        )
+        self.anonymization_warning.setObjectName("WarningText")
+        self.anonymization_warning.setWordWrap(True)
+        anonymization_form.addRow("启用匿名", self.anonymization_enabled_checkbox)
+        anonymization_form.addRow("匿名方案", self.anonymization_profile_combo)
+        anonymization_form.addRow("", self.anonymization_profile_hint)
+        anonymization_form.addRow("", self.anonymization_warning)
+        self.anonymization_enabled_checkbox.toggled.connect(
+            self._update_anonymization_state
+        )
+        self.anonymization_profile_combo.currentIndexChanged.connect(
+            self._update_anonymization_state
+        )
+
         self.error_label = QLabel()
         self.error_label.setObjectName("ErrorText")
         self.error_label.setWordWrap(True)
@@ -192,6 +224,7 @@ class SettingsPage(QWidget):
         content_layout.addWidget(dcmtk_card)
         content_layout.addWidget(pacs_card)
         content_layout.addWidget(receiver_card)
+        content_layout.addWidget(anonymization_card)
         content_layout.addWidget(self.error_label)
         content_layout.addStretch()
         scroll.setWidget(content)
@@ -217,6 +250,7 @@ class SettingsPage(QWidget):
             "storage_ae_title": self.storage_ae_edit,
             "storage_port": self.storage_port_spin,
             "directory_template": self.directory_template_combo,
+            "anonymization_profile": self.anonymization_profile_combo,
             "max_log_file_size_bytes": self.log_size_spin,
         }
 
@@ -251,12 +285,21 @@ class SettingsPage(QWidget):
         self.storage_ae_edit.setText(config.storage_ae_title)
         self.storage_port_spin.setValue(config.storage_port)
         self.directory_template_combo.setCurrentText(config.directory_template)
+        self.anonymization_enabled_checkbox.setChecked(config.anonymization_enabled)
+        profile_index = self.anonymization_profile_combo.findData(
+            config.anonymization_profile
+        )
+        if profile_index < 0:
+            profile_index = self.anonymization_profile_combo.findData(
+                DEFAULT_ANONYMIZATION_PROFILE
+            )
+        self.anonymization_profile_combo.setCurrentIndex(profile_index)
+        self._update_anonymization_state()
         self.log_size_spin.setValue(max(1, config.max_log_file_size_bytes // (1024 * 1024)))
         self.apply_errors({})
 
     def config(self) -> AppConfig:
         return AppConfig(
-            config_version=2,
             dcmtk_bin_dir=self.dcmtk_edit.text().strip(),
             access_numbers_file_path=self._config.access_numbers_file_path,
             dicom_destination_folder=self._config.dicom_destination_folder,
@@ -267,7 +310,27 @@ class SettingsPage(QWidget):
             storage_ae_title=self.storage_ae_edit.text().strip(),
             storage_port=self.storage_port_spin.value(),
             directory_template=self.directory_template_combo.currentText().strip(),
+            anonymization_enabled=self.anonymization_enabled_checkbox.isChecked(),
+            anonymization_profile=str(
+                self.anonymization_profile_combo.currentData()
+                or DEFAULT_ANONYMIZATION_PROFILE
+            ),
             max_log_file_size_bytes=self.log_size_spin.value() * 1024 * 1024,
+        )
+
+    def _update_anonymization_state(self, _value=None) -> None:
+        enabled = self.anonymization_enabled_checkbox.isChecked()
+        self.anonymization_profile_combo.setEnabled(enabled)
+        profile_id = str(
+            self.anonymization_profile_combo.currentData()
+            or DEFAULT_ANONYMIZATION_PROFILE
+        )
+        descriptions = {
+            item_id: description
+            for item_id, _label, description in ANONYMIZATION_PROFILE_OPTIONS
+        }
+        self.anonymization_profile_hint.setText(
+            "元数据处理：" + descriptions.get(profile_id, "请选择匿名方案")
         )
 
     def apply_errors(self, errors: dict[str, str]) -> None:
@@ -442,7 +505,7 @@ class DcmGetWindow(QMainWindow):
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        self.settings_button.setToolTip("连接与接收设置（Ctrl+,）")
+        self.settings_button.setToolTip("连接、接收与匿名设置（Ctrl+,）")
         self.settings_button.clicked.connect(self._show_settings)
         layout.addWidget(self.settings_button)
         return header
@@ -934,7 +997,9 @@ class DcmGetWindow(QMainWindow):
             QApplication.clipboard().setText(" | ".join(item.text() if item else "" for item in values))
 
     def _open_log_directory(self) -> None:
-        path = Path(self.destination_edit.text()).expanduser() / "logs"
+        config = AppConfig.from_dict(self.config.to_dict())
+        config.dicom_destination_folder = self.destination_edit.text().strip()
+        path = log_directory(config)
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
@@ -1023,6 +1088,7 @@ QLabel#PageTitle {{ font-size: 20px; font-weight: 700; }}
 QLabel#SectionTitle {{ font-size: 15px; font-weight: 650; }}
 QLabel#ProgressText {{ color: {COLORS['muted']}; font-weight: 600; }}
 QLabel#ErrorText {{ color: {COLORS['danger']}; background: #FEF2F2; border: 1px solid #FECACA; padding: 9px; border-radius: 6px; }}
+QLabel#WarningText {{ color: {COLORS['warning']}; background: #FFF7ED; border: 1px solid #FED7AA; padding: 9px; border-radius: 6px; }}
 QLabel#StatusPill, QLabel#CheckPill {{ padding: 6px 10px; border-radius: 12px; background: #F1F5F9; color: {COLORS['muted']}; }}
 QLabel#StatusPill[status="ok"], QLabel#CheckPill[status="ok"], QLabel#FieldHint[status="ok"] {{ background: #ECFDF5; color: {COLORS['success']}; }}
 QLabel#StatusPill[status="warning"] {{ background: #FFF7ED; color: {COLORS['warning']}; }}

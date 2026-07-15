@@ -179,6 +179,21 @@ def test_file_archive_adds_dcm_suffix_and_uses_metadata_directory(tmp_path):
     assert target.read_bytes()[128:132] == b"DICM"
 
 
+def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+    anonymous = AppConfig(
+        dicom_destination_folder=str(tmp_path / "dicom"),
+        anonymization_enabled=True,
+    )
+    regular = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+
+    assert core.staging_directory_root(anonymous) == state / "staging"
+    assert core.log_directory(anonymous) == state / "logs"
+    assert core.staging_directory_root(regular) == tmp_path / "dicom" / ".dcmget-staging"
+    assert core.log_directory(regular) == tmp_path / "dicom" / "logs"
+
+
 def test_file_archive_uses_safe_fallbacks_and_does_not_overwrite(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()

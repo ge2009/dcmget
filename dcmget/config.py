@@ -17,10 +17,32 @@ DIRECTORY_TEMPLATES = (
 )
 DIRECTORY_TEMPLATE_FIELDS = {"PatientID", "AccessionNumber", "StudyInstanceUID"}
 
+DEFAULT_ANONYMIZATION_PROFILE = "research"
+ANONYMIZATION_PROFILE_OPTIONS = (
+    (
+        "basic",
+        "基础脱敏（院内）",
+        "处理直接身份和检查号；保留检查日期、机构、描述和 DICOM UID。",
+    ),
+    (
+        "research",
+        "研究匿名（推荐）",
+        "检查号与 UID 假名化、日期一致偏移，并清理机构、描述和私有标签。",
+    ),
+    (
+        "strict",
+        "严格元数据匿名",
+        "在研究方案上继续清除日期、人口学和设备信息；仍不处理像素内容。",
+    ),
+)
+ANONYMIZATION_PROFILE_IDS = {
+    profile_id for profile_id, _label, _description in ANONYMIZATION_PROFILE_OPTIONS
+}
+
 
 @dataclass(slots=True)
 class AppConfig:
-    config_version: int = 2
+    config_version: int = 3
     dcmtk_bin_dir: str = ""
     access_numbers_file_path: str = "access.txt"
     dicom_destination_folder: str = "Dicom"
@@ -31,6 +53,8 @@ class AppConfig:
     storage_ae_title: str = "DCMGET"
     storage_port: int = 6666
     directory_template: str = DEFAULT_DIRECTORY_TEMPLATE
+    anonymization_enabled: bool = False
+    anonymization_profile: str = DEFAULT_ANONYMIZATION_PROFILE
     max_log_file_size_bytes: int = 104_857_600
 
     @classmethod
@@ -41,7 +65,7 @@ class AppConfig:
         if is_legacy:
             legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
-                "config_version": 2,
+                "config_version": 3,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
                 "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
@@ -52,6 +76,8 @@ class AppConfig:
                 "storage_ae_title": legacy_move_destination,
                 "storage_port": data.get("network_port", 6666),
                 "directory_template": DEFAULT_DIRECTORY_TEMPLATE,
+                "anonymization_enabled": False,
+                "anonymization_profile": DEFAULT_ANONYMIZATION_PROFILE,
                 "max_log_file_size_bytes": data.get(
                     "max_log_file_size_bytes", 104_857_600
                 ),
@@ -62,12 +88,18 @@ class AppConfig:
             field: data.get(field, getattr(defaults, field))
             for field in asdict(defaults)
         }
-        values["config_version"] = 2
+        values["config_version"] = 3
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
         values["max_log_file_size_bytes"] = _as_int(
             values["max_log_file_size_bytes"], 104_857_600
         )
+        values["anonymization_enabled"] = _as_bool(
+            values["anonymization_enabled"], False
+        )
+        values["anonymization_profile"] = str(
+            values["anonymization_profile"] or DEFAULT_ANONYMIZATION_PROFILE
+        ).strip().lower()
         return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,6 +129,11 @@ class AppConfig:
             errors["storage_port"] = "端口必须在 1 到 65535 之间"
         if self.max_log_file_size_bytes < 1024:
             errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
+        if (
+            self.anonymization_enabled
+            and self.anonymization_profile not in ANONYMIZATION_PROFILE_IDS
+        ):
+            errors["anonymization_profile"] = "请选择有效的匿名方案"
         template = self.directory_template.strip().replace("\\", "/")
         fields = set(re.findall(r"\{([^{}]+)\}", template))
         without_placeholders = re.sub(
@@ -182,3 +219,17 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default

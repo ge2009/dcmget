@@ -1,4 +1,4 @@
-# DcmGet 2.1
+# DcmGet 2.2
 
 DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `storescp` 接收器，再由 `movescu` 逐个提交检查号，收到的文件按可配置的 DICOM 元数据目录归档。界面和命令行共用同一套配置、预检、进程管理和下载核心。
 
@@ -15,8 +15,8 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 Windows 发布物提供两种形式：
 
-- `DcmGet-2.1.0-Setup-x64.exe`：一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.1.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
+- `DcmGet-2.2.0-Setup-x64.exe`：一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.2.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。默认下载目录为“文档\DcmGet\Dicom”。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
@@ -25,7 +25,7 @@ Windows 发布物提供两种形式：
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.1.0
+python scripts/build_windows.py --version 2.2.0
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
@@ -86,12 +86,30 @@ Linux 桌面环境若缺少 Qt 运行库，请按发行版安装常用的 XCB/Op
 
 ## 使用界面
 
-1. 打开“设置”，填写 PACS 地址、端口和 PACS AE。新配置默认使用本机调用 AE `DCMGET`、接收 AE `DCMGET` 和接收端口 `6666`。
+1. 打开“设置”，填写 PACS 地址、端口和 PACS AE。新配置默认使用本机调用 AE `DCMGET`、接收 AE `DCMGET` 和接收端口 `6666`；如需下载后脱敏，可在同一页启用匿名处理并选择方案。
 2. 在任务主页选择或拖入 TXT，也可以直接粘贴多行检查号；空行会忽略，重复项会按首次出现顺序去重。
 3. 选择保存目录，确认预检中的 DCMTK、目录和接收端口均通过。
 4. 在设置中选择或编辑目录模板。默认按 `PatientID/AccessionNumber/StudyInstanceUID` 组织，也可选择检查号、Study UID 等较短组合。
-5. 点击“开始下载”。所有归档文件统一以 `.dcm` 结尾，日志位于 `保存目录/logs/`。
+5. 点击“开始下载”。所有归档文件统一以 `.dcm` 结尾；普通模式日志位于 `保存目录/logs/`，匿名模式日志改存应用私有状态目录。
 6. 部分失败时可点击“重试失败项”。停止或退出不会删除已收到的文件。
+
+## 下载后匿名处理
+
+匿名功能默认关闭，可在“设置 → 下载后匿名处理”中开启。最终目录名使用处理后的 Patient ID、检查号和 Study UID，文件名使用处理后的 SOP Instance UID。三个内置方案如下：
+
+- “基础脱敏（院内）”：处理患者姓名、Patient ID、检查号、常见直接身份字段、人员姓名和私有标签，但保留日期、机构、描述及 DICOM UID。该档仍可能保留自由文本身份信息，`PatientIdentityRemoved` 会写为 `NO`，只适合受控院内流程。
+- “研究匿名（推荐）”：在直接身份处理基础上稳定映射关联 UID、对同一患者一致偏移日期，并清理机构、描述和私有标签；保留部分人口学及设备信息。
+- “严格元数据匿名”：在研究方案基础上继续清除日期、时间、人口学及设备字段。
+
+这些方案参考 [DICOM PS3.15 Annex E](https://dicom.nema.org/medical/dicom/current/output/chtml/part15/chapter_e.html) 的常见元数据处理思路，不等同于完整的 PS3.15 合规认证。程序不会分析或修改像素中的烧录文字、人脸特征；研究/严格方案遇 `BurnedInAnnotation=YES`、`RecognizableVisualFeatures=YES`、PDF、SR、图形标注、缩略图、曲线或叠加层时会拒绝归档，而不是把未处理内容标成已匿名。外发前仍需按实际模态和数据类型复核。
+
+启用匿名时，原始接收暂存、失败文件和运行日志不会写入结果目录，而是保存在当前系统用户的应用状态目录：
+
+- Windows：`%LOCALAPPDATA%\DcmGet\`
+- macOS：`~/Library/Application Support/DcmGet/`
+- Linux：`$XDG_STATE_HOME/dcmget/`，未设置时为 `~/.local/state/dcmget/`
+
+假名映射密钥为上述目录中的 `anonymization.key`。同一密钥会让重试和后续批次保持稳定映射；丢失或删除密钥后，新生成的 Patient ID、检查号和 UID 将与以前不同。匿名写入采用“生成临时文件 → 校验 DICM 与 SOP UID → 发布结果 → 删除原始暂存”的顺序，处理失败不会把半成品计入下载结果。
 
 ## 命令行
 
@@ -125,13 +143,15 @@ DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.j
 | `pacs_ae_title` | PACS AE |
 | `storage_ae_title` / `storage_port` | storescp 接收 AE 与端口 |
 | `directory_template` | 目录组合模板；支持 `PatientID`、`AccessionNumber`、`StudyInstanceUID` |
+| `anonymization_enabled` | 是否在最终归档前启用 DICOM 元数据处理，默认 `false` |
+| `anonymization_profile` | `basic`、`research` 或 `strict`；默认 `research` |
 | `max_log_file_size_bytes` | 单个日志文件最大字节数 |
 
 旧版配置会自动迁移。DCMTK 的查找顺序是：配置目录、`.runtime/dcmtk` 部署目录、旧版 `dcmtk/bin`、系统 `PATH`。
 
 ## 下载流程与故障处理
 
-每批任务使用独立 `.dcmget-staging` 目录。程序确认 `storescp` 已监听后再执行 `movescu --no-port`。每条 C-MOVE 完成后读取 DICOM 元数据，按设置中的目录模板归档并补充 `.dcm` 后缀；关键元数据缺失时使用安全占位值，无法归属的暂存文件会保留并写入日志。
+每批任务使用独立暂存目录。普通模式暂存在保存目录下的 `.dcmget-staging`；匿名模式暂存在应用私有状态目录。程序确认 `storescp` 已监听后再执行 `movescu --no-port`。每条 C-MOVE 完成后读取 DICOM 元数据，按设置中的目录模板归档并补充 `.dcm` 后缀；关键元数据缺失时使用安全占位值，无法归属或匿名失败的暂存文件会保留并写入日志。
 
 当当前 DCMTK 的 `storescp --help` 包含 `--fork` 时，Windows、macOS 和 Linux 都会启用每个 association 一个子进程的并发接收模式；旧版工具不支持时才回退单进程。若 PACS 已返回待处理响应或接收连接被中止但没有落盘文件，任务会标记为失败而不是“无数据”，并可通过“重试失败项”再次执行。
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 from dcmget.config import (
+    DEFAULT_ANONYMIZATION_PROFILE,
     DEFAULT_DIRECTORY_TEMPLATE,
     AppConfig,
     load_config,
@@ -31,12 +32,14 @@ def test_migrates_legacy_configuration(tmp_path):
 
     config = load_config(path)
 
-    assert config.config_version == 2
+    assert config.config_version == 3
     assert Path(config.dcmtk_bin_dir) == Path("C:/dcmtk/bin")
     assert config.calling_ae_title == "CALLING"
     assert config.pacs_ae_title == "PACS"
     assert config.storage_ae_title == "STORAGE"
     assert config.storage_port == 11112
+    assert not config.anonymization_enabled
+    assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
 
 
 def test_accession_parser_ignores_blanks_and_deduplicates_in_order():
@@ -64,6 +67,50 @@ def test_new_configuration_uses_dcmget_receiver_and_metadata_layout():
     assert config.storage_ae_title == "DCMGET"
     assert config.storage_port == 6666
     assert config.directory_template == DEFAULT_DIRECTORY_TEMPLATE
+    assert not config.anonymization_enabled
+    assert config.anonymization_profile == "research"
+
+
+def test_version_two_configuration_keeps_existing_values_and_adds_anonymization_defaults():
+    config = AppConfig.from_dict(
+        {
+            "config_version": 2,
+            "pacs_server_ip": "10.1.2.3",
+            "storage_port": 16666,
+            "directory_template": "{StudyInstanceUID}",
+        }
+    )
+
+    assert config.config_version == 3
+    assert config.pacs_server_ip == "10.1.2.3"
+    assert config.storage_port == 16666
+    assert config.directory_template == "{StudyInstanceUID}"
+    assert not config.anonymization_enabled
+    assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
+
+
+def test_anonymization_profile_is_validated_only_when_enabled():
+    disabled = AppConfig(anonymization_enabled=False, anonymization_profile="unknown")
+    enabled = AppConfig(anonymization_enabled=True, anonymization_profile="unknown")
+
+    assert "anonymization_profile" not in disabled.validate()
+    assert "anonymization_profile" in enabled.validate()
+
+
+def test_configuration_parses_string_boolean_without_enabling_anonymization():
+    config = AppConfig.from_dict(
+        {"config_version": 3, "anonymization_enabled": "false"}
+    )
+
+    assert not config.anonymization_enabled
+
+
+def test_example_configuration_matches_current_schema():
+    config = load_config(Path(__file__).parents[1] / "config.example.json")
+
+    assert config.config_version == 3
+    assert not config.anonymization_enabled
+    assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
 
 
 def test_validation_reports_required_and_invalid_values():
@@ -113,3 +160,18 @@ def test_frozen_runtime_uses_appdata_for_persistent_config(tmp_path, monkeypatch
     assert config.dicom_destination_folder == str(
         Path.home() / "Documents" / "DcmGet" / "Dicom"
     )
+
+
+def test_application_state_directory_is_platform_specific(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert runtime.application_state_dir() == tmp_path / "local" / "DcmGet"
+
+    monkeypatch.setattr(runtime.sys, "platform", "darwin")
+    assert runtime.application_state_dir() == (
+        Path.home() / "Library" / "Application Support" / "DcmGet"
+    )
+
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    assert runtime.application_state_dir() == tmp_path / "state" / "dcmget"

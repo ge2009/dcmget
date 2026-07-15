@@ -1,5 +1,5 @@
 {
-  "config_version": 2,
+  "config_version": 3,
   "dcmtk_bin_dir": "",
   "access_numbers_file_path": "access.txt",
   "dicom_destination_folder": "Dicom/Dest",
@@ -10,5 +10,7 @@
   "storage_ae_title": "DCMGET",
   "storage_port": 6666,
   "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
+  "anonymization_enabled": false,
+  "anonymization_profile": "research",
   "max_log_file_size_bytes": 104857600
 }

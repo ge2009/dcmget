@@ -23,6 +23,28 @@ def default_config_path() -> Path:
     return base / "DcmGet" / "config.json"
 
 
+def application_state_dir() -> Path:
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "DcmGet"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "DcmGet"
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg_state_home) if xdg_state_home else Path.home() / ".local" / "state"
+    return base / "dcmget"
+
+
+def ensure_application_state_dir() -> Path:
+    path = application_state_dir()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
 def ensure_default_config() -> Path:
     path = default_config_path()
     if is_frozen() and not path.exists():

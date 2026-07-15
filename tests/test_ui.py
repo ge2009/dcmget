@@ -64,6 +64,54 @@ def test_cancel_settings_discards_unsaved_directory_template(qtbot, tmp_path):
     assert window.settings_page.config().directory_template == original
 
 
+def test_anonymization_settings_default_to_off_and_show_profile_warning(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window._show_settings()
+    page = window.settings_page
+
+    assert not page.anonymization_enabled_checkbox.isChecked()
+    assert not page.anonymization_profile_combo.isEnabled()
+    assert page.anonymization_profile_combo.currentData() == "research"
+
+    page.anonymization_enabled_checkbox.setChecked(True)
+
+    assert page.anonymization_profile_combo.isEnabled()
+    assert "像素" in page.anonymization_warning.text()
+    assert "元数据" in page.anonymization_profile_hint.text()
+
+
+def test_cancel_settings_discards_unsaved_anonymization_options(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window._show_settings()
+    page = window.settings_page
+    page.anonymization_enabled_checkbox.setChecked(True)
+    page.anonymization_profile_combo.setCurrentIndex(
+        page.anonymization_profile_combo.findData("strict")
+    )
+
+    window._cancel_settings()
+
+    restored = page.config()
+    assert not restored.anonymization_enabled
+    assert restored.anonymization_profile == "research"
+
+
+def test_anonymization_settings_are_saved_and_reloaded(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window._show_settings()
+    page = window.settings_page
+    page.anonymization_enabled_checkbox.setChecked(True)
+    page.anonymization_profile_combo.setCurrentIndex(
+        page.anonymization_profile_combo.findData("strict")
+    )
+
+    page._save()
+
+    saved = ui_module.load_config(tmp_path / "config.json")
+    assert saved.anonymization_enabled
+    assert saved.anonymization_profile == "strict"
+
+
 def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window.accession_edit.setPlainText("A001")

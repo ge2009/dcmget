@@ -11,6 +11,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import AppConfig
+from .anonymization import DicomAnonymizer
+from .runtime import ensure_application_state_dir
 
 
 class AccessionStatus(str, Enum):
@@ -94,6 +97,7 @@ LogCallback = Callable[[str, str, str], None]
 StateCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, AccessionResult], None]
 ReadyCallback = Callable[[], None]
+ArchiveErrorCallback = Callable[[Path, str], None]
 
 
 class DcmtkResolver:
@@ -298,6 +302,11 @@ class DownloadRunner:
         self._storescp_abort_count = 0
         self._movescu_pending_count = 0
         self._logger = self._build_file_logger()
+        self._anonymizer = (
+            DicomAnonymizer(config.anonymization_profile)
+            if config.anonymization_enabled
+            else None
+        )
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -312,14 +321,20 @@ class DownloadRunner:
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
-        destination = Path(self.config.dicom_destination_folder).expanduser().resolve()
-        staging_root = destination / ".dcmget-staging"
-        staging = staging_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        staging = staging_directory_root(self.config) / datetime.now().strftime(
+            "%Y%m%d-%H%M%S-%f"
+        )
         staging.mkdir(parents=True, exist_ok=False)
         summary = BatchSummary(staging_directory=str(staging))
 
         self.state_callback("starting_receiver")
         try:
+            if self._anonymizer:
+                self._emit(
+                    "匿名",
+                    f"已启用 {self.config.anonymization_profile} 元数据匿名方案",
+                    "info",
+                )
             self._start_storescp(staging)
             if not self._cancel.is_set():
                 self.ready_callback()
@@ -419,11 +434,27 @@ class DownloadRunner:
 
         new_files = sorted(_files_in(staging) - before)
         destination_root = Path(self.config.dicom_destination_folder).expanduser()
+
+        def record_archive_error(_source: Path, message: str) -> None:
+            reason = message.strip() or "未知错误"
+            self._emit(
+                "匿名" if self._anonymizer else "应用",
+                f"文件归档失败：{reason}",
+                "error",
+            )
+
         moved, rejected = _archive_dicom_files(
             new_files,
             destination_root,
             self.config.directory_template,
             accession,
+            anonymizer=self._anonymizer,
+            error_callback=record_archive_error,
+        )
+        rejected_detail = (
+            f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
+            if self._anonymizer
+            else f"{len(rejected)} 个异常文件留在暂存目录"
         )
         output_directory = _common_output_directory(moved, destination_root)
         duration = time.monotonic() - started
@@ -440,7 +471,7 @@ class DownloadRunner:
             if receiver_aborts:
                 details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
-                details.append(f"{len(rejected)} 个异常文件留在暂存目录")
+                details.append(rejected_detail)
             message = f"收到 {len(moved)} 个文件，但" + "，".join(details)
         elif return_code == 0 and moved:
             status = AccessionStatus.COMPLETED
@@ -453,7 +484,7 @@ class DownloadRunner:
             if receiver_aborts:
                 details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
-                details.append(f"{len(rejected)} 个异常文件留在暂存目录")
+                details.append(rejected_detail)
             message = "，".join(details) + "，未收到文件"
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
@@ -462,12 +493,12 @@ class DownloadRunner:
             status = AccessionStatus.PARTIAL
             message = f"movescu 退出码 {return_code}，已保留 {len(moved)} 个文件"
             if rejected:
-                message += f"，{len(rejected)} 个异常文件留在暂存目录"
+                message += f"，{rejected_detail}"
         else:
             status = AccessionStatus.FAILED
             message = f"movescu 退出码 {return_code}，未收到文件"
             if rejected:
-                message += f"，{len(rejected)} 个异常文件留在暂存目录"
+                message += f"，{rejected_detail}"
 
         level = "success" if status == AccessionStatus.COMPLETED else (
             "warning" if status in {AccessionStatus.NO_DATA, AccessionStatus.PARTIAL, AccessionStatus.CANCELLED} else "error"
@@ -563,8 +594,7 @@ class DownloadRunner:
         self._logger.log(log_level, "[%s] %s", source, message)
 
     def _build_file_logger(self) -> logging.Logger:
-        destination = Path(self.config.dicom_destination_folder).expanduser()
-        log_dir = destination / "logs"
+        log_dir = log_directory(self.config)
         log_dir.mkdir(parents=True, exist_ok=True)
         logger = logging.getLogger(f"dcmget.runner.{id(self)}")
         logger.setLevel(logging.DEBUG)
@@ -587,6 +617,21 @@ class DownloadRunner:
 
 def safe_accession_dir(accession: str) -> str:
     return _safe_path_component(accession, "accession")[:120]
+
+
+def staging_directory_root(config: AppConfig) -> Path:
+    if config.anonymization_enabled:
+        return ensure_application_state_dir() / "staging"
+    return (
+        Path(config.dicom_destination_folder).expanduser().resolve()
+        / ".dcmget-staging"
+    )
+
+
+def log_directory(config: AppConfig) -> Path:
+    if config.anonymization_enabled:
+        return ensure_application_state_dir() / "logs"
+    return Path(config.dicom_destination_folder).expanduser().resolve() / "logs"
 
 
 def _run_probe(command: list[str], allow_nonzero: bool = False) -> str:
@@ -627,6 +672,8 @@ def _archive_dicom_files(
     destination_root: Path,
     directory_template: str,
     fallback_accession: str,
+    anonymizer: DicomAnonymizer | None = None,
+    error_callback: ArchiveErrorCallback | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
@@ -637,6 +684,7 @@ def _archive_dicom_files(
     if not values:
         return moved, rejected
     for source in values:
+        temporary: Path | None = None
         metadata = {
             "PatientID": "UNKNOWN_PATIENT",
             "AccessionNumber": fallback_accession or "UNKNOWN_ACCESSION",
@@ -644,12 +692,22 @@ def _archive_dicom_files(
             "SOPInstanceUID": "",
         }
         try:
-            dataset = dcmread(
-                source,
-                stop_before_pixels=True,
-                force=True,
-                specific_tags=list(metadata),
-            )
+            if anonymizer:
+                dataset = dcmread(source, force=True)
+                if not str(getattr(dataset, "PatientID", "") or "").strip():
+                    dataset.PatientID = str(
+                        getattr(dataset, "StudyInstanceUID", "") or "UNKNOWN_PATIENT"
+                    )
+                if not str(getattr(dataset, "AccessionNumber", "") or "").strip():
+                    dataset.AccessionNumber = fallback_accession or "UNKNOWN_ACCESSION"
+                anonymizer.anonymize_dataset(dataset)
+            else:
+                dataset = dcmread(
+                    source,
+                    stop_before_pixels=True,
+                    force=True,
+                    specific_tags=list(metadata),
+                )
             for field in metadata:
                 value = str(getattr(dataset, field, "") or "").strip()
                 if value:
@@ -657,7 +715,9 @@ def _archive_dicom_files(
             sop_instance_uid = UID(metadata["SOPInstanceUID"])
             if not sop_instance_uid.is_valid:
                 raise ValueError("invalid SOP Instance UID")
-        except (OSError, ValueError):
+        except Exception as exc:
+            if error_callback:
+                error_callback(source, str(exc))
             rejected.append(source)
             continue
 
@@ -672,13 +732,51 @@ def _archive_dicom_files(
         )
         try:
             destination.mkdir(parents=True, exist_ok=True)
-            target = _unique_dicom_target(destination, source.name)
-            os.replace(source, target)
-        except OSError:
+            target_name = (
+                f"{metadata['SOPInstanceUID']}.dcm" if anonymizer else source.name
+            )
+            target = _unique_dicom_target(destination, target_name)
+            if anonymizer:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".dcmget-anonymous-", suffix=".tmp", dir=destination
+                )
+                os.close(descriptor)
+                temporary = Path(temporary_name)
+                dataset.save_as(temporary, enforce_file_format=True)
+                _validate_anonymized_file(temporary, metadata["SOPInstanceUID"])
+                os.replace(temporary, target)
+                temporary = None
+                try:
+                    source.unlink()
+                except OSError as exc:
+                    if error_callback:
+                        error_callback(source, str(exc))
+                    rejected.append(source)
+            else:
+                os.replace(source, target)
+        except Exception as exc:
+            if temporary:
+                temporary.unlink(missing_ok=True)
+            if error_callback:
+                error_callback(source, str(exc))
             rejected.append(source)
             continue
         moved.append(target)
     return moved, rejected
+
+
+def _validate_anonymized_file(path: Path, expected_sop_instance_uid: str) -> None:
+    from pydicom import dcmread
+    from pydicom.uid import UID
+
+    with path.open("rb") as handle:
+        handle.seek(128)
+        if handle.read(4) != b"DICM":
+            raise ValueError("anonymous output is missing DICM prefix")
+    dataset = dcmread(path, stop_before_pixels=True)
+    sop_instance_uid = str(getattr(dataset, "SOPInstanceUID", "") or "")
+    if sop_instance_uid != expected_sop_instance_uid or not UID(sop_instance_uid).is_valid:
+        raise ValueError("anonymous output has invalid SOP Instance UID")
 
 
 def _render_directory_template(

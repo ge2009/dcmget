@@ -20,7 +20,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.1 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.2 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -37,6 +37,8 @@ def run_self_test(config_path: str) -> int:
     from pydicom.dataset import FileDataset, FileMetaDataset
     from pydicom.uid import ExplicitVRLittleEndian
 
+    from dcmget.anonymization import DicomAnonymizer
+
     load_config(config_path)
     trial_status()
     public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM)
@@ -47,6 +49,13 @@ def run_self_test(config_path: str) -> int:
     file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
     dataset = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
     dataset.SOPInstanceUID = "1.2.826.0.1.3680043.10.999.1"
+    dataset.PatientID = "SELF-TEST-PATIENT"
+    dataset.AccessionNumber = "SELF-TEST"
+    DicomAnonymizer("research", secret=b"dcmget-self-test-key-material-32b").anonymize_dataset(
+        dataset
+    )
+    if not str(dataset.PatientID).startswith("ANON-"):
+        raise RuntimeError("pydicom 匿名处理自检失败")
     buffer = BytesIO()
     dataset.save_as(buffer)
     buffer.seek(0)
