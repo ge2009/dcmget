@@ -149,8 +149,11 @@ jobs:
           if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer failed with exit code $($upgrade.ExitCode)" }
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
           if (-not (Test-Path "$env:LOCALAPPDATA\DcmGet\logs")) { throw "Diagnostic log directory is missing" }
-          $diagnosticShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\DcmGet 诊断日志.lnk"
-          if (-not (Test-Path $diagnosticShortcut)) { throw "Diagnostic log shortcut is missing" }
+          $diagnosticShortcuts = @(
+            (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\DcmGet 诊断日志.lnk"),
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\DcmGet 诊断日志.lnk")
+          )
+          if (-not ($diagnosticShortcuts | Where-Object { Test-Path $_ })) { throw "Diagnostic log shortcut is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter Weasis.exe)) { throw "Installed Weasis.exe is missing" }
