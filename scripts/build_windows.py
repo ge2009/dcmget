@@ -10,12 +10,18 @@ import sys
 import zipfile
 from pathlib import Path
 
+try:
+    from scripts.prepare_weasis import load_manifest, payload_is_current
+except ModuleNotFoundError:  # direct execution from the scripts directory
+    from prepare_weasis import load_manifest, payload_is_current
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_ROOT = ROOT / "build" / "windows"
 DIST_ROOT = BUILD_ROOT / "dist"
 RELEASE_ROOT = ROOT / "release" / "windows"
 PLATFORM_RUNTIME = ROOT / ".runtime" / "dcmtk" / "windows-x86_64"
+WEASIS_RUNTIME = ROOT / ".runtime" / "weasis" / "windows-x86_64" / "Weasis"
 
 
 def source_version() -> str:
@@ -51,11 +57,28 @@ def version_tuple(version: str) -> tuple[int, int, int, int]:
 
 def find_dcmtk_bin() -> Path:
     for movescu in PLATFORM_RUNTIME.rglob("movescu.exe"):
-        if (movescu.parent / "storescp.exe").is_file():
+        required = (
+            "storescp.exe",
+            "dcmmkdir.exe",
+            "dcmj2pnm.exe",
+            "dcmdjpeg.exe",
+            "dcmdump.exe",
+        )
+        if all((movescu.parent / name).is_file() for name in required):
             return movescu.parent
     raise FileNotFoundError(
-        "未找到 Windows DCMTK。请先运行 scripts/download_dcmtk.py --platform windows-x86_64"
+        "未找到完整的 Windows DCMTK/PDI 工具。请先运行 "
+        "scripts/download_dcmtk.py --platform windows-x86_64"
     )
+
+
+def find_weasis_payload() -> Path:
+    if not payload_is_current(WEASIS_RUNTIME, load_manifest()):
+        raise FileNotFoundError(
+            "未找到通过逐文件 SHA-256 校验的 Weasis 4.7.1 Windows 便携查看器。请先运行 "
+            "scripts/prepare_weasis.py --platform windows-x86_64"
+        )
+    return WEASIS_RUNTIME
 
 
 def make_icon() -> Path:
@@ -97,9 +120,14 @@ def make_version_file(version: str) -> Path:
 
 
 def pyinstaller_args(
-    name: str, mode: str, icon: Path, version_file: Path, runtime_root: Path
+    name: str,
+    mode: str,
+    icon: Path,
+    version_file: Path,
+    runtime_root: Path,
+    weasis_root: Path | None = None,
 ) -> list[str]:
-    return [
+    arguments = [
         str(ROOT / "DICOM_download_ui.py"),
         "--noconfirm",
         "--clean",
@@ -135,12 +163,21 @@ def pyinstaller_args(
         f"{runtime_root}:.runtime/dcmtk/windows-x86_64",
         "--noupx",
     ]
+    if weasis_root is not None:
+        arguments.extend(
+            [
+                "--add-data",
+                f"{weasis_root}:.runtime/weasis/windows-x86_64/Weasis",
+            ]
+        )
+    return arguments
 
 
 def build_payloads(version: str) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
     find_dcmtk_bin()
+    weasis = find_weasis_payload()
     from PyInstaller.__main__ import run as run_pyinstaller
 
     if BUILD_ROOT.exists():
@@ -152,7 +189,9 @@ def build_payloads(version: str) -> None:
     version_file = make_version_file(version)
 
     run_pyinstaller(
-        pyinstaller_args("DcmGet", "--onedir", icon, version_file, PLATFORM_RUNTIME)
+        pyinstaller_args(
+            "DcmGet", "--onedir", icon, version_file, PLATFORM_RUNTIME, weasis
+        )
     )
     run_pyinstaller(
         pyinstaller_args(

@@ -39,10 +39,20 @@ ANONYMIZATION_PROFILE_IDS = {
     profile_id for profile_id, _label, _description in ANONYMIZATION_PROFILE_OPTIONS
 }
 
+DEFAULT_PDI_PREVIEW_MODE = "hybrid"
+PDI_PREVIEW_MODE_OPTIONS = (
+    ("hybrid", "混合预览（推荐）", "全部单帧图像；多帧对象最多生成前 100 帧。"),
+    ("all", "全部可预览图像", "转换所有支持的实例和帧，导出时间和体积较大。"),
+    ("series_cover", "每序列代表图", "每个序列仅生成第一张可预览图像。"),
+)
+PDI_PREVIEW_MODE_IDS = {
+    mode_id for mode_id, _label, _description in PDI_PREVIEW_MODE_OPTIONS
+}
+
 
 @dataclass(slots=True)
 class AppConfig:
-    config_version: int = 3
+    config_version: int = 4
     dcmtk_bin_dir: str = ""
     access_numbers_file_path: str = "access.txt"
     dicom_destination_folder: str = "Dicom"
@@ -55,6 +65,12 @@ class AppConfig:
     directory_template: str = DEFAULT_DIRECTORY_TEMPLATE
     anonymization_enabled: bool = False
     anonymization_profile: str = DEFAULT_ANONYMIZATION_PROFILE
+    pdi_export_enabled: bool = False
+    pdi_institution_name: str = ""
+    pdi_output_folder: str = ""
+    pdi_include_html_preview: bool = True
+    pdi_preview_mode: str = DEFAULT_PDI_PREVIEW_MODE
+    pdi_include_weasis_windows: bool = True
     max_log_file_size_bytes: int = 104_857_600
 
     @classmethod
@@ -65,7 +81,7 @@ class AppConfig:
         if is_legacy:
             legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
-                "config_version": 3,
+                "config_version": 4,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
                 "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
@@ -78,6 +94,12 @@ class AppConfig:
                 "directory_template": DEFAULT_DIRECTORY_TEMPLATE,
                 "anonymization_enabled": False,
                 "anonymization_profile": DEFAULT_ANONYMIZATION_PROFILE,
+                "pdi_export_enabled": False,
+                "pdi_institution_name": "",
+                "pdi_output_folder": "",
+                "pdi_include_html_preview": True,
+                "pdi_preview_mode": DEFAULT_PDI_PREVIEW_MODE,
+                "pdi_include_weasis_windows": True,
                 "max_log_file_size_bytes": data.get(
                     "max_log_file_size_bytes", 104_857_600
                 ),
@@ -88,7 +110,7 @@ class AppConfig:
             field: data.get(field, getattr(defaults, field))
             for field in asdict(defaults)
         }
-        values["config_version"] = 3
+        values["config_version"] = 4
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
         values["max_log_file_size_bytes"] = _as_int(
@@ -97,8 +119,20 @@ class AppConfig:
         values["anonymization_enabled"] = _as_bool(
             values["anonymization_enabled"], False
         )
+        values["pdi_export_enabled"] = _as_bool(
+            values["pdi_export_enabled"], False
+        )
+        values["pdi_include_html_preview"] = _as_bool(
+            values["pdi_include_html_preview"], True
+        )
+        values["pdi_include_weasis_windows"] = _as_bool(
+            values["pdi_include_weasis_windows"], True
+        )
         values["anonymization_profile"] = str(
             values["anonymization_profile"] or DEFAULT_ANONYMIZATION_PROFILE
+        ).strip().lower()
+        values["pdi_preview_mode"] = str(
+            values["pdi_preview_mode"] or DEFAULT_PDI_PREVIEW_MODE
         ).strip().lower()
         return cls(**values)
 
@@ -134,6 +168,11 @@ class AppConfig:
             and self.anonymization_profile not in ANONYMIZATION_PROFILE_IDS
         ):
             errors["anonymization_profile"] = "请选择有效的匿名方案"
+        if self.pdi_export_enabled:
+            if not self.pdi_institution_name.strip():
+                errors["pdi_institution_name"] = "启用 PDI 时请输入机构名称"
+            if self.pdi_preview_mode not in PDI_PREVIEW_MODE_IDS:
+                errors["pdi_preview_mode"] = "请选择有效的网页预览范围"
         template = self.directory_template.strip().replace("\\", "/")
         fields = set(re.findall(r"\{([^{}]+)\}", template))
         without_placeholders = re.sub(

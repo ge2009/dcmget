@@ -54,8 +54,8 @@ jobs:
       - name: Download OFFIS DCMTK 3.7.0
         run: python scripts/download_dcmtk.py --platform ${{ matrix.dcmtk }}
 
-      - name: Verify DCMTK version
-        run: python -c "from dcmget.core import DcmtkResolver; assert DcmtkResolver().resolve().version == '3.7.0'"
+      - name: Verify DCMTK version and PDI tools
+        run: python -c "from dcmget.core import DcmtkResolver; t=DcmtkResolver().resolve(); assert t.version == '3.7.0'; assert t.dcmmkdir and t.dcmj2pnm and t.dcmdjpeg and t.dcmdump"
 
       - name: Run unit, UI and DICOM integration tests
         env:
@@ -70,10 +70,10 @@ jobs:
         if: matrix.dcmtk == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: dcmget-2.4.0-source-deploy
+          name: dcmget-2.5.0-source-deploy
           path: |
-            release/dcmget-2.4.0-source-deploy.zip
-            release/dcmget-2.4.0-source-deploy.zip.sha256
+            release/dcmget-2.5.0-source-deploy.zip
+            release/dcmget-2.5.0-source-deploy.zip.sha256
           if-no-files-found: error
 
   minimum-python:

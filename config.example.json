@@ -1,5 +1,5 @@
 {
-  "config_version": 3,
+  "config_version": 4,
   "dcmtk_bin_dir": "",
   "access_numbers_file_path": "access.txt",
   "dicom_destination_folder": "Dicom/Dest",
@@ -12,5 +12,11 @@
   "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
   "anonymization_enabled": false,
   "anonymization_profile": "research",
+  "pdi_export_enabled": false,
+  "pdi_institution_name": "",
+  "pdi_output_folder": "",
+  "pdi_include_html_preview": true,
+  "pdi_preview_mode": "hybrid",
+  "pdi_include_weasis_windows": true,
   "max_log_file_size_bytes": 104857600
 }

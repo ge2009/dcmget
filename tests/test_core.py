@@ -138,6 +138,23 @@ def test_resolver_only_uses_current_platform_runtime(tmp_path, monkeypatch):
     assert resolved.bin_dir == current
 
 
+def test_resolver_discovers_optional_pdi_tools_next_to_dcmtk_binaries(tmp_path, monkeypatch):
+    suffix = ".exe" if core.os.name == "nt" else ""
+    for name in ("movescu", "storescp", "dcmmkdir", "dcmj2pnm", "dcmdjpeg", "dcmdump"):
+        (tmp_path / f"{name}{suffix}").touch()
+    resolver = DcmtkResolver(tmp_path)
+    monkeypatch.setattr(core, "_run_probe", lambda *_args, **_kwargs: "dcmtk v3.7.0")
+
+    tools = resolver._probe(
+        tmp_path / f"movescu{suffix}", tmp_path / f"storescp{suffix}"
+    )
+
+    assert tools.dcmmkdir == tmp_path / f"dcmmkdir{suffix}"
+    assert tools.dcmj2pnm == tmp_path / f"dcmj2pnm{suffix}"
+    assert tools.dcmdjpeg == tmp_path / f"dcmdjpeg{suffix}"
+    assert tools.dcmdump == tmp_path / f"dcmdump{suffix}"
+
+
 def test_preflight_reports_port_conflict(tmp_path):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -154,6 +171,83 @@ def test_preflight_reports_port_conflict(tmp_path):
 
     assert not result.ok
     assert "storage_port" in result.errors
+
+
+def test_preflight_requires_pdi_dcmtk_tools_only_when_pdi_is_enabled(tmp_path):
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.return_value = tools
+
+    disabled = preflight(
+        AppConfig(dicom_destination_folder=str(tmp_path), pdi_export_enabled=False),
+        resolver,
+    )
+    enabled = preflight(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        resolver,
+    )
+
+    assert "dcmtk_bin_dir" not in disabled.errors
+    assert "dcmtk_bin_dir" in enabled.errors
+
+
+def test_preflight_allows_missing_optional_pdi_preview_tool(tmp_path):
+    tools = ToolPaths(
+        Path("movescu"),
+        Path("storescp"),
+        Path("."),
+        "3.7.0",
+        dcmmkdir=Path("dcmmkdir"),
+        dcmj2pnm=None,
+    )
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.return_value = tools
+
+    result = preflight(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        resolver,
+    )
+
+    assert result.ok
+    assert any(
+        name == "PDI 网页预览" and ok and "部分成功" in message
+        for name, ok, message in result.checks
+    )
+
+
+def test_preflight_uses_configured_pdi_output_folder(tmp_path):
+    pdi_output = tmp_path / "portable media"
+    tools = ToolPaths(
+        Path("movescu"),
+        Path("storescp"),
+        Path("."),
+        "3.7.0",
+        dcmmkdir=Path("dcmmkdir"),
+        dcmj2pnm=Path("dcmj2pnm"),
+    )
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.return_value = tools
+    result = preflight(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+            pdi_output_folder=str(pdi_output),
+        ),
+        resolver,
+    )
+
+    assert result.ok
+    assert pdi_output.is_dir()
+    assert any(name == "PDI 输出目录" and ok for name, ok, _message in result.checks)
 
 
 def test_file_archive_adds_dcm_suffix_and_uses_metadata_directory(tmp_path):
@@ -414,6 +508,25 @@ def test_cancel_wakes_a_paused_runner(tmp_path, monkeypatch):
     assert result[0].results[0].status == AccessionStatus.CANCELLED
 
 
+def test_cancel_during_receiver_cleanup_marks_batch_cancelled(tmp_path, monkeypatch):
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    monkeypatch.setattr(
+        runner,
+        "_download_one",
+        lambda accession, *_args: AccessionResult(
+            accession, AccessionStatus.COMPLETED
+        ),
+    )
+    monkeypatch.setattr(runner, "_stop_storescp", runner.request_cancel)
+
+    summary = runner.run(["A001"])
+
+    assert summary.cancelled
+
+
 def test_paused_runner_fails_if_storescp_exits(tmp_path):
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
@@ -537,6 +650,29 @@ def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
     assert result.status == AccessionStatus.PARTIAL
     assert result.file_count == 1
     assert "接收连接中止" in result.message
+    assert result.archived_files == [
+        str(next((tmp_path / "dicom").rglob("*.dcm")))
+    ]
+
+
+def test_batch_summary_exposes_only_exact_archived_files():
+    summary = BatchSummary(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                archived_files=["/data/a.dcm", "/data/b.dcm"],
+            ),
+            AccessionResult("A002", AccessionStatus.NO_DATA),
+            AccessionResult(
+                "A003",
+                AccessionStatus.PARTIAL,
+                archived_files=["/data/c.dcm"],
+            ),
+        ]
+    )
+
+    assert summary.archived_files == ["/data/a.dcm", "/data/b.dcm", "/data/c.dcm"]
 
 
 def test_download_result_uses_received_bytes_and_transfer_time_for_speed(

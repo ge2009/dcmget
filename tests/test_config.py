@@ -7,6 +7,7 @@ import sys
 from dcmget.config import (
     DEFAULT_ANONYMIZATION_PROFILE,
     DEFAULT_DIRECTORY_TEMPLATE,
+    DEFAULT_PDI_PREVIEW_MODE,
     AppConfig,
     load_config,
     parse_accessions,
@@ -32,7 +33,7 @@ def test_migrates_legacy_configuration(tmp_path):
 
     config = load_config(path)
 
-    assert config.config_version == 3
+    assert config.config_version == 4
     assert Path(config.dcmtk_bin_dir) == Path("C:/dcmtk/bin")
     assert config.calling_ae_title == "CALLING"
     assert config.pacs_ae_title == "PACS"
@@ -40,6 +41,8 @@ def test_migrates_legacy_configuration(tmp_path):
     assert config.storage_port == 11112
     assert not config.anonymization_enabled
     assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
+    assert not config.pdi_export_enabled
+    assert config.pdi_preview_mode == DEFAULT_PDI_PREVIEW_MODE
 
 
 def test_accession_parser_ignores_blanks_and_deduplicates_in_order():
@@ -69,9 +72,12 @@ def test_new_configuration_uses_dcmget_receiver_and_metadata_layout():
     assert config.directory_template == DEFAULT_DIRECTORY_TEMPLATE
     assert not config.anonymization_enabled
     assert config.anonymization_profile == "research"
+    assert not config.pdi_export_enabled
+    assert config.pdi_include_html_preview
+    assert config.pdi_include_weasis_windows
 
 
-def test_version_two_configuration_keeps_existing_values_and_adds_anonymization_defaults():
+def test_version_two_configuration_keeps_existing_values_and_adds_current_defaults():
     config = AppConfig.from_dict(
         {
             "config_version": 2,
@@ -81,12 +87,14 @@ def test_version_two_configuration_keeps_existing_values_and_adds_anonymization_
         }
     )
 
-    assert config.config_version == 3
+    assert config.config_version == 4
     assert config.pacs_server_ip == "10.1.2.3"
     assert config.storage_port == 16666
     assert config.directory_template == "{StudyInstanceUID}"
     assert not config.anonymization_enabled
     assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
+    assert not config.pdi_export_enabled
+    assert config.pdi_preview_mode == DEFAULT_PDI_PREVIEW_MODE
 
 
 def test_anonymization_profile_is_validated_only_when_enabled():
@@ -105,10 +113,34 @@ def test_configuration_parses_string_boolean_without_enabling_anonymization():
     assert not config.anonymization_enabled
 
 
+def test_version_three_configuration_migrates_pdi_defaults_without_overwriting_values():
+    config = AppConfig.from_dict(
+        {
+            "config_version": 3,
+            "pacs_server_ip": "10.1.2.3",
+            "pdi_export_enabled": "true",
+            "pdi_institution_name": "测试医院",
+            "pdi_output_folder": "/tmp/pdi",
+            "pdi_include_html_preview": "false",
+            "pdi_preview_mode": "all",
+            "pdi_include_weasis_windows": "false",
+        }
+    )
+
+    assert config.config_version == 4
+    assert config.pacs_server_ip == "10.1.2.3"
+    assert config.pdi_export_enabled
+    assert config.pdi_institution_name == "测试医院"
+    assert config.pdi_output_folder == "/tmp/pdi"
+    assert not config.pdi_include_html_preview
+    assert config.pdi_preview_mode == "all"
+    assert not config.pdi_include_weasis_windows
+
+
 def test_example_configuration_matches_current_schema():
     config = load_config(Path(__file__).parents[1] / "config.example.json")
 
-    assert config.config_version == 3
+    assert config.config_version == 4
     assert not config.anonymization_enabled
     assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
 
@@ -131,6 +163,24 @@ def test_validation_reports_required_and_invalid_values():
         "storage_port",
         "max_log_file_size_bytes",
     }
+
+
+def test_pdi_validation_is_only_required_when_export_is_enabled():
+    disabled = AppConfig(
+        pdi_export_enabled=False,
+        pdi_institution_name="",
+        pdi_preview_mode="unknown",
+    )
+    enabled = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="",
+        pdi_preview_mode="unknown",
+    )
+
+    assert "pdi_institution_name" not in disabled.validate()
+    assert "pdi_preview_mode" not in disabled.validate()
+    assert enabled.validate()["pdi_institution_name"]
+    assert enabled.validate()["pdi_preview_mode"]
 
 
 def test_directory_template_rejects_unknown_fields_and_parent_paths():

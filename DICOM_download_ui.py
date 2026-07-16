@@ -21,7 +21,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.4 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.5 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),

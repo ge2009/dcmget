@@ -48,8 +48,10 @@ from .auth_ui import activate_gui, entitlement_text, prepare_download_entitlemen
 from .config import (
     ANONYMIZATION_PROFILE_OPTIONS,
     DEFAULT_ANONYMIZATION_PROFILE,
+    DEFAULT_PDI_PREVIEW_MODE,
     AppConfig,
     DIRECTORY_TEMPLATES,
+    PDI_PREVIEW_MODE_OPTIONS,
     load_config,
     parse_accessions,
     save_config,
@@ -161,7 +163,7 @@ class SettingsPage(QWidget):
         back.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
         back.setToolTip("返回任务主页")
         back.clicked.connect(self.back_requested)
-        title = QLabel("连接、接收与匿名设置")
+        title = QLabel("连接、接收、匿名与 PDI 设置")
         title.setObjectName("PageTitle")
         title_row.addWidget(back)
         title_row.addWidget(title)
@@ -260,10 +262,78 @@ class SettingsPage(QWidget):
             self._update_anonymization_state
         )
 
+        pdi_card = QFrame()
+        pdi_card.setObjectName("Card")
+        pdi_layout = QVBoxLayout(pdi_card)
+        pdi_header = QHBoxLayout()
+        pdi_heading = QLabel("PDI 便携目录导出")
+        pdi_heading.setObjectName("SectionTitle")
+        pdi_header.addWidget(pdi_heading)
+        pdi_header.addStretch()
+        self.pdi_enabled_checkbox = QCheckBox("每批下载完成后自动生成")
+        self.pdi_enabled_checkbox.setAccessibleName("自动生成 PDI 便携目录")
+        pdi_header.addWidget(self.pdi_enabled_checkbox)
+        self.pdi_card_toggle = QToolButton()
+        self.pdi_card_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.pdi_card_toggle.setAccessibleName("展开或收起 PDI 设置")
+        self.pdi_card_toggle.clicked.connect(self._toggle_pdi_card)
+        pdi_header.addWidget(self.pdi_card_toggle)
+        pdi_layout.addLayout(pdi_header)
+
+        self.pdi_card_body = QWidget()
+        pdi_form = QFormLayout(self.pdi_card_body)
+        pdi_form.setContentsMargins(0, 4, 0, 0)
+        pdi_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        pdi_form.setHorizontalSpacing(20)
+        pdi_form.setVerticalSpacing(12)
+        self.pdi_institution_edit = QLineEdit()
+        self.pdi_institution_edit.setPlaceholderText("显示在 PDI 首页和说明文件中")
+        pdi_form.addRow("机构名称", self.pdi_institution_edit)
+
+        pdi_output_row = QWidget()
+        pdi_output_layout = QHBoxLayout(pdi_output_row)
+        pdi_output_layout.setContentsMargins(0, 0, 0, 0)
+        self.pdi_output_edit = QLineEdit()
+        self.pdi_output_edit.setPlaceholderText("留空时保存到 DICOM 目录/PDI")
+        self.pdi_output_button = QPushButton("选择目录")
+        self.pdi_output_button.clicked.connect(self._browse_pdi_output)
+        pdi_output_layout.addWidget(self.pdi_output_edit, 1)
+        pdi_output_layout.addWidget(self.pdi_output_button)
+        pdi_form.addRow("输出根目录", pdi_output_row)
+
+        self.pdi_html_checkbox = QCheckBox("生成可双击打开的静态网页预览")
+        pdi_form.addRow("网页预览", self.pdi_html_checkbox)
+        self.pdi_preview_mode_combo = QComboBox()
+        self.pdi_preview_mode_combo.setAccessibleName("PDI 网页预览范围")
+        for mode_id, label, _description in PDI_PREVIEW_MODE_OPTIONS:
+            self.pdi_preview_mode_combo.addItem(label, mode_id)
+        pdi_form.addRow("预览范围", self.pdi_preview_mode_combo)
+        self.pdi_preview_hint = QLabel()
+        self.pdi_preview_hint.setObjectName("FieldHint")
+        self.pdi_preview_hint.setWordWrap(True)
+        pdi_form.addRow("", self.pdi_preview_hint)
+        self.pdi_weasis_checkbox = QCheckBox("包含 Windows x64 Weasis 便携查看器")
+        pdi_form.addRow("DICOM 查看器", self.pdi_weasis_checkbox)
+        self.pdi_privacy_warning = QLabel(
+            "PDI 会复制本批归档文件并生成网页预览。未启用匿名时，"
+            "导出目录可能包含患者隐私信息，请按医疗数据管理要求保管和传递。"
+        )
+        self.pdi_privacy_warning.setObjectName("WarningText")
+        self.pdi_privacy_warning.setWordWrap(True)
+        pdi_form.addRow("", self.pdi_privacy_warning)
+        pdi_layout.addWidget(self.pdi_card_body)
+        self._pdi_card_expanded = False
+        self.pdi_enabled_checkbox.toggled.connect(self._update_pdi_state)
+        self.pdi_html_checkbox.toggled.connect(self._update_pdi_state)
+        self.pdi_preview_mode_combo.currentIndexChanged.connect(
+            self._update_pdi_state
+        )
+
         content_layout.addWidget(dcmtk_card)
         content_layout.addWidget(pacs_card)
         content_layout.addWidget(receiver_card)
         content_layout.addWidget(anonymization_card)
+        content_layout.addWidget(pdi_card)
         content_layout.addStretch()
         self.settings_scroll.setWidget(content)
         outer.addWidget(self.settings_scroll, 1)
@@ -289,6 +359,9 @@ class SettingsPage(QWidget):
             "storage_port": self.storage_port_spin,
             "directory_template": self.directory_template_combo,
             "anonymization_profile": self.anonymization_profile_combo,
+            "pdi_institution_name": self.pdi_institution_edit,
+            "pdi_output_folder": self.pdi_output_edit,
+            "pdi_preview_mode": self.pdi_preview_mode_combo,
             "max_log_file_size_bytes": self.log_size_spin,
         }
 
@@ -333,14 +406,26 @@ class SettingsPage(QWidget):
             )
         self.anonymization_profile_combo.setCurrentIndex(profile_index)
         self._update_anonymization_state()
+        self.pdi_enabled_checkbox.setChecked(config.pdi_export_enabled)
+        self.pdi_institution_edit.setText(config.pdi_institution_name)
+        self.pdi_output_edit.setText(config.pdi_output_folder)
+        self.pdi_html_checkbox.setChecked(config.pdi_include_html_preview)
+        preview_index = self.pdi_preview_mode_combo.findData(config.pdi_preview_mode)
+        if preview_index < 0:
+            preview_index = self.pdi_preview_mode_combo.findData(
+                DEFAULT_PDI_PREVIEW_MODE
+            )
+        self.pdi_preview_mode_combo.setCurrentIndex(preview_index)
+        self.pdi_weasis_checkbox.setChecked(config.pdi_include_weasis_windows)
+        self._set_pdi_card_expanded(config.pdi_export_enabled)
+        self._update_pdi_state()
         self.log_size_spin.setValue(max(1, config.max_log_file_size_bytes // (1024 * 1024)))
         self.apply_errors({})
 
     def config(self) -> AppConfig:
-        return AppConfig(
+        values = self._config.to_dict()
+        values.update(
             dcmtk_bin_dir=self.dcmtk_edit.text().strip(),
-            access_numbers_file_path=self._config.access_numbers_file_path,
-            dicom_destination_folder=self._config.dicom_destination_folder,
             pacs_server_ip=self.pacs_host_edit.text().strip(),
             pacs_server_port=self.pacs_port_spin.value(),
             calling_ae_title=self.calling_ae_edit.text().strip(),
@@ -353,8 +438,18 @@ class SettingsPage(QWidget):
                 self.anonymization_profile_combo.currentData()
                 or DEFAULT_ANONYMIZATION_PROFILE
             ),
+            pdi_export_enabled=self.pdi_enabled_checkbox.isChecked(),
+            pdi_institution_name=self.pdi_institution_edit.text().strip(),
+            pdi_output_folder=self.pdi_output_edit.text().strip(),
+            pdi_include_html_preview=self.pdi_html_checkbox.isChecked(),
+            pdi_preview_mode=str(
+                self.pdi_preview_mode_combo.currentData()
+                or DEFAULT_PDI_PREVIEW_MODE
+            ),
+            pdi_include_weasis_windows=self.pdi_weasis_checkbox.isChecked(),
             max_log_file_size_bytes=self.log_size_spin.value() * 1024 * 1024,
         )
+        return AppConfig.from_dict(values)
 
     def _update_anonymization_state(self, _value=None) -> None:
         enabled = self.anonymization_enabled_checkbox.isChecked()
@@ -370,6 +465,47 @@ class SettingsPage(QWidget):
         self.anonymization_profile_hint.setText(
             "元数据处理：" + descriptions.get(profile_id, "请选择匿名方案")
         )
+
+    def _update_pdi_state(self, _value=None) -> None:
+        enabled = self.pdi_enabled_checkbox.isChecked()
+        if enabled and not self._pdi_card_expanded:
+            self._set_pdi_card_expanded(True)
+        for widget in (
+            self.pdi_institution_edit,
+            self.pdi_output_edit,
+            self.pdi_output_button,
+            self.pdi_html_checkbox,
+            self.pdi_weasis_checkbox,
+        ):
+            widget.setEnabled(enabled)
+        self.pdi_preview_mode_combo.setEnabled(
+            enabled and self.pdi_html_checkbox.isChecked()
+        )
+        mode_id = str(
+            self.pdi_preview_mode_combo.currentData()
+            or DEFAULT_PDI_PREVIEW_MODE
+        )
+        descriptions = {
+            item_id: description
+            for item_id, _label, description in PDI_PREVIEW_MODE_OPTIONS
+        }
+        self.pdi_preview_hint.setText(
+            "预览生成：" + descriptions.get(mode_id, "请选择预览范围")
+        )
+        self.pdi_preview_hint.setEnabled(
+            enabled and self.pdi_html_checkbox.isChecked()
+        )
+
+    def _set_pdi_card_expanded(self, expanded: bool) -> None:
+        self._pdi_card_expanded = expanded
+        self.pdi_card_body.setVisible(expanded)
+        self.pdi_card_toggle.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.pdi_card_toggle.setText("收起" if expanded else "展开")
+
+    def _toggle_pdi_card(self) -> None:
+        self._set_pdi_card_expanded(not self._pdi_card_expanded)
 
     def apply_errors(self, errors: dict[str, str]) -> None:
         for field, widget in self._field_widgets.items():
@@ -401,6 +537,13 @@ class SettingsPage(QWidget):
         selected = QFileDialog.getExistingDirectory(self, "选择 DCMTK bin 目录", self.dcmtk_edit.text())
         if selected:
             self.dcmtk_edit.setText(selected)
+
+    def _browse_pdi_output(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "选择 PDI 输出根目录", self.pdi_output_edit.text()
+        )
+        if selected:
+            self.pdi_output_edit.setText(selected)
 
     def _save(self) -> None:
         config = self.config()
@@ -482,6 +625,58 @@ class DownloadWorker(QObject):
         self.trial_consumed.emit(f"本次使用免费试用，剩余 {trial.remaining} 次")
 
 
+class PdiWorker(QObject):
+    """Run the optional PDI exporter without blocking the Qt event loop."""
+
+    log = pyqtSignal(str, str, str)
+    progress = pyqtSignal(object, int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        config: AppConfig,
+        tools: ToolPaths,
+        files: list[str],
+        project_root: Path,
+    ):
+        super().__init__()
+        self.config = config
+        self.tools = tools
+        self.files = files
+        self.project_root = project_root
+        self.exporter = None
+        self.cancel_requested = False
+        self._control_lock = threading.Lock()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            # Keep the optional export subsystem out of the normal UI import path.
+            from .pdi import PdiExporter
+
+            exporter = PdiExporter(
+                self.config,
+                self.tools,
+                project_root=self.project_root,
+                log_callback=self.log.emit,
+                progress_callback=self.progress.emit,
+            )
+            with self._control_lock:
+                self.exporter = exporter
+                if self.cancel_requested:
+                    exporter.request_cancel()
+            self.finished.emit(exporter.export(self.files))
+        except Exception as exc:  # surface exporter failures in the main UI
+            self.failed.emit(str(exc))
+
+    def request_cancel(self) -> None:
+        with self._control_lock:
+            self.cancel_requested = True
+            if self.exporter is not None:
+                self.exporter.request_cancel()
+
+
 class DcmGetWindow(QMainWindow):
     def __init__(self, config_path: str | Path, project_root: str | Path):
         super().__init__()
@@ -492,7 +687,11 @@ class DcmGetWindow(QMainWindow):
         self.tools: ToolPaths | None = None
         self.worker: DownloadWorker | None = None
         self.worker_thread: QThread | None = None
+        self.pdi_worker: PdiWorker | None = None
+        self.pdi_thread: QThread | None = None
         self.last_summary: BatchSummary | None = None
+        self.last_pdi_result = None
+        self._pdi_source_files: list[str] = []
         self.release_notes_dialog: ReleaseNotesDialog | None = None
         self._closing_after_cancel = False
         self._pause_requested = False
@@ -516,6 +715,7 @@ class DcmGetWindow(QMainWindow):
         self._build_ui()
         self._restore_ui_state()
         self.settings_page.set_config(self.config)
+        self._reset_pdi_status_card()
         last_destination = self.settings_store.value("task/destination", "", type=str)
         self.destination_edit.setText(last_destination or self.config.dicom_destination_folder)
         self._load_configured_accessions()
@@ -579,7 +779,7 @@ class DcmGetWindow(QMainWindow):
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        self.settings_button.setToolTip("连接、接收与匿名设置（Ctrl+,）")
+        self.settings_button.setToolTip("连接、接收、匿名与 PDI 设置（Ctrl+,）")
         self.settings_button.clicked.connect(self._show_settings)
         layout.addWidget(self.settings_button)
         return header
@@ -647,18 +847,25 @@ class DcmGetWindow(QMainWindow):
 
         preflight_card = QFrame()
         preflight_card.setObjectName("Card")
-        preflight_layout = QHBoxLayout(preflight_card)
+        preflight_layout = QVBoxLayout(preflight_card)
+        preflight_layout.setSpacing(8)
         preflight_title = QLabel("启动预检")
         preflight_title.setObjectName("SectionTitle")
         preflight_layout.addWidget(preflight_title)
+        self.preflight_grid = QGridLayout()
+        self.preflight_grid.setHorizontalSpacing(8)
+        self.preflight_grid.setVerticalSpacing(8)
         self.preflight_labels: list[QLabel] = []
-        for text in ("DCMTK 待检测", "保存目录待检测", "端口待检测", "PACS 待检测"):
+        for index, text in enumerate(
+            ("DCMTK 待检测", "保存目录待检测", "端口待检测", "PACS 待检测")
+        ):
             label = QLabel(text)
             label.setObjectName("CheckPill")
             label.setProperty("status", "pending")
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             self.preflight_labels.append(label)
-            preflight_layout.addWidget(label)
-        preflight_layout.addStretch()
+            self.preflight_grid.addWidget(label, index // 3, index % 3)
+        preflight_layout.addLayout(self.preflight_grid)
         layout.addWidget(preflight_card)
 
         action_row = QHBoxLayout()
@@ -697,6 +904,35 @@ class DcmGetWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
+
+        self.pdi_status_card = QFrame()
+        self.pdi_status_card.setObjectName("PdiStatusCard")
+        pdi_status_layout = QVBoxLayout(self.pdi_status_card)
+        pdi_status_layout.setContentsMargins(14, 10, 14, 10)
+        pdi_status_layout.setSpacing(8)
+        pdi_status_header = QHBoxLayout()
+        pdi_title = QLabel("PDI 便携目录")
+        pdi_title.setObjectName("SectionTitle")
+        pdi_status_header.addWidget(pdi_title)
+        self.pdi_status_label = QLabel("下载完成后自动生成")
+        self.pdi_status_label.setObjectName("PdiStatusText")
+        self.pdi_status_label.setWordWrap(True)
+        pdi_status_header.addWidget(self.pdi_status_label, 1)
+        self.pdi_open_button = QPushButton("打开 PDI 目录")
+        self.pdi_open_button.setEnabled(False)
+        self.pdi_open_button.clicked.connect(self._open_pdi_directory)
+        self.pdi_retry_button = QPushButton("重试 PDI")
+        self.pdi_retry_button.setEnabled(False)
+        self.pdi_retry_button.clicked.connect(self._retry_pdi)
+        pdi_status_header.addWidget(self.pdi_open_button)
+        pdi_status_header.addWidget(self.pdi_retry_button)
+        pdi_status_layout.addLayout(pdi_status_header)
+        self.pdi_progress_bar = QProgressBar()
+        self.pdi_progress_bar.setRange(0, 100)
+        self.pdi_progress_bar.setValue(0)
+        self.pdi_progress_bar.setTextVisible(False)
+        pdi_status_layout.addWidget(self.pdi_progress_bar)
+        layout.addWidget(self.pdi_status_card)
 
         self.task_splitter = QSplitter(Qt.Vertical)
         self.task_table = QTableWidget(0, 6)
@@ -750,8 +986,11 @@ class DcmGetWindow(QMainWindow):
         layout.addWidget(self.log_edit)
         return panel
 
+    def _is_busy(self) -> bool:
+        return self.worker is not None or self.pdi_worker is not None
+
     def _show_settings(self) -> None:
-        if self.worker:
+        if self._is_busy():
             return
         self.settings_page.set_config(self.config)
         self.pages.setCurrentIndex(1)
@@ -761,7 +1000,7 @@ class DcmGetWindow(QMainWindow):
         self.pages.setCurrentIndex(0)
 
     def _show_activation(self) -> None:
-        if self.worker:
+        if self._is_busy():
             return
         if activate_gui(self):
             self._refresh_entitlement_status()
@@ -791,6 +1030,23 @@ class DcmGetWindow(QMainWindow):
         self.config = config
         save_config(self.config_path, self.config)
         self.pages.setCurrentIndex(0)
+        self._reset_pdi_status_card()
+        previous_status = str(
+            getattr(getattr(self.last_pdi_result, "status", ""), "value", "")
+        )
+        if (
+            self.config.pdi_export_enabled
+            and self._pdi_source_files
+            and previous_status != "完成"
+        ):
+            self._set_pdi_status("设置已更新，可以重试 PDI 导出", "warning")
+            self.pdi_retry_button.setEnabled(True)
+            previous_output = str(
+                getattr(self.last_pdi_result, "output_directory", "") or ""
+            )
+            self.pdi_open_button.setEnabled(
+                bool(previous_output and Path(previous_output).is_dir())
+            )
         self._refresh_tool_status()
         self._append_log("应用", "设置已保存", "success")
 
@@ -855,7 +1111,7 @@ class DcmGetWindow(QMainWindow):
             f"有效 {len(parsed.values)} · 空行 {parsed.blank_count} · 重复 {parsed.duplicate_count}"
         )
         self._update_task_form_summary()
-        if self.worker:
+        if self._is_busy():
             return
         self._populate_waiting_rows(parsed.values)
 
@@ -870,7 +1126,7 @@ class DcmGetWindow(QMainWindow):
             )
 
     def _start_download(self, override: list[str] | None = None) -> None:
-        if self.worker:
+        if self._is_busy():
             return
         accessions = list(
             override if override is not None else self.current_accessions
@@ -905,6 +1161,9 @@ class DcmGetWindow(QMainWindow):
         save_config(self.config_path, self.config)
         self.tools = check.tools
         self._active_accessions = accessions
+        self._pdi_source_files = []
+        self.last_pdi_result = None
+        self._reset_pdi_status_card()
         self._populate_waiting_rows(self._active_accessions)
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"准备下载 0/{len(self._active_accessions)}")
@@ -938,6 +1197,15 @@ class DcmGetWindow(QMainWindow):
         self._append_log("授权", message, "info")
 
     def _show_preflight(self, check: PreflightResult) -> None:
+        while len(self.preflight_labels) < len(check.checks):
+            label = QLabel()
+            label.setObjectName("CheckPill")
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            index = len(self.preflight_labels)
+            self.preflight_labels.append(label)
+            self.preflight_grid.addWidget(label, index // 3, index % 3)
+        for index, label in enumerate(self.preflight_labels):
+            label.setVisible(index < len(check.checks))
         for label, (name, ok, message) in zip(self.preflight_labels, check.checks):
             label.setText(f"{name}：{message}")
             label.setProperty("status", "ok" if ok else "error")
@@ -945,12 +1213,18 @@ class DcmGetWindow(QMainWindow):
             label.style().unpolish(label)
             label.style().polish(label)
 
-    def _set_running(self, running: bool) -> None:
-        if running:
+    def _set_running(
+        self,
+        running: bool,
+        *,
+        reset_summary: bool = True,
+        can_pause: bool = True,
+    ) -> None:
+        if running and reset_summary:
             self.last_summary = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.pause_button.setEnabled(running)
+        self.pause_button.setEnabled(running and can_pause)
         if running:
             self._set_task_form_expanded(False)
         if not running:
@@ -1037,8 +1311,27 @@ class DcmGetWindow(QMainWindow):
 
     def _on_worker_finished(self, summary: BatchSummary) -> None:
         self.last_summary = summary
-        self._finish_worker()
+        self._finish_worker(set_idle=False)
         if self._closing_after_cancel:
+            self._set_running(False)
+            return
+        if self.config.pdi_export_enabled and not summary.cancelled:
+            if summary.archived_files:
+                self._start_pdi_export(summary.archived_files)
+                return
+            pdi_notice = "本批没有可导出的 DICOM 文件，已跳过 PDI。"
+            self._show_pdi_skipped(pdi_notice)
+            self._set_running(False)
+            self._show_download_completion(pdi_notice)
+            return
+        self._set_running(False)
+        self._show_download_completion()
+
+    def _show_download_completion(
+        self, pdi_message: str = "", *, pdi_problem: bool = False
+    ) -> None:
+        summary = self.last_summary
+        if summary is None:
             return
         if summary.cancelled:
             title, message = "任务已取消", "已停止下载，已收到的 DICOM 文件已保留。"
@@ -1046,8 +1339,180 @@ class DcmGetWindow(QMainWindow):
             title = "任务部分完成"
             message = f"有 {len(summary.failed_accessions)} 个检查号失败，可点击“重试失败项”。"
         else:
-            title, message = "下载完成", "所有检查号均已处理完成。"
+            title = "任务部分完成" if pdi_problem else "下载完成"
+            message = "所有检查号均已处理完成。"
+        if pdi_message:
+            message += "\n\n" + pdi_message
         QMessageBox.information(self, title, message)
+
+    def _start_pdi_export(self, files: list[str] | None = None) -> None:
+        if self._is_busy():
+            return
+        source_files = list(files if files is not None else self._pdi_source_files)
+        if not source_files:
+            self._show_pdi_skipped("没有可重试的 DICOM 文件。")
+            return
+        self._pdi_source_files = source_files
+        if self.tools is None:
+            try:
+                self.tools = self.resolver.resolve(self.config.dcmtk_bin_dir)
+            except Exception as exc:
+                self._on_pdi_failed(str(exc))
+                return
+        self.last_pdi_result = None
+        self.pdi_status_card.show()
+        self._set_pdi_status("准备生成 PDI 便携目录…", "pending")
+        self.pdi_progress_bar.setRange(0, 0)
+        self.pdi_open_button.setEnabled(False)
+        self.pdi_retry_button.setEnabled(False)
+        self._set_running(True, reset_summary=False, can_pause=False)
+        self.progress_label.setText("下载已完成，正在生成 PDI…")
+
+        thread = QThread(self)
+        worker = PdiWorker(
+            self.config,
+            self.tools,
+            source_files,
+            self.project_root,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._append_log)
+        worker.progress.connect(self._on_pdi_progress)
+        worker.finished.connect(self._on_pdi_finished)
+        worker.failed.connect(self._on_pdi_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_pdi_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.pdi_thread = thread
+        self.pdi_worker = worker
+        thread.start()
+
+    def _on_pdi_progress(
+        self,
+        stage: object,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        stage_text = str(getattr(stage, "value", stage))
+        detail = f"{stage_text}：{message}" if message else stage_text
+        self._set_pdi_status(detail, "generating")
+        if total > 0:
+            self.pdi_progress_bar.setRange(0, total)
+            self.pdi_progress_bar.setValue(max(0, min(current, total)))
+        else:
+            self.pdi_progress_bar.setRange(0, 0)
+
+    def _on_pdi_finished(self, result: object) -> None:
+        self.last_pdi_result = result
+        status_text = str(getattr(getattr(result, "status", ""), "value", ""))
+        message = str(getattr(result, "message", "") or status_text or "PDI 导出已结束")
+        warnings = list(getattr(result, "warnings", []) or [])
+        output_directory = str(getattr(result, "output_directory", "") or "")
+        if warnings:
+            message += f" 共 {len(warnings)} 条警告，详见运行日志。"
+
+        ui_status = {
+            "完成": "ok",
+            "部分成功": "warning",
+            "失败": "error",
+            "已取消": "warning",
+        }.get(status_text, "warning")
+        self._set_pdi_status(message, ui_status)
+        self.progress_label.setText(
+            {
+                "完成": "下载与 PDI 导出已完成",
+                "部分成功": "下载已完成，PDI 部分成功",
+                "失败": "下载已完成，PDI 导出失败",
+                "已取消": "下载已完成，PDI 导出已取消",
+            }.get(status_text, "PDI 导出已结束")
+        )
+        self.pdi_progress_bar.setRange(0, 1)
+        self.pdi_progress_bar.setValue(1 if status_text in {"完成", "部分成功"} else 0)
+        output_exists = bool(output_directory and Path(output_directory).exists())
+        self.pdi_open_button.setEnabled(output_exists)
+        self.pdi_retry_button.setEnabled(
+            bool(self._pdi_source_files) and status_text != "完成"
+        )
+        self._finish_pdi_worker()
+        if self._closing_after_cancel:
+            return
+
+        if status_text == "完成":
+            pdi_message = f"PDI 便携目录已生成：{output_directory}"
+        elif status_text == "部分成功":
+            pdi_message = f"PDI 已生成，但有部分预览或查看器未完成。\n{message}"
+        elif status_text == "已取消":
+            pdi_message = "PDI 生成已取消，下载的 DICOM 文件仍已保留。"
+        else:
+            pdi_message = f"PDI 导出未完成：{message}"
+        self._show_download_completion(
+            pdi_message, pdi_problem=status_text != "完成"
+        )
+
+    def _on_pdi_failed(self, message: str) -> None:
+        self._append_log("PDI", message, "error")
+        self.progress_label.setText("下载已完成，PDI 导出失败")
+        self._set_pdi_status(f"PDI 导出失败：{message}", "error")
+        self.pdi_progress_bar.setRange(0, 1)
+        self.pdi_progress_bar.setValue(0)
+        self.pdi_open_button.setEnabled(False)
+        self.pdi_retry_button.setEnabled(bool(self._pdi_source_files))
+        self._finish_pdi_worker()
+        if self._closing_after_cancel:
+            return
+        self._show_download_completion(
+            f"PDI 导出失败：{message}", pdi_problem=True
+        )
+
+    def _finish_pdi_worker(self) -> None:
+        if self.pdi_thread is None:
+            self.pdi_worker = None
+            self._set_running(False)
+
+    def _on_pdi_thread_finished(self) -> None:
+        if self.sender() is self.pdi_thread:
+            self.pdi_worker = None
+            self.pdi_thread = None
+        self._set_running(False)
+
+    def _set_pdi_status(self, text: str, status: str) -> None:
+        self.pdi_status_label.setText(text)
+        self.pdi_status_label.setProperty("status", status)
+        self.pdi_status_label.style().unpolish(self.pdi_status_label)
+        self.pdi_status_label.style().polish(self.pdi_status_label)
+
+    def _show_pdi_skipped(self, message: str) -> None:
+        self.pdi_status_card.setVisible(self.config.pdi_export_enabled)
+        self._set_pdi_status(message, "warning")
+        self.pdi_progress_bar.setRange(0, 1)
+        self.pdi_progress_bar.setValue(0)
+        self.pdi_open_button.setEnabled(False)
+        self.pdi_retry_button.setEnabled(False)
+
+    def _reset_pdi_status_card(self) -> None:
+        self.pdi_status_card.setVisible(self.config.pdi_export_enabled)
+        self._set_pdi_status("下载完成后自动生成", "pending")
+        self.pdi_progress_bar.setRange(0, 100)
+        self.pdi_progress_bar.setValue(0)
+        self.pdi_open_button.setEnabled(False)
+        self.pdi_retry_button.setEnabled(False)
+
+    def _open_pdi_directory(self) -> None:
+        directory = str(
+            getattr(self.last_pdi_result, "output_directory", "") or ""
+        )
+        if directory:
+            path = Path(directory).expanduser()
+            if path.exists():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _retry_pdi(self) -> None:
+        if self._pdi_source_files:
+            self._start_pdi_export()
 
     def _on_worker_failed(self, message: str) -> None:
         self._append_log("应用", message, "error")
@@ -1057,13 +1522,28 @@ class DcmGetWindow(QMainWindow):
             return
         QMessageBox.critical(self, "下载失败", message)
 
-    def _finish_worker(self) -> None:
+    def _finish_worker(self, *, set_idle: bool = True) -> None:
         self.worker = None
         self.worker_thread = None
         self.progress_bar.setRange(0, max(1, len(self._active_accessions)))
-        self._set_running(False)
+        if set_idle:
+            self._set_running(False)
 
     def _stop_download(self) -> None:
+        if self.pdi_worker is not None:
+            answer = QMessageBox.question(
+                self,
+                "取消 PDI 生成",
+                "确定取消当前 PDI 导出吗？已下载的 DICOM 文件不会删除。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self.stop_button.setEnabled(False)
+                self.progress_label.setText("正在取消 PDI 生成…")
+                self._set_pdi_status("正在取消…", "warning")
+                self.pdi_worker.request_cancel()
+            return
         if not self.worker:
             return
         answer = QMessageBox.question(
@@ -1193,14 +1673,19 @@ class DcmGetWindow(QMainWindow):
             self.task_splitter.restoreState(splitter)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.worker:
+        if self._is_busy():
             if self._closing_after_cancel:
                 event.ignore()
                 return
+            pdi_running = self.pdi_worker is not None
             answer = QMessageBox.question(
                 self,
                 "退出 DcmGet",
-                "下载仍在进行。停止任务并退出吗？",
+                (
+                    "PDI 便携目录仍在生成。取消导出并退出吗？"
+                    if pdi_running
+                    else "下载仍在进行。停止任务并退出吗？"
+                ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -1209,9 +1694,12 @@ class DcmGetWindow(QMainWindow):
                 return
             self._closing_after_cancel = True
             self.pause_button.setEnabled(False)
-            self.worker.request_cancel()
-            if self.worker_thread:
-                self.worker_thread.finished.connect(self.close)
+            active_worker = self.pdi_worker or self.worker
+            if active_worker is not None:
+                active_worker.request_cancel()
+            active_thread = self.pdi_thread or self.worker_thread
+            if active_thread:
+                active_thread.finished.connect(self.close)
             self.progress_label.setText("正在停止后台进程并退出…")
             event.ignore()
             return
@@ -1243,11 +1731,21 @@ QFrame#Card {{
     border: 1px solid {COLORS['border']};
     border-radius: 8px;
 }}
+QFrame#PdiStatusCard {{
+    background: #F0F9FF;
+    border: 1px solid #BAE6FD;
+    border-radius: 8px;
+}}
 QLabel#AppTitle {{ font-size: 20px; font-weight: 700; color: {COLORS['text']}; }}
 QLabel#HeaderSubtitle, QLabel#FieldHint {{ color: {COLORS['muted']}; }}
 QLabel#PageTitle {{ font-size: 20px; font-weight: 700; }}
 QLabel#SectionTitle {{ font-size: 15px; font-weight: 650; }}
 QLabel#ProgressText {{ color: {COLORS['muted']}; font-weight: 600; }}
+QLabel#PdiStatusText {{ color: {COLORS['muted']}; }}
+QLabel#PdiStatusText[status="generating"] {{ color: {COLORS['primary']}; font-weight: 600; }}
+QLabel#PdiStatusText[status="ok"] {{ color: {COLORS['success']}; font-weight: 600; }}
+QLabel#PdiStatusText[status="warning"] {{ color: {COLORS['warning']}; font-weight: 600; }}
+QLabel#PdiStatusText[status="error"] {{ color: {COLORS['danger']}; font-weight: 600; }}
 QLabel#ErrorText {{ color: {COLORS['danger']}; background: #FEF2F2; border: 1px solid #FECACA; padding: 9px; border-radius: 6px; }}
 QLabel#WarningText {{ color: {COLORS['warning']}; background: #FFF7ED; border: 1px solid #FED7AA; padding: 9px; border-radius: 6px; }}
 QLabel#StatusPill, QLabel#CheckPill {{ padding: 6px 10px; border-radius: 12px; background: #F1F5F9; color: {COLORS['muted']}; }}

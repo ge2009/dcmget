@@ -6,6 +6,7 @@ import socket
 from pathlib import Path
 
 import pytest
+from pydicom import dcmread
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 from pynetdicom import AE, evt
@@ -20,6 +21,7 @@ from dcmget.core import (
     build_storescp_command,
     is_port_available,
 )
+from dcmget.pdi import PdiExporter, PdiStatus
 
 
 def sample_dataset(accession: str, instance_uid: str | None = None) -> FileDataset:
@@ -37,6 +39,11 @@ def sample_dataset(accession: str, instance_uid: str | None = None) -> FileDatas
     dataset.PatientID = "DGM001"
     dataset.AccessionNumber = accession
     dataset.Modality = "CT"
+    dataset.StudyDate = "20260716"
+    dataset.StudyTime = "090000"
+    dataset.StudyID = "STUDY001"
+    dataset.SeriesNumber = 1
+    dataset.InstanceNumber = 1
     dataset.Rows = 1
     dataset.Columns = 1
     dataset.SamplesPerPixel = 1
@@ -164,3 +171,44 @@ def test_real_storescp_accepts_parallel_associations(tmp_path):
     while time.monotonic() < deadline and not is_port_available(storage_port):
         time.sleep(0.05)
     assert is_port_available(storage_port)
+
+
+@pytest.mark.integration
+def test_real_dcmtk_builds_valid_pdi_dicomdir_and_jpeg_preview(tmp_path):
+    try:
+        tools = DcmtkResolver(Path(__file__).resolve().parents[1]).resolve()
+    except FileNotFoundError:
+        pytest.skip("本机未安装 DCMTK")
+    if tools.dcmmkdir is None or tools.dcmj2pnm is None:
+        pytest.skip("当前 DCMTK 缺少 PDI 工具")
+
+    source = tmp_path / "download" / "source.dcm"
+    source.parent.mkdir()
+    dataset = sample_dataset("PDI-INTEGRATION")
+    dataset.save_as(source, enforce_file_format=True)
+    source_digest = source.read_bytes()
+    config = AppConfig(
+        dicom_destination_folder=str(source.parent),
+        pdi_export_enabled=True,
+        pdi_institution_name="DcmGet Integration Hospital",
+        pdi_output_folder=str(tmp_path / "portable"),
+        pdi_include_html_preview=True,
+        pdi_preview_mode="hybrid",
+        pdi_include_weasis_windows=False,
+    )
+
+    result = PdiExporter(config, tools).export([source])
+
+    assert result.status == PdiStatus.COMPLETED
+    output = Path(result.output_directory)
+    assert source.read_bytes() == source_digest
+    copied = [path for path in (output / "DICOM").rglob("*") if path.is_file()]
+    assert len(copied) == 1 and copied[0].suffix == ""
+    assert list((output / "IHE_PDI").rglob("*.JPG"))
+    directory = dcmread(output / "DICOMDIR")
+    references = [
+        record.ReferencedFileID
+        for record in directory.DirectoryRecordSequence
+        if "ReferencedFileID" in record
+    ]
+    assert len(references) == 1

@@ -1,6 +1,6 @@
-# DcmGet 2.4
+# DcmGet 2.5
 
-DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `storescp` 接收器，再由 `movescu` 逐个提交检查号，收到的文件按可配置的 DICOM 元数据目录归档。界面和命令行共用同一套配置、预检、进程管理和下载核心。
+DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `storescp` 接收器，再由 `movescu` 逐个提交检查号，收到的文件按可配置的 DICOM 元数据目录归档。下载结束后可自动生成包含 DICOMDIR、离线网页预览和 Windows 查看器的 PDI 便携目录。界面和命令行共用同一套配置、预检、进程管理、下载与导出核心。
 
 各版本新增内容见 [CHANGELOG.md](CHANGELOG.md)，也可以在主界面点击“版本说明”查看。
 
@@ -8,18 +8,18 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 - Windows x64、macOS ARM64/x86_64、Linux x86_64
 - Python 3.10 或更高版本
-- 发布部署使用 DCMTK 3.7.0；代码兼容本机 DCMTK 3.6.9
+- 发布部署使用 DCMTK 3.7.0；代码兼容本机 DCMTK 3.6.9，并使用 `dcmmkdir`、`dcmj2pnm`、`dcmdjpeg` 和 `dcmdump` 支持 PDI
 - 提供源码部署包、Windows x64 便携版和一键安装器
 
-首次部署需要能访问 Python 包源与 [OFFIS DCMTK 下载源](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)。
+首次部署需要能访问 Python 包源与 [OFFIS DCMTK 下载源](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)。如需随 PDI 携带 Windows Weasis，还需访问其 [GitHub 4.7.1 发布页](https://github.com/nroduit/Weasis/releases/tag/v4.7.1)；可设置 `DCMGET_SKIP_WEASIS=1` 跳过，不影响 DICOMDIR 和网页预览。
 
 ## Windows 一键安装
 
 Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
 
-- `DcmGet-2.4.0-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0 和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.4.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。
-- `DcmGet-2.4.0-windows-x64.zip`：解压后直接运行的独立目录版。
+- `DcmGet-2.5.0-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、Weasis 4.7.1 便携查看器和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.5.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。为控制体积，该单文件版不内置 Weasis，PDI 仍可生成 DICOMDIR 和网页预览。
+- `DcmGet-2.5.0-windows-x64.zip`：解压后直接运行的独立目录版，包含 Weasis 便携查看器。
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。当前实现的是安全原位升级，不会在后台自动联网安装新版本。默认下载目录为“文档\DcmGet\Dicom”。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
@@ -28,7 +28,8 @@ Windows 发布物拆分为三个独立下载项，获取安装器时不再同时
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.4.0
+python scripts/prepare_weasis.py --platform windows-x86_64
+python scripts/build_windows.py --version 2.5.0
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
@@ -69,7 +70,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\run_ui.ps1
 ```
 
-部署脚本会检查 Python 版本、重建干净的 `.venv`、安装 PyQt5、下载 DCMTK 3.7.0、检查 VC++ Runtime，并在管理员模式下创建 `storescp` 入站防火墙规则。重建虚拟环境不会改动配置、注册码、试用记录或下载结果。
+部署脚本会检查 Python 版本、重建干净的 `.venv`、安装 PyQt5、下载 DCMTK 3.7.0、准备 Weasis 4.7.1、检查 VC++ Runtime，并在管理员模式下创建 `storescp` 入站防火墙规则。Weasis 下载或提取失败只会给出警告，不阻断基础部署。重建虚拟环境不会改动配置、注册码、试用记录或下载结果。
 
 ### macOS
 
@@ -87,6 +88,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Linux 桌面环境若缺少 Qt 运行库，请按发行版安装常用的 XCB/OpenGL 运行库。
 
+macOS/Linux 部署脚本只缓存经过校验的 Windows Weasis MSI，无法在非 Windows 系统上提取便携 app-image；不需要该资源时可在运行部署脚本前设置 `DCMGET_SKIP_WEASIS=1`。
+
 ## 使用界面
 
 1. 打开“设置”，填写 PACS 地址、端口和 PACS AE。新配置默认使用本机调用 AE `DCMGET`、接收 AE `DCMGET` 和接收端口 `6666`；如需下载后脱敏，可在同一页启用匿名处理并选择方案。
@@ -96,6 +99,7 @@ Linux 桌面环境若缺少 Qt 运行库，请按发行版安装常用的 XCB/Op
 5. 点击“开始下载”。任务详情会显示每个检查号的文件数、实际接收速度和耗时。所有归档文件统一以 `.dcm` 结尾；普通模式日志位于 `保存目录/logs/`，匿名模式日志改存应用私有状态目录。
 6. 点击“暂停”后，按钮会先显示“取消暂停”，程序安全完成并归档当前检查号后才显示“继续下载”；`storescp` 在暂停期间保持监听。
 7. 部分失败时可点击“重试失败项”。停止或退出不会删除已收到的文件。
+8. 如需交付 U 盘，在设置中启用 PDI 并填写机构名称；批次结束后可打开生成目录，或在 PDI 失败时单独重试而无需重新下载。
 
 ## 下载后匿名处理
 
@@ -115,6 +119,43 @@ Linux 桌面环境若缺少 Qt 运行库，请按发行版安装常用的 XCB/Op
 
 假名映射密钥为上述目录中的 `anonymization.key`。同一密钥会让重试和后续批次保持稳定映射；丢失或删除密钥后，新生成的 Patient ID、检查号和 UID 将与以前不同。匿名写入采用“生成临时文件 → 校验 DICM 与 SOP UID → 发布结果 → 删除原始暂存”的顺序，处理失败不会把半成品计入下载结果。
 
+## PDI 便携目录
+
+在“设置 → PDI 便携目录”中启用后，每批下载归档完成会自动导出一个可整体复制到 U 盘的目录。此功能不生成 ISO，也不控制光驱或刻录机。默认输出到 `DICOM 保存目录/PDI/DCMGET_PDI_日期时间`；可以设置独立输出位置。
+
+典型目录结构如下：
+
+```text
+DCMGET_PDI_20260716_120000/
+├── DICOMDIR
+├── INDEX.HTM
+├── README.TXT
+├── MANIFEST.SHA256
+├── DICOM/
+├── IHE_PDI/
+├── VIEWER/WINDOWS/       # 成功准备 Weasis 时存在
+└── RUN.bat               # 成功准备 Weasis 时存在
+```
+
+- 普通下载结果仍以 `.dcm` 结尾；PDI 内部复制件使用符合 DICOM File ID 约束的无扩展名短路径，源文件不会被修改。
+- 默认“混合预览”会转换全部单帧图像，并为每个多帧对象最多生成前 100 帧；也可选择全部可预览图像或每序列代表图。静态网页仅供查阅，不用于诊断。
+- `dcmmkdir` 先尝试严格 Profile；遇到目录字段、传输语法或编码不兼容时会使用兼容模式重试，并在 `README.TXT` 和界面中明确警告，不会宣称严格 Profile 合规。
+- PDF、SR、视频或不支持的压缩对象无法生成网页预览时，原始 DICOM 仍会保留并列入报告。DICOMDIR 失败则不会发布半成品目录。
+- PDI 使用本批次实际归档文件，不会扫描并混入目标目录中的历史检查。PDI 失败不改变下载状态、不重新下载，也不额外消耗试用次数。
+- 未匿名的网页预览与 DICOM 同样可能包含患者隐私。外发前应启用合适的匿名方案并完成复核。
+
+Windows 源码部署脚本会从官方发布页下载固定版本 MSI，校验 SHA-256 后使用 Windows Installer 的管理提取生成 app-image，并对提取后的全部文件生成和验证逐文件 SHA-256 清单。PDI 随查看器附带 Weasis 许可证与第三方声明。Windows 安装版和独立目录版内置该资源；单文件便携 EXE 不内置。macOS/Linux 能下载并校验同一 MSI，但不能跨平台提取 Windows app-image，因此默认只缓存资源；若 `.runtime/weasis/windows-x86_64/Weasis/Weasis.exe` 不存在，PDI 仍正常生成 HTML 和 DICOMDIR，并标记为部分成功。
+
+固定资源与校验值位于 `packaging/weasis/windows-x86_64.json`。维护者可分别执行：
+
+```bash
+# macOS/Linux：仅校验并缓存，不生成 Windows app-image
+python scripts/prepare_weasis.py --platform windows-x86_64 --download-only
+
+# Windows：校验后提取便携 app-image
+python scripts/prepare_weasis.py --platform windows-x86_64
+```
+
 ## 命令行
 
 保留两个直接入口：
@@ -128,9 +169,9 @@ DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.j
 
 命令行退出码：
 
-- `0`：全部处理完成
+- `0`：下载及启用的 PDI 导出全部完成
 - `1`：配置、预检或接收器启动失败
-- `2`：存在失败或部分成功的检查号
+- `2`：存在下载失败、部分成功，或启用的 PDI 导出失败/部分成功
 - `130`：用户取消
 
 ## 配置
@@ -149,6 +190,12 @@ DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.j
 | `directory_template` | 目录组合模板；支持 `PatientID`、`AccessionNumber`、`StudyInstanceUID` |
 | `anonymization_enabled` | 是否在最终归档前启用 DICOM 元数据处理，默认 `false` |
 | `anonymization_profile` | `basic`、`research` 或 `strict`；默认 `research` |
+| `pdi_export_enabled` | 是否在每批下载结束后自动生成 PDI 便携目录，升级配置默认 `false` |
+| `pdi_institution_name` | PDI 首页和说明中的机构名称；启用 PDI 时必填 |
+| `pdi_output_folder` | PDI 输出根目录；留空时使用 `DICOM 保存目录/PDI` |
+| `pdi_include_html_preview` | 是否生成可双击打开的静态 HTML/JPEG 预览 |
+| `pdi_preview_mode` | `hybrid`、`all` 或 `series_cover`；默认 `hybrid` |
+| `pdi_include_weasis_windows` | 是否在可用时加入 Windows Weasis 便携查看器 |
 | `max_log_file_size_bytes` | 单个日志文件最大字节数 |
 
 旧版配置会自动迁移。DCMTK 的查找顺序是：配置目录、`.runtime/dcmtk` 部署目录、旧版 `dcmtk/bin`、系统 `PATH`。

@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.4.0
+        default: 2.5.0
 
 permissions:
   contents: read
@@ -41,12 +41,27 @@ jobs:
         run: |
           python scripts/download_dcmtk.py --platform windows-x86_64
 
+      - name: Restore Weasis portable viewer cache
+        uses: actions/cache@v4
+        with:
+          path: .runtime/weasis/windows-x86_64
+          key: weasis-4.7.1-windows-x86_64-${{ hashFiles('packaging/weasis/**', 'scripts/prepare_weasis.py') }}
+
+      - name: Prepare Weasis portable viewer
+        shell: pwsh
+        run: python scripts/prepare_weasis.py --platform windows-x86_64
+
       - name: Build standalone and portable EXE
         run: python scripts/build_windows.py --version "${{ inputs.version }}"
 
       - name: Download VC++ Runtime for installer
         shell: pwsh
-        run: Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile build/windows/vc_redist.x64.exe
+        run: |
+          Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile build/windows/vc_redist.x64.exe
+          $signature = Get-AuthenticodeSignature build/windows/vc_redist.x64.exe
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Microsoft") {
+            throw "VC++ Runtime Authenticode validation failed: $($signature.Status) $($signature.SignerCertificate.Subject)"
+          }
 
       - name: Smoke test unpacked application
         shell: pwsh
@@ -135,6 +150,10 @@ jobs:
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter Weasis.exe)) { throw "Installed Weasis.exe is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter LICENSE-Weasis.txt)) { throw "Installed Weasis license is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter THIRD_PARTY-Weasis.md)) { throw "Installed Weasis third-party notice is missing" }
+          if (-not (Get-ChildItem $installDir -Recurse -Filter DCMGET_PAYLOAD.SHA256)) { throw "Installed Weasis payload checksum is missing" }
           if (Test-Path "$installDir/_internal/obsolete-upgrade-marker.txt") { throw "Upgrade did not remove obsolete runtime files" }
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Upgrade changed the existing user configuration" }
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Upgrade changed the existing license" }

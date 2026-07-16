@@ -43,6 +43,10 @@ class ToolPaths:
     bin_dir: Path
     version: str
     storescp_help: str = ""
+    dcmmkdir: Path | None = None
+    dcmj2pnm: Path | None = None
+    dcmdjpeg: Path | None = None
+    dcmdump: Path | None = None
 
     @property
     def supports_fork(self) -> bool:
@@ -59,6 +63,7 @@ class AccessionResult:
     output_directory: str = ""
     received_bytes: int = 0
     speed_bytes_per_second: float = 0.0
+    archived_files: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -82,6 +87,10 @@ class BatchSummary:
             for result in self.results
             if result.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
         ]
+
+    @property
+    def archived_files(self) -> list[str]:
+        return [path for result in self.results for path in result.archived_files]
 
 
 @dataclass(slots=True)
@@ -172,7 +181,21 @@ class DcmtkResolver:
         storescp_version = _run_probe([str(storescp), "--version"])
         help_text = _run_probe([str(storescp), "--help"], allow_nonzero=True)
         version = _parse_version(version_text) or _parse_version(storescp_version) or "未知"
-        return ToolPaths(movescu, storescp, movescu.parent, version, help_text)
+        return ToolPaths(
+            movescu,
+            storescp,
+            movescu.parent,
+            version,
+            help_text,
+            dcmmkdir=self._optional_tool(movescu.parent, "dcmmkdir"),
+            dcmj2pnm=self._optional_tool(movescu.parent, "dcmj2pnm"),
+            dcmdjpeg=self._optional_tool(movescu.parent, "dcmdjpeg"),
+            dcmdump=self._optional_tool(movescu.parent, "dcmdump"),
+        )
+
+    def _optional_tool(self, directory: Path, name: str) -> Path | None:
+        path = directory / self._tool_name(name)
+        return path if path.is_file() else None
 
     @staticmethod
     def _tool_name(name: str) -> str:
@@ -249,17 +272,54 @@ def preflight(config: AppConfig, resolver: DcmtkResolver) -> PreflightResult:
         errors["dcmtk_bin_dir"] = str(exc)
         checks.append(("DCMTK 工具", False, str(exc)))
 
+    if config.pdi_export_enabled and tools is not None:
+        if tools.dcmmkdir is None:
+            message = "PDI 导出缺少核心 DCMTK 工具：dcmmkdir"
+            errors["dcmtk_bin_dir"] = message
+            checks.append(("PDI 导出工具", False, message))
+        else:
+            checks.append(("PDI 导出工具", True, "DICOMDIR 工具已就绪"))
+        if config.pdi_include_html_preview and tools.dcmj2pnm is None:
+            checks.append(
+                (
+                    "PDI 网页预览",
+                    True,
+                    "缺少 dcmj2pnm；仍会生成 DICOMDIR，并标记为部分成功",
+                )
+            )
+
     destination = Path(config.dicom_destination_folder).expanduser()
     try:
         destination.mkdir(parents=True, exist_ok=True)
-        probe = destination / ".dcmget-write-test"
-        probe.touch(exist_ok=True)
-        probe.unlink()
+        descriptor, probe_name = tempfile.mkstemp(
+            prefix=".dcmget-write-test-", dir=destination
+        )
+        os.close(descriptor)
+        Path(probe_name).unlink()
         checks.append(("保存目录", True, "目录可写"))
     except OSError as exc:
         message = f"保存目录不可写：{exc}"
         errors["dicom_destination_folder"] = message
         checks.append(("保存目录", False, message))
+
+    if config.pdi_export_enabled:
+        pdi_root = (
+            Path(config.pdi_output_folder).expanduser()
+            if config.pdi_output_folder.strip()
+            else destination / "PDI"
+        )
+        try:
+            pdi_root.mkdir(parents=True, exist_ok=True)
+            descriptor, probe_name = tempfile.mkstemp(
+                prefix=".dcmget-pdi-write-test-", dir=pdi_root
+            )
+            os.close(descriptor)
+            Path(probe_name).unlink()
+            checks.append(("PDI 输出目录", True, f"目录可写：{pdi_root}"))
+        except OSError as exc:
+            message = f"PDI 输出目录不可写：{exc}"
+            errors["pdi_output_folder"] = message
+            checks.append(("PDI 输出目录", False, message))
 
     if "storage_port" not in errors:
         available = is_port_available(config.storage_port)
@@ -394,6 +454,8 @@ class DownloadRunner:
             self._cleanup_staging(staging)
             self._close_file_logger()
 
+        if self._cancel.is_set():
+            summary.cancelled = True
         if summary.cancelled:
             self.state_callback("cancelled")
         elif summary.exit_code == 2:
@@ -601,6 +663,7 @@ class DownloadRunner:
             output_directory=str(output_directory) if moved else "",
             received_bytes=received_bytes,
             speed_bytes_per_second=average_speed,
+            archived_files=[str(path) for path in moved],
         )
 
     def _start_movescu_process(

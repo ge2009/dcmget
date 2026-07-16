@@ -289,7 +289,15 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog is not None
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
-    for version in ("2.4.0", "2.3.0", "2.2.0", "2.1.0", "2.0.0", "1.0.0"):
+    for version in (
+        "2.5.0",
+        "2.4.0",
+        "2.3.0",
+        "2.2.0",
+        "2.1.0",
+        "2.0.0",
+        "1.0.0",
+    ):
         assert version in text
     close_button = next(
         button
