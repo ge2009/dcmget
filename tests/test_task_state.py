@@ -167,6 +167,7 @@ def test_each_manual_pdi_retry_gets_a_new_attempt_id(tmp_path):
     assert first != second
     assert resumed_existing
     assert resumed == second
+    assert store.load_required().pdi_attempt_id == second
 
 
 def test_recovery_config_updates_without_losing_progress(tmp_path):

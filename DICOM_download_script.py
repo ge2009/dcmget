@@ -26,7 +26,7 @@ from dcmget.licensing import (
     validate_daily_password,
 )
 from dcmget.runtime import ensure_default_config, resource_root
-from dcmget.pdi import PdiExporter, PdiStatus
+from dcmget.pdi import PdiExporter, PdiStatus, cleanup_interrupted_pdi
 from dcmget.task_state import (
     TaskCheckpointStore,
     TaskStateError,
@@ -100,6 +100,26 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:
             if args.discard_checkpoint:
+                try:
+                    discarded = store.load()
+                except TaskStateError as exc:
+                    discarded = None
+                    print(
+                        f"[恢复] 恢复点损坏，无法定位其中的 PDI 暂存目录：{exc}",
+                        file=sys.stderr,
+                    )
+                if discarded is not None and discarded.pdi_attempt_id:
+                    try:
+                        removed = cleanup_interrupted_pdi(
+                            discarded.config,
+                            discarded.pdi_attempt_id,
+                        )
+                    except (OSError, ValueError) as exc:
+                        store.release_lease()
+                        print(f"无法放弃 PDI 恢复：{exc}", file=sys.stderr)
+                        return 1
+                    for path in removed:
+                        print(f"[PDI] 已删除中断的暂存目录：{path}")
                 store.clear()
                 print("已放弃旧任务恢复点；已下载文件保持不变。")
             else:

@@ -1280,6 +1280,9 @@ class DcmGetWindow(QMainWindow):
             QMessageBox.Yes,
         )
         if answer != QMessageBox.Yes:
+            if not self._cleanup_pdi_partial(checkpoint):
+                self.task_store.release_lease()
+                return
             try:
                 self.task_store.clear(checkpoint.task_id)
             except TaskStateError as exc:
@@ -1316,6 +1319,9 @@ class DcmGetWindow(QMainWindow):
             QMessageBox.Yes,
         )
         if answer != QMessageBox.Yes:
+            if not self._cleanup_pdi_partial(checkpoint):
+                self.task_store.release_lease()
+                return
             try:
                 self.task_store.clear(checkpoint.task_id)
             except TaskStateError as exc:
@@ -1345,6 +1351,28 @@ class DcmGetWindow(QMainWindow):
         self._pdi_source_files = list(archived_files)
         self._append_log("恢复", "下载已完成，正在继续 PDI 导出", "info")
         self._start_pdi_export(archived_files)
+
+    def _cleanup_pdi_partial(self, checkpoint: TaskCheckpoint) -> bool:
+        if not checkpoint.pdi_attempt_id:
+            return True
+        try:
+            from .pdi import cleanup_interrupted_pdi
+
+            removed = cleanup_interrupted_pdi(
+                checkpoint.config,
+                checkpoint.pdi_attempt_id,
+            )
+        except (OSError, ValueError) as exc:
+            self._append_log("PDI", str(exc), "error")
+            QMessageBox.warning(
+                self,
+                "无法放弃 PDI 恢复",
+                f"{exc}\n\n恢复记录已保留，请关闭占用文件的程序后重试。",
+            )
+            return False
+        for path in removed:
+            self._append_log("PDI", f"已删除中断的暂存目录：{path}", "warning")
+        return True
 
     def _choose_accession_file(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -2199,6 +2227,11 @@ class DcmGetWindow(QMainWindow):
         try:
             if not self.task_store.lease_held and not self.task_store.try_acquire_lease():
                 QMessageBox.warning(self, "任务正在运行", "另一个 DcmGet 实例正在使用该任务。")
+                return
+            stored = self.task_store.load_required()
+            if stored.task_id != task_id:
+                raise TaskStateError("活动任务已改变，拒绝放弃旧任务")
+            if not self._cleanup_pdi_partial(stored):
                 return
             self.task_store.clear(task_id)
         except TaskStateError as exc:

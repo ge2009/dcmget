@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 
 import pytest
 from PyQt5.QtCore import QSettings, Qt
@@ -407,6 +408,86 @@ def test_pdi_checkpoint_guard_rejects_direct_start_and_failed_retry(
     assert len(warnings) == 2
     assert all("PDI" in warning for warning in warnings)
     assert window.task_store.load_required().task_id == checkpoint.task_id
+
+
+def test_discard_keeps_checkpoint_when_pdi_partial_cannot_be_deleted(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+            pdi_output_folder=str(tmp_path / "portable"),
+        ),
+        ["A001"],
+        trial_required=False,
+    )
+    window.task_store.begin_pdi_attempt(
+        checkpoint.task_id,
+        reuse_existing=False,
+    )
+    window._pdi_task_id = checkpoint.task_id
+    window._set_running(False)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        pdi_module,
+        "cleanup_interrupted_pdi",
+        lambda *_args: (_ for _ in ()).throw(OSError("目录正在使用")),
+    )
+
+    window._discard_resume_task()
+
+    assert window.task_store.load_required().task_id == checkpoint.task_id
+    assert window._pdi_task_id == checkpoint.task_id
+
+
+def test_declining_pdi_resume_deletes_matching_partial_before_checkpoint(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    output_root = tmp_path / "portable"
+    config = AppConfig(
+        dicom_destination_folder=str(tmp_path / "dicom"),
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+        pdi_output_folder=str(output_root),
+    )
+    checkpoint = window.task_store.start(config, ["A001"], trial_required=False)
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            archived_files=[str(tmp_path / "image.dcm")],
+        ),
+    )
+    attempt_id, _reused = window.task_store.begin_pdi_attempt(
+        checkpoint.task_id,
+        reuse_existing=False,
+    )
+    partial = output_root / ".DCMGET_PDI_OLD.partial-deadbeef"
+    partial.mkdir(parents=True)
+    (partial / pdi_module.RECOVERY_MARKER).write_text(
+        json.dumps({"version": 1, "attempt_id": attempt_id}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.No,
+    )
+
+    window._offer_task_resume()
+
+    assert not partial.exists()
+    assert window.task_store.load() is None
 
 
 def test_pdi_thread_completion_releases_busy_state(qtbot, tmp_path, monkeypatch):

@@ -246,6 +246,28 @@ def test_restart_removes_only_matching_interrupted_partial_directory(
     assert other.exists()
 
 
+def test_partial_cleanup_reports_failure_and_keeps_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "portable"
+    partial = output_root / ".DCMGET_PDI_OLD.partial-deadbeef"
+    partial.mkdir(parents=True)
+    (partial / pdi.RECOVERY_MARKER).write_text(
+        json.dumps({"version": 1, "attempt_id": "d" * 32}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pdi.shutil,
+        "rmtree",
+        Mock(side_effect=OSError("directory is in use")),
+    )
+
+    with pytest.raises(OSError, match="无法删除 PDI 暂存目录"):
+        pdi.cleanup_interrupted_pdi(_config(tmp_path), "d" * 32)
+
+    assert partial.exists()
+
+
 def test_crashed_manual_retry_does_not_reuse_previous_attempt(
     tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:

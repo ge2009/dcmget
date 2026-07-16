@@ -175,7 +175,7 @@ class PdiExporter:
             mode = self._preview_mode()
             output_root = self._output_root()
             output_root.mkdir(parents=True, exist_ok=True)
-            self._remove_recovery_partials(output_root)
+            self._remove_recovery_partials()
             if self.reuse_published:
                 published = self._find_reusable_export(output_root)
                 if published is not None:
@@ -879,11 +879,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             raise ValueError(f"不支持的 PDI 预览模式：{value}") from exc
 
     def _output_root(self) -> Path:
-        configured = str(getattr(self.config, "pdi_output_folder", "")).strip()
-        if configured:
-            return Path(configured).expanduser().resolve()
-        destination = Path(self.config.dicom_destination_folder).expanduser().resolve()
-        return destination / "PDI"
+        return _pdi_output_root(self.config)
 
     def _write_recovery_marker(
         self,
@@ -920,16 +916,10 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             newline="\n",
         )
 
-    def _remove_recovery_partials(self, output_root: Path) -> None:
+    def _remove_recovery_partials(self) -> None:
         if not self.recovery_id:
             return
-        for candidate in output_root.glob(".DCMGET_PDI_*.partial-*"):
-            if not candidate.is_dir():
-                continue
-            marker = self._read_recovery_marker(candidate)
-            if marker is None or marker.get("attempt_id") != self.recovery_id:
-                continue
-            shutil.rmtree(candidate, ignore_errors=True)
+        for candidate in cleanup_interrupted_pdi(self.config, self.recovery_id):
             self._emit(f"已清理上次中断的 PDI 暂存目录：{candidate.name}", "warning")
 
     def _find_reusable_export(self, output_root: Path) -> PdiExportResult | None:
@@ -975,14 +965,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
 
     @staticmethod
     def _read_recovery_marker(root: Path) -> dict[str, object] | None:
-        try:
-            payload = json.loads((root / RECOVERY_MARKER).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or payload.get("version") != 1:
-            return None
-        return payload
-
+        return _read_recovery_marker(root)
     def _resolve_weasis_payload(self) -> Path | None:
         if not bool(getattr(self.config, "pdi_include_weasis_windows", True)):
             return None
@@ -1089,6 +1072,48 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             self.process_callback("pdi", pid, executable, active)
         except Exception as exc:
             self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "warning")
+
+
+def _read_recovery_marker(root: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads((root / RECOVERY_MARKER).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return None
+    return payload
+
+
+def _pdi_output_root(config: AppConfig) -> Path:
+    configured = str(getattr(config, "pdi_output_folder", "")).strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    destination = Path(config.dicom_destination_folder).expanduser().resolve()
+    return destination / "PDI"
+
+
+def cleanup_interrupted_pdi(config: AppConfig, attempt_id: str) -> list[Path]:
+    normalized_attempt_id = attempt_id.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", normalized_attempt_id):
+        raise ValueError("PDI 恢复标识格式不正确")
+    output_root = _pdi_output_root(config)
+    if not output_root.is_dir():
+        return []
+    removed: list[Path] = []
+    for candidate in output_root.glob(".DCMGET_PDI_*.partial-*"):
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        marker = _read_recovery_marker(candidate)
+        if marker is None or marker.get("attempt_id") != normalized_attempt_id:
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except OSError as exc:
+            raise OSError(f"无法删除 PDI 暂存目录 {candidate}：{exc}") from exc
+        if candidate.exists():
+            raise OSError(f"PDI 暂存目录删除后仍然存在：{candidate}")
+        removed.append(candidate)
+    return removed
 
 
 def _strict_profile(items: list[_DicomItem]) -> str:

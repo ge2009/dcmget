@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class TaskCheckpoint:
     trial_required: bool
     created_at: str
     phase: str
+    pdi_attempt_id: str = ""
 
     @property
     def pending_accessions(self) -> list[str]:
@@ -99,7 +101,7 @@ class TaskCheckpointStore:
             f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
         try:
-            with sqlite3.connect(temporary) as connection:
+            with closing(sqlite3.connect(temporary)) as connection, connection:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.executescript(
                     """
@@ -146,14 +148,17 @@ class TaskCheckpointStore:
         except (OSError, sqlite3.Error) as exc:
             raise TaskStateError(f"无法保存任务恢复点：{exc}") from exc
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         return self.load_required()
 
     def load(self) -> TaskCheckpoint | None:
         if not self.path.is_file():
             return None
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection:
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
                 rows = list(
                     connection.execute(
@@ -195,6 +200,11 @@ class TaskCheckpointStore:
             phase = metadata.get("phase", "downloading")
             if phase not in TASK_PHASES:
                 raise ValueError("invalid task phase")
+            pdi_attempt_id = metadata.get("pdi_attempt_id", "")
+            if pdi_attempt_id and not re.fullmatch(
+                r"[0-9a-f]{32}", pdi_attempt_id
+            ):
+                raise ValueError("invalid PDI attempt id")
             return TaskCheckpoint(
                 task_id=task_id,
                 config=AppConfig.from_dict(raw_config),
@@ -204,6 +214,7 @@ class TaskCheckpointStore:
                 trial_required=metadata.get("trial_required") == "1",
                 created_at=metadata["created_at"],
                 phase=phase,
+                pdi_attempt_id=pdi_attempt_id,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskStateError("任务恢复点内容不完整或版本不受支持") from exc
@@ -220,7 +231,7 @@ class TaskCheckpointStore:
         if result.status not in FINAL_STATUSES | {AccessionStatus.CANCELLED}:
             return result
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 stored_task_id = _metadata_value(connection, "task_id")
                 if stored_task_id != task_id:
                     raise TaskStateError("活动任务已改变，拒绝写入旧任务结果")
@@ -257,7 +268,7 @@ class TaskCheckpointStore:
             return
         if task_id is not None:
             try:
-                with sqlite3.connect(self.path) as connection:
+                with closing(sqlite3.connect(self.path)) as connection:
                     if _metadata_value(connection, "task_id") != task_id:
                         return
             except TaskStateError:
@@ -274,7 +285,7 @@ class TaskCheckpointStore:
         if phase not in TASK_PHASES:
             raise TaskStateError(f"不支持的任务阶段：{phase}")
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝更新旧任务阶段")
                 connection.execute(
@@ -293,7 +304,7 @@ class TaskCheckpointStore:
         reuse_existing: bool,
     ) -> tuple[str, bool]:
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝启动旧任务的 PDI")
                 phase = _metadata_value(connection, "phase")
@@ -328,7 +339,7 @@ class TaskCheckpointStore:
             separators=(",", ":"),
         )
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝更新旧任务配置")
                 connection.execute(
@@ -353,7 +364,7 @@ class TaskCheckpointStore:
             raise TaskStateError(f"不支持的后台进程类型：{kind}")
         key = f"process:{kind}"
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝更新旧任务进程")
                 if not active:
@@ -383,7 +394,7 @@ class TaskCheckpointStore:
 
     def cleanup_recorded_processes(self, task_id: str) -> list[str]:
         try:
-            with sqlite3.connect(self.path) as connection:
+            with closing(sqlite3.connect(self.path)) as connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝清理旧任务进程")
                 records = dict(
