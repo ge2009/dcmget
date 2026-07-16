@@ -151,14 +151,15 @@ def test_macos_plugin_failure_is_logged_with_readable_log_path(tmp_path):
         try:
             diagnostics.prepare_macos_qt_plugins({str(plugins)!r})
         except diagnostics.DiagnosticsError as exc:
-            print(exc)
+            assert str(diagnostics.diagnostic_log_path()) in str(exc)
+            print("caught expected diagnostics error")
         else:
             raise AssertionError("missing Cocoa plugin should fail")
         """
     )
 
     assert result.returncode == 0, result.stderr
-    assert "诊断日志" in result.stdout
+    assert "caught expected diagnostics error" in result.stdout
     log = _combined_logs(logs)
     assert "macOS Qt 插件准备失败" in log
     assert "缺少 macOS Qt Cocoa 平台插件" in log

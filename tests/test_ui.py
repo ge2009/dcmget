@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import threading
 import traceback
 
@@ -726,7 +727,8 @@ def test_header_diagnostic_log_button_opens_private_log_directory(
     qtbot.mouseClick(window.diagnostic_log_button, Qt.LeftButton)
 
     assert diagnostic_logs.is_dir()
-    assert opened == [str(diagnostic_logs.resolve())]
+    assert len(opened) == 1
+    assert Path(opened[0]).resolve() == diagnostic_logs.resolve()
 
 
 def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
