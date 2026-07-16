@@ -473,8 +473,8 @@ def test_group_cleanup_windows_does_not_call_posix_process_apis(monkeypatch):
     killpg = Mock(side_effect=AssertionError("killpg must not be called"))
     monkeypatch.setattr(task_state_module.os, "name", "nt")
     monkeypatch.setattr(task_state_module.psutil, "process_iter", process_iter)
-    monkeypatch.setattr(task_state_module.os, "getpgid", getpgid)
-    monkeypatch.setattr(task_state_module.os, "killpg", killpg)
+    monkeypatch.setattr(task_state_module.os, "getpgid", getpgid, raising=False)
+    monkeypatch.setattr(task_state_module.os, "killpg", killpg, raising=False)
 
     result = task_state_module._cleanup_recorded_process_group(
         {
