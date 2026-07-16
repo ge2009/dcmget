@@ -4,11 +4,24 @@ import argparse
 from io import BytesIO
 import sys
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication
-
 from dcmget import __version__
-from dcmget.auth_ui import DailyPasswordDialog, authorize_gui
+from dcmget.diagnostics import (
+    diagnostic_log_path,
+    install_diagnostics,
+    install_qt_message_handler,
+    prepare_macos_qt_plugins,
+    record_exception,
+)
+
+
+install_diagnostics(__version__)
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QMessageBox
+
+install_qt_message_handler()
+
+from dcmget.auth_ui import authorize_gui
 from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
@@ -77,6 +90,7 @@ def run_self_test(config_path: str) -> int:
 
 
 def create_application() -> QApplication:
+    prepare_macos_qt_plugins()
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv[:1])
@@ -88,13 +102,6 @@ def create_application() -> QApplication:
 
 def run_ui_self_test(config_path: str) -> int:
     app = create_application()
-    login = DailyPasswordDialog()
-    login.show()
-    app.processEvents()
-    if not login.isVisible():
-        raise RuntimeError("登录窗口未能显示")
-    login.close()
-
     window = DcmGetWindow(
         config_path,
         PROJECT_ROOT,
@@ -111,12 +118,22 @@ def run_ui_self_test(config_path: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.self_test:
-        return run_self_test(args.config)
-    if args.ui_self_test:
-        return run_ui_self_test(args.config)
-    app = create_application()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    self_test_requested = any(
+        value in {"--self-test", "--ui-self-test"} for value in arguments
+    )
+    try:
+        args = build_parser().parse_args(arguments)
+        if args.self_test:
+            return run_self_test(args.config)
+        if args.ui_self_test:
+            return run_ui_self_test(args.config)
+
+        app = create_application()
+    except Exception as exc:
+        _report_startup_failure("DcmGet 启动失败", exc, self_test_requested)
+        return 1
+
     resume_task_id = None
     try:
         checkpoint = TaskCheckpointStore().load()
@@ -124,11 +141,35 @@ def main(argv: list[str] | None = None) -> int:
             resume_task_id = checkpoint.task_id
     except TaskStateError:
         pass
-    if not authorize_gui(resume_task_id):
+
+    try:
+        if not authorize_gui(resume_task_id):
+            return 1
+        window = DcmGetWindow(args.config, PROJECT_ROOT)
+        window.show()
+        return app.exec_()
+    except Exception as exc:
+        _report_startup_failure("DcmGet 主窗口启动失败", exc, False)
         return 1
-    window = DcmGetWindow(args.config, PROJECT_ROOT)
-    window.show()
-    return app.exec_()
+
+
+def _report_startup_failure(
+    context: str,
+    exc: BaseException,
+    self_test: bool,
+) -> None:
+    record_exception(context, exc)
+    message = f"{context}：{exc}\n\n诊断日志：{diagnostic_log_path()}"
+    if self_test:
+        print(message, file=sys.stderr)
+        return
+    if QApplication.instance() is not None:
+        try:
+            QMessageBox.critical(None, "DcmGet 启动失败", message)
+            return
+        except Exception as dialog_error:
+            record_exception("无法显示启动失败提示", dialog_error)
+    print(message, file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
 import signal
 import sys
 import threading
@@ -23,7 +21,6 @@ from dcmget.licensing import (
     machine_code,
     trial_status,
     trial_task_consumed,
-    validate_daily_password,
 )
 from dcmget.runtime import ensure_default_config, resource_root
 from dcmget.pdi import PdiExporter, PdiStatus, cleanup_interrupted_pdi
@@ -61,15 +58,7 @@ def authorize_cli(
     license_path: str | None,
     resume_task_id: str | None = None,
 ) -> str | None:
-    value = password or os.environ.get("DCMGET_DAILY_PASSWORD", "")
-    if not value and sys.stdin.isatty():
-        value = getpass.getpass("当天口令：")
-    if not validate_daily_password(value):
-        print(
-            "当天口令不正确；非交互运行请设置 DCMGET_DAILY_PASSWORD。",
-            file=sys.stderr,
-        )
-        return None
+    del password  # 保留旧命令参数兼容性，但不再进行日期口令验证。
     try:
         load_license(license_path)
         return "licensed"

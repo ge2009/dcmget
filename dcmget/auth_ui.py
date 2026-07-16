@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,56 +20,7 @@ from .licensing import (
     save_license,
     trial_status,
     trial_task_consumed,
-    validate_daily_password,
 )
-
-
-class DailyPasswordDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("DcmGet 登录")
-        self.setModal(True)
-        self.setMinimumWidth(420)
-
-        layout = QVBoxLayout(self)
-        title = QLabel("登录验证")
-        title.setObjectName("PageTitle")
-        description = QLabel("请输入当天的 8 位授权口令后继续。")
-        description.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(description)
-
-        form = QFormLayout()
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setMaxLength(8)
-        self.password_edit.setPlaceholderText("8 位口令")
-        self.password_edit.setAccessibleName("当天授权口令")
-        self.password_edit.returnPressed.connect(self._submit)
-        form.addRow("当天口令", self.password_edit)
-        layout.addLayout(form)
-
-        self.error_label = QLabel()
-        self.error_label.setObjectName("ErrorText")
-        self.error_label.setWordWrap(True)
-        self.error_label.hide()
-        layout.addWidget(self.error_label)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
-        buttons.button(QDialogButtonBox.Ok).setText("登录")
-        buttons.button(QDialogButtonBox.Cancel).setText("退出")
-        buttons.accepted.connect(self._submit)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _submit(self) -> None:
-        if validate_daily_password(self.password_edit.text()):
-            self.accept()
-            return
-        self.error_label.setText("当天口令不正确，请检查电脑日期后重试。")
-        self.error_label.show()
-        self.password_edit.selectAll()
-        self.password_edit.setFocus(Qt.OtherFocusReason)
 
 
 class ActivationDialog(QDialog):
@@ -133,8 +82,6 @@ class ActivationDialog(QDialog):
 
 
 def authorize_gui(resume_task_id: str | None = None) -> bool:
-    if DailyPasswordDialog().exec_() != QDialog.Accepted:
-        return False
     try:
         load_license()
         return True

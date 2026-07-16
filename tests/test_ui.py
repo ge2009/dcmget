@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
+import traceback
 
 import pytest
-from PyQt5.QtCore import QSettings, Qt
+from PyQt5.QtCore import QSettings, Qt, QThread
 from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTextBrowser
 
@@ -11,7 +12,7 @@ from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
 from dcmget.task_state import TaskCheckpointStore
 import dcmget.ui as ui_module
-from dcmget.ui import DcmGetWindow, DownloadWorker
+from dcmget.ui import DcmGetWindow, DownloadWorker, PdiWorker
 
 
 @pytest.fixture(autouse=True)
@@ -454,6 +455,77 @@ def test_worker_persists_final_result_before_emitting_progress(tmp_path):
     assert persisted_before_signal == [["A001"]]
 
 
+def test_download_worker_records_full_traceback_before_failure_signal(
+    tmp_path, monkeypatch
+):
+    recorded = []
+
+    def capture_exception(context, exc):
+        recorded.append((context, exc, traceback.format_exc()))
+
+    class Runner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _accessions):
+            raise RuntimeError("download worker exploded")
+
+    monkeypatch.setattr(ui_module, "record_exception", capture_exception)
+    monkeypatch.setattr(ui_module, "DownloadRunner", Runner)
+    worker = DownloadWorker(
+        AppConfig(),
+        ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
+        ["A001"],
+    )
+    failures = []
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == ["download worker exploded"]
+    assert recorded[0][0] == "DownloadWorker.run"
+    assert isinstance(recorded[0][1], RuntimeError)
+    assert "Traceback (most recent call last)" in recorded[0][2]
+    assert "RuntimeError: download worker exploded" in recorded[0][2]
+
+
+def test_pdi_worker_records_full_traceback_before_failure_signal(
+    tmp_path, monkeypatch
+):
+    import dcmget.pdi as pdi_module
+
+    recorded = []
+
+    def capture_exception(context, exc):
+        recorded.append((context, exc, traceback.format_exc()))
+
+    class Exporter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def export(self, _files):
+            raise RuntimeError("PDI worker exploded")
+
+    monkeypatch.setattr(ui_module, "record_exception", capture_exception)
+    monkeypatch.setattr(pdi_module, "PdiExporter", Exporter)
+    worker = PdiWorker(
+        AppConfig(),
+        ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
+        [str(tmp_path / "image.dcm")],
+        tmp_path,
+    )
+    failures = []
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == ["PDI worker exploded"]
+    assert recorded[0][0] == "PdiWorker.run"
+    assert isinstance(recorded[0][1], RuntimeError)
+    assert "Traceback (most recent call last)" in recorded[0][2]
+    assert "RuntimeError: PDI worker exploded" in recorded[0][2]
+
+
 def test_startup_offer_restores_snapshot_and_only_resumes_pending_items(
     qtbot, tmp_path, monkeypatch
 ):
@@ -578,6 +650,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.5.1",
         "2.5.0",
         "2.4.0",
         "2.3.0",
@@ -635,6 +708,27 @@ def test_log_panel_defaults_collapsed_and_error_expands_it(qtbot, tmp_path):
     assert window.log_toggle_button.text() == "收起日志"
 
 
+def test_header_diagnostic_log_button_opens_private_log_directory(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    diagnostic_logs = tmp_path / "private-state" / "logs"
+    opened = []
+    monkeypatch.setattr(
+        ui_module, "diagnostic_log_directory", lambda: diagnostic_logs
+    )
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.diagnostic_log_button, Qt.LeftButton)
+
+    assert diagnostic_logs.is_dir()
+    assert opened == [str(diagnostic_logs.resolve())]
+
+
 def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window.accession_edit.setPlainText("A001\nA002")
@@ -677,6 +771,117 @@ def test_finish_worker_uses_active_retry_batch_for_progress_range(qtbot, tmp_pat
     assert window.progress_bar.maximum() == 2
 
 
+def test_download_result_keeps_thread_busy_until_thread_finished(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    thread = QThread(window)
+    worker = object()
+    completions = []
+    window.worker = worker  # type: ignore[assignment]
+    window.worker_thread = thread
+    window._set_running(True)
+    thread.finished.connect(window._on_worker_thread_finished)
+    monkeypatch.setattr(
+        window,
+        "_show_download_completion",
+        lambda *_args, **_kwargs: completions.append(True),
+    )
+    thread.start()
+    qtbot.waitUntil(thread.isRunning)
+
+    window._on_worker_finished(BatchSummary())
+
+    assert window.worker is worker
+    assert window.worker_thread is thread
+    assert window._is_busy()
+    assert not window.start_button.isEnabled()
+    assert completions == []
+
+    thread.quit()
+    qtbot.waitUntil(lambda: window.worker_thread is None)
+
+    assert window.worker is None
+    assert not window._is_busy()
+    assert window.start_button.isEnabled()
+    assert completions == [True]
+
+
+def test_download_failure_keeps_thread_busy_until_thread_finished(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    thread = QThread(window)
+    worker = object()
+    critical_messages = []
+    window.worker = worker  # type: ignore[assignment]
+    window.worker_thread = thread
+    window._set_running(True)
+    thread.finished.connect(window._on_worker_thread_finished)
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: critical_messages.append((title, message)),
+    )
+    thread.start()
+    qtbot.waitUntil(thread.isRunning)
+
+    window._on_worker_failed("download failed")
+
+    assert window.worker is worker
+    assert window.worker_thread is thread
+    assert window._is_busy()
+    assert not window.start_button.isEnabled()
+    assert critical_messages == []
+
+    thread.quit()
+    qtbot.waitUntil(lambda: window.worker_thread is None)
+
+    assert window.worker is None
+    assert not window._is_busy()
+    assert window.start_button.isEnabled()
+    assert critical_messages[0][0] == "下载中断"
+    assert "download failed" in critical_messages[0][1]
+
+
+def test_pdi_failure_keeps_thread_busy_and_retry_disabled_until_finished(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    thread = QThread(window)
+    worker = object()
+    completions = []
+    window.pdi_worker = worker  # type: ignore[assignment]
+    window.pdi_thread = thread
+    window._pdi_source_files = [str(tmp_path / "image.dcm")]
+    window.last_summary = BatchSummary()
+    window._set_running(True, reset_summary=False, can_pause=False)
+    thread.finished.connect(window._on_pdi_thread_finished)
+    monkeypatch.setattr(
+        window,
+        "_show_download_completion",
+        lambda message="", **kwargs: completions.append((message, kwargs)),
+    )
+    thread.start()
+    qtbot.waitUntil(thread.isRunning)
+
+    window._on_pdi_failed("PDI failed")
+
+    assert window.pdi_worker is worker
+    assert window.pdi_thread is thread
+    assert window._is_busy()
+    assert not window.pdi_retry_button.isEnabled()
+    assert completions == []
+
+    thread.quit()
+    qtbot.waitUntil(lambda: window.pdi_thread is None)
+
+    assert window.pdi_worker is None
+    assert not window._is_busy()
+    assert window.pdi_retry_button.isEnabled()
+    assert completions == [("PDI 导出失败：PDI failed", {"pdi_problem": True})]
+
+
 def test_new_task_form_collapse_state_is_restored(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window._set_task_form_expanded(False)
@@ -708,3 +913,42 @@ def test_close_running_task_requests_cleanup(qtbot, tmp_path, monkeypatch):
     assert worker.cancelled
     assert window._closing_after_cancel
     assert not event.isAccepted()
+
+
+def test_close_waits_for_running_thread_before_window_is_destroyed(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+
+    class Worker:
+        cancelled = False
+
+        def request_cancel(self):
+            self.cancelled = True
+
+    worker = Worker()
+    thread = QThread(window)
+    window.worker = worker  # type: ignore[assignment]
+    window.worker_thread = thread
+    thread.finished.connect(window._on_worker_thread_finished)
+    thread.start()
+    qtbot.waitUntil(thread.isRunning)
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes
+    )
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert worker.cancelled
+    assert thread.isRunning()
+    assert window.worker_thread is thread
+    assert window.isVisible()
+    assert not event.isAccepted()
+
+    thread.quit()
+    qtbot.waitUntil(lambda: not thread.isRunning())
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+    assert window.worker_thread is None
+    assert window.worker is None

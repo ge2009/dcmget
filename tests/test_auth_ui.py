@@ -3,28 +3,8 @@ from __future__ import annotations
 from PyQt5.QtWidgets import QApplication, QDialog
 
 import dcmget.auth_ui as auth_ui
-from dcmget.auth_ui import ActivationDialog, DailyPasswordDialog
+from dcmget.auth_ui import ActivationDialog
 from dcmget.licensing import LicenseError, TrialInfo
-
-
-def test_daily_password_dialog_rejects_wrong_and_accepts_today(qtbot, monkeypatch):
-    monkeypatch.setattr(
-        auth_ui,
-        "validate_daily_password",
-        lambda value: value == "20260714",
-    )
-    dialog = DailyPasswordDialog()
-    qtbot.addWidget(dialog)
-    dialog.show()
-
-    dialog.password_edit.setText("20260713")
-    dialog._submit()
-    assert dialog.result() != QDialog.Accepted
-    assert dialog.error_label.isVisible()
-
-    dialog.password_edit.setText("20260714")
-    dialog._submit()
-    assert dialog.result() == QDialog.Accepted
 
 
 def test_activation_dialog_copies_machine_code_and_saves_token(
@@ -63,12 +43,28 @@ def test_unregistered_download_is_prepared_to_consume_trial_when_ready(monkeypat
     assert "剩余 30 次" in message
 
 
-def test_consumed_thirtieth_trial_task_can_reenter_for_resume(monkeypatch):
-    class AcceptedPassword:
-        def exec_(self):
-            return QDialog.Accepted
+def test_authorize_gui_allows_remaining_trial_without_login(monkeypatch):
+    monkeypatch.setattr(
+        auth_ui,
+        "load_license",
+        lambda: (_ for _ in ()).throw(LicenseError("尚未注册")),
+    )
+    monkeypatch.setattr(
+        auth_ui,
+        "trial_status",
+        lambda: TrialInfo(used=1, remaining=29),
+    )
 
-    monkeypatch.setattr(auth_ui, "DailyPasswordDialog", AcceptedPassword)
+    class UnexpectedActivation:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("试用期内不应弹出注册窗口")
+
+    monkeypatch.setattr(auth_ui, "ActivationDialog", UnexpectedActivation)
+
+    assert auth_ui.authorize_gui()
+
+
+def test_consumed_thirtieth_trial_task_can_reenter_for_resume(monkeypatch):
     monkeypatch.setattr(
         auth_ui,
         "load_license",

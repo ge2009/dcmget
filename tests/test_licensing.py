@@ -29,14 +29,6 @@ def signing_key(tmp_path):
     return private_path, public_pem
 
 
-def test_daily_password_uses_local_calendar_date():
-    today = date(2026, 7, 14)
-
-    assert licensing.daily_password(today) == "20260714"
-    assert licensing.validate_daily_password("20260714", today)
-    assert not licensing.validate_daily_password("20260713", today)
-
-
 def test_issue_validate_save_and_load_license(signing_key, tmp_path):
     private_path, public_pem = signing_key
     target = "ABCDEF-123456-7890AB-CDEF12"

@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.5.0"
+  #define AppVersion "2.5.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -63,6 +63,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Dirs]
 Name: "{commonappdata}\DcmGet"; Permissions: users-modify; Flags: uninsneveruninstall
+Name: "{localappdata}\DcmGet\logs"; Flags: uninsneveruninstall
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
@@ -75,6 +76,7 @@ Source: "{#VCRedistPath}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flag
 
 [Icons]
 Name: "{autoprograms}\DcmGet"; Filename: "{app}\{#AppExeName}"
+Name: "{autoprograms}\DcmGet 诊断日志"; Filename: "{localappdata}\DcmGet\logs"
 Name: "{autodesktop}\DcmGet"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]

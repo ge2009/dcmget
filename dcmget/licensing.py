@@ -60,14 +60,6 @@ class _TrialState:
     task_ids: frozenset[str]
 
 
-def daily_password(today: date | None = None) -> str:
-    return (today or date.today()).strftime("%Y%m%d")
-
-
-def validate_daily_password(value: str, today: date | None = None) -> bool:
-    return hmac.compare_digest(value.strip(), daily_password(today))
-
-
 def user_data_directory() -> Path:
     app_data = os.environ.get("APPDATA")
     if app_data:

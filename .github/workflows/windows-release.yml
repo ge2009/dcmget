@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.5.0
+        default: 2.5.1
 
 permissions:
   contents: read
@@ -148,6 +148,9 @@ jobs:
           $upgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer failed with exit code $($upgrade.ExitCode)" }
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\DcmGet\logs")) { throw "Diagnostic log directory is missing" }
+          $diagnosticShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\DcmGet 诊断日志.lnk"
+          if (-not (Test-Path $diagnosticShortcut)) { throw "Diagnostic log shortcut is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter Weasis.exe)) { throw "Installed Weasis.exe is missing" }
@@ -172,6 +175,8 @@ jobs:
 
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
+          $diagnosticLog = Join-Path $env:LOCALAPPDATA "DcmGet\logs\dcmget-diagnostics.log"
+          if (-not (Test-Path $diagnosticLog) -or (Get-Item $diagnosticLog).Length -eq 0) { throw "Installed self-test did not write a diagnostic log" }
           $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
@@ -179,6 +184,7 @@ jobs:
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Uninstall removed or changed the license" }
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
+          if (-not (Test-Path $diagnosticLog)) { throw "Uninstall removed the diagnostic log" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the firewall rule behind" }
           Remove-Item $configDir -Recurse -Force
 

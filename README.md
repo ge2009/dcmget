@@ -17,9 +17,9 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
 
-- `DcmGet-2.5.0-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、Weasis 4.7.1 便携查看器和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.5.0-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。为控制体积，该单文件版不内置 Weasis，PDI 仍可生成 DICOMDIR 和网页预览。
-- `DcmGet-2.5.0-windows-x64.zip`：解压后直接运行的独立目录版，包含 Weasis 便携查看器。
+- `DcmGet-2.5.1-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、Weasis 4.7.1 便携查看器和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.5.1-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。为控制体积，该单文件版不内置 Weasis，PDI 仍可生成 DICOMDIR 和网页预览。
+- `DcmGet-2.5.1-windows-x64.zip`：解压后直接运行的独立目录版，包含 Weasis 便携查看器。
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。当前实现的是安全原位升级，不会在后台自动联网安装新版本。默认下载目录为“文档\DcmGet\Dicom”。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
@@ -29,14 +29,14 @@ Windows 发布物拆分为三个独立下载项，获取安装器时不再同时
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
 python scripts/prepare_weasis.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.5.0
+python scripts/build_windows.py --version 2.5.1
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
 
-## 登录与软件注册
+## 试用与软件注册
 
-程序每次启动都要求输入目标电脑本地日期组成的 8 位口令，例如 2026 年 7 月 14 日为 `20260714`。未注册电脑默认可免费启动 30 个批量下载任务；只有 `storescp` 成功监听后才扣次数，配置错误、接收器启动失败或只打开界面不会扣次，重试失败项会作为新任务计数。试用结束后必须输入当前电脑的离线注册码。主界面会显示剩余次数，并可随时点击“软件注册”查看和复制机器码。
+程序启动时不再要求输入日期口令。未注册电脑默认可免费启动 30 个批量下载任务；只有 `storescp` 成功监听后才扣次数，配置错误、接收器启动失败或只打开界面不会扣次，重试失败项会作为新任务计数。试用结束后必须输入当前电脑的离线注册码。主界面会显示剩余次数，并可随时点击“软件注册”查看和复制机器码。
 
 授权人员在保存有私钥的 Mac 上生成注册码：
 
@@ -56,7 +56,7 @@ python tools/build_license_generator_macos.py
 
 客户端只保存签名后的注册码和机器绑定试用计数。试用计数采用文件锁和双份冗余状态；Windows 安装版的锚点位于共享程序数据目录，普通重装、切换用户或只删除主 `trial.json` 不会恢复次数，安装升级与卸载也不会删除这些文件。macOS/Linux 源码部署的锚点仍属于当前系统用户。
 
-每日日期口令主要用于操作入口控制，真正的复制限制来自“机器码 + Ed25519 签名”。纯离线客户端无法阻止管理员清除全部本地试用状态，若需要不可重置的强试用限制，应增加在线授权服务。源码部署包便于内部部署，但持有源码的人能够修改校验逻辑；对外发放时应使用构建后的 EXE，而不是源码包。
+复制限制来自“机器码 + Ed25519 签名”。纯离线客户端无法阻止管理员清除全部本地试用状态，若需要不可重置的强试用限制，应增加在线授权服务。源码部署包便于内部部署，但持有源码的人能够修改校验逻辑；对外发放时应使用构建后的 EXE，而不是源码包。
 
 ## 快速部署
 
@@ -164,10 +164,10 @@ python scripts/prepare_weasis.py --platform windows-x86_64
 
 ```bash
 python DICOM_download_ui.py
-DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.json
+python DICOM_download_script.py --config config.json
 ```
 
-命令行同样要求当天口令，并与界面共享 30 次试用计数和注册码；它从 `DCMGET_DAILY_PASSWORD` 读取口令，交互式终端未设置环境变量时会安全提示输入。可用 `--license PATH` 指定注册码文件。
+命令行与界面共享 30 次试用计数和注册码，不再要求日期口令。可用 `--license PATH` 指定注册码文件。
 
 命令行退出码：
 
@@ -203,6 +203,14 @@ DCMGET_DAILY_PASSWORD=20260714 python DICOM_download_script.py --config config.j
 旧版配置会自动迁移。DCMTK 的查找顺序是：配置目录、`.runtime/dcmtk` 部署目录、旧版 `dcmtk/bin`、系统 `PATH`。
 
 ## 下载流程与故障处理
+
+程序从启动最早阶段开始写入独立诊断日志。`dcmget-diagnostics.log` 记录启动、Python、Qt 和后台线程异常，`dcmget-crash.log` 记录原生崩溃信息。即使主界面尚未显示，也可以直接查看：
+
+- Windows：`%LOCALAPPDATA%\DcmGet\logs\dcmget-diagnostics.log`，安装版也可从开始菜单点击“DcmGet 诊断日志”。
+- macOS：`~/Library/Application Support/DcmGet/logs/dcmget-diagnostics.log`。
+- Linux：`$XDG_STATE_HOME/dcmget/logs/dcmget-diagnostics.log`，未设置时为 `~/.local/state/dcmget/logs/dcmget-diagnostics.log`。
+
+主界面顶部的“诊断日志”可打开该固定目录；发生闪退时请同时提供上述两个文件。任务自身的 `storescp`、`movescu` 日志仍位于保存目录的 `logs/dcmget.log`；匿名模式则写入应用私有状态目录。macOS 源码启动还会在创建界面前自动清除 iCloud 可能附加到平台插件的 hidden 标志，避免 Qt 找不到 Cocoa 插件后直接退出。
 
 每批任务使用独立暂存目录。普通模式暂存在保存目录下的 `.dcmget-staging`；匿名模式暂存在应用私有状态目录。程序确认 `storescp` 已监听后再执行带连接与 DIMSE 超时的 `movescu --no-port`。每条 C-MOVE 完成后读取 DICOM 元数据，按设置中的目录模板归档并补充 `.dcm` 后缀；关键元数据缺失时使用安全占位值，无法归属或匿名失败的暂存文件会保留并写入日志。
 

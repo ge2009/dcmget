@@ -9,8 +9,41 @@ import pytest
 import DICOM_download_script as cli
 from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, PreflightResult, ToolPaths
+from dcmget.licensing import LicenseError, TrialInfo
 from dcmget.pdi import PdiExportResult, PdiStatus
 from dcmget.task_state import TaskCheckpointStore
+
+
+def test_cli_legacy_password_is_ignored_for_remaining_trial(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "load_license",
+        Mock(side_effect=LicenseError("尚未注册")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "trial_status",
+        lambda: TrialInfo(used=1, remaining=29),
+    )
+
+    assert cli.authorize_cli("不是当天日期", None) == "trial"
+
+
+def test_cli_resume_remains_authorized_after_last_trial(monkeypatch):
+    task_id = "a" * 32
+    monkeypatch.setattr(
+        cli,
+        "load_license",
+        Mock(side_effect=LicenseError("尚未注册")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "trial_status",
+        lambda: TrialInfo(used=30, remaining=0),
+    )
+    monkeypatch.setattr(cli, "trial_task_consumed", lambda value: value == task_id)
+
+    assert cli.authorize_cli("任意旧口令", None, task_id) == "trial"
 
 
 def _run_cli(

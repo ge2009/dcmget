@@ -45,6 +45,20 @@ def ensure_application_state_dir() -> Path:
     return path
 
 
+def application_log_dir() -> Path:
+    return application_state_dir() / "logs"
+
+
+def ensure_application_log_dir() -> Path:
+    path = application_log_dir()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
 def ensure_default_config() -> Path:
     path = default_config_path()
     if is_frozen() and not path.exists():

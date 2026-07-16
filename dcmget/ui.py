@@ -67,6 +67,7 @@ from .core import (
     log_directory,
     preflight,
 )
+from .diagnostics import diagnostic_log_directory, record_exception
 from .licensing import consume_trial, trial_task_consumed
 from .release_notes import load_release_notes
 from .task_state import (
@@ -613,6 +614,7 @@ class DownloadWorker(QObject):
                     runner.request_pause()
             self.finished.emit(runner.run(self.accessions))
         except Exception as exc:  # keep worker failures visible in the UI
+            record_exception("DownloadWorker.run", exc)
             self.failed.emit(str(exc))
 
     def request_cancel(self) -> None:
@@ -715,6 +717,7 @@ class PdiWorker(QObject):
                     exporter.request_cancel()
             self.finished.emit(exporter.export(self.files))
         except Exception as exc:  # surface exporter failures in the main UI
+            record_exception("PdiWorker.run", exc)
             self.failed.emit(str(exc))
 
     def request_cancel(self) -> None:
@@ -760,6 +763,8 @@ class DcmGetWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.pdi_worker: PdiWorker | None = None
         self.pdi_thread: QThread | None = None
+        self._worker_failure_message: str | None = None
+        self._pending_pdi_completion: tuple[str, bool, bool] | None = None
         self.last_summary: BatchSummary | None = None
         self.last_pdi_result = None
         self._pdi_source_files: list[str] = []
@@ -859,6 +864,14 @@ class DcmGetWindow(QMainWindow):
         self.release_notes_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.release_notes_button.clicked.connect(self._show_release_notes)
         layout.addWidget(self.release_notes_button)
+        self.diagnostic_log_button = QToolButton()
+        self.diagnostic_log_button.setText("诊断日志")
+        self.diagnostic_log_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.diagnostic_log_button.setToolTip("打开启动、异常和崩溃诊断日志目录")
+        self.diagnostic_log_button.clicked.connect(
+            self._open_diagnostic_log_directory
+        )
+        layout.addWidget(self.diagnostic_log_button)
         self.settings_button = QToolButton()
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -1093,7 +1106,15 @@ class DcmGetWindow(QMainWindow):
         return panel
 
     def _is_busy(self) -> bool:
-        return self.worker is not None or self.pdi_worker is not None
+        return any(
+            item is not None
+            for item in (
+                self.worker,
+                self.worker_thread,
+                self.pdi_worker,
+                self.pdi_thread,
+            )
+        )
 
     def _show_settings(self) -> None:
         if self._is_busy():
@@ -1677,6 +1698,7 @@ class DcmGetWindow(QMainWindow):
             f"{action} {self._progress_offset}/{self._display_total}"
         )
         self._set_running(True)
+        self._worker_failure_message = None
 
         thread = QThread(self)
         worker = DownloadWorker(
@@ -1697,6 +1719,7 @@ class DcmGetWindow(QMainWindow):
         worker.trial_consumed.connect(self._on_trial_consumed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_worker_thread_finished)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self.worker_thread = thread
@@ -1884,7 +1907,6 @@ class DcmGetWindow(QMainWindow):
                     ]
                 ),
             )
-        self._finish_worker(set_idle=False)
         self._resume_checkpoint = active_checkpoint if summary.cancelled else None
         self._prior_results = []
         self._active_task_id = ""
@@ -1897,6 +1919,15 @@ class DcmGetWindow(QMainWindow):
         self._pdi_task_id = task_id if keep_lease_for_pdi else ""
         if not keep_lease_for_pdi:
             self.task_store.release_lease()
+        if self.worker_thread is None:
+            self._finish_worker(set_idle=False)
+            self._complete_worker_finished()
+
+    def _complete_worker_finished(self) -> None:
+        summary = self.last_summary
+        if summary is None:
+            self._set_running(False)
+            return
         if self._closing_after_cancel:
             self._set_running(False)
             return
@@ -1938,6 +1969,7 @@ class DcmGetWindow(QMainWindow):
             self._show_pdi_skipped("没有可重试的 DICOM 文件。")
             return
         self._pdi_source_files = source_files
+        self._pending_pdi_completion = None
         reuse_published = self._pdi_reuse_published
         self._pdi_reuse_published = False
         pdi_attempt_id = ""
@@ -2039,13 +2071,8 @@ class DcmGetWindow(QMainWindow):
         self.pdi_progress_bar.setValue(1 if status_text in {"完成", "部分成功"} else 0)
         output_exists = bool(output_directory and Path(output_directory).exists())
         self.pdi_open_button.setEnabled(output_exists)
-        self.pdi_retry_button.setEnabled(
-            bool(self._pdi_source_files) and status_text != "完成"
-        )
+        self.pdi_retry_button.setEnabled(False)
         self._save_pdi_checkpoint_status(completed=status_text == "完成")
-        self._finish_pdi_worker()
-        if self._closing_after_cancel:
-            return
 
         if status_text == "完成":
             pdi_message = f"PDI 便携目录已生成：{output_directory}"
@@ -2055,9 +2082,12 @@ class DcmGetWindow(QMainWindow):
             pdi_message = "PDI 生成已取消，下载的 DICOM 文件仍已保留。"
         else:
             pdi_message = f"PDI 导出未完成：{message}"
-        self._show_download_completion(
-            pdi_message, pdi_problem=status_text != "完成"
+        self._pending_pdi_completion = (
+            pdi_message,
+            status_text != "完成",
+            bool(self._pdi_source_files) and status_text != "完成",
         )
+        self._finish_pdi_worker()
 
     def _on_pdi_failed(self, message: str) -> None:
         self._append_log("PDI", message, "error")
@@ -2066,14 +2096,14 @@ class DcmGetWindow(QMainWindow):
         self.pdi_progress_bar.setRange(0, 1)
         self.pdi_progress_bar.setValue(0)
         self.pdi_open_button.setEnabled(False)
-        self.pdi_retry_button.setEnabled(bool(self._pdi_source_files))
+        self.pdi_retry_button.setEnabled(False)
         self._save_pdi_checkpoint_status(completed=False)
-        self._finish_pdi_worker()
-        if self._closing_after_cancel:
-            return
-        self._show_download_completion(
-            f"PDI 导出失败：{message}", pdi_problem=True
+        self._pending_pdi_completion = (
+            f"PDI 导出失败：{message}",
+            True,
+            bool(self._pdi_source_files),
         )
+        self._finish_pdi_worker()
 
     def _save_pdi_checkpoint_status(self, *, completed: bool) -> None:
         task_id = self._pdi_task_id
@@ -2095,12 +2125,26 @@ class DcmGetWindow(QMainWindow):
         if self.pdi_thread is None:
             self.pdi_worker = None
             self._set_running(False)
+            self._complete_pdi_worker()
 
     def _on_pdi_thread_finished(self) -> None:
-        if self.sender() is self.pdi_thread:
-            self.pdi_worker = None
-            self.pdi_thread = None
+        if self.sender() is not self.pdi_thread:
+            return
+        self.pdi_worker = None
+        self.pdi_thread = None
         self._set_running(False)
+        self._complete_pdi_worker()
+
+    def _complete_pdi_worker(self) -> None:
+        completion = self._pending_pdi_completion
+        self._pending_pdi_completion = None
+        if completion is None:
+            return
+        message, problem, retry_enabled = completion
+        self.pdi_retry_button.setEnabled(retry_enabled)
+        if self._closing_after_cancel:
+            return
+        self._show_download_completion(message, pdi_problem=problem)
 
     def _set_pdi_status(self, text: str, status: str) -> None:
         self.pdi_status_label.setText(text)
@@ -2138,6 +2182,7 @@ class DcmGetWindow(QMainWindow):
             self._start_pdi_export()
 
     def _on_worker_failed(self, message: str) -> None:
+        self._worker_failure_message = message
         self._append_log("应用", message, "error")
         try:
             checkpoint = self.task_store.load()
@@ -2146,8 +2191,13 @@ class DcmGetWindow(QMainWindow):
         except TaskStateError as exc:
             self._append_log("恢复", str(exc), "error")
         self.progress_label.setText("任务中断，可点击开始或在下次启动时继续")
-        self._finish_worker()
         self.task_store.release_lease()
+        if self.worker_thread is None:
+            self._finish_worker(set_idle=False)
+            self._complete_worker_failed(message)
+
+    def _complete_worker_failed(self, message: str) -> None:
+        self._set_running(False)
         if self._closing_after_cancel:
             return
         QMessageBox.critical(
@@ -2155,6 +2205,19 @@ class DcmGetWindow(QMainWindow):
             "下载中断",
             f"{message}\n\n已完成项已保存；重新启动 DcmGet 后可继续剩余任务。",
         )
+
+    def _on_worker_thread_finished(self) -> None:
+        if self.sender() is not self.worker_thread:
+            return
+        failure_message = self._worker_failure_message
+        self._worker_failure_message = None
+        self._finish_worker(set_idle=False)
+        if failure_message is not None:
+            self._complete_worker_failed(failure_message)
+        elif self.last_summary is not None:
+            self._complete_worker_finished()
+        else:
+            self._set_running(False)
 
     def _finish_worker(self, *, set_idle: bool = True) -> None:
         self.worker = None
@@ -2298,6 +2361,11 @@ class DcmGetWindow(QMainWindow):
         config = AppConfig.from_dict(self.config.to_dict())
         config.dicom_destination_folder = self.destination_edit.text().strip()
         path = log_directory(config)
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _open_diagnostic_log_directory(self) -> None:
+        path = diagnostic_log_directory()
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
