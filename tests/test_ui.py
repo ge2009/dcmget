@@ -651,6 +651,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.5.2",
         "2.5.1",
         "2.5.0",
         "2.4.0",
@@ -684,6 +685,24 @@ def test_retry_only_passes_failed_items(qtbot, tmp_path, monkeypatch):
     window._retry_failed()
 
     assert called == [["FAILED"]]
+
+
+def test_start_button_mouse_click_uses_current_accessions(
+    qtbot, tmp_path, monkeypatch
+):
+    started = []
+
+    def capture_start(window, override=None, *, resume_checkpoint=None):
+        values = window.current_accessions if override is None else override
+        started.append((list(values), resume_checkpoint))
+
+    monkeypatch.setattr(DcmGetWindow, "_start_download", capture_start)
+    window = make_window(qtbot, tmp_path)
+    window.accession_edit.setPlainText("A001\nA002")
+
+    qtbot.mouseClick(window.start_button, Qt.LeftButton)
+
+    assert started == [(["A001", "A002"], None)]
 
 
 def test_log_panel_can_be_collapsed_and_restored(qtbot, tmp_path):

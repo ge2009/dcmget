@@ -993,7 +993,9 @@ class DcmGetWindow(QMainWindow):
         self.start_button = QPushButton("开始下载")
         self.start_button.setObjectName("PrimaryButton")
         self.start_button.setToolTip("开始下载（Ctrl+Enter）")
-        self.start_button.clicked.connect(self._start_download)
+        self.start_button.clicked.connect(
+            lambda _checked=False: self._start_download()
+        )
         action_row.addWidget(self.discard_resume_button)
         action_row.addWidget(self.retry_button)
         action_row.addWidget(self.log_toggle_button)

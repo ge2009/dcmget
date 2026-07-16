@@ -17,9 +17,9 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
 
-- `DcmGet-2.5.1-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、Weasis 4.7.1 便携查看器和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.5.1-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。为控制体积，该单文件版不内置 Weasis，PDI 仍可生成 DICOMDIR 和网页预览。
-- `DcmGet-2.5.1-windows-x64.zip`：解压后直接运行的独立目录版，包含 Weasis 便携查看器。
+- `DcmGet-2.5.2-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、Weasis 4.7.1 便携查看器和 Microsoft Visual C++ x64 Runtime，并创建 `storescp` 默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.5.2-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境。为控制体积，该单文件版不内置 Weasis，PDI 仍可生成 DICOMDIR 和网页预览。
+- `DcmGet-2.5.2-windows-x64.zip`：解压后直接运行的独立目录版，包含 Weasis 便携查看器。
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。当前实现的是安全原位升级，不会在后台自动联网安装新版本。默认下载目录为“文档\DcmGet\Dicom”。当前发布物未进行商业代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
@@ -29,7 +29,7 @@ Windows 发布物拆分为三个独立下载项，获取安装器时不再同时
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
 python scripts/prepare_weasis.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.5.1
+python scripts/build_windows.py --version 2.5.2
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
