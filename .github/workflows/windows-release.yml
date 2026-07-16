@@ -200,9 +200,13 @@ jobs:
           $baselineRuntime = Join-Path $baselineRoot ".runtime"
           New-Item -ItemType Directory -Force $baselineRuntime | Out-Null
           Copy-Item -LiteralPath ".runtime\dcmtk" -Destination $baselineRuntime -Recurse -Force
-          Copy-Item -LiteralPath ".runtime\ohif" -Destination $baselineRuntime -Recurse -Force
+          $baselineOhif = Join-Path $baselineRuntime "ohif"
+          New-Item -ItemType Directory -Force $baselineOhif | Out-Null
+          Copy-Item -LiteralPath ".runtime\ohif\cache" -Destination (Join-Path $baselineOhif "cache") -Recurse -Force
           Push-Location $baselineRoot
           try {
+            python scripts/prepare_ohif.py --offline
+            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 OHIF preparation failed with exit code $LASTEXITCODE" }
             python scripts/build_windows.py --version 2.6.1
             if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 application build failed with exit code $LASTEXITCODE" }
           } finally {

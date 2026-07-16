@@ -81,6 +81,9 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
 
     assert "ref: c01c83a1963a55457bef15917ddd4cfdbab81fd1" in workflow
     assert "path: upgrade-baseline" in workflow
+    assert 'Copy-Item -LiteralPath ".runtime\\ohif\\cache"' in workflow
+    assert "python scripts/prepare_ohif.py --offline" in workflow
+    assert 'Copy-Item -LiteralPath ".runtime\\ohif" -Destination' not in workflow
     assert "python scripts/build_windows.py --version 2.6.1" in workflow
     assert 'Join-Path $baselineRoot "packaging\\windows\\dcmget.iss"' in workflow
     assert "DcmGet-2.6.1-Setup-x64.exe" in workflow
