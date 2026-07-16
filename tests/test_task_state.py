@@ -5,7 +5,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 
+import psutil
 import pytest
 
 from dcmget.config import AppConfig
@@ -204,6 +206,21 @@ def test_recorded_orphan_process_is_identity_checked_and_terminated(tmp_path, ki
         stderr=subprocess.DEVNULL,
     )
     try:
+        expected_executable = os.path.realpath(sys.executable)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                actual_executable = os.path.realpath(
+                    psutil.Process(process.pid).exe()
+                )
+                if actual_executable == expected_executable:
+                    break
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                pass
+            time.sleep(0.01)
+        else:
+            pytest.fail("测试子进程未在 5 秒内完成启动")
+
         store.record_process(
             checkpoint.task_id,
             kind,
@@ -214,12 +231,16 @@ def test_recorded_orphan_process_is_identity_checked_and_terminated(tmp_path, ki
 
         messages = store.cleanup_recorded_processes(checkpoint.task_id)
 
-        assert process.wait(timeout=5) is not None
+        assert not psutil.pid_exists(process.pid)
         assert any(kind in message and "已清理" in message for message in messages)
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if psutil.pid_exists(process.pid):
+            try:
+                leftover = psutil.Process(process.pid)
+                leftover.kill()
+                leftover.wait(timeout=5)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
 
 
 def test_mismatched_process_identity_is_not_killed_and_record_is_discarded(tmp_path):
