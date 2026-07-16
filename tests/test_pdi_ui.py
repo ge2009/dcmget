@@ -19,7 +19,7 @@ from dcmget.core import (
 )
 import dcmget.pdi as pdi_module
 import dcmget.ui as ui_module
-from dcmget.ui import DcmGetWindow, PdiWorker
+from dcmget.ui import DcmGetWindow, PdiWorker, pdi_viewer_command
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +44,18 @@ def make_window(qtbot, tmp_path):
     return window
 
 
+def make_pdi_viewer_root(output: Path) -> Path:
+    viewer = output / "VIEWER" / "OHIF"
+    viewer.mkdir(parents=True)
+    (viewer / "index.html").write_text("OHIF", encoding="utf-8")
+    private = output / "VIEWER" / ".dcmget"
+    private.mkdir()
+    (private / "index").write_text('{"studies": []}', encoding="utf-8")
+    server_script = output / "VIEWER" / "pdi_server.py"
+    server_script.write_text("# viewer", encoding="utf-8")
+    return server_script
+
+
 def test_pdi_settings_are_collapsed_and_disabled_by_default(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
@@ -53,7 +65,10 @@ def test_pdi_settings_are_collapsed_and_disabled_by_default(qtbot, tmp_path):
     assert not page.pdi_institution_edit.isEnabled()
     assert page.pdi_ohif_checkbox.isChecked()
     assert not page.pdi_ohif_checkbox.isEnabled()
+    assert page.pdi_ohif_checkbox.text() == "在目录内附带离线阅片器（推荐）"
+    assert "DCMGET_PDI_…" in page.pdi_output_hint.text()
     assert "不生成 JPG" in page.pdi_ohif_hint.text()
+    assert "无需选择 JSON、DICOMDIR 或逐个影像文件" in page.pdi_ohif_hint.text()
     assert not window.pdi_status_card.isVisible()
 
     qtbot.mouseClick(page.pdi_card_toggle, Qt.LeftButton)
@@ -97,7 +112,7 @@ def test_pdi_settings_round_trip_ohif_option(qtbot, tmp_path):
     assert result.pdi_output_folder == str(output)
     assert not result.pdi_include_ohif_viewer
     assert page.pdi_ohif_checkbox.isEnabled()
-    assert "无需选择索引文件" in page.pdi_ohif_hint.text()
+    assert "无需选择 JSON、DICOMDIR 或逐个影像文件" in page.pdi_ohif_hint.text()
 
 
 def test_download_completion_starts_pdi_with_exact_batch_files(
@@ -384,8 +399,7 @@ def test_pdi_progress_and_success_enable_viewer_and_open_directory(
 ):
     window = make_window(qtbot, tmp_path)
     output = tmp_path / "PDI" / "DCMGET_PDI_20260716_120000"
-    (output / "VIEWER").mkdir(parents=True)
-    (output / "VIEWER" / "pdi_server.py").write_text("# viewer")
+    make_pdi_viewer_root(output)
     window.config.pdi_export_enabled = True
     window._pdi_source_files = [str(tmp_path / "image.dcm")]
     window.last_summary = BatchSummary()
@@ -420,7 +434,12 @@ def test_pdi_progress_and_success_enable_viewer_and_open_directory(
     assert window.pdi_view_button.isEnabled()
     assert window.pdi_open_button.isEnabled()
     assert not window.pdi_retry_button.isEnabled()
+    assert window.pdi_view_button.text() == "打开影像"
+    assert window.pdi_open_button.text() == "打开导出目录"
+    assert "离线阅片器" in window.pdi_view_button.toolTip()
+    assert "PDI 导出目录" in window.pdi_open_button.toolTip()
     assert "已生成" in window.pdi_status_label.text()
+    assert output.name in window.pdi_status_label.text()
     assert str(output) in messages[0][1]
 
 
@@ -429,9 +448,8 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
 ):
     window = make_window(qtbot, tmp_path)
     output = tmp_path / "PDI 目录"
-    (output / "VIEWER").mkdir(parents=True)
-    server_script = output / "VIEWER" / "pdi_server.py"
-    server_script.write_text("# viewer", encoding="utf-8")
+    make_pdi_viewer_root(output)
+    trusted_server_script = Path(ui_module.__file__).with_name("pdi_server.py")
 
     @dataclass
     class Result:
@@ -516,18 +534,24 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
     program, arguments, cwd = launched[0]
     assert Path(program).resolve() == Path(ui_module.sys.executable).resolve()
     assert arguments[:4] == [
-        str(server_script),
+        str(trusted_server_script),
         "--root",
         str(output.resolve()),
         "--quiet",
     ]
-    assert arguments[4] == "--port"
-    port = int(arguments[5])
-    assert arguments[6] == "--no-browser"
+    assert arguments[4] == "--session-token"
+    session_token = arguments[5]
+    assert len(session_token) >= 43
+    assert arguments[6] == "--port"
+    port = int(arguments[7])
+    assert arguments[8] == "--no-browser"
     assert cwd == str(output.resolve())
     from dcmget.pdi_server import viewer_url
 
     assert opened == []
+    assert window._pdi_viewer_probe_url == (
+        f"http://127.0.0.1:{port}/ready/{session_token}"
+    )
 
     class FakeReply:
         def __init__(self):
@@ -543,9 +567,12 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
     window._pdi_viewer_probe_reply = reply
     window._on_pdi_viewer_probe_finished(reply)
 
-    assert opened == [viewer_url(port)]
+    assert opened == [viewer_url(port, session_token)]
     window._open_pdi_viewer()
-    assert opened == [viewer_url(port), viewer_url(port)]
+    assert opened == [
+        viewer_url(port, session_token),
+        viewer_url(port, session_token),
+    ]
 
     process = FakeProcess.instances[0]
     event = QCloseEvent()
@@ -554,6 +581,20 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
     assert process.terminated
     assert process.deleted
     assert window._pdi_viewer_process is None
+
+
+def test_frozen_ui_never_executes_a_viewer_from_the_pdi_directory(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "external PDI"
+    make_pdi_viewer_root(output)
+    (output / "OPEN_VIEWER.exe").write_bytes(b"untrusted")
+    empty_resources = tmp_path / "installed-resources"
+    empty_resources.mkdir()
+    monkeypatch.setattr(ui_module, "is_frozen", lambda: True)
+    monkeypatch.setattr(ui_module, "resource_root", lambda: empty_resources)
+
+    assert pdi_viewer_command(output) is None
 
 
 def test_retry_pdi_does_not_restart_download(qtbot, tmp_path, monkeypatch):

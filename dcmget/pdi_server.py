@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import mimetypes
 import os
 import posixpath
+import secrets
 import sys
 import threading
 import time
 import urllib.parse
 import webbrowser
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PurePosixPath
 
 
-VIEWER_PATH = "/viewer/dicomjson/"
+VIEWER_PATH = "/viewer/directory/"
+LEGACY_VIEWER_PATH = "/viewer/dicomjson/"
 STUDY_INDEX = "VIEWER/.dcmget/index"
 LEGACY_STUDY_INDEX = "DCMGET_STUDIES.json"
 STUDY_INDEX_ENDPOINT = "/api/studies"
@@ -27,6 +31,9 @@ MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024
 MAX_VIEWER_FILES = 4096
 MAX_VIEWER_FILE_BYTES = 512 * 1024 * 1024
 MAX_VIEWER_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_STUDY_INDEX_BYTES = 64 * 1024 * 1024
+MAX_STUDY_INDEX_INSTANCES = 100_000
+SESSION_TOKEN_BYTES = 32
 DEFAULT_IDLE_TIMEOUT_SECONDS = 4 * 60 * 60
 
 
@@ -57,24 +64,22 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 class PdiRequestHandler(BaseHTTPRequestHandler):
     """Serve one PDI directory without exposing the surrounding filesystem."""
 
-    server_version = "DcmGetPDI/2.6"
+    server_version = "DcmGetPDI/2.6.3"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        self._request_started()
-        try:
-            self._serve(send_body=True)
-        finally:
-            self._request_finished()
+        self._dispatch(send_body=True)
 
     def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        self._request_started()
-        try:
-            self._serve(send_body=False)
-        finally:
-            self._request_finished()
+        self._dispatch(send_body=False)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if not self._host_is_allowed():
+            self._send_empty(HTTPStatus.MISDIRECTED_REQUEST)
+            return
+        if not self._cookie_is_valid():
+            self._send_empty(HTTPStatus.FORBIDDEN)
+            return
         self._request_started()
         try:
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
@@ -98,16 +103,20 @@ class PdiRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         if getattr(self.server, "quiet", False):
             return
+        message = format % args
+        session_token = str(getattr(self.server, "session_token", ""))
+        if session_token:
+            message = message.replace(session_token, "<redacted>")
         recorder = getattr(self.server, "record_access", None)
         if callable(recorder):
-            recorder(format % args)
+            recorder(message)
         # PyInstaller's Windows ``--windowed`` mode intentionally leaves
         # stderr unset.  HTTP access logging must never be allowed to abort a
         # request before the response status line is written.
         if sys.stderr is None:
             return
         try:
-            super().log_message(format, *args)
+            super().log_message("%s", message)
         except (AttributeError, OSError, ValueError):
             return
 
@@ -132,12 +141,71 @@ class PdiRequestHandler(BaseHTTPRequestHandler):
         )
         super().end_headers()
 
-    def _serve(self, *, send_body: bool) -> None:
+    def _dispatch(self, *, send_body: bool) -> None:
         if not self._host_is_allowed():
-            self.send_error(HTTPStatus.MISDIRECTED_REQUEST)
+            self._send_empty(HTTPStatus.MISDIRECTED_REQUEST)
             return
         request_path = urllib.parse.urlsplit(self.path).path
-        file_path = self._resolve_request_path(request_path)
+        if request_path.startswith("/open/"):
+            if self.command != "GET":
+                self._send_empty(HTTPStatus.METHOD_NOT_ALLOWED)
+                return
+            if not self._path_token_is_valid(request_path, "/open/"):
+                self._send_empty(HTTPStatus.NOT_FOUND)
+                return
+            self._request_started()
+            try:
+                self._open_session()
+            finally:
+                self._request_finished()
+            return
+        if request_path.startswith("/ready/"):
+            if self.command != "HEAD":
+                self._send_empty(HTTPStatus.METHOD_NOT_ALLOWED)
+                return
+            if not self._path_token_is_valid(request_path, "/ready/"):
+                self._send_empty(HTTPStatus.NOT_FOUND)
+                return
+            self._request_started()
+            try:
+                self._send_empty(HTTPStatus.OK)
+            finally:
+                self._request_finished()
+            return
+        if not self._cookie_is_valid():
+            self._send_empty(HTTPStatus.FORBIDDEN)
+            return
+
+        self._request_started()
+        try:
+            self._serve_authorized(request_path, send_body=send_body)
+        finally:
+            self._request_finished()
+
+    def _serve_authorized(self, request_path: str, *, send_body: bool) -> None:
+        normalized = _normalize_request_path(request_path)
+        if normalized is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if normalized == STUDY_INDEX_ENDPOINT:
+            payload = bytes(getattr(self.server, "study_index_bytes"))
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
+        if normalized.startswith("/api/") or normalized in {
+            f"/{LEGACY_STUDY_INDEX}",
+            f"/{STUDY_INDEX}",
+        }:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if normalized == "/DICOM" or normalized.startswith("/DICOM/"):
+            file_path = self._resolve_dicom_path(normalized)
+        else:
+            file_path = self._resolve_viewer_path(normalized)
         if file_path is None or not file_path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -181,42 +249,78 @@ class PdiRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def _resolve_request_path(self, request_path: str) -> Path | None:
-        root = Path(getattr(self.server, "pdi_root")).resolve()
-        viewer_root = root / "VIEWER" / "OHIF"
-        decoded = urllib.parse.unquote(request_path)
-        if ".." in decoded.replace("\\", "/").split("/"):
+    def _resolve_dicom_path(self, request_path: str) -> Path | None:
+        allowlist = getattr(self.server, "dicom_allowlist", frozenset())
+        if request_path not in allowlist:
             return None
-        normalized = posixpath.normpath(decoded)
-        if "\0" in decoded or normalized.startswith("../"):
-            return None
+        return _safe_dicom_path(Path(getattr(self.server, "pdi_root")), request_path)
 
-        if normalized == STUDY_INDEX_ENDPOINT:
-            candidate = _study_index_path(root)
-            if candidate is None:
+    def _resolve_viewer_path(self, request_path: str) -> Path | None:
+        root = Path(getattr(self.server, "pdi_root")).resolve()
+        viewer_root = (root / "VIEWER" / "OHIF").resolve()
+        relative = request_path.lstrip("/")
+        candidate = viewer_root.joinpath(*relative.split("/"))
+        if not candidate.is_file():
+            if Path(relative).suffix:
                 return None
-        elif normalized.startswith("/api/"):
+            candidate = viewer_root / "index.html"
+        if _path_contains_symlink(viewer_root, candidate):
             return None
-        elif normalized in {f"/{LEGACY_STUDY_INDEX}", f"/{STUDY_INDEX}"}:
-            # The metadata cache is private implementation data.  Existing PDI
-            # directories are supported through the virtual endpoint only.
-            return None
-        elif normalized.startswith("/DICOM/"):
-            candidate = root.joinpath(*normalized.lstrip("/").split("/"))
-        else:
-            relative = normalized.lstrip("/")
-            candidate = viewer_root / relative
-            if not candidate.is_file():
-                if Path(relative).suffix:
-                    return None
-                candidate = viewer_root / "index.html"
 
         try:
             resolved = candidate.resolve(strict=True)
-            resolved.relative_to(root)
+            resolved.relative_to(viewer_root)
         except (OSError, ValueError):
             return None
         return resolved
+
+    def _open_session(self) -> None:
+        cookie_name = str(getattr(self.server, "cookie_name"))
+        session_token = str(getattr(self.server, "session_token"))
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header(
+            "Location",
+            _viewer_directory_location(
+                str(getattr(self.server, "viewer_path", VIEWER_PATH))
+            ),
+        )
+        self.send_header(
+            "Set-Cookie",
+            f"{cookie_name}={session_token}; Path=/; HttpOnly; SameSite=Strict",
+        )
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _path_token_is_valid(self, request_path: str, prefix: str) -> bool:
+        candidate = request_path[len(prefix) :]
+        if not candidate or "/" in candidate:
+            return False
+        return secrets.compare_digest(
+            candidate,
+            str(getattr(self.server, "session_token", "")),
+        )
+
+    def _cookie_is_valid(self) -> bool:
+        raw_cookie = self.headers.get("Cookie", "")
+        if not raw_cookie:
+            return False
+        cookies = SimpleCookie()
+        try:
+            cookies.load(raw_cookie)
+        except CookieError:
+            return False
+        morsel = cookies.get(str(getattr(self.server, "cookie_name", "")))
+        if morsel is None:
+            return False
+        return secrets.compare_digest(
+            morsel.value,
+            str(getattr(self.server, "session_token", "")),
+        )
+
+    def _send_empty(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _host_is_allowed(self) -> bool:
         host = self.headers.get("Host", "").strip().lower()
@@ -270,15 +374,29 @@ class PdiHttpServer(ThreadingHTTPServer):
         quiet: bool = False,
         logger: logging.Logger | None = None,
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
+        session_token: str | None = None,
     ):
         if host != "127.0.0.1":
             raise ValueError("PDI 服务只允许绑定 127.0.0.1")
         if not 0 < idle_timeout_seconds < float("inf"):
             raise ValueError("PDI 服务空闲超时必须大于 0")
-        self.pdi_root = root
+        self.pdi_root = Path(root).expanduser().resolve()
         self.quiet = quiet
         self.logger = logger
         self.idle_timeout_seconds = float(idle_timeout_seconds)
+        self.session_token = _validated_session_token(
+            session_token or generate_session_token()
+        )
+        self.cookie_name = f"dcmget_pdi_{secrets.token_hex(12)}"
+        study_index_path = _study_index_path(self.pdi_root)
+        self.viewer_path = (
+            LEGACY_VIEWER_PATH
+            if study_index_path == self.pdi_root / LEGACY_STUDY_INDEX
+            else VIEWER_PATH
+        )
+        self.study_index_bytes, self.dicom_allowlist = _load_study_index(
+            self.pdi_root, study_index_path
+        )
         self.idle_expired = False
         self._last_activity = time.monotonic()
         self._idle_condition = threading.Condition()
@@ -475,9 +593,30 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def viewer_url(port: int) -> str:
+def generate_session_token() -> str:
+    return secrets.token_urlsafe(SESSION_TOKEN_BYTES)
+
+
+def _validated_session_token(value: str) -> str:
+    token = str(value)
+    allowed = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    )
+    if not 43 <= len(token) <= 128 or any(
+        character not in allowed for character in token
+    ):
+        raise ValueError("PDI 会话令牌格式无效")
+    return token
+
+
+def _viewer_directory_location(viewer_path: str = VIEWER_PATH) -> str:
     query = urllib.parse.urlencode({"url": STUDY_INDEX_ENDPOINT, "lng": "zh"})
-    return f"http://127.0.0.1:{port}{VIEWER_PATH}?{query}"
+    return f"{viewer_path}?{query}"
+
+
+def viewer_url(port: int, session_token: str) -> str:
+    token = _validated_session_token(session_token)
+    return f"http://127.0.0.1:{port}/open/{token}"
 
 
 def _study_index_path(root: Path) -> Path | None:
@@ -493,6 +632,141 @@ def _study_index_path(root: Path) -> Path | None:
     return None
 
 
+def _normalize_request_path(request_path: str) -> str | None:
+    decoded = urllib.parse.unquote(request_path)
+    if not decoded.startswith("/") or "\0" in decoded or "\\" in decoded:
+        return None
+    if ".." in decoded.split("/"):
+        return None
+    normalized = posixpath.normpath(decoded)
+    return normalized if normalized.startswith("/") else None
+
+
+def _path_contains_symlink(base: Path, candidate: Path) -> bool:
+    try:
+        relative = candidate.relative_to(base)
+    except ValueError:
+        return True
+    current = base
+    if current.is_symlink():
+        return True
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _safe_dicom_path(root: Path, request_path: str) -> Path | None:
+    normalized = _normalize_request_path(request_path)
+    if normalized is None or not normalized.startswith("/DICOM/"):
+        return None
+    relative = PurePosixPath(normalized.lstrip("/"))
+    if any(
+        not part or part in {".", ".."} or ":" in part
+        for part in relative.parts
+    ):
+        return None
+    dicom_root = root / "DICOM"
+    candidate = root.joinpath(*relative.parts)
+    if dicom_root.is_symlink() or _path_contains_symlink(root, candidate):
+        return None
+    try:
+        resolved_dicom_root = dicom_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(resolved_dicom_root)
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _load_study_index(
+    root: Path,
+    index_path: Path | None = None,
+) -> tuple[bytes, frozenset[str]]:
+    index_path = index_path or _study_index_path(root)
+    if index_path is None:
+        raise FileNotFoundError(f"PDI 目录不完整，缺少：{STUDY_INDEX}")
+    try:
+        with index_path.open("rb") as source:
+            raw = source.read(MAX_STUDY_INDEX_BYTES + 1)
+    except OSError as exc:
+        raise RuntimeError(f"PDI 阅片索引无法读取：{exc}") from exc
+    if len(raw) > MAX_STUDY_INDEX_BYTES:
+        raise RuntimeError("PDI 阅片索引超过 64 MiB 上限")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"PDI 阅片索引格式无效：{exc}") from exc
+    allowlist = _validate_study_index(payload, root)
+    return bytes(raw), frozenset(allowlist)
+
+
+def _validate_study_index(payload: object, root: Path) -> set[str]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("studies"), list):
+        raise RuntimeError("PDI 阅片索引必须包含 studies 数组")
+    allowlist: set[str] = set()
+    instance_count = 0
+    for study in payload["studies"]:
+        if not isinstance(study, dict) or not isinstance(study.get("series"), list):
+            raise RuntimeError("PDI 阅片索引的 study/series 结构无效")
+        for series in study["series"]:
+            if not isinstance(series, dict) or not isinstance(
+                series.get("instances"), list
+            ):
+                raise RuntimeError("PDI 阅片索引的 series/instances 结构无效")
+            for instance in series["instances"]:
+                instance_count += 1
+                if instance_count > MAX_STUDY_INDEX_INSTANCES:
+                    raise RuntimeError("PDI 阅片索引实例数超过上限")
+                if (
+                    not isinstance(instance, dict)
+                    or not isinstance(instance.get("metadata"), dict)
+                    or not isinstance(instance.get("url"), str)
+                ):
+                    raise RuntimeError("PDI 阅片索引的实例结构无效")
+                request_path = _validate_dicom_url(instance["url"])
+                if request_path not in allowlist:
+                    if _safe_dicom_path(root, request_path) is None:
+                        raise RuntimeError(
+                            f"PDI 阅片索引引用了无效 DICOM 文件：{request_path}"
+                        )
+                    allowlist.add(request_path)
+    return allowlist
+
+
+def _validate_dicom_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "dicomweb"
+        or parsed.netloc
+        or parsed.fragment
+        or not parsed.path.startswith("/DICOM/")
+    ):
+        raise RuntimeError("PDI 阅片索引包含无效 DICOM URL")
+    normalized = _normalize_request_path(parsed.path)
+    if normalized is None or normalized != parsed.path:
+        raise RuntimeError("PDI 阅片索引包含不安全的 DICOM 路径")
+    if parsed.query:
+        try:
+            query = urllib.parse.parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise RuntimeError("PDI 阅片索引包含无效帧参数") from exc
+        frames = query.get("frame", [])
+        if (
+            set(query) != {"frame"}
+            or len(frames) != 1
+            or not frames[0].isdigit()
+            or int(frames[0]) <= 0
+        ):
+            raise RuntimeError("PDI 阅片索引包含无效帧参数")
+    return normalized
+
+
 def run_server(
     root: str | Path,
     *,
@@ -501,6 +775,7 @@ def run_server(
     quiet: bool = False,
     logger: logging.Logger | None = None,
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    session_token: str | None = None,
 ) -> int:
     pdi_root = validate_pdi_root(root)
     with PdiHttpServer(
@@ -510,8 +785,9 @@ def run_server(
         quiet=quiet,
         logger=logger,
         idle_timeout_seconds=idle_timeout_seconds,
+        session_token=session_token,
     ) as server:
-        url = viewer_url(server.server_address[1])
+        url = viewer_url(server.server_address[1], server.session_token)
         if logger is not None:
             logger.info(
                 "SESSION START pid=%s frozen=%s port=%s",
@@ -542,6 +818,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--quiet", action="store_true", help="不输出 HTTP 访问日志")
     parser.add_argument(
+        "--session-token",
+        default="",
+        help="高熵本机会话令牌；留空时自动生成",
+    )
+    parser.add_argument(
         "--idle-timeout",
         type=int,
         default=DEFAULT_IDLE_TIMEOUT_SECONDS,
@@ -564,6 +845,7 @@ def main(argv: list[str] | None = None) -> int:
             quiet=args.quiet,
             logger=logger,
             idle_timeout_seconds=args.idle_timeout,
+            session_token=args.session_token or None,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         if logger is not None:

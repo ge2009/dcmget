@@ -7,6 +7,7 @@ import pytest
 
 from DICOM_download_ui import build_parser, validate_frozen_pdi_resources
 from dcmget import __version__
+from dcmget.pdi_server import PdiRequestHandler
 from dcmget.release_notes import load_release_notes
 from scripts.build_deploy_bundle import VERSION as DEPLOY_VERSION, source_files
 from scripts.build_windows import validate_release_version
@@ -42,6 +43,7 @@ def test_release_version_sources_and_ui_self_test_flag_stay_in_sync():
     )
 
     assert DEPLOY_VERSION == __version__
+    assert PdiRequestHandler.server_version == f"DcmGetPDI/{__version__}"
     assert f"default: {__version__}" in windows_workflow
     assert build_parser().parse_args(["--ui-self-test"]).ui_self_test
 
@@ -55,6 +57,20 @@ def test_windows_release_artifacts_are_split_to_avoid_duplicate_runtime_download
     for suffix in ("Setup-x64", "Portable-x64", "Windows-x64-ZIP"):
         assert f"DcmGet-${{{{ inputs.version }}}}-{suffix}" in workflow
     assert "name: DcmGet-${{ inputs.version }}-windows-x64\n" not in workflow
+
+
+def test_windows_pdi_smoke_uses_authenticated_directory_entry():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "secrets.token_urlsafe(32)" in workflow
+    assert '"--session-token", $token' in workflow
+    assert '"http://127.0.0.1:$port/ready/$token"' in workflow
+    assert '"http://127.0.0.1:$port/open/$token" -WebSession $session' in workflow
+    assert '"dicomweb:/DICOM/I000001"' in workflow
+    assert "/viewer/dicomjson/" not in workflow
 
 
 def test_windows_upgrade_uses_a_pinned_real_previous_release_build():

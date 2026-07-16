@@ -792,10 +792,10 @@ class PdiExporter:
                 "</article>"
             )
         launch = (
-            '<div class="launch"><strong>查看影像请从本目录启动离线阅片器</strong>'
-            "<p>Windows：返回目录双击 OPEN_VIEWER.exe（推荐）或 OPEN_VIEWER.bat</p>"
-            "<p>macOS：双击 OPEN_VIEWER.command</p>"
-            "<p>Linux：运行 OPEN_VIEWER.sh</p></div>"
+            '<div class="launch"><strong>这是检查清单，不是阅片器</strong>'
+            "<p>查看影像无需选择 JSON、DICOMDIR 或逐个文件，请返回当前目录运行："
+            "Windows 双击 OPEN_VIEWER.exe（推荐）或 OPEN_VIEWER.bat；"
+            "macOS 双击 OPEN_VIEWER.command；Linux 运行 OPEN_VIEWER.sh。</p></div>"
             if viewer_included
             else (
                 '<div class="warning"><strong>此页仅显示检查清单，不能直接看图。</strong> '
@@ -860,7 +860,8 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
 使用方法：
 1. 将整个目录复制到 U 盘，不要只复制部分文件。
 2. {viewer}
-3. INDEX.HTM 只用于查看目录说明和检查清单，不能直接显示 DICOM 图像。
+3. INDEX.HTM 只用于查看目录说明和检查清单，不能直接显示 DICOM 图像；
+   无需选择 JSON、DICOMDIR 或逐个影像文件。
 
 {profile}
 离线阅片器直接读取目录中的原始 DICOM，不生成 JPEG 预览，也不会连接 PACS 或公网。

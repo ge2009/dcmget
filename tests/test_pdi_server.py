@@ -26,6 +26,43 @@ def _write_viewer_checksums(root: Path) -> None:
     checksum_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _study_index_payload(
+    url: str = "dicomweb:/DICOM/I000001",
+) -> dict[str, object]:
+    return {
+        "studies": [
+            {
+                "StudyInstanceUID": "1.2.3",
+                "series": [
+                    {
+                        "SeriesInstanceUID": "1.2.3.4",
+                        "instances": [{"metadata": {}, "url": url}],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def _write_study_index(
+    root: Path,
+    payload: object | None = None,
+    *,
+    legacy: bool = False,
+) -> Path:
+    path = (
+        root / pdi_server.LEGACY_STUDY_INDEX
+        if legacy
+        else root / pdi_server.STUDY_INDEX
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(_study_index_payload() if payload is None else payload),
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.fixture
 def served_pdi(tmp_path: Path):
     (tmp_path / "VIEWER" / "OHIF").mkdir(parents=True)
@@ -34,9 +71,7 @@ def served_pdi(tmp_path: Path):
     (tmp_path / "VIEWER" / ".dcmget").mkdir()
     (tmp_path / "DICOM").mkdir()
     (tmp_path / "DICOM" / "I000001").write_bytes(b"0123456789")
-    (tmp_path / "VIEWER" / ".dcmget" / "index").write_text(
-        json.dumps({"studies": []}), encoding="utf-8"
-    )
+    _write_study_index(tmp_path)
     server = PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -48,9 +83,15 @@ def served_pdi(tmp_path: Path):
         thread.join(timeout=3)
 
 
-def _request(server: PdiHttpServer, path: str, headers: dict[str, str] | None = None):
+def _request(
+    server: PdiHttpServer,
+    path: str,
+    headers: dict[str, str] | None = None,
+    *,
+    method: str = "GET",
+):
     connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
-    connection.request("GET", path, headers=headers or {})
+    connection.request(method, path, headers=headers or {})
     response = connection.getresponse()
     body = response.read()
     result = response.status, dict(response.getheaders()), body
@@ -58,26 +99,76 @@ def _request(server: PdiHttpServer, path: str, headers: dict[str, str] | None = 
     return result
 
 
-def test_server_serves_spa_manifest_and_extensionless_dicom(served_pdi) -> None:
-    status, headers, body = _request(served_pdi, "/viewer/dicomjson/?url=x&lng=zh")
+def _authenticate(server: PdiHttpServer) -> dict[str, str]:
+    status, headers, body = _request(server, f"/open/{server.session_token}")
+    assert status == 303 and body == b""
+    return {"Cookie": headers["Set-Cookie"].partition(";")[0]}
+
+
+def test_server_opens_authenticated_session_and_redirects_to_directory(
+    served_pdi,
+) -> None:
+    status, _headers, _body = _request(served_pdi, "/api/studies")
+    assert status == 403
+
+    status, headers, body = _request(
+        served_pdi, f"/open/{served_pdi.session_token}"
+    )
+    assert status == 303 and body == b""
+    assert headers["Location"] == (
+        "/viewer/directory/?url=%2Fapi%2Fstudies&lng=zh"
+    )
+    cookie = headers["Set-Cookie"]
+    assert cookie.startswith(f"{served_pdi.cookie_name}={served_pdi.session_token};")
+    assert "Path=/" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Strict" in cookie
+
+    status, _headers, _body = _request(
+        served_pdi,
+        f"/ready/{served_pdi.session_token}",
+        method="HEAD",
+    )
+    assert status == 200
+    status, _headers, _body = _request(
+        served_pdi,
+        "/ready/invalid-token",
+        method="HEAD",
+    )
+    assert status == 404
+
+
+def test_server_serves_directory_index_and_allowlisted_dicom(served_pdi) -> None:
+    authenticated = _authenticate(served_pdi)
+    status, headers, body = _request(
+        served_pdi,
+        "/viewer/directory/?url=%2Fapi%2Fstudies&lng=zh",
+        authenticated,
+    )
     assert status == 200 and body == b"OHIF INDEX"
     assert headers["Cross-Origin-Opener-Policy"] == "same-origin"
     assert headers["Cache-Control"] == "no-store"
     assert headers["Permissions-Policy"] == "camera=(), microphone=(), geolocation=()"
     assert "connect-src 'self'" in headers["Content-Security-Policy"]
 
-    status, headers, body = _request(served_pdi, "/api/studies")
-    assert status == 200 and json.loads(body)["studies"] == []
+    status, headers, body = _request(served_pdi, "/api/studies", authenticated)
+    assert status == 200 and len(json.loads(body)["studies"]) == 1
     assert headers["Cache-Control"] == "no-store"
 
-    status, _headers, _body = _request(served_pdi, "/api/unknown")
+    status, _headers, _body = _request(
+        served_pdi, "/api/unknown", authenticated
+    )
     assert status == 404
 
     for private_path in ("/DCMGET_STUDIES.json", "/VIEWER/.dcmget/index"):
-        status, _headers, _body = _request(served_pdi, private_path)
+        status, _headers, _body = _request(
+            served_pdi, private_path, authenticated
+        )
         assert status == 404
 
-    status, headers, body = _request(served_pdi, "/DICOM/I000001")
+    status, headers, body = _request(
+        served_pdi, "/DICOM/I000001", authenticated
+    )
     assert status == 200 and body == b"0123456789"
     assert headers["Content-Type"] == "application/dicom"
 
@@ -86,10 +177,13 @@ def test_windowed_server_serves_when_stderr_is_unavailable(
     served_pdi, monkeypatch
 ) -> None:
     served_pdi.quiet = False
+    authenticated = _authenticate(served_pdi)
     with monkeypatch.context() as context:
         context.setattr(sys, "stderr", None)
         status, _headers, body = _request(
-            served_pdi, "/viewer/dicomjson/?url=x&lng=zh"
+            served_pdi,
+            "/viewer/directory/?url=%2Fapi%2Fstudies&lng=zh",
+            authenticated,
         )
     assert status == 200
     assert body == b"OHIF INDEX"
@@ -113,51 +207,70 @@ def test_viewer_diagnostic_log_is_private(tmp_path, monkeypatch) -> None:
 
 
 def test_server_supports_byte_ranges(served_pdi) -> None:
+    authenticated = _authenticate(served_pdi)
     status, headers, body = _request(
-        served_pdi, "/DICOM/I000001?frame=1", {"Range": "bytes=2-5"}
+        served_pdi,
+        "/DICOM/I000001?frame=1",
+        {**authenticated, "Range": "bytes=2-5"},
     )
     assert status == 206 and body == b"2345"
     assert headers["Content-Range"] == "bytes 2-5/10"
 
     status, error_headers, _body = _request(
-        served_pdi, "/DICOM/I000001", {"Range": "bytes=99-100"}
+        served_pdi,
+        "/DICOM/I000001",
+        {**authenticated, "Range": "bytes=99-100"},
     )
     assert status == 416
     assert error_headers["Content-Range"] == "bytes */10"
     assert error_headers["Cache-Control"] == "no-store"
 
     status, headers, body = _request(
-        served_pdi, "/DICOM/I000001", {"Range": "bytes=0-9"}
+        served_pdi,
+        "/DICOM/I000001",
+        {**authenticated, "Range": "bytes=0-9"},
     )
     assert status == 206 and body == b"0123456789"
     assert headers["Content-Range"] == "bytes 0-9/10"
 
 
 def test_server_rejects_escape_and_writes_nothing(served_pdi, tmp_path: Path) -> None:
-    status, _headers, _body = _request(served_pdi, "/DICOM/../../secret")
-    assert status == 404
-    connection = http.client.HTTPConnection(
-        "127.0.0.1", served_pdi.server_address[1]
+    authenticated = _authenticate(served_pdi)
+    status, _headers, _body = _request(
+        served_pdi, "/DICOM/../../secret", authenticated
     )
-    connection.request("POST", "/DICOM/I000001", body=b"replace")
-    response = connection.getresponse()
-    response.read()
-    assert response.status == 405
-    connection.close()
+    assert status == 404
+    status, _headers, _body = _request(
+        served_pdi,
+        "/DICOM/I000001",
+        authenticated,
+        method="POST",
+    )
+    assert status == 405
     assert (Path(served_pdi.pdi_root) / "DICOM" / "I000001").read_bytes() == b"0123456789"
 
-    status, error_headers, body = _request(served_pdi, "/missing-script.js")
+    status, error_headers, body = _request(
+        served_pdi, "/missing-script.js", authenticated
+    )
     assert status == 404 and b"OHIF INDEX" not in body
     assert error_headers["Cache-Control"] == "no-store"
+
+    unlisted = Path(served_pdi.pdi_root) / "DICOM" / "I999999"
+    unlisted.write_bytes(b"not indexed")
+    status, _headers, _body = _request(
+        served_pdi, "/DICOM/I999999", authenticated
+    )
+    assert status == 404
 
 
 def test_root_validation_and_viewer_url(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="PDI 目录不完整"):
         validate_pdi_root(tmp_path)
-    assert viewer_url(12345) == (
-        "http://127.0.0.1:12345/viewer/dicomjson/"
-        "?url=%2Fapi%2Fstudies&lng=zh"
-    )
+    token = pdi_server.generate_session_token()
+    assert viewer_url(12345, token) == f"http://127.0.0.1:12345/open/{token}"
+    assert pdi_server.VIEWER_PATH == "/viewer/directory/"
+    with pytest.raises(ValueError, match="令牌"):
+        viewer_url(12345, "weak")
 
 
 def test_server_rejects_untrusted_host_and_non_loopback_binding(served_pdi) -> None:
@@ -171,6 +284,130 @@ def test_server_rejects_untrusted_host_and_non_loopback_binding(served_pdi) -> N
 
     with pytest.raises(ValueError, match="127.0.0.1"):
         PdiHttpServer(Path(served_pdi.pdi_root), "0.0.0.0", 0, quiet=True)
+
+
+def test_cookie_is_required_for_static_api_and_dicom(served_pdi) -> None:
+    for path in (
+        "/viewer/directory/",
+        "/api/studies",
+        "/DICOM/I000001",
+    ):
+        status, _headers, _body = _request(served_pdi, path)
+        assert status == 403
+        status, _headers, _body = _request(
+            served_pdi,
+            path,
+            {"Cookie": f"{served_pdi.cookie_name}=wrong"},
+        )
+        assert status == 403
+
+
+def test_service_cookie_names_are_unique(served_pdi) -> None:
+    second = PdiHttpServer(
+        Path(served_pdi.pdi_root),
+        "127.0.0.1",
+        0,
+        quiet=True,
+        session_token=served_pdi.session_token,
+    )
+    try:
+        assert second.cookie_name != served_pdi.cookie_name
+    finally:
+        second.server_close()
+
+
+def test_study_index_is_cached_in_memory(tmp_path: Path) -> None:
+    (tmp_path / "VIEWER" / "OHIF").mkdir(parents=True)
+    (tmp_path / "VIEWER" / "OHIF" / "index.html").write_text("OHIF")
+    (tmp_path / "DICOM").mkdir()
+    (tmp_path / "DICOM" / "I000001").write_bytes(b"dicom")
+    index_path = _write_study_index(tmp_path)
+    expected = index_path.read_bytes()
+    server = PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
+    index_path.write_text('{"studies": []}', encoding="utf-8")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        authenticated = _authenticate(server)
+        status, _headers, body = _request(
+            server, "/api/studies", authenticated
+        )
+        assert status == 200 and body == expected
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"studies": {}},
+        {"studies": [{"series": {}}]},
+        {"studies": [{"series": [{"instances": {}}]}]},
+        {
+            "studies": [
+                {"series": [{"instances": [{"metadata": {}, "url": 3}]}]}
+            ]
+        },
+        _study_index_payload("https://evil.example/DICOM/I000001"),
+        _study_index_payload("dicomweb:/DICOM/../secret"),
+        _study_index_payload("dicomweb:/DICOM/missing"),
+        _study_index_payload("dicomweb:/DICOM/I000001?frame=0"),
+    ],
+)
+def test_server_rejects_invalid_study_index(tmp_path: Path, payload: object) -> None:
+    (tmp_path / "DICOM").mkdir()
+    (tmp_path / "DICOM" / "I000001").write_bytes(b"dicom")
+    _write_study_index(tmp_path, payload)
+    with pytest.raises(RuntimeError, match="索引"):
+        PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
+
+
+def test_server_rejects_malformed_or_oversized_study_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "DICOM").mkdir()
+    index_path = _write_study_index(tmp_path, {"studies": []})
+    index_path.write_bytes(b"not-json")
+    with pytest.raises(RuntimeError, match="索引格式"):
+        PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
+
+    index_path.write_text('{"studies": []}', encoding="utf-8")
+    monkeypatch.setattr(pdi_server, "MAX_STUDY_INDEX_BYTES", 1)
+    with pytest.raises(RuntimeError, match="64 MiB"):
+        PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
+
+
+def test_server_rejects_dicom_replaced_with_symlink(tmp_path: Path) -> None:
+    (tmp_path / "VIEWER" / "OHIF").mkdir(parents=True)
+    (tmp_path / "VIEWER" / "OHIF" / "index.html").write_text("OHIF")
+    (tmp_path / "DICOM").mkdir()
+    dicom_path = tmp_path / "DICOM" / "I000001"
+    dicom_path.write_bytes(b"dicom")
+    _write_study_index(tmp_path)
+    server = PdiHttpServer(tmp_path, "127.0.0.1", 0, quiet=True)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"patient data")
+    dicom_path.unlink()
+    try:
+        dicom_path.symlink_to(outside)
+    except OSError:
+        server.server_close()
+        pytest.skip("symlinks are unavailable on this platform")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        authenticated = _authenticate(server)
+        status, _headers, _body = _request(
+            server, "/DICOM/I000001", authenticated
+        )
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def test_root_validation_rejects_symlinked_content(tmp_path: Path) -> None:
@@ -262,13 +499,46 @@ def test_server_exits_when_idle_and_requests_renew_timeout(tmp_path: Path) -> No
     thread.start()
     try:
         time.sleep(0.25)
-        status, _headers, _body = _request(server, "/api/studies")
+        status, _headers, _body = _request(
+            server,
+            f"/ready/{server.session_token}",
+            method="HEAD",
+        )
         assert status == 200
         time.sleep(0.25)
-        assert thread.is_alive(), "HTTP 请求未续期空闲超时"
+        assert thread.is_alive(), "已认证的就绪探测未续期空闲超时"
         thread.join(timeout=1.5)
         assert not thread.is_alive()
         assert server.idle_expired
+    finally:
+        if thread.is_alive():
+            server.shutdown()
+            thread.join(timeout=3)
+        server.server_close()
+
+
+def test_unauthorized_requests_do_not_renew_idle_timeout(tmp_path: Path) -> None:
+    (tmp_path / "VIEWER" / "OHIF").mkdir(parents=True)
+    (tmp_path / "VIEWER" / "OHIF" / "index.html").write_text("OHIF")
+    (tmp_path / "DICOM").mkdir()
+    _write_study_index(tmp_path, {"studies": []})
+    server = PdiHttpServer(
+        tmp_path,
+        "127.0.0.1",
+        0,
+        quiet=True,
+        idle_timeout_seconds=0.4,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.25)
+        status, _headers, _body = _request(server, "/api/studies")
+        assert status == 403
+        time.sleep(0.25)
+        assert server.idle_expired, "未授权请求不应续期空闲超时"
+        thread.join(timeout=1)
+        assert not thread.is_alive()
     finally:
         if thread.is_alive():
             server.shutdown()
@@ -300,11 +570,54 @@ def test_legacy_index_is_private_but_still_supported(tmp_path: Path) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        status, _headers, body = _request(server, "/api/studies")
+        status, headers, body = _request(server, f"/open/{server.session_token}")
+        assert status == 303 and body == b""
+        assert headers["Location"] == (
+            "/viewer/dicomjson/?url=%2Fapi%2Fstudies&lng=zh"
+        )
+        authenticated = {
+            "Cookie": headers["Set-Cookie"].partition(";")[0]
+        }
+        status, _headers, body = _request(
+            server,
+            "/viewer/dicomjson/?url=%2Fapi%2Fstudies&lng=zh",
+            authenticated,
+        )
+        assert status == 200 and body == b"OHIF"
+        status, _headers, body = _request(
+            server, "/api/studies", authenticated
+        )
         assert status == 200 and json.loads(body)["studies"] == []
-        status, _headers, _body = _request(server, "/DCMGET_STUDIES.json")
+        status, _headers, _body = _request(
+            server, "/DCMGET_STUDIES.json", authenticated
+        )
         assert status == 404
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_repeated_frames_validate_one_dicom_path_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "DICOM").mkdir()
+    (tmp_path / "DICOM" / "I000001").write_bytes(b"DICOM")
+    payload = _study_index_payload("dicomweb:/DICOM/I000001?frame=1")
+    instances = payload["studies"][0]["series"][0]["instances"]
+    instances.append(
+        {"metadata": {}, "url": "dicomweb:/DICOM/I000001?frame=2"}
+    )
+    calls = []
+    real_safe_path = pdi_server._safe_dicom_path
+
+    def counted_safe_path(root, request_path):
+        calls.append(request_path)
+        return real_safe_path(root, request_path)
+
+    monkeypatch.setattr(pdi_server, "_safe_dicom_path", counted_safe_path)
+
+    assert pdi_server._validate_study_index(payload, tmp_path) == {
+        "/DICOM/I000001"
+    }
+    assert calls == ["/DICOM/I000001"]

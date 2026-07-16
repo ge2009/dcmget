@@ -467,7 +467,8 @@ def test_frozen_windows_export_uses_bundled_physical_server_script(
     assert (output / "OPEN_VIEWER.bat").is_file()
     assert (output / "MANIFEST.SHA256").is_file()
     index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
-    assert "查看影像请从本目录启动离线阅片器" in index_html
+    assert "这是检查清单，不是阅片器" in index_html
+    assert "无需选择 JSON、DICOMDIR 或逐个文件" in index_html
     assert "OPEN_VIEWER.exe（推荐）" in index_html
     assert "本次导出未能加入离线阅片器" not in index_html
 

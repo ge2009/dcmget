@@ -57,10 +57,23 @@ jobs:
       - name: Verify DCMTK version and PDI tools
         run: python -c "from dcmget.core import DcmtkResolver; t=DcmtkResolver().resolve(); assert t.version == '3.7.0'; assert t.dcmmkdir"
 
-      - name: Run unit, UI and DICOM integration tests
+      - name: Run unit and DICOM integration tests
+        run: >-
+          python -m pytest -q
+          --ignore=tests/test_auth_ui.py
+          --ignore=tests/test_diagnostics.py
+          --ignore=tests/test_pdi_ui.py
+          --ignore=tests/test_ui.py
+
+      - name: Run UI tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q
+        run: >-
+          python -m pytest -q
+          tests/test_auth_ui.py
+          tests/test_diagnostics.py
+          tests/test_pdi_ui.py
+          tests/test_ui.py
 
       - name: Build source deployment package
         if: matrix.dcmtk == 'linux-x86_64'
@@ -70,10 +83,10 @@ jobs:
         if: matrix.dcmtk == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: dcmget-2.6.2-source-deploy
+          name: dcmget-2.6.3-source-deploy
           path: |
-            release/dcmget-2.6.2-source-deploy.zip
-            release/dcmget-2.6.2-source-deploy.zip.sha256
+            release/dcmget-2.6.3-source-deploy.zip
+            release/dcmget-2.6.3-source-deploy.zip.sha256
           if-no-files-found: error
 
   minimum-python:
@@ -98,5 +111,6 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pytest -q -m "not integration"
+          python -m pytest -q -m "not integration" --ignore=tests/test_auth_ui.py --ignore=tests/test_diagnostics.py --ignore=tests/test_pdi_ui.py --ignore=tests/test_ui.py
+          python -m pytest -q tests/test_auth_ui.py tests/test_diagnostics.py tests/test_pdi_ui.py tests/test_ui.py
           python DICOM_download_ui.py --ui-self-test --config "${{ runner.temp }}/dcmget-ui-self-test.json"

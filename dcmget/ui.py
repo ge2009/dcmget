@@ -94,6 +94,7 @@ from .core import (
 from .diagnostics import diagnostic_log_directory, record_exception
 from .licensing import consume_trial, trial_task_consumed
 from .release_notes import load_release_notes
+from .runtime import is_frozen, resource_root
 from .task_state import (
     TaskCheckpoint,
     TaskCheckpointStore,
@@ -121,46 +122,35 @@ PDI_VIEWER_START_TIMEOUT_MS = 30_000
 
 
 def pdi_viewer_command(directory: str | Path) -> tuple[str, list[str]] | None:
-    """Return a safe detached command for a viewer bundled in one PDI root."""
+    """Return the trusted local server command for one complete PDI root."""
 
     root = Path(directory).expanduser().resolve()
     if not root.is_dir():
         return None
-
-    standalone_names = (
-        ("OPEN_VIEWER.exe", "OPEN_VIEWER")
-        if sys.platform == "win32"
-        else ("OPEN_VIEWER",)
+    viewer_index = root / "VIEWER" / "OHIF" / "index.html"
+    study_indexes = (
+        root / "VIEWER" / ".dcmget" / "index",
+        root / "DCMGET_STUDIES.json",
     )
-    for name in standalone_names:
-        executable = root / name
-        if executable.is_file() and not executable.is_symlink():
-            return str(executable), ["--root", str(root), "--quiet"]
-
-    server_script = root / "VIEWER" / "pdi_server.py"
     if (
-        server_script.is_file()
-        and not server_script.is_symlink()
-        and not bool(getattr(sys, "frozen", False))
+        not viewer_index.is_file()
+        or viewer_index.is_symlink()
+        or not any(path.is_file() and not path.is_symlink() for path in study_indexes)
     ):
-        return str(Path(sys.executable).resolve()), [
-            str(server_script),
-            "--root",
-            str(root),
-            "--quiet",
-        ]
-
-    if sys.platform == "win32":
-        batch = root / "OPEN_VIEWER.bat"
-        if batch.is_file() and not batch.is_symlink():
-            return "cmd.exe", ["/d", "/s", "/c", str(batch)]
         return None
 
-    launcher = root / (
-        "OPEN_VIEWER.command" if sys.platform == "darwin" else "OPEN_VIEWER.sh"
-    )
-    if launcher.is_file() and not launcher.is_symlink():
-        return "/bin/sh", [str(launcher)]
+    base_arguments = ["--root", str(root), "--quiet"]
+    if is_frozen():
+        trusted_executable = resource_root() / "DcmGetPdiServer.exe"
+        if trusted_executable.is_file() and not trusted_executable.is_symlink():
+            return str(trusted_executable), base_arguments
+    else:
+        trusted_script = Path(__file__).with_name("pdi_server.py")
+        if trusted_script.is_file() and not trusted_script.is_symlink():
+            return str(Path(sys.executable).resolve()), [
+                str(trusted_script),
+                *base_arguments,
+            ]
     return None
 
 
@@ -348,12 +338,12 @@ class SettingsPage(QWidget):
         pdi_card.setObjectName("Card")
         pdi_layout = QVBoxLayout(pdi_card)
         pdi_header = QHBoxLayout()
-        pdi_heading = QLabel("PDI 便携目录导出")
+        pdi_heading = QLabel("PDI 便携阅片目录")
         pdi_heading.setObjectName("SectionTitle")
         pdi_header.addWidget(pdi_heading)
         pdi_header.addStretch()
         self.pdi_enabled_checkbox = QCheckBox("每批下载完成后自动生成")
-        self.pdi_enabled_checkbox.setAccessibleName("自动生成 PDI 便携目录")
+        self.pdi_enabled_checkbox.setAccessibleName("自动生成 PDI 便携阅片目录")
         pdi_header.addWidget(self.pdi_enabled_checkbox)
         self.pdi_card_toggle = QToolButton()
         self.pdi_card_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -376,17 +366,24 @@ class SettingsPage(QWidget):
         pdi_output_layout = QHBoxLayout(pdi_output_row)
         pdi_output_layout.setContentsMargins(0, 0, 0, 0)
         self.pdi_output_edit = QLineEdit()
-        self.pdi_output_edit.setPlaceholderText("留空时保存到 DICOM 目录/PDI")
+        self.pdi_output_edit.setPlaceholderText("留空时使用 DICOM 保存目录/PDI")
         self.pdi_output_button = QPushButton("选择目录")
         self.pdi_output_button.clicked.connect(self._browse_pdi_output)
         pdi_output_layout.addWidget(self.pdi_output_edit, 1)
         pdi_output_layout.addWidget(self.pdi_output_button)
-        pdi_form.addRow("输出根目录", pdi_output_row)
+        pdi_form.addRow("保存位置", pdi_output_row)
+        self.pdi_output_hint = QLabel(
+            "每批会在此位置自动新建 DCMGET_PDI_… 子目录。"
+        )
+        self.pdi_output_hint.setObjectName("FieldHint")
+        self.pdi_output_hint.setWordWrap(True)
+        pdi_form.addRow("", self.pdi_output_hint)
 
-        self.pdi_ohif_checkbox = QCheckBox("生成后可直接阅片（推荐）")
+        self.pdi_ohif_checkbox = QCheckBox("在目录内附带离线阅片器（推荐）")
         pdi_form.addRow("DICOM 查看器", self.pdi_ohif_checkbox)
         self.pdi_ohif_hint = QLabel(
-            "直接读取目录中的原始 DICOM，不生成 JPG；无需选择索引文件。"
+            "直接读取目录中的原始 DICOM，不生成 JPG；"
+            "无需选择 JSON、DICOMDIR 或逐个影像文件。"
         )
         self.pdi_ohif_hint.setObjectName("FieldHint")
         self.pdi_ohif_hint.setWordWrap(True)
@@ -593,7 +590,7 @@ class SettingsPage(QWidget):
 
     def _browse_pdi_output(self) -> None:
         selected = QFileDialog.getExistingDirectory(
-            self, "选择 PDI 输出根目录", self.pdi_output_edit.text()
+            self, "选择 PDI 保存位置", self.pdi_output_edit.text()
         )
         if selected:
             self.pdi_output_edit.setText(selected)
@@ -1090,20 +1087,21 @@ class DcmGetWindow(QMainWindow):
         pdi_status_layout.setContentsMargins(14, 10, 14, 10)
         pdi_status_layout.setSpacing(8)
         pdi_status_header = QHBoxLayout()
-        pdi_title = QLabel("PDI 便携目录")
+        pdi_title = QLabel("PDI 便携阅片目录")
         pdi_title.setObjectName("SectionTitle")
         pdi_status_header.addWidget(pdi_title)
         self.pdi_status_label = QLabel("下载完成后自动生成")
         self.pdi_status_label.setObjectName("PdiStatusText")
         self.pdi_status_label.setWordWrap(True)
         pdi_status_header.addWidget(self.pdi_status_label, 1)
-        self.pdi_view_button = QPushButton("立即阅片")
+        self.pdi_view_button = QPushButton("打开影像")
         self.pdi_view_button.setObjectName("PrimaryButton")
         self.pdi_view_button.setEnabled(False)
-        self.pdi_view_button.setToolTip("从当前 PDI 目录启动本地离线阅片器")
+        self.pdi_view_button.setToolTip("从当前导出目录启动离线阅片器并打开影像")
         self.pdi_view_button.clicked.connect(self._open_pdi_viewer)
-        self.pdi_open_button = QPushButton("打开文件夹")
+        self.pdi_open_button = QPushButton("打开导出目录")
         self.pdi_open_button.setEnabled(False)
+        self.pdi_open_button.setToolTip("打开本批 PDI 导出目录")
         self.pdi_open_button.clicked.connect(self._open_pdi_directory)
         self.pdi_retry_button = QPushButton("重试 PDI")
         self.pdi_retry_button.setEnabled(False)
@@ -2275,7 +2273,7 @@ class DcmGetWindow(QMainWindow):
                 return
         self.last_pdi_result = None
         self.pdi_status_card.show()
-        self._set_pdi_status("准备生成 PDI 便携目录…", "pending")
+        self._set_pdi_status("准备生成 PDI 便携阅片目录…", "pending")
         self.pdi_progress_bar.setRange(0, 0)
         self.pdi_view_button.setEnabled(False)
         self.pdi_open_button.setEnabled(False)
@@ -2331,6 +2329,8 @@ class DcmGetWindow(QMainWindow):
         message = str(getattr(result, "message", "") or status_text or "PDI 导出已结束")
         warnings = list(getattr(result, "warnings", []) or [])
         output_directory = str(getattr(result, "output_directory", "") or "")
+        if status_text == "完成" and output_directory:
+            message = f"PDI 便携阅片目录已生成：{Path(output_directory).name}"
         if warnings:
             message += f" 共 {len(warnings)} 条警告，详见运行日志。"
 
@@ -2360,7 +2360,7 @@ class DcmGetWindow(QMainWindow):
         self._save_pdi_checkpoint_status(completed=status_text == "完成")
 
         if status_text == "完成":
-            pdi_message = f"PDI 便携目录已生成：{output_directory}"
+            pdi_message = f"PDI 便携阅片目录已生成：{output_directory}"
         elif status_text == "部分成功":
             pdi_message = f"PDI 已生成，但离线阅片器有部分未完成。\n{message}"
         elif status_text == "已取消":
@@ -2490,7 +2490,7 @@ class DcmGetWindow(QMainWindow):
                 else:
                     self._append_log(
                         "PDI",
-                        "离线阅片服务正在启动，请稍后再点击“立即阅片”",
+                        "离线阅片服务正在启动，请稍后再点击“打开影像”",
                         "info",
                     )
                 return
@@ -2499,6 +2499,9 @@ class DcmGetWindow(QMainWindow):
         viewer_url = ""
         controls_browser = "--root" in arguments
         if controls_browser:
+            from .pdi_server import generate_session_token
+
+            session_token = generate_session_token()
             port = 0
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -2508,6 +2511,8 @@ class DcmGetWindow(QMainWindow):
                 record_exception("DcmGetWindow._open_pdi_viewer.port", exc)
             arguments = [
                 *arguments,
+                "--session-token",
+                session_token,
                 "--port",
                 str(port),
                 "--no-browser",
@@ -2515,7 +2520,7 @@ class DcmGetWindow(QMainWindow):
             if port:
                 from .pdi_server import viewer_url as build_viewer_url
 
-                viewer_url = build_viewer_url(port)
+                viewer_url = build_viewer_url(port, session_token)
         process = QProcess(self)
         process.setWorkingDirectory(str(root))
         process.readyReadStandardOutput.connect(
@@ -2561,8 +2566,21 @@ class DcmGetWindow(QMainWindow):
             or port <= 0
         ):
             return
+        path = candidate.path()
+        token_prefix = "/open/"
+        if path.startswith(token_prefix):
+            session_token = path[len(token_prefix) :]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", session_token):
+                return
+            probe_url = (
+                f"http://127.0.0.1:{port}/ready/{session_token}"
+            )
+        elif path in {"/viewer/directory/", "/viewer/dicomjson/"}:
+            probe_url = f"http://127.0.0.1:{port}/api/studies"
+        else:
+            return
         self._pdi_viewer_url = candidate.toString()
-        self._pdi_viewer_probe_url = f"http://127.0.0.1:{port}/api/studies"
+        self._pdi_viewer_probe_url = probe_url
 
     def _capture_pdi_viewer_url(self, process: QProcess | None = None) -> None:
         current = process or self._pdi_viewer_process

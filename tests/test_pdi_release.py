@@ -125,7 +125,8 @@ def test_ohif_payload_overlays_offline_config_and_detects_tampering(tmp_path: Pa
     config = (payload / "app-config.js").read_text(encoding="utf-8")
     assert "https://" not in config and "http://" not in config
     assert "dataSourcesModule.dicomjson" in config
-    assert "defaultDataSourceName: 'dicomjson'" in config
+    assert "defaultDataSourceName: 'directory'" in config
+    assert "sourceName: 'directory'" in config
     assert "/dicomweb" not in config
     service_worker = (payload / "init-service-worker.js").read_text(encoding="utf-8")
     assert "https://" not in service_worker and "http://" not in service_worker

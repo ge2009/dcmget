@@ -1,8 +1,8 @@
 /** @type {AppTypes.Config} */
 
-// DcmGet PDI serves this bundle, its manifest and DICOM objects from one
-// 127.0.0.1 origin. Keep only the DICOM JSON source: no PACS, OIDC, sharing,
-// cloud service, external CDN or demonstration endpoint is permitted here.
+// DcmGet PDI serves this bundle, its private directory catalogue and DICOM
+// objects from one 127.0.0.1 origin. Keep only the local directory source: no
+// PACS, OIDC, sharing, cloud service, external CDN or demonstration endpoint.
 window.config = {
   name: 'DcmGet PDI',
   routerBasename: null,
@@ -51,14 +51,14 @@ window.config = {
     thumbnail: 5,
     prefetch: 6,
   },
-  defaultDataSourceName: 'dicomjson',
+  defaultDataSourceName: 'directory',
   dataSources: [
     {
       namespace: '@ohif/extension-default.dataSourcesModule.dicomjson',
-      sourceName: 'dicomjson',
+      sourceName: 'directory',
       configuration: {
         friendlyName: 'DcmGet PDI 本地影像',
-        name: 'dicomjson',
+        name: 'directory',
       },
     },
   ],
