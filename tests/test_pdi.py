@@ -413,7 +413,9 @@ def test_crash_recovery_reuses_published_directory(
     assert restored.status == PdiStatus.COMPLETED
     assert restored.output_directory == original.output_directory
     marker = json.loads(
-        (Path(restored.output_directory) / pdi.RECOVERY_MARKER).read_text()
+        (Path(restored.output_directory) / pdi.RECOVERY_MARKER).read_text(
+            encoding="utf-8"
+        )
     )
     assert marker["version"] == 2 and marker["indexed_count"] == 1
 
