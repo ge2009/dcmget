@@ -1448,6 +1448,18 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         except OSError:
             if process.poll() is None:
                 process.kill()
+        # Signal delivery and process-state updates are asynchronous on macOS.
+        # Give the kernel a short window to retire the orphaned group before
+        # reporting cleanup complete to the worker thread.
+        kill_deadline = time.monotonic() + 1
+        while time.monotonic() < kill_deadline:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            time.sleep(0.05)
 
     if process.poll() is None:
         try:
