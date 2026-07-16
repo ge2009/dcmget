@@ -498,11 +498,16 @@ def test_cleanup_recovers_fork_child_after_recorded_leader_disappears(tmp_path):
     checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
     child_pid_file = tmp_path / "child.pid"
     leader_code = (
-        "import os, pathlib, sys, time; "
-        "child = os.fork(); "
-        "path = pathlib.Path(sys.argv[1]); "
-        "path.write_text(str(child) if child else str(os.getpid())); "
-        "time.sleep(30) if child == 0 else time.sleep(1)"
+        "import os, pathlib, sys, time\n"
+        "child = os.fork()\n"
+        "if child:\n"
+        "    path = pathlib.Path(sys.argv[1])\n"
+        "    temporary = path.with_suffix('.tmp')\n"
+        "    temporary.write_text(str(child))\n"
+        "    temporary.replace(path)\n"
+        "    time.sleep(1)\n"
+        "else:\n"
+        "    time.sleep(30)\n"
     )
     leader = subprocess.Popen(
         [sys.executable, "-c", leader_code, str(child_pid_file)],
