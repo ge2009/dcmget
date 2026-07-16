@@ -21,6 +21,7 @@ from .licensing import (
     machine_code,
     save_license,
     trial_status,
+    trial_task_consumed,
     validate_daily_password,
 )
 
@@ -131,7 +132,7 @@ class ActivationDialog(QDialog):
         self.accept()
 
 
-def authorize_gui() -> bool:
+def authorize_gui(resume_task_id: str | None = None) -> bool:
     if DailyPasswordDialog().exec_() != QDialog.Accepted:
         return False
     try:
@@ -141,6 +142,12 @@ def authorize_gui() -> bool:
         trial = trial_status()
         if trial.remaining > 0:
             return True
+        if resume_task_id:
+            try:
+                if trial_task_consumed(resume_task_id):
+                    return True
+            except LicenseError:
+                pass
         return (
             ActivationDialog("30 次免费试用已用完，请输入注册码。").exec_()
             == QDialog.Accepted

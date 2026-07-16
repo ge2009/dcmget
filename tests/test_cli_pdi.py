@@ -7,8 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 import DICOM_download_script as cli
+from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, PreflightResult, ToolPaths
 from dcmget.pdi import PdiExportResult, PdiStatus
+from dcmget.task_state import TaskCheckpointStore
 
 
 def _run_cli(
@@ -74,7 +76,16 @@ def _run_cli(
     exporter_factory = Mock(return_value=exporter)
     monkeypatch.setattr(cli, "PdiExporter", exporter_factory)
 
-    exit_code = cli.main(["--config", str(config), "--password", "ignored"])
+    exit_code = cli.main(
+        [
+            "--config",
+            str(config),
+            "--password",
+            "ignored",
+            "--task-state",
+            str(tmp_path / "active-task.sqlite3"),
+        ]
+    )
     return exit_code, exporter_factory
 
 
@@ -116,3 +127,184 @@ def test_cli_returns_one_when_pdi_core_tool_cannot_start(tmp_path, monkeypatch):
     )
 
     assert exit_code == 1
+
+
+def test_cli_restart_only_runs_pending_accessions(tmp_path, monkeypatch):
+    state_path = tmp_path / "active-task.sqlite3"
+    store = TaskCheckpointStore(state_path)
+    checkpoint = store.start(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ["A001", "A002"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.COMPLETED),
+    )
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = Mock()
+    runner.run.return_value = BatchSummary(
+        [AccessionResult("A002", AccessionStatus.COMPLETED)]
+    )
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(
+        cli,
+        "preflight",
+        lambda *_args: PreflightResult(tools, {}, [("DCMTK", True, "就绪")]),
+    )
+    monkeypatch.setattr(cli, "DownloadRunner", Mock(return_value=runner))
+
+    exit_code = cli.main(
+        ["--password", "ignored", "--task-state", str(state_path)]
+    )
+
+    assert exit_code == 0
+    runner.run.assert_called_once_with(["A002"])
+    assert store.load() is None
+
+
+def test_cli_restart_can_retry_pdi_without_running_download(tmp_path, monkeypatch):
+    state_path = tmp_path / "active-task.sqlite3"
+    archived = tmp_path / "dicom" / "A001.dcm"
+    store = TaskCheckpointStore(state_path)
+    checkpoint = store.start(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        ["A001"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            archived_files=[str(archived)],
+        ),
+    )
+    store.set_phase(checkpoint.task_id, "pdi_retryable")
+    tools = ToolPaths(
+        Path("movescu"),
+        Path("storescp"),
+        Path("."),
+        "3.7.0",
+        dcmmkdir=Path("dcmmkdir"),
+        dcmj2pnm=Path("dcmj2pnm"),
+    )
+    resolver = Mock()
+    resolver.resolve.return_value = tools
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(cli, "DcmtkResolver", Mock(return_value=resolver))
+    runner_factory = Mock()
+    monkeypatch.setattr(cli, "DownloadRunner", runner_factory)
+    exporter = Mock()
+    exporter.export.return_value = PdiExportResult(PdiStatus.COMPLETED)
+    exporter_factory = Mock(return_value=exporter)
+    monkeypatch.setattr(cli, "PdiExporter", exporter_factory)
+
+    exit_code = cli.main(
+        ["--password", "ignored", "--task-state", str(state_path)]
+    )
+
+    assert exit_code == 0
+    runner_factory.assert_not_called()
+    exporter.export.assert_called_once_with([str(archived)])
+    assert store.load() is None
+
+
+def test_cli_cancel_does_not_persist_unstarted_large_batch_placeholders(
+    tmp_path, monkeypatch
+):
+    values = [f"A{index:05d}" for index in range(40_000)]
+    accessions = tmp_path / "access.txt"
+    accessions.write_text("\n".join(values), encoding="utf-8")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "config_version": 4,
+                "access_numbers_file_path": str(accessions),
+                "dicom_destination_folder": str(tmp_path / "dicom"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = Mock()
+    runner.run.return_value = BatchSummary(
+        [
+            AccessionResult(value, AccessionStatus.CANCELLED)
+            for value in values
+        ],
+        cancelled=True,
+    )
+    record_result = Mock(wraps=TaskCheckpointStore.record_result)
+    monkeypatch.setattr(TaskCheckpointStore, "record_result", record_result)
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(
+        cli,
+        "preflight",
+        lambda *_args: PreflightResult(tools, {}, [("DCMTK", True, "就绪")]),
+    )
+    monkeypatch.setattr(cli, "DownloadRunner", Mock(return_value=runner))
+
+    exit_code = cli.main(
+        [
+            "--config",
+            str(config),
+            "--password",
+            "ignored",
+            "--task-state",
+            str(tmp_path / "active-task.sqlite3"),
+        ]
+    )
+
+    assert exit_code == 130
+    record_result.assert_not_called()
+
+
+def test_cli_explicit_discard_can_replace_a_corrupt_checkpoint(tmp_path, monkeypatch):
+    accessions = tmp_path / "access.txt"
+    accessions.write_text("A001\n", encoding="utf-8")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "config_version": 4,
+                "access_numbers_file_path": str(accessions),
+                "dicom_destination_folder": str(tmp_path / "dicom"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "active-task.sqlite3"
+    state_path.write_bytes(b"not a sqlite database")
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = Mock()
+    runner.run.return_value = BatchSummary(
+        [AccessionResult("A001", AccessionStatus.COMPLETED)]
+    )
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(
+        cli,
+        "preflight",
+        lambda *_args: PreflightResult(tools, {}, [("DCMTK", True, "就绪")]),
+    )
+    monkeypatch.setattr(cli, "DownloadRunner", Mock(return_value=runner))
+
+    exit_code = cli.main(
+        [
+            "--config",
+            str(config),
+            "--password",
+            "ignored",
+            "--discard-checkpoint",
+            "--task-state",
+            str(state_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert not state_path.exists()

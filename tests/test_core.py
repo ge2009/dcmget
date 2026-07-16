@@ -913,6 +913,41 @@ def test_movescu_pending_diagnostics_are_isolated_per_process(tmp_path, monkeypa
     assert second.status == AccessionStatus.NO_DATA
 
 
+def test_movescu_process_callback_tracks_start_and_stop(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    events = []
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(
+        config,
+        tools,
+        process_callback=lambda *event: events.append(event),
+    )
+
+    class Process:
+        pid = 123
+        stdout = iter(())
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("A001", staging, 1, 1)
+
+    assert result.status == AccessionStatus.NO_DATA
+    assert events == [
+        ("movescu", 123, "movescu", True),
+        ("movescu", 123, "movescu", False),
+    ]
+
+
 def test_windows_process_cleanup_kills_the_full_process_tree(monkeypatch):
     process = Mock(pid=4321)
     process.poll.return_value = None

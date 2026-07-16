@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import locale
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -62,6 +64,8 @@ class PdiExportResult:
 
 ProgressCallback = Callable[[PdiStage, int, int, str], None]
 LogCallback = Callable[[str, str, str], None]
+ProcessCallback = Callable[[str, int, str, bool], None]
+RECOVERY_MARKER = ".DCMGET-EXPORT.JSON"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,9 @@ class PdiExporter:
         weasis_payload_dir: str | Path | None = None,
         log_callback: LogCallback | None = None,
         progress_callback: ProgressCallback | None = None,
+        process_callback: ProcessCallback | None = None,
+        recovery_id: str = "",
+        reuse_published: bool = False,
     ):
         self.config = config
         self.tools = tools
@@ -128,6 +135,16 @@ class PdiExporter:
         self.progress_callback = progress_callback or (
             lambda _stage, _current, _total, _message: None
         )
+        self.process_callback = process_callback or (
+            lambda _kind, _pid, _executable, _active: None
+        )
+        normalized_recovery_id = recovery_id.strip().lower()
+        if normalized_recovery_id and not re.fullmatch(
+            r"[0-9a-f]{32}", normalized_recovery_id
+        ):
+            raise ValueError("PDI 恢复标识格式不正确")
+        self.recovery_id = normalized_recovery_id
+        self.reuse_published = bool(reuse_published and normalized_recovery_id)
         self._cancel = threading.Event()
         self._process_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
@@ -158,6 +175,15 @@ class PdiExporter:
             mode = self._preview_mode()
             output_root = self._output_root()
             output_root.mkdir(parents=True, exist_ok=True)
+            self._remove_recovery_partials(output_root)
+            if self.reuse_published:
+                published = self._find_reusable_export(output_root)
+                if published is not None:
+                    self._emit(
+                        f"已恢复上次完成的 PDI 目录：{published.output_directory}",
+                        "success" if published.status == PdiStatus.COMPLETED else "warning",
+                    )
+                    return published
             payload = self._resolve_weasis_payload()
             preview_requested = bool(
                 getattr(self.config, "pdi_include_html_preview", True)
@@ -176,6 +202,7 @@ class PdiExporter:
             final = self._next_output_directory(output_root)
             temporary = output_root / f".{final.name}.partial-{uuid.uuid4().hex[:8]}"
             temporary.mkdir(parents=False, exist_ok=False)
+            self._write_recovery_marker(temporary, result, state="building")
 
             self._progress(PdiStage.PREPARING, 0, len(source_paths), "正在检查 DICOM 文件")
             items, duplicate_count, duplicate_warnings = self._prepare_items(source_paths)
@@ -259,6 +286,15 @@ class PdiExporter:
                 viewer_included,
             )
 
+            is_partial = (not strict_profile) or preview_problem or viewer_problem
+            result.status = PdiStatus.PARTIAL if is_partial else PdiStatus.COMPLETED
+            result.message = (
+                f"PDI 便携目录已生成，包含 {len(items)} 个 DICOM 文件"
+                if result.status == PdiStatus.COMPLETED
+                else f"PDI 目录已生成，但有 {len(result.warnings)} 条警告"
+            )
+            self._write_recovery_marker(temporary, result, state="published")
+
             self._progress(PdiStage.VERIFYING, 0, 1, "正在生成 SHA-256 校验清单")
             self._write_manifest(temporary)
             self._verify_published_content(temporary, items)
@@ -267,14 +303,7 @@ class PdiExporter:
             temporary.rename(final)
             temporary = None
 
-            is_partial = (not strict_profile) or preview_problem or viewer_problem
-            result.status = PdiStatus.PARTIAL if is_partial else PdiStatus.COMPLETED
             result.output_directory = str(final)
-            result.message = (
-                f"PDI 便携目录已生成，包含 {len(items)} 个 DICOM 文件"
-                if result.status == PdiStatus.COMPLETED
-                else f"PDI 目录已生成，但有 {len(result.warnings)} 条警告"
-            )
             self._emit(result.message, "success" if not is_partial else "warning")
             return result
         except _Cancelled:
@@ -783,6 +812,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             raise PdiCoreToolError(f"无法启动 {Path(command[0]).name}：{exc}") from exc
         with self._process_lock:
             self._current_process = process
+        self._notify_process(process.pid, command[0], True)
         try:
             while True:
                 if self._cancel.is_set():
@@ -799,6 +829,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+            self._notify_process(process.pid, command[0], False)
 
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
@@ -853,6 +884,104 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             return Path(configured).expanduser().resolve()
         destination = Path(self.config.dicom_destination_folder).expanduser().resolve()
         return destination / "PDI"
+
+    def _write_recovery_marker(
+        self,
+        root: Path,
+        result: PdiExportResult,
+        *,
+        state: str,
+    ) -> None:
+        if not self.recovery_id:
+            return
+        payload = {
+            "duplicate_count": result.duplicate_count,
+            "exported_count": result.exported_count,
+            "message": result.message,
+            "preview_count": result.preview_count,
+            "source_count": result.source_count,
+            "state": state,
+            "status": result.status.value,
+            "strict_profile": result.strict_profile,
+            "attempt_id": self.recovery_id,
+            "unpreviewable_count": result.unpreviewable_count,
+            "version": 1,
+            "warnings": list(result.warnings),
+        }
+        (root / RECOVERY_MARKER).write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def _remove_recovery_partials(self, output_root: Path) -> None:
+        if not self.recovery_id:
+            return
+        for candidate in output_root.glob(".DCMGET_PDI_*.partial-*"):
+            if not candidate.is_dir():
+                continue
+            marker = self._read_recovery_marker(candidate)
+            if marker is None or marker.get("attempt_id") != self.recovery_id:
+                continue
+            shutil.rmtree(candidate, ignore_errors=True)
+            self._emit(f"已清理上次中断的 PDI 暂存目录：{candidate.name}", "warning")
+
+    def _find_reusable_export(self, output_root: Path) -> PdiExportResult | None:
+        for candidate in sorted(output_root.glob("DCMGET_PDI_*"), reverse=True):
+            if not candidate.is_dir():
+                continue
+            marker = self._read_recovery_marker(candidate)
+            if (
+                marker is None
+                or marker.get("attempt_id") != self.recovery_id
+                or marker.get("state") != "published"
+            ):
+                continue
+            try:
+                status = PdiStatus(str(marker["status"]))
+                if status not in {PdiStatus.COMPLETED, PdiStatus.PARTIAL}:
+                    continue
+                self._verify_published_content(candidate, [])
+                warnings = marker.get("warnings", [])
+                if not isinstance(warnings, list):
+                    raise ValueError("invalid warnings")
+                strict_profile = marker.get("strict_profile")
+                if strict_profile not in {True, False, None}:
+                    raise ValueError("invalid profile status")
+                return PdiExportResult(
+                    status=status,
+                    output_directory=str(candidate),
+                    message=str(marker.get("message", "") or status.value),
+                    warnings=[str(warning) for warning in warnings],
+                    source_count=int(marker.get("source_count", 0)),
+                    exported_count=int(marker.get("exported_count", 0)),
+                    duplicate_count=int(marker.get("duplicate_count", 0)),
+                    preview_count=int(marker.get("preview_count", 0)),
+                    unpreviewable_count=int(marker.get("unpreviewable_count", 0)),
+                    strict_profile=strict_profile,
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._emit(
+                    f"忽略无法校验的 PDI 恢复目录 {candidate.name}：{exc}",
+                    "warning",
+                )
+        return None
+
+    @staticmethod
+    def _read_recovery_marker(root: Path) -> dict[str, object] | None:
+        try:
+            payload = json.loads((root / RECOVERY_MARKER).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return None
+        return payload
 
     def _resolve_weasis_payload(self) -> Path | None:
         if not bool(getattr(self.config, "pdi_include_weasis_windows", True)):
@@ -954,6 +1083,12 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
 
     def _emit(self, message: str, level: str) -> None:
         self.log_callback("PDI", message, level)
+
+    def _notify_process(self, pid: int, executable: str, active: bool) -> None:
+        try:
+            self.process_callback("pdi", pid, executable, active)
+        except Exception as exc:
+            self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "warning")
 
 
 def _strict_profile(items: list[_DicomItem]) -> str:

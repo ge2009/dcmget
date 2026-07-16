@@ -184,6 +184,63 @@ def test_concurrent_trial_consumption_does_not_lose_updates(tmp_path):
     assert licensing.trial_status(path, target).used == 30
 
 
+def test_trial_task_id_is_idempotent_even_for_the_thirtieth_use(tmp_path):
+    path = tmp_path / "trial.json"
+    target = "ABCDEF-123456-7890AB-CDEF12"
+    for _index in range(29):
+        licensing.consume_trial(path, target)
+    task_id = "a" * 32
+
+    first = licensing.consume_trial(path, target, task_id=task_id)
+    resumed = licensing.consume_trial(path, target, task_id=task_id)
+
+    assert first.remaining == 0
+    assert resumed == first
+    assert licensing.trial_task_consumed(task_id, path, target)
+    with pytest.raises(LicenseError, match="试用已用完"):
+        licensing.consume_trial(path, target, task_id="b" * 32)
+
+
+def test_version_one_trial_state_is_read_and_migrated_on_next_use(tmp_path):
+    path = tmp_path / "trial.json"
+    target = "ABCDEF-123456-7890AB-CDEF12"
+    path.write_text(
+        licensing.json.dumps(
+            {
+                "checksum": licensing._trial_checksum(target, 3, version=1),
+                "machine": target,
+                "used": 3,
+                "version": 1,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    assert licensing.trial_status(path, target).used == 3
+    licensing.consume_trial(path, target, task_id="c" * 32)
+
+    saved = licensing.json.loads(path.read_text(encoding="utf-8"))
+    assert saved["version"] == licensing.TRIAL_STATE_VERSION
+    assert saved["task_ids"] == ["c" * 32]
+
+
+def test_trial_task_ledger_survives_other_tasks_and_cli_style_consumption(tmp_path):
+    path = tmp_path / "trial.json"
+    target = "ABCDEF-123456-7890AB-CDEF12"
+    task_a = "a" * 32
+    task_b = "b" * 32
+
+    licensing.consume_trial(path, target, task_id=task_a)
+    licensing.consume_trial(path, target, task_id=task_b)
+    licensing.consume_trial(path, target)
+    resumed = licensing.consume_trial(path, target, task_id=task_a)
+
+    assert resumed.used == 3
+    assert licensing.trial_task_consumed(task_a, path, target)
+    assert licensing.trial_task_consumed(task_b, path, target)
+
+
 def test_windows_installer_uses_machine_shared_trial_anchor(tmp_path, monkeypatch):
     program_data = tmp_path / "ProgramData"
     shared = program_data / "DcmGet"

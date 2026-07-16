@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTextBrowser
 
 from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
+from dcmget.task_state import TaskCheckpointStore
 import dcmget.ui as ui_module
 from dcmget.ui import DcmGetWindow, DownloadWorker
 
@@ -24,7 +25,12 @@ def isolated_settings(monkeypatch, tmp_path):
 
 
 def make_window(qtbot, tmp_path):
-    window = DcmGetWindow(tmp_path / "config.json", tmp_path)
+    window = DcmGetWindow(
+        tmp_path / "config.json",
+        tmp_path,
+        tmp_path / "active-task.sqlite3",
+        offer_task_resume=False,
+    )
     qtbot.addWidget(window)
     window.show()
     return window
@@ -38,6 +44,147 @@ def test_paste_preview_deduplicates_and_updates_table(qtbot, tmp_path):
     assert window.accession_summary.text() == "有效 2 · 空行 1 · 重复 1"
     assert window.task_table.rowCount() == 2
     assert window.task_table.item(1, 0).text() == "A002"
+
+
+def test_more_than_200_accessions_use_summary_mode_without_table_rows(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    accessions = [f"A{index:05d}" for index in range(40_000)]
+
+    window.accession_edit.setPlainText("\n".join(accessions))
+
+    assert window.current_accessions == accessions
+    assert window.task_table.rowCount() == 0
+    assert window.row_by_accession == {}
+    assert window.task_table.isHidden()
+    assert window.large_batch_summary_card.isVisible()
+    assert "40,000" in window.large_batch_summary_label.text()
+    assert "超过 200 条" in window.large_batch_summary_label.text()
+
+
+def test_200_accessions_keep_details_and_201_hide_them(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    two_hundred = [f"A{index:03d}" for index in range(200)]
+
+    window._populate_waiting_rows(two_hundred)
+    assert window.task_table.rowCount() == 200
+    assert not window._task_table_summary_mode
+
+    window._populate_waiting_rows([*two_hundred, "A200"])
+    assert window.task_table.rowCount() == 0
+    assert window._task_table_summary_mode
+
+
+def test_large_batch_progress_is_aggregated_once_and_small_retry_restores_table(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    accessions = [f"A{index:03d}" for index in range(201)]
+    window._display_total = len(accessions)
+    window._populate_waiting_rows(accessions)
+    downloading = AccessionResult(
+        "A000", AccessionStatus.DOWNLOADING, file_count=2
+    )
+
+    window._on_worker_progress(1, len(accessions), downloading)
+    window._on_worker_progress(1, len(accessions), downloading)
+    window._on_worker_progress(
+        1,
+        len(accessions),
+        AccessionResult("A000", AccessionStatus.COMPLETED, file_count=3),
+    )
+    window._on_worker_progress(
+        2,
+        len(accessions),
+        AccessionResult("A001", AccessionStatus.FAILED),
+    )
+
+    assert window._summary_processed == 2
+    assert window._summary_files == 3
+    assert "失败 1" in window.large_batch_summary_label.text()
+    assert window.task_table.rowCount() == 0
+
+    window._populate_waiting_rows(["A001", "A002"])
+    assert not window._task_table_summary_mode
+    assert window.task_table.isVisible()
+    assert window.task_table.rowCount() == 2
+    assert window.row_by_accession == {"A001": 0, "A002": 1}
+
+
+def test_large_batch_cancel_does_not_count_unstarted_items_as_processed(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    accessions = [f"A{index:03d}" for index in range(201)]
+    checkpoint = window.task_store.start(
+        AppConfig(), accessions, trial_required=False
+    )
+    window._active_task_id = checkpoint.task_id
+    window._active_accessions = accessions
+    window._display_total = len(accessions)
+    window._populate_waiting_rows(accessions)
+    monkeypatch.setattr(window, "_show_download_completion", lambda *_args: None)
+
+    window._on_worker_finished(
+        BatchSummary(
+            [
+                AccessionResult(
+                    accession,
+                    AccessionStatus.CANCELLED,
+                    message="任务尚未开始",
+                )
+                for accession in accessions
+            ],
+            cancelled=True,
+        )
+    )
+
+    assert window._summary_processed == 0
+    assert "已处理 0/201" in window.large_batch_summary_label.text()
+    assert len(window.task_store.load_required().pending_accessions) == 201
+
+
+def test_large_batch_cancel_keeps_current_partial_file_count(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    accessions = [f"A{index:03d}" for index in range(201)]
+    checkpoint = window.task_store.start(
+        AppConfig(), accessions, trial_required=False
+    )
+    partial = AccessionResult(
+        "A000",
+        AccessionStatus.CANCELLED,
+        file_count=2,
+        message="用户已取消",
+        archived_files=[str(tmp_path / "one.dcm"), str(tmp_path / "two.dcm")],
+    )
+    window.task_store.record_result(checkpoint.task_id, partial)
+    window._active_task_id = checkpoint.task_id
+    window._active_accessions = accessions
+    window._display_total = len(accessions)
+    window._populate_waiting_rows(accessions)
+    monkeypatch.setattr(window, "_show_download_completion", lambda *_args: None)
+
+    window._on_worker_finished(
+        BatchSummary(
+            [
+                partial,
+                *[
+                    AccessionResult(
+                        accession,
+                        AccessionStatus.CANCELLED,
+                        message="任务尚未开始",
+                    )
+                    for accession in accessions[1:]
+                ],
+            ],
+            cancelled=True,
+        )
+    )
+
+    assert window._summary_processed == 1
+    assert window._summary_files == 2
+    assert "已取消 1" in window.large_batch_summary_label.text()
 
 
 def test_accession_editor_tab_moves_focus_to_next_control(qtbot, tmp_path):
@@ -279,6 +426,147 @@ def test_worker_does_not_lose_resume_during_startup(monkeypatch, tmp_path):
     assert resumed.is_set()
     assert not worker.pause_requested
     assert not instance[0].paused
+
+
+def test_worker_persists_final_result_before_emitting_progress(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    worker = DownloadWorker(
+        AppConfig(),
+        ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
+        ["A001"],
+        task_store=store,
+        task_id=checkpoint.task_id,
+    )
+    persisted_before_signal = []
+    worker.progress.connect(
+        lambda *_args: persisted_before_signal.append(
+            [result.accession for result in store.load_required().results]
+        )
+    )
+
+    worker._report_progress(
+        1,
+        1,
+        AccessionResult("A001", AccessionStatus.COMPLETED),
+    )
+
+    assert persisted_before_signal == [["A001"]]
+
+
+def test_startup_offer_restores_snapshot_and_only_resumes_pending_items(
+    qtbot, tmp_path, monkeypatch
+):
+    state_path = tmp_path / "active-task.sqlite3"
+    store = TaskCheckpointStore(state_path)
+    destination = tmp_path / "original-destination"
+    checkpoint = store.start(
+        AppConfig(dicom_destination_folder=str(destination)),
+        ["A001", "A002", "A003"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.COMPLETED),
+    )
+    window = make_window(qtbot, tmp_path)
+    started = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(
+        window,
+        "_start_download",
+        lambda override=None, **kwargs: started.append((override, kwargs)),
+    )
+
+    window._offer_task_resume()
+
+    assert window.current_accessions == ["A001", "A002", "A003"]
+    assert window.destination_edit.text() == str(destination)
+    resumed = started[0][1]["resume_checkpoint"]
+    assert resumed.pending_accessions == ["A002", "A003"]
+    assert resumed.config.dicom_destination_folder == str(destination)
+
+
+def test_finished_resume_merges_history_and_clears_checkpoint(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(), ["A001", "A002"], trial_required=False
+    )
+    first = AccessionResult(
+        "A001",
+        AccessionStatus.COMPLETED,
+        archived_files=[str(tmp_path / "a.dcm")],
+    )
+    second = AccessionResult(
+        "A002",
+        AccessionStatus.COMPLETED,
+        archived_files=[str(tmp_path / "b.dcm")],
+    )
+    window.task_store.record_result(checkpoint.task_id, first)
+    window.task_store.record_result(checkpoint.task_id, second)
+    window._active_task_id = checkpoint.task_id
+    window._display_total = 2
+    window._active_accessions = ["A002"]
+    monkeypatch.setattr(window, "_show_download_completion", lambda *_args, **_kwargs: None)
+
+    window._on_worker_finished(BatchSummary([second]))
+
+    assert [result.accession for result in window.last_summary.results] == [
+        "A001",
+        "A002",
+    ]
+    assert window.last_summary.archived_files == [
+        str(tmp_path / "a.dcm"),
+        str(tmp_path / "b.dcm"),
+    ]
+    assert window.task_store.load() is None
+
+
+def test_pending_resume_locks_inputs_and_disables_failed_retry_until_discarded(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(), ["FAILED", "PENDING"], trial_required=False
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult("FAILED", AccessionStatus.FAILED),
+    )
+    window._resume_checkpoint = window.task_store.load_required()
+    window.last_summary = BatchSummary(
+        [
+            AccessionResult("FAILED", AccessionStatus.FAILED),
+            AccessionResult("PENDING", AccessionStatus.CANCELLED),
+        ],
+        cancelled=True,
+    )
+
+    window._set_running(False)
+
+    assert window.start_button.text() == "继续未完成任务"
+    assert window.accession_edit.isReadOnly()
+    assert not window.destination_edit.isReadOnly()
+    assert window.settings_button.isEnabled()
+    assert not window.retry_button.isEnabled()
+    assert window.discard_resume_button.isVisible()
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.Yes,
+    )
+    qtbot.mouseClick(window.discard_resume_button, Qt.LeftButton)
+
+    assert window.task_store.load() is None
+    assert not window.accession_edit.isReadOnly()
+    assert window.start_button.text() == "开始下载"
 
 
 def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):

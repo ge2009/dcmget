@@ -3,3 +3,4 @@ PyQt5-Qt5==5.15.17; platform_system == "Darwin"
 cryptography>=44,<47
 filelock>=3.16,<4
 pydicom>=3.0,<4
+psutil>=6.1,<8

@@ -15,6 +15,7 @@ from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
 from dcmget.release_notes import load_release_notes
 from dcmget.ui import APP_STYLESHEET, DcmGetWindow
 from dcmget.runtime import ensure_default_config, resource_root
+from dcmget.task_state import TaskCheckpointStore, TaskStateError
 
 
 PROJECT_ROOT = resource_root()
@@ -94,7 +95,11 @@ def run_ui_self_test(config_path: str) -> int:
         raise RuntimeError("登录窗口未能显示")
     login.close()
 
-    window = DcmGetWindow(config_path, PROJECT_ROOT)
+    window = DcmGetWindow(
+        config_path,
+        PROJECT_ROOT,
+        offer_task_resume=False,
+    )
     window.show()
     app.processEvents()
     if not window.isVisible() or window.centralWidget() is None:
@@ -112,7 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.ui_self_test:
         return run_ui_self_test(args.config)
     app = create_application()
-    if not authorize_gui():
+    resume_task_id = None
+    try:
+        checkpoint = TaskCheckpointStore().load()
+        if checkpoint is not None:
+            resume_task_id = checkpoint.task_id
+    except TaskStateError:
+        pass
+    if not authorize_gui(resume_task_id):
         return 1
     window = DcmGetWindow(args.config, PROJECT_ROOT)
     window.show()

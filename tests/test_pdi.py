@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -182,6 +183,105 @@ def test_export_uses_only_exact_files_and_standard_extensionless_ids(
     assert all(pdi._sha256(path) == digest for path, digest in source_hashes.items())
     manifest = (output / "MANIFEST.SHA256").read_text(encoding="utf-8")
     assert "DICOMDIR" in manifest and "INDEX.HTM" in manifest
+
+
+def test_crash_recovery_reuses_already_published_directory(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "download" / "source.dcm")
+    task_id = "a" * 32
+    first = PdiExporter(_config(tmp_path), tools, recovery_id=task_id)
+    _fake_dcmtk(first, monkeypatch)
+
+    original = first.export([source])
+
+    assert original.status == PdiStatus.COMPLETED
+    second = PdiExporter(
+        _config(tmp_path),
+        tools,
+        recovery_id=task_id,
+        reuse_published=True,
+    )
+    monkeypatch.setattr(
+        second,
+        "_prepare_items",
+        Mock(side_effect=AssertionError("published PDI must not be rebuilt")),
+    )
+    restored = second.export([source])
+
+    assert restored.status == PdiStatus.COMPLETED
+    assert restored.output_directory == original.output_directory
+    assert len(list((tmp_path / "portable").glob("DCMGET_PDI_*"))) == 1
+    manifest = (
+        Path(restored.output_directory) / "MANIFEST.SHA256"
+    ).read_text(encoding="utf-8")
+    assert pdi.RECOVERY_MARKER in manifest
+
+
+def test_restart_removes_only_matching_interrupted_partial_directory(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "download" / "source.dcm")
+    output_root = tmp_path / "portable"
+    output_root.mkdir()
+    matching = output_root / ".DCMGET_PDI_OLD.partial-deadbeef"
+    other = output_root / ".DCMGET_PDI_OTHER.partial-deadbeef"
+    matching.mkdir()
+    other.mkdir()
+    (matching / pdi.RECOVERY_MARKER).write_text(
+        json.dumps({"version": 1, "attempt_id": "b" * 32}),
+        encoding="utf-8",
+    )
+    (other / pdi.RECOVERY_MARKER).write_text(
+        json.dumps({"version": 1, "attempt_id": "c" * 32}),
+        encoding="utf-8",
+    )
+    exporter = PdiExporter(_config(tmp_path), tools, recovery_id="b" * 32)
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.COMPLETED
+    assert not matching.exists()
+    assert other.exists()
+
+
+def test_crashed_manual_retry_does_not_reuse_previous_attempt(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "download" / "source.dcm")
+    first = PdiExporter(_config(tmp_path), tools, recovery_id="a" * 32)
+    _fake_dcmtk(first, monkeypatch, strict_fails=True)
+    previous = first.export([source])
+    assert previous.status == PdiStatus.PARTIAL
+
+    interrupted = tmp_path / "portable" / ".DCMGET_PDI_RETRY.partial-deadbeef"
+    interrupted.mkdir()
+    (interrupted / pdi.RECOVERY_MARKER).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "attempt_id": "b" * 32,
+                "state": "building",
+            }
+        ),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    restarted = PdiExporter(
+        _config(tmp_path),
+        tools,
+        recovery_id="b" * 32,
+        reuse_published=True,
+    )
+    _fake_dcmtk(restarted, monkeypatch, commands=commands)
+
+    recovered = restarted.export([source])
+
+    assert recovered.status == PdiStatus.COMPLETED
+    assert recovered.output_directory != previous.output_directory
+    assert commands
+    assert not interrupted.exists()
 
 
 def test_identical_sop_uid_is_skipped_with_warning(
@@ -425,7 +525,12 @@ def test_cancel_terminates_current_dcmtk_process(
 def test_dcmtk_command_drains_large_output_without_deadlock(
     tmp_path: Path, tools: ToolPaths
 ) -> None:
-    exporter = PdiExporter(_config(tmp_path), tools)
+    process_events = []
+    exporter = PdiExporter(
+        _config(tmp_path),
+        tools,
+        process_callback=lambda *event: process_events.append(event),
+    )
 
     result = exporter._run_command(
         [sys.executable, "-c", "import sys; sys.stdout.write('x' * 2_000_000)"],
@@ -434,6 +539,9 @@ def test_dcmtk_command_drains_large_output_without_deadlock(
 
     assert result.returncode == 0
     assert len(result.output) == 2_000_000
+    assert [event[3] for event in process_events] == [True, False]
+    assert all(event[0] == "pdi" for event in process_events)
+    assert all(event[2] == sys.executable for event in process_events)
 
 
 def test_core_tool_start_failure_is_classified_for_cli_exit_code(

@@ -61,3 +61,24 @@ def test_unregistered_download_is_prepared_to_consume_trial_when_ready(monkeypat
     assert allowed
     assert use_trial
     assert "剩余 30 次" in message
+
+
+def test_consumed_thirtieth_trial_task_can_reenter_for_resume(monkeypatch):
+    class AcceptedPassword:
+        def exec_(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(auth_ui, "DailyPasswordDialog", AcceptedPassword)
+    monkeypatch.setattr(
+        auth_ui,
+        "load_license",
+        lambda: (_ for _ in ()).throw(LicenseError("尚未注册")),
+    )
+    monkeypatch.setattr(auth_ui, "trial_status", lambda: TrialInfo(used=30, remaining=0))
+    monkeypatch.setattr(
+        auth_ui,
+        "trial_task_consumed",
+        lambda task_id: task_id == "a" * 32,
+    )
+
+    assert auth_ui.authorize_gui("a" * 32)

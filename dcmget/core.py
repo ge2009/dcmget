@@ -109,6 +109,7 @@ StateCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, AccessionResult], None]
 ReadyCallback = Callable[[], None]
 ArchiveErrorCallback = Callable[[Path, str], None]
+ProcessCallback = Callable[[str, int, str, bool], None]
 
 
 @dataclass(slots=True)
@@ -358,6 +359,7 @@ class DownloadRunner:
         state_callback: StateCallback | None = None,
         progress_callback: ProgressCallback | None = None,
         ready_callback: ReadyCallback | None = None,
+        process_callback: ProcessCallback | None = None,
     ):
         self.config = config
         self.tools = tools
@@ -365,6 +367,9 @@ class DownloadRunner:
         self.state_callback = state_callback or (lambda _state: None)
         self.progress_callback = progress_callback or (lambda _index, _total, _result: None)
         self.ready_callback = ready_callback or (lambda: None)
+        self.process_callback = process_callback or (
+            lambda _kind, _pid, _executable, _active: None
+        )
         self._cancel = threading.Event()
         self._pause_condition = threading.Condition()
         self._pause_requested = False
@@ -492,6 +497,7 @@ class DownloadRunner:
         self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
         process = self._popen(command)
         self._storescp_process = process
+        self._notify_process("storescp", getattr(process, "pid", 0), command[0], True)
         self._start_reader(process, "storescp")
 
         deadline = time.monotonic() + 10
@@ -576,6 +582,9 @@ class DownloadRunner:
                     with self._process_lock:
                         if self._current_process is process:
                             self._current_process = None
+                    self._notify_process(
+                        "movescu", getattr(process, "pid", 0), command[0], False
+                    )
 
         new_files = sorted(_files_in(staging) - before)
         received_bytes = _total_file_size(new_files)
@@ -678,6 +687,9 @@ class DownloadRunner:
                     process = self._popen(command)
                     with self._process_lock:
                         self._current_process = process
+                    self._notify_process(
+                        "movescu", getattr(process, "pid", 0), command[0], True
+                    )
                     return process, started
             if not self._wait_if_paused():
                 return None
@@ -739,6 +751,10 @@ class DownloadRunner:
         if process and process.poll() is None:
             _terminate_process(process)
             self._emit("storescp", "接收器已停止", "info")
+        if process:
+            self._notify_process(
+                "storescp", getattr(process, "pid", 0), str(self.tools.storescp), False
+            )
 
     def _cleanup_staging(self, staging: Path) -> None:
         remaining = _files_in(staging)
@@ -756,6 +772,20 @@ class DownloadRunner:
             summary.results.append(
                 AccessionResult(accession, AccessionStatus.CANCELLED, message="任务尚未开始")
             )
+
+    def _notify_process(
+        self,
+        kind: str,
+        pid: int,
+        executable: str,
+        active: bool,
+    ) -> None:
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        try:
+            self.process_callback(kind, pid, executable, active)
+        except Exception as exc:
+            self._emit("恢复", f"无法更新 {kind} 进程恢复信息：{exc}", "warning")
 
     def _emit(self, source: str, message: str, level: str) -> None:
         self.log_callback(source, message, level)

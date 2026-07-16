@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Iterable
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -26,7 +27,9 @@ from filelock import FileLock, Timeout
 PRODUCT = "DcmGet"
 TOKEN_PREFIX = "DGM1"
 TRIAL_LIMIT = 30
-TRIAL_STATE_VERSION = 1
+TRIAL_STATE_VERSION = 3
+LEGACY_TRIAL_STATE_VERSION = 1
+TASK_ID_TRIAL_STATE_VERSION = 2
 PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAS7ATBrKJ0C3xqN+ZrKDYr3QpKniXj/smdL5AkwyRHn4=
 -----END PUBLIC KEY-----
@@ -49,6 +52,12 @@ class LicenseInfo:
 class TrialInfo:
     used: int
     remaining: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TrialState:
+    used: int
+    task_ids: frozenset[str]
 
 
 def daily_password(today: date | None = None) -> str:
@@ -228,28 +237,45 @@ def trial_status(
 def consume_trial(
     path: str | Path | None = None,
     expected_machine_code: str | None = None,
+    task_id: str | None = None,
 ) -> TrialInfo:
     expected = normalize_machine_code(expected_machine_code or machine_code())
+    normalized_task_id = _normalize_trial_task_id(task_id)
     paths = _trial_paths(path)
     lock_path = paths[0].with_suffix(paths[0].suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(lock_path), timeout=10):
-            current = _read_trial_status(paths, expected)
+            current, consumed_task_ids = _read_trial_details(paths, expected)
+            if normalized_task_id and normalized_task_id in consumed_task_ids:
+                state = _trial_state(expected, current.used, consumed_task_ids)
+                for state_path in paths:
+                    _write_trial_state(state_path, state)
+                return current
             if current.remaining <= 0:
                 raise LicenseError("30 次免费试用已用完，请输入注册码")
             used = current.used + 1
-            state = {
-                "checksum": _trial_checksum(expected, used),
-                "machine": expected,
-                "used": used,
-                "version": TRIAL_STATE_VERSION,
-            }
+            if normalized_task_id:
+                consumed_task_ids.add(normalized_task_id)
+            state = _trial_state(expected, used, consumed_task_ids)
             for state_path in paths:
                 _write_trial_state(state_path, state)
     except Timeout as exc:
         raise LicenseError("试用计数正被其他进程使用，请稍后重试") from exc
     return TrialInfo(used, TRIAL_LIMIT - used)
+
+
+def trial_task_consumed(
+    task_id: str,
+    path: str | Path | None = None,
+    expected_machine_code: str | None = None,
+) -> bool:
+    expected = normalize_machine_code(expected_machine_code or machine_code())
+    normalized_task_id = _normalize_trial_task_id(task_id)
+    if not normalized_task_id:
+        return False
+    _current, consumed_task_ids = _read_trial_details(_trial_paths(path), expected)
+    return normalized_task_id in consumed_task_ids
 
 
 def _trial_paths(path: str | Path | None) -> list[Path]:
@@ -261,7 +287,13 @@ def _trial_paths(path: str | Path | None) -> list[Path]:
 
 
 def _read_trial_status(paths: list[Path], expected_machine: str) -> TrialInfo:
-    used_values: list[int] = []
+    return _read_trial_details(paths, expected_machine)[0]
+
+
+def _read_trial_details(
+    paths: list[Path], expected_machine: str
+) -> tuple[TrialInfo, set[str]]:
+    states: list[_TrialState] = []
     for state_path in paths:
         if not state_path.is_file():
             continue
@@ -271,21 +303,46 @@ def _read_trial_status(paths: list[Path], expected_machine: str) -> TrialInfo:
             stored_machine = normalize_machine_code(str(raw["machine"]))
             checksum = str(raw["checksum"])
             version = int(raw["version"])
-            if version != TRIAL_STATE_VERSION:
+            if version not in {
+                LEGACY_TRIAL_STATE_VERSION,
+                TASK_ID_TRIAL_STATE_VERSION,
+                TRIAL_STATE_VERSION,
+            }:
                 raise ValueError("unsupported trial state")
+            if version == TRIAL_STATE_VERSION:
+                raw_task_ids = raw.get("task_ids", [])
+                if not isinstance(raw_task_ids, list):
+                    raise ValueError("invalid task ledger")
+                task_ids = frozenset(
+                    _normalize_trial_task_id(str(task_id))
+                    for task_id in raw_task_ids
+                )
+                if "" in task_ids or len(task_ids) > TRIAL_LIMIT:
+                    raise ValueError("invalid task ledger")
+            elif version == TASK_ID_TRIAL_STATE_VERSION:
+                task_id = _normalize_trial_task_id(str(raw.get("task_id", "")))
+                task_ids = frozenset({task_id} if task_id else set())
+            else:
+                task_ids = frozenset()
             if not hmac.compare_digest(stored_machine, expected_machine):
                 raise ValueError("trial state belongs to another machine")
             if not hmac.compare_digest(
-                checksum, _trial_checksum(stored_machine, used)
+                checksum, _trial_checksum(stored_machine, used, task_ids, version)
             ):
                 raise ValueError("trial state checksum mismatch")
             if not 0 <= used <= TRIAL_LIMIT:
                 raise ValueError("invalid trial count")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return TrialInfo(TRIAL_LIMIT, 0)
-        used_values.append(used)
-    used = max(used_values, default=0)
-    return TrialInfo(used, TRIAL_LIMIT - used)
+            return TrialInfo(TRIAL_LIMIT, 0), set()
+        states.append(_TrialState(used, task_ids))
+    used = max((state.used for state in states), default=0)
+    consumed_task_ids = {
+        task_id
+        for state in states
+        if state.used == used
+        for task_id in state.task_ids
+    }
+    return TrialInfo(used, TRIAL_LIMIT - used), consumed_task_ids
 
 
 def _write_trial_state(state_path: Path, state: dict[str, object]) -> None:
@@ -326,9 +383,69 @@ def _format_machine_code(value: str) -> str:
     return "-".join(upper[index : index + 6] for index in range(0, 24, 6))
 
 
-def _trial_checksum(target_machine: str, used: int) -> str:
-    value = f"{PRODUCT}|trial|{TRIAL_STATE_VERSION}|{target_machine}|{used}|DGM-30"
+def _trial_checksum(
+    target_machine: str,
+    used: int,
+    task_ids: str | Iterable[str] = (),
+    version: int = TRIAL_STATE_VERSION,
+) -> str:
+    canonical_task_ids = _canonical_trial_task_ids(task_ids)
+    if version == LEGACY_TRIAL_STATE_VERSION:
+        value = f"{PRODUCT}|trial|1|{target_machine}|{used}|DGM-30"
+    elif version == TASK_ID_TRIAL_STATE_VERSION:
+        task_id = canonical_task_ids[-1] if canonical_task_ids else ""
+        value = f"{PRODUCT}|trial|2|{target_machine}|{used}|{task_id}|DGM-30"
+    else:
+        ledger = ",".join(canonical_task_ids)
+        value = (
+            f"{PRODUCT}|trial|{TRIAL_STATE_VERSION}|{target_machine}|{used}|"
+            f"{ledger}|DGM-30"
+        )
     return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _trial_state(
+    target_machine: str,
+    used: int,
+    task_ids: Iterable[str],
+) -> dict[str, object]:
+    canonical_task_ids = _canonical_trial_task_ids(task_ids)
+    return {
+        "checksum": _trial_checksum(
+            target_machine,
+            used,
+            canonical_task_ids,
+            TRIAL_STATE_VERSION,
+        ),
+        "machine": target_machine,
+        "task_ids": list(canonical_task_ids),
+        "used": used,
+        "version": TRIAL_STATE_VERSION,
+    }
+
+
+def _canonical_trial_task_ids(
+    task_ids: str | Iterable[str],
+) -> tuple[str, ...]:
+    values = (task_ids,) if isinstance(task_ids, str) else task_ids
+    return tuple(
+        sorted(
+            {
+                normalized
+                for value in values
+                if (normalized := _normalize_trial_task_id(str(value)))
+            }
+        )
+    )
+
+
+def _normalize_trial_task_id(task_id: str | None) -> str:
+    value = str(task_id or "").strip().lower()
+    if not value:
+        return ""
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise LicenseError("试用任务标识格式不正确")
+    return value
 
 
 def _machine_identifier() -> str:
