@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -200,13 +201,22 @@ def test_recovery_config_updates_without_losing_progress(tmp_path):
 def test_recorded_orphan_process_is_identity_checked_and_terminated(tmp_path, kind):
     store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    process_executable = (
+        sys.executable if os.name == "nt" else shutil.which("sleep")
+    )
+    assert process_executable is not None
+    command = (
+        [process_executable, "-c", "import time; time.sleep(60)"]
+        if os.name == "nt"
+        else [process_executable, "60"]
+    )
     process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
-        expected_executable = os.path.realpath(sys.executable)
+        expected_executable = os.path.realpath(process_executable)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             try:
@@ -225,13 +235,13 @@ def test_recorded_orphan_process_is_identity_checked_and_terminated(tmp_path, ki
             checkpoint.task_id,
             kind,
             process.pid,
-            sys.executable,
+            process_executable,
             active=True,
         )
 
         messages = store.cleanup_recorded_processes(checkpoint.task_id)
 
-        assert not psutil.pid_exists(process.pid)
+        assert process.wait(timeout=5) is not None
         assert any(kind in message and "已清理" in message for message in messages)
     finally:
         if psutil.pid_exists(process.pid):
