@@ -37,9 +37,12 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 if ($IsAdmin) {
-    if (-not (Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Config.storage_port | Out-Null
-    }
+    $Storescp = Get-ChildItem ".runtime\dcmtk\windows-x86_64" -Filter "storescp.exe" -File -Recurse | Select-Object -First 1
+    if (-not $Storescp) { throw "未找到 storescp.exe，无法创建精确的防火墙规则。" }
+    Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
+        -Program $Storescp.FullName -Protocol TCP -LocalPort $Config.storage_port `
+        -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null
     Write-Host "已确认 storescp 防火墙规则：$RuleName"
 } else {
     Write-Warning "当前不是管理员，未创建 storescp 防火墙规则。需要跨主机接收时，请以管理员身份重新运行本脚本。"

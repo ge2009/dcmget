@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 
 import pytest
 from PyQt5.QtCore import QSettings, Qt
@@ -96,7 +97,7 @@ def test_pdi_settings_round_trip_ohif_option(qtbot, tmp_path):
     assert result.pdi_output_folder == str(output)
     assert not result.pdi_include_ohif_viewer
     assert page.pdi_ohif_checkbox.isEnabled()
-    assert "本地只读服务" in page.pdi_ohif_hint.text()
+    assert "无需选择索引文件" in page.pdi_ohif_hint.text()
 
 
 def test_download_completion_starts_pdi_with_exact_batch_files(
@@ -154,6 +155,81 @@ def test_download_checkpoint_is_kept_until_pdi_finishes(
     window.task_store.release_lease()
 
 
+def test_large_download_completion_keeps_archived_paths_lazy_until_pdi(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    config = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+    )
+    accessions = [f"A{index:03d}" for index in range(201)]
+    checkpoint = window.task_store.start(config, accessions, trial_required=False)
+    results = []
+    for index, accession in enumerate(accessions):
+        result = AccessionResult(
+            accession,
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[str(tmp_path / f"{index}.dcm")],
+        )
+        window.task_store.record_result(checkpoint.task_id, result)
+        results.append(result)
+    window.task_store.try_acquire_lease()
+    window.config = config
+    window._active_task_id = checkpoint.task_id
+    window._display_total = len(accessions)
+    window._populate_waiting_rows(accessions)
+    started = []
+    monkeypatch.setattr(
+        window, "_start_pdi_export", lambda files=None: started.append(files)
+    )
+
+    window._on_worker_finished(BatchSummary(results))
+
+    assert window.last_summary.archived_files == []
+    assert window._pdi_source_files == []
+    assert window._pdi_task_id == checkpoint.task_id
+    assert window.task_store.load_required().phase == "pdi_pending"
+    assert started == [None]
+    window.task_store.release_lease()
+
+
+def test_download_failures_are_retried_before_pdi_starts(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    config = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+    )
+    checkpoint = window.task_store.start(
+        config, ["OK", "FAILED"], trial_required=False
+    )
+    completed = AccessionResult(
+        "OK",
+        AccessionStatus.COMPLETED,
+        archived_files=[str(tmp_path / "ok.dcm")],
+    )
+    failed = AccessionResult("FAILED", AccessionStatus.FAILED, message="timeout")
+    window.task_store.record_result(checkpoint.task_id, completed)
+    window.task_store.record_result(checkpoint.task_id, failed)
+    window.config = config
+    window._active_task_id = checkpoint.task_id
+    started = []
+    monkeypatch.setattr(
+        window, "_start_pdi_export", lambda files=None: started.append(files)
+    )
+    monkeypatch.setattr(window, "_show_download_completion", lambda *_args, **_kwargs: None)
+
+    window._on_worker_finished(BatchSummary([completed, failed]))
+
+    assert started == []
+    assert window.task_store.load_required().phase == "download_retryable"
+    assert window._pdi_task_id == ""
+    assert window._resume_checkpoint is not None
+
+
 def test_startup_can_resume_pdi_without_redownloading(qtbot, tmp_path, monkeypatch):
     window = make_window(qtbot, tmp_path)
     archived = tmp_path / "study" / "image.dcm"
@@ -187,8 +263,82 @@ def test_startup_can_resume_pdi_without_redownloading(qtbot, tmp_path, monkeypat
 
     assert started == [[str(archived)]]
     assert window._pdi_task_id == checkpoint.task_id
-    assert window.last_summary.archived_files == [str(archived)]
+    # Large recovery points keep file paths on disk and load them only when
+    # PDI actually starts.
+    assert window.last_summary.archived_files == []
+    assert window.last_summary.results[0].file_count == 1
     window.task_store.release_lease()
+
+
+def test_startup_converts_finished_download_with_failures_to_retryable_before_pdi(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    config = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+    )
+    checkpoint = window.task_store.start(config, ["FAILED"], trial_required=False)
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "FAILED",
+            AccessionStatus.PARTIAL,
+            file_count=1,
+            archived_files=[str(tmp_path / "partial.dcm")],
+        ),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.No,
+    )
+
+    window._offer_task_resume()
+
+    restored = window.task_store.load_required(include_archived_files=False)
+    assert restored.phase == "download_retryable"
+    assert window._resume_checkpoint is not None
+    assert window._resume_checkpoint.phase == "download_retryable"
+    assert window._pdi_task_id == ""
+    assert window.start_button.text() == "重试失败项"
+    assert not window.pdi_retry_button.isEnabled()
+
+
+def test_pdi_recovery_restores_accepted_partial_result_semantics(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    config = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+    )
+    checkpoint = window.task_store.start(config, ["PARTIAL"], trial_required=False)
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "PARTIAL",
+            AccessionStatus.PARTIAL,
+            file_count=1,
+            archived_files=[str(tmp_path / "partial.dcm")],
+        ),
+    )
+    window.task_store.set_phase(checkpoint.task_id, "pdi_retryable")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.No,
+    )
+
+    window._offer_task_resume()
+
+    assert window._accepted_partial_results
+    assert window._pdi_task_id == checkpoint.task_id
+    window._save_pdi_checkpoint_status(completed=True)
+    window._set_running(False)
+
+    assert window.task_store.load() is None
+    assert not window.retry_button.isEnabled()
 
 
 def test_pdi_success_clears_checkpoint_and_failure_keeps_retryable_phase(
@@ -229,10 +379,13 @@ def test_preflight_area_expands_for_pdi_checks(qtbot, tmp_path):
     assert window.preflight_labels[1].text().startswith("PDI 导出工具")
 
 
-def test_pdi_progress_and_success_enable_open_directory(qtbot, tmp_path, monkeypatch):
+def test_pdi_progress_and_success_enable_viewer_and_open_directory(
+    qtbot, tmp_path, monkeypatch
+):
     window = make_window(qtbot, tmp_path)
     output = tmp_path / "PDI" / "DCMGET_PDI_20260716_120000"
-    output.mkdir(parents=True)
+    (output / "VIEWER").mkdir(parents=True)
+    (output / "VIEWER" / "pdi_server.py").write_text("# viewer")
     window.config.pdi_export_enabled = True
     window._pdi_source_files = [str(tmp_path / "image.dcm")]
     window.last_summary = BatchSummary()
@@ -264,10 +417,143 @@ def test_pdi_progress_and_success_enable_open_directory(qtbot, tmp_path, monkeyp
 
     window._on_pdi_finished(Result(Status(), str(output)))
 
+    assert window.pdi_view_button.isEnabled()
     assert window.pdi_open_button.isEnabled()
     assert not window.pdi_retry_button.isEnabled()
     assert "已生成" in window.pdi_status_label.text()
     assert str(output) in messages[0][1]
+
+
+def test_pdi_immediate_viewer_starts_with_pdi_root_only(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    output = tmp_path / "PDI 目录"
+    (output / "VIEWER").mkdir(parents=True)
+    server_script = output / "VIEWER" / "pdi_server.py"
+    server_script.write_text("# viewer", encoding="utf-8")
+
+    @dataclass
+    class Result:
+        output_directory: str
+
+    window.last_pdi_result = Result(str(output))
+    launched = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeProcess:
+        NotRunning = 0
+        Running = 2
+        instances = []
+
+        def __init__(self, _parent=None):
+            self._state = self.NotRunning
+            self.cwd = ""
+            self.terminated = False
+            self.killed = False
+            self.deleted = False
+            self.readyReadStandardOutput = FakeSignal()
+            self.finished = FakeSignal()
+            self.errorOccurred = FakeSignal()
+            self.instances.append(self)
+
+        def setWorkingDirectory(self, cwd):
+            self.cwd = cwd
+
+        def start(self, program, arguments):
+            launched.append((program, list(arguments), self.cwd))
+            self._state = self.Running
+
+        def waitForStarted(self, _timeout):
+            return True
+
+        def state(self):
+            return self._state
+
+        def readAllStandardOutput(self):
+            return b""
+
+        def terminate(self):
+            self.terminated = True
+            self._state = self.NotRunning
+
+        def waitForFinished(self, _timeout):
+            return self._state == self.NotRunning
+
+        def kill(self):
+            self.killed = True
+            self._state = self.NotRunning
+
+        def deleteLater(self):
+            self.deleted = True
+
+        def errorString(self):
+            return "fake error"
+
+    monkeypatch.setattr(ui_module, "QProcess", FakeProcess)
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toString()) or True,
+    )
+    monkeypatch.setattr(window, "_probe_pdi_viewer_ready", lambda: None)
+
+    window._open_pdi_viewer()
+    window._pdi_viewer_probe_timer.stop()
+
+    assert len(launched) == 1
+    program, arguments, cwd = launched[0]
+    assert Path(program).resolve() == Path(ui_module.sys.executable).resolve()
+    assert arguments[:4] == [
+        str(server_script),
+        "--root",
+        str(output.resolve()),
+        "--quiet",
+    ]
+    assert arguments[4] == "--port"
+    port = int(arguments[5])
+    assert arguments[6] == "--no-browser"
+    assert cwd == str(output.resolve())
+    from dcmget.pdi_server import viewer_url
+
+    assert opened == []
+
+    class FakeReply:
+        def __init__(self):
+            self.deleted = False
+
+        def attribute(self, _attribute):
+            return 200
+
+        def deleteLater(self):
+            self.deleted = True
+
+    reply = FakeReply()
+    window._pdi_viewer_probe_reply = reply
+    window._on_pdi_viewer_probe_finished(reply)
+
+    assert opened == [viewer_url(port)]
+    window._open_pdi_viewer()
+    assert opened == [viewer_url(port), viewer_url(port)]
+
+    process = FakeProcess.instances[0]
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert process.terminated
+    assert process.deleted
+    assert window._pdi_viewer_process is None
 
 
 def test_retry_pdi_does_not_restart_download(qtbot, tmp_path, monkeypatch):
@@ -280,6 +566,158 @@ def test_retry_pdi_does_not_restart_download(qtbot, tmp_path, monkeypatch):
     window._retry_pdi()
 
     assert called == [None]
+
+
+def test_pdi_viewer_reports_early_exit_and_readiness_timeout(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    messages = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    class FakeProcess:
+        def __init__(self, state):
+            self._state = state
+            self.terminated = False
+            self.deleted = False
+
+        def state(self):
+            return self._state
+
+        def readAllStandardOutput(self):
+            return b""
+
+        def terminate(self):
+            self.terminated = True
+            self._state = ui_module.QProcess.NotRunning
+
+        def waitForFinished(self, _timeout):
+            return self._state == ui_module.QProcess.NotRunning
+
+        def kill(self):
+            self._state = ui_module.QProcess.NotRunning
+
+        def deleteLater(self):
+            self.deleted = True
+
+    exited = FakeProcess(ui_module.QProcess.NotRunning)
+    window._pdi_viewer_process = exited
+    window._pdi_viewer_root = tmp_path
+    window._on_pdi_viewer_finished(exited, 1, None)
+
+    assert window._pdi_viewer_process is None
+    assert exited.deleted
+    assert "就绪前退出" in messages[-1][1]
+    assert "诊断日志" in messages[-1][1]
+
+    timed_out = FakeProcess(ui_module.QProcess.Running)
+    window._pdi_viewer_process = timed_out
+    window._pdi_viewer_root = tmp_path
+    window._on_pdi_viewer_start_timeout()
+
+    assert window._pdi_viewer_process is None
+    assert timed_out.terminated
+    assert timed_out.deleted
+    assert "30 秒内未就绪" in messages[-1][1]
+
+
+def test_accept_partial_results_continues_pdi_without_redownload(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    archived = str(tmp_path / "completed.dcm")
+    config = AppConfig(
+        pdi_export_enabled=True,
+        pdi_institution_name="测试医院",
+    )
+    checkpoint = window.task_store.start(
+        config, ["A001", "A002"], trial_required=False
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[archived],
+        ),
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A002", AccessionStatus.FAILED, message="PACS failed"),
+    )
+    window.task_store.set_phase(checkpoint.task_id, "download_retryable")
+    window._resume_checkpoint = window.task_store.load_required(
+        include_archived_files=False
+    )
+    window.last_summary = BatchSummary(window._resume_checkpoint.results)
+    window._set_running(False)
+    assert not window.accept_partial_button.isHidden()
+    assert window.accept_partial_button.isEnabled()
+
+    started: list[list[str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(
+        window,
+        "_start_pdi_export",
+        lambda files=None: started.append(list(files or [])),
+    )
+
+    window._accept_partial_results()
+
+    assert started == [[archived]]
+    assert window._resume_checkpoint is None
+    assert window._pdi_task_id == checkpoint.task_id
+    assert window.task_store.load_required().phase == "pdi_pending"
+    window.task_store.release_lease()
+
+
+def test_accept_partial_results_without_pdi_ends_recovery(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(pdi_export_enabled=False), ["A001"], trial_required=False
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.FAILED),
+    )
+    window.task_store.set_phase(checkpoint.task_id, "download_retryable")
+    window._resume_checkpoint = window.task_store.load_required(
+        include_archived_files=False
+    )
+    window.last_summary = BatchSummary(list(window._resume_checkpoint.results))
+    window._set_running(False)
+    assert window.retry_button.isEnabled()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.Yes,
+    )
+    messages = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    window._accept_partial_results()
+    window._show_download_completion()
+
+    assert window.task_store.load() is None
+    assert window._resume_checkpoint is None
+    assert window.start_button.isEnabled()
+    assert not window.retry_button.isEnabled()
+    assert all("重试" not in message for _title, message in messages)
 
 
 def test_saving_corrected_settings_preserves_failed_pdi_retry(
@@ -348,6 +786,59 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
 
     assert started_with == [("海市中心医院", False)]
     restarted.task_store.release_lease()
+
+
+def test_saving_settings_preserves_completed_pdi_actions(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    output = tmp_path / "portable"
+    (output / "VIEWER").mkdir(parents=True)
+    (output / "VIEWER" / "pdi_server.py").write_text(
+        "# viewer", encoding="utf-8"
+    )
+
+    class Status:
+        value = "完成"
+
+    @dataclass
+    class Result:
+        status: object = field(default_factory=Status)
+        output_directory: str = str(output)
+
+    window.config.pdi_export_enabled = True
+    window.last_pdi_result = Result()
+    window._set_pdi_status("PDI 便携目录已生成", "ok")
+    window.pdi_open_button.setEnabled(True)
+    window.pdi_view_button.setEnabled(True)
+    window.pdi_progress_bar.setValue(100)
+
+    window._save_settings(
+        AppConfig(pdi_export_enabled=True, pdi_institution_name="测试医院")
+    )
+
+    assert window.pdi_status_label.text() == "PDI 便携目录已生成"
+    assert window.pdi_open_button.isEnabled()
+    assert window.pdi_view_button.isEnabled()
+    assert window.pdi_progress_bar.value() == 100
+
+
+def test_saving_settings_preserves_lazy_pdi_recovery_retry(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(pdi_export_enabled=True, pdi_institution_name="旧机构"),
+        ["A001"],
+        trial_required=False,
+    )
+    window.task_store.set_phase(checkpoint.task_id, "pdi_retryable")
+    window._pdi_task_id = checkpoint.task_id
+    window._pdi_source_files = []
+    window.pdi_retry_button.setEnabled(True)
+
+    window._save_settings(
+        AppConfig(pdi_export_enabled=True, pdi_institution_name="新机构")
+    )
+
+    assert window.pdi_retry_button.isEnabled()
+    assert "可以重试" in window.pdi_status_label.text()
 
 
 def test_failed_pdi_checkpoint_blocks_new_download_until_discarded(
@@ -448,7 +939,7 @@ def test_discard_keeps_checkpoint_when_pdi_partial_cannot_be_deleted(
     assert window._pdi_task_id == checkpoint.task_id
 
 
-def test_declining_pdi_resume_deletes_matching_partial_before_checkpoint(
+def test_declining_pdi_resume_preserves_partial_and_checkpoint_for_later(
     qtbot, tmp_path, monkeypatch
 ):
     window = make_window(qtbot, tmp_path)
@@ -486,8 +977,10 @@ def test_declining_pdi_resume_deletes_matching_partial_before_checkpoint(
 
     window._offer_task_resume()
 
-    assert not partial.exists()
-    assert window.task_store.load() is None
+    assert partial.exists()
+    assert window.task_store.load_required().task_id == checkpoint.task_id
+    assert window._pdi_task_id == checkpoint.task_id
+    assert window.pdi_retry_button.isEnabled()
 
 
 def test_pdi_thread_completion_releases_busy_state(qtbot, tmp_path, monkeypatch):

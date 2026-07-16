@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import socket
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import Mock
@@ -138,9 +141,11 @@ def test_resolver_only_uses_current_platform_runtime(tmp_path, monkeypatch):
     assert resolved.bin_dir == current
 
 
-def test_resolver_discovers_dcmmkdir_next_to_dcmtk_binaries(tmp_path, monkeypatch):
+def test_resolver_discovers_validation_and_pdi_tools_next_to_dcmtk_binaries(
+    tmp_path, monkeypatch
+):
     suffix = ".exe" if core.os.name == "nt" else ""
-    for name in ("movescu", "storescp", "dcmmkdir"):
+    for name in ("movescu", "storescp", "dcmmkdir", "dcmdump"):
         (tmp_path / f"{name}{suffix}").touch()
     resolver = DcmtkResolver(tmp_path)
     monkeypatch.setattr(core, "_run_probe", lambda *_args, **_kwargs: "dcmtk v3.7.0")
@@ -150,6 +155,7 @@ def test_resolver_discovers_dcmmkdir_next_to_dcmtk_binaries(tmp_path, monkeypatc
     )
 
     assert tools.dcmmkdir == tmp_path / f"dcmmkdir{suffix}"
+    assert tools.dcmdump == tmp_path / f"dcmdump{suffix}"
 
 
 def test_preflight_reports_port_conflict(tmp_path):
@@ -266,10 +272,17 @@ def test_file_archive_adds_dcm_suffix_and_uses_metadata_directory(tmp_path):
         "FALLBACK",
     )
 
-    assert [path.name for path in moved] == ["CT.1.dcm"]
+    assert [path.name for path in moved] == ["1.2.3.4.5.dcm"]
     assert rejected == []
     assert not first.exists()
-    target = tmp_path / "dicom" / "PAT001" / "ACC001" / "1.2.3.4" / "CT.1.dcm"
+    target = (
+        tmp_path
+        / "dicom"
+        / "PAT001"
+        / "ACC001"
+        / "1.2.3.4"
+        / "1.2.3.4.5.dcm"
+    )
     assert target.exists()
     assert target.read_bytes()[128:132] == b"DICM"
 
@@ -286,7 +299,25 @@ def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkey
     assert core.staging_directory_root(anonymous) == state / "staging"
     assert core.log_directory(anonymous) == state / "logs"
     assert core.staging_directory_root(regular) == tmp_path / "dicom" / ".dcmget-staging"
-    assert core.log_directory(regular) == tmp_path / "dicom" / "logs"
+    assert core.log_directory(regular) == state / "logs"
+
+
+def test_task_log_is_private_and_not_created_beside_dicom(tmp_path, monkeypatch):
+    state = tmp_path / "private-state"
+    destination = tmp_path / "dicom"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(destination)),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    runner._emit("应用", "private log test", "info")
+    runner._close_file_logger()
+
+    log = state / "logs" / "dcmget.log"
+    assert log.is_file()
+    assert not (destination / "logs").exists()
+    if os.name != "nt":
+        assert log.stat().st_mode & 0o777 == 0o600
 
 
 def test_file_archive_uses_safe_fallbacks_and_does_not_overwrite(tmp_path):
@@ -304,10 +335,87 @@ def test_file_archive_uses_safe_fallbacks_and_does_not_overwrite(tmp_path):
         "ACC/002",
     )
 
-    assert [path.name for path in moved] == ["MR.1.dcm", "MR.1-1.dcm"]
+    assert [path.name for path in moved] == ["1.2.3.1.dcm", "1.2.3.2.dcm"]
     assert rejected == []
     assert all(path.suffix == ".dcm" for path in moved)
     assert all("ACC_002" in str(path) for path in moved)
+
+
+def test_truncated_pixel_data_is_rejected_and_kept_in_staging(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    source = staging / "truncated.dcm"
+    metadata = FileMetaDataset()
+    metadata.TransferSyntaxUID = ExplicitVRLittleEndian
+    dataset = FileDataset(source, {}, file_meta=metadata, preamble=b"\0" * 128)
+    dataset.SOPInstanceUID = "1.2.3.99"
+    dataset.Rows = 64
+    dataset.Columns = 64
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.BitsAllocated = 8
+    dataset.BitsStored = 8
+    dataset.HighBit = 7
+    dataset.PixelRepresentation = 0
+    dataset.PixelData = b"\0" * (64 * 64)
+    dataset.save_as(source)
+    source.write_bytes(source.read_bytes()[:-512])
+
+    moved, rejected = core._archive_dicom_files(
+        [source],
+        tmp_path / "dicom",
+        "{AccessionNumber}",
+        "ACC-TRUNCATED",
+    )
+
+    assert moved == []
+    assert rejected == [source]
+    assert source.exists()
+
+
+def test_retry_same_sop_and_content_is_idempotent(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    first = staging / "first.dcm"
+    duplicate = staging / "duplicate.dcm"
+    _write_minimal_dicom(first, "1.2.3.50", accession="ACC050")
+    duplicate.write_bytes(first.read_bytes())
+
+    first_moved, first_rejected = core._archive_dicom_files(
+        [first], tmp_path / "dicom", "{AccessionNumber}", "ACC050"
+    )
+    retry_moved, retry_rejected = core._archive_dicom_files(
+        [duplicate], tmp_path / "dicom", "{AccessionNumber}", "ACC050"
+    )
+
+    assert first_rejected == retry_rejected == []
+    assert retry_moved == first_moved
+    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
+    assert not duplicate.exists()
+
+
+def test_same_sop_with_different_content_is_rejected_as_conflict(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    first = staging / "first.dcm"
+    conflict = staging / "conflict.dcm"
+    _write_minimal_dicom(first, "1.2.3.51", accession="ACC051")
+    different = bytearray(first.read_bytes())
+    different[0] = 1
+    conflict.write_bytes(different)
+
+    moved, rejected = core._archive_dicom_files(
+        [first], tmp_path / "dicom", "{AccessionNumber}", "ACC051"
+    )
+    conflict_moved, conflict_rejected = core._archive_dicom_files(
+        [conflict], tmp_path / "dicom", "{AccessionNumber}", "ACC051"
+    )
+
+    assert len(moved) == 1 and rejected == []
+    assert conflict_moved == []
+    assert conflict_rejected == [conflict]
+    assert conflict.exists()
+    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
 
 
 def test_non_dicom_file_stays_in_staging_and_is_not_counted(tmp_path):
@@ -616,6 +724,129 @@ def test_invalid_received_file_is_failed_and_left_in_staging(tmp_path, monkeypat
     assert result.status == AccessionStatus.FAILED
     assert "异常文件留在暂存目录" in result.message
     assert (staging / "broken.dcm").exists()
+
+
+def test_received_accession_is_not_assigned_by_timing_and_is_recovered_later(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+    calls = 0
+
+    class Process:
+        stdout = iter(())
+
+        @staticmethod
+        def poll():
+            return 0
+
+        def wait(self):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                _write_minimal_dicom(
+                    staging / "foreign.dcm",
+                    "1.2.3.60",
+                    accession="A001",
+                )
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    wrong_window = runner._download_one("B001", staging, 1, 2)
+    recovered = runner._download_one("A001", staging, 2, 2)
+    runner._close_file_logger()
+
+    assert wrong_window.status == AccessionStatus.NO_DATA
+    assert recovered.status == AccessionStatus.COMPLETED
+    assert recovered.file_count == 1
+    assert not list(staging.glob("*.dcm"))
+    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
+
+
+def test_unchanged_staging_file_metadata_is_cached_between_accessions(
+    tmp_path, monkeypatch
+):
+    import pydicom
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    foreign = staging / "foreign.dcm"
+    _write_minimal_dicom(foreign, "1.2.3.61", accession="LATER")
+    real_dcmread = pydicom.dcmread
+    reads = 0
+
+    def counted_dcmread(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return real_dcmread(*args, **kwargs)
+
+    monkeypatch.setattr(pydicom, "dcmread", counted_dcmread)
+    cache: dict[Path, tuple[int, int, int, str | None]] = {}
+
+    selected, mismatched = core._select_files_for_accession(
+        {foreign}, {foreign}, "EARLY", cache=cache
+    )
+    assert selected == []
+    assert mismatched == [foreign]
+
+    for index in range(100):
+        selected, mismatched = core._select_files_for_accession(
+            {foreign}, set(), f"OTHER-{index}", cache=cache
+        )
+        assert selected == []
+        assert mismatched == []
+
+    selected, mismatched = core._select_files_for_accession(
+        {foreign}, set(), "LATER", cache=cache
+    )
+
+    assert selected == [foreign]
+    assert mismatched == []
+    assert reads == 1
+
+
+def test_receiver_death_aborts_current_move_and_marks_failure(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = DownloadRunner(config, tools)
+
+    class Receiver:
+        @staticmethod
+        def poll():
+            return 9
+
+    class MoveProcess:
+        stdout = iter(())
+        terminated = False
+
+        def poll(self):
+            return -15 if self.terminated else None
+
+        @staticmethod
+        def wait():
+            return -15
+
+    process = MoveProcess()
+    runner._storescp_process = Receiver()  # type: ignore[assignment]
+    monkeypatch.setattr(runner, "_popen", lambda _command: process)
+    monkeypatch.setattr(
+        core,
+        "_terminate_process",
+        lambda target: setattr(target, "terminated", True),
+    )
+
+    result = runner._download_one("A001", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert process.terminated
+    assert result.status == AccessionStatus.FAILED
+    assert "storescp 意外退出" in result.message
 
 
 def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
@@ -958,6 +1189,66 @@ def test_windows_process_cleanup_kills_the_full_process_tree(monkeypatch):
     process.wait.assert_called_once_with(timeout=3)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_posix_cleanup_kills_fork_child_after_group_leader_exits(tmp_path):
+    import psutil
+
+    child_pid_file = tmp_path / "child.pid"
+    leader_code = (
+        "import subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)']); "
+        "open(sys.argv[1], 'w').write(str(child.pid))"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader_code, str(child_pid_file)],
+        start_new_session=True,
+    )
+    setattr(process, "_dcmget_process_group", process.pid)
+    process.wait(timeout=5)
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+
+    try:
+        os.kill(child_pid, 0)
+        child_was_running = True
+    except OSError:
+        child_was_running = False
+
+    try:
+        core._terminate_process(process)
+        assert not psutil.pid_exists(child_pid) or (
+            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        )
+    finally:
+        if child_was_running:
+            try:
+                os.kill(child_pid, 9)
+            except OSError:
+                pass
+
+    assert child_was_running
+
+
+def test_stop_storescp_cleans_group_even_when_leader_already_exited(
+    tmp_path, monkeypatch
+):
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path)),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    process = Mock(pid=1234)
+    process.poll.return_value = 0
+    runner._storescp_process = process
+    terminate = Mock()
+    monkeypatch.setattr(core, "_terminate_process", terminate)
+
+    runner._stop_storescp()
+    runner._close_file_logger()
+
+    terminate.assert_called_once_with(process)
+    assert runner._storescp_process is None
+
+
 def test_safe_accession_directory_is_cross_platform():
     result = safe_accession_dir(' A/B:C*D?"E<F>G| ')
     assert not set('/\\:*?"<>|') & set(result)
@@ -1005,9 +1296,16 @@ def test_common_output_directory_covers_multiple_studies(tmp_path):
     assert core._common_output_directory(files, root) == root / "PAT1" / "ACC1"
 
 
-def _write_minimal_dicom(path: Path, sop_instance_uid: str) -> None:
+def _write_minimal_dicom(
+    path: Path,
+    sop_instance_uid: str,
+    *,
+    accession: str = "",
+) -> None:
     metadata = FileMetaDataset()
     metadata.TransferSyntaxUID = ExplicitVRLittleEndian
     dataset = FileDataset(path, {}, file_meta=metadata, preamble=b"\0" * 128)
     dataset.SOPInstanceUID = sop_instance_uid
+    if accession:
+        dataset.AccessionNumber = accession
     dataset.save_as(path)

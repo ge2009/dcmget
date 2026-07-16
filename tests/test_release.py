@@ -57,6 +57,46 @@ def test_windows_release_artifacts_are_split_to_avoid_duplicate_runtime_download
     assert "name: DcmGet-${{ inputs.version }}-windows-x64\n" not in workflow
 
 
+def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ref: c01c83a1963a55457bef15917ddd4cfdbab81fd1" in workflow
+    assert "path: upgrade-baseline" in workflow
+    assert "python scripts/build_windows.py --version 2.6.1" in workflow
+    assert 'Join-Path $baselineRoot "packaging\\windows\\dcmget.iss"' in workflow
+    assert "DcmGet-2.6.1-Setup-x64.exe" in workflow
+    assert '$baselineRecords[0].DisplayVersion -ne "2.6.1"' in workflow
+    assert "/DAppVersion=2.0.0" not in workflow
+
+
+def test_windows_firewall_is_limited_to_storescp_and_private_networks():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    bootstrap = (root / "scripts/bootstrap_windows.ps1").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'program=""{app}\\_internal\\.runtime\\dcmtk' in installer
+    assert "profile=domain,private" in installer
+    assert "-Program $Storescp.FullName" in bootstrap
+    assert "-Profile Domain,Private" in bootstrap
+    assert "$firewallRules.Count -ne 1" in workflow
+    assert "$applicationFilters.Count -ne 1" in workflow
+    assert (
+        ".runtime\\dcmtk\\windows-x86_64\\dcmtk-3.7.0-win64-dynamic"
+        "\\bin\\storescp.exe"
+    ) in workflow
+    assert "[StringComparison]::OrdinalIgnoreCase" in workflow
+    assert "$profileNames.Count -ne 2" in workflow
+    assert '$profileNames -notcontains "Domain"' in workflow
+    assert '$profileNames -notcontains "Private"' in workflow
+    assert "DCMGET_PAYLOAD.SHA256" in workflow
+
+
 def test_frozen_self_test_requires_offline_ohif_and_local_server(
     tmp_path: Path, monkeypatch
 ):

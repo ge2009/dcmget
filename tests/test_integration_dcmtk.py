@@ -203,7 +203,9 @@ def test_real_dcmtk_builds_valid_pdi_dicomdir_and_ohif_index(tmp_path):
     assert source.read_bytes() == source_digest
     copied = [path for path in (output / "DICOM").rglob("*") if path.is_file()]
     assert len(copied) == 1 and copied[0].suffix == ""
-    index = json.loads((output / "DCMGET_STUDIES.json").read_text(encoding="utf-8"))
+    index = json.loads(
+        (output / "VIEWER" / ".dcmget" / "index").read_text(encoding="utf-8")
+    )
     instances = index["studies"][0]["series"][0]["instances"]
     assert len(instances) == 1
     assert instances[0]["url"].startswith("dicomweb:/DICOM/")

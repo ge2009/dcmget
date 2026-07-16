@@ -53,6 +53,7 @@ def _run_cli(
     pdi_enabled: bool,
     pdi_status: PdiStatus = PdiStatus.COMPLETED,
     core_tool_failure: bool = False,
+    download_status: AccessionStatus = AccessionStatus.COMPLETED,
 ) -> tuple[int, Mock]:
     accessions = tmp_path / "access.txt"
     accessions.write_text("ACC001\n", encoding="utf-8")
@@ -81,8 +82,13 @@ def _run_cli(
         [
             AccessionResult(
                 "ACC001",
-                AccessionStatus.COMPLETED,
-                archived_files=[str(archived)],
+                download_status,
+                archived_files=(
+                    [str(archived)]
+                    if download_status
+                    in {AccessionStatus.COMPLETED, AccessionStatus.PARTIAL}
+                    else []
+                ),
             )
         ]
     )
@@ -149,6 +155,26 @@ def test_cli_does_not_create_pdi_exporter_when_feature_is_disabled(tmp_path, mon
     exporter_factory.assert_not_called()
 
 
+@pytest.mark.parametrize("pdi_enabled", [False, True])
+def test_cli_download_failure_keeps_retry_checkpoint_and_skips_pdi(
+    tmp_path, monkeypatch, pdi_enabled
+):
+    exit_code, exporter_factory = _run_cli(
+        tmp_path,
+        monkeypatch,
+        pdi_enabled=pdi_enabled,
+        download_status=AccessionStatus.FAILED,
+    )
+
+    assert exit_code == 2
+    exporter_factory.assert_not_called()
+    checkpoint = TaskCheckpointStore(
+        tmp_path / "active-task.sqlite3"
+    ).load_required()
+    assert checkpoint.phase == "download_retryable"
+    assert [result.accession for result in checkpoint.results] == ["ACC001"]
+
+
 def test_cli_returns_one_when_pdi_core_tool_cannot_start(tmp_path, monkeypatch):
     exit_code, _exporter_factory = _run_cli(
         tmp_path,
@@ -192,6 +218,117 @@ def test_cli_restart_only_runs_pending_accessions(tmp_path, monkeypatch):
 
     assert exit_code == 0
     runner.run.assert_called_once_with(["A002"])
+    assert store.load() is None
+
+
+def test_cli_restart_retries_only_failed_and_partial_results(tmp_path, monkeypatch):
+    state_path = tmp_path / "active-task.sqlite3"
+    store = TaskCheckpointStore(state_path)
+    checkpoint = store.start(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ["DONE", "FAILED", "PARTIAL"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("DONE", AccessionStatus.COMPLETED),
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("FAILED", AccessionStatus.FAILED),
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "PARTIAL",
+            AccessionStatus.PARTIAL,
+            archived_files=[str(tmp_path / "dicom" / "kept.dcm")],
+        ),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = Mock()
+    runner.run.return_value = BatchSummary(
+        [
+            AccessionResult("FAILED", AccessionStatus.COMPLETED),
+            AccessionResult("PARTIAL", AccessionStatus.COMPLETED),
+        ]
+    )
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(
+        cli,
+        "preflight",
+        lambda *_args: PreflightResult(tools, {}, [("DCMTK", True, "就绪")]),
+    )
+    monkeypatch.setattr(cli, "DownloadRunner", Mock(return_value=runner))
+
+    exit_code = cli.main(
+        ["--password", "ignored", "--task-state", str(state_path)]
+    )
+
+    assert exit_code == 0
+    runner.run.assert_called_once_with(["FAILED", "PARTIAL"])
+    assert store.load() is None
+
+
+def test_cli_can_accept_download_failures_and_continue_pdi(tmp_path, monkeypatch):
+    state_path = tmp_path / "active-task.sqlite3"
+    archived = tmp_path / "dicom" / "DONE.dcm"
+    store = TaskCheckpointStore(state_path)
+    checkpoint = store.start(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        ["DONE", "FAILED"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "DONE",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[str(archived)],
+        ),
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("FAILED", AccessionStatus.FAILED),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+    tools = ToolPaths(
+        Path("movescu"),
+        Path("storescp"),
+        Path("."),
+        "3.7.0",
+        dcmmkdir=Path("dcmmkdir"),
+    )
+    resolver = Mock()
+    resolver.resolve.return_value = tools
+    exporter = Mock()
+    exporter.export.return_value = PdiExportResult(PdiStatus.COMPLETED)
+    exporter_factory = Mock(return_value=exporter)
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(cli, "DcmtkResolver", Mock(return_value=resolver))
+    runner_factory = Mock()
+    monkeypatch.setattr(cli, "DownloadRunner", runner_factory)
+    monkeypatch.setattr(cli, "PdiExporter", exporter_factory)
+
+    exit_code = cli.main(
+        [
+            "--password",
+            "ignored",
+            "--task-state",
+            str(state_path),
+            "--accept-download-failures",
+        ]
+    )
+
+    assert exit_code == 2
+    runner_factory.assert_not_called()
+    exporter.export.assert_called_once_with([str(archived)])
     assert store.load() is None
 
 

@@ -17,12 +17,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import AppConfig
 from .anonymization import DicomAnonymizer
+from .diagnostics import PrivateRotatingFileHandler
 from .runtime import ensure_application_state_dir
 
 
@@ -44,6 +44,7 @@ class ToolPaths:
     version: str
     storescp_help: str = ""
     dcmmkdir: Path | None = None
+    dcmdump: Path | None = None
 
     @property
     def supports_fork(self) -> bool:
@@ -186,6 +187,7 @@ class DcmtkResolver:
             version,
             help_text,
             dcmmkdir=self._optional_tool(movescu.parent, "dcmmkdir"),
+            dcmdump=self._optional_tool(movescu.parent, "dcmdump"),
         )
 
     def _optional_tool(self, directory: Path, name: str) -> Path | None:
@@ -368,6 +370,9 @@ class DownloadRunner:
         self._current_process: subprocess.Popen[str] | None = None
         self._storescp_process: subprocess.Popen[str] | None = None
         self._storescp_abort_count = 0
+        self._staging_accession_cache: dict[
+            Path, tuple[int, int, int, str | None]
+        ] = {}
         self._logger = self._build_file_logger()
         self._anonymizer = (
             DicomAnonymizer(config.anonymization_profile)
@@ -407,6 +412,7 @@ class DownloadRunner:
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
+        self._staging_accession_cache.clear()
         staging = staging_directory_root(self.config) / datetime.now().strftime(
             "%Y%m%d-%H%M%S-%f"
         )
@@ -523,6 +529,7 @@ class DownloadRunner:
         reader: threading.Thread | None = None
         last_received_bytes = 0
         last_sample_at = started
+        receiver_exit_code: int | None = None
         try:
             self._emit("movescu", f"开始检查号 {accession}", "info")
             self._emit("movescu", _display_command(command), "debug")
@@ -531,6 +538,17 @@ class DownloadRunner:
                 if self._cancel.is_set():
                     _terminate_process(process)
                     break
+                receiver = self._storescp_process
+                if receiver is not None:
+                    receiver_exit_code = receiver.poll()
+                    if receiver_exit_code is not None:
+                        self._emit(
+                            "storescp",
+                            f"接收器意外退出，退出码 {receiver_exit_code}",
+                            "error",
+                        )
+                        _terminate_process(process)
+                        break
                 now = time.monotonic()
                 if now - last_sample_at >= 0.5:
                     new_files = _files_in(staging) - before
@@ -576,8 +594,24 @@ class DownloadRunner:
                         "movescu", getattr(process, "pid", 0), command[0], False
                     )
 
-        new_files = sorted(_files_in(staging) - before)
-        received_bytes = _total_file_size(new_files)
+        all_files = _files_in(staging)
+        new_files = all_files - before
+        candidate_files, mismatched_files = _select_files_for_accession(
+            all_files,
+            new_files,
+            accession,
+            cache=self._staging_accession_cache,
+        )
+        if mismatched_files:
+            self._emit(
+                "storescp",
+                (
+                    f"收到 {len(mismatched_files)} 个检查号与当前任务不匹配的文件，"
+                    f"已保留在暂存目录：{staging}"
+                ),
+                "warning",
+            )
+        received_bytes = _total_file_size(candidate_files)
         transfer_seconds = max(0.0, transfer_finished - started)
         average_speed = (
             received_bytes / transfer_seconds if transfer_seconds > 0 else 0.0
@@ -593,12 +627,14 @@ class DownloadRunner:
             )
 
         moved, rejected = _archive_dicom_files(
-            new_files,
+            candidate_files,
             destination_root,
             self.config.directory_template,
             accession,
             anonymizer=self._anonymizer,
             error_callback=record_archive_error,
+            dcmdump=self.tools.dcmdump,
+            dcmtk_environment=_dcmtk_environment(self.tools),
         )
         rejected_detail = (
             f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
@@ -614,6 +650,13 @@ class DownloadRunner:
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
             message = "用户已取消"
+        elif receiver_exit_code is not None:
+            status = AccessionStatus.PARTIAL if moved else AccessionStatus.FAILED
+            message = f"storescp 意外退出（退出码 {receiver_exit_code}）"
+            if moved:
+                message += f"，已保留 {len(moved)} 个完整文件"
+            if rejected:
+                message += f"，{rejected_detail}"
         elif return_code == 0 and moved and (receiver_aborts or rejected):
             status = AccessionStatus.PARTIAL
             details = []
@@ -698,7 +741,13 @@ class DownloadRunner:
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        return subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
+        process = subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
+        if os.name != "nt":
+            # Every POSIX child above starts a new session, so its PID is also
+            # the process-group ID.  Keep that identity even if the group
+            # leader exits before its forked storescp children.
+            setattr(process, "_dcmget_process_group", process.pid)
+        return process
 
     def _start_reader(
         self,
@@ -738,10 +787,11 @@ class DownloadRunner:
     def _stop_storescp(self) -> None:
         process = self._storescp_process
         self._storescp_process = None
-        if process and process.poll() is None:
+        if process:
+            # ``storescp --fork`` children can outlive an exited group leader.
+            # Always ask the process-group cleanup helper to drain the group.
             _terminate_process(process)
             self._emit("storescp", "接收器已停止", "info")
-        if process:
             self._notify_process(
                 "storescp", getattr(process, "pid", 0), str(self.tools.storescp), False
             )
@@ -794,7 +844,7 @@ class DownloadRunner:
         logger = logging.getLogger(f"dcmget.runner.{id(self)}")
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
-        handler = RotatingFileHandler(
+        handler = PrivateRotatingFileHandler(
             log_dir / "dcmget.log",
             maxBytes=self.config.max_log_file_size_bytes,
             backupCount=5,
@@ -824,9 +874,8 @@ def staging_directory_root(config: AppConfig) -> Path:
 
 
 def log_directory(config: AppConfig) -> Path:
-    if config.anonymization_enabled:
-        return ensure_application_state_dir() / "logs"
-    return Path(config.dicom_destination_folder).expanduser().resolve() / "logs"
+    del config
+    return ensure_application_state_dir() / "logs"
 
 
 def _run_probe(command: list[str], allow_nonzero: bool = False) -> str:
@@ -872,6 +921,69 @@ def _total_file_size(files: Iterable[Path]) -> int:
     return total
 
 
+def _select_files_for_accession(
+    all_files: Iterable[Path],
+    new_files: Iterable[Path],
+    accession: str,
+    *,
+    cache: dict[Path, tuple[int, int, int, str | None]] | None = None,
+) -> tuple[list[Path], list[Path]]:
+    """Select received files without assigning another accession by timing alone."""
+
+    from pydicom import dcmread
+
+    new = set(new_files)
+    current = set(all_files)
+    metadata_cache = cache if cache is not None else {}
+    for stale in metadata_cache.keys() - current:
+        metadata_cache.pop(stale, None)
+    selected: list[Path] = []
+    mismatched: list[Path] = []
+    expected = accession.strip()
+    for path in sorted(current):
+        try:
+            stat = path.stat()
+        except OSError:
+            metadata_cache.pop(path, None)
+            continue
+        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+        cached = metadata_cache.get(path)
+        if cached is not None and cached[:3] == fingerprint:
+            received_accession = cached[3]
+        else:
+            try:
+                dataset = dcmread(
+                    path,
+                    stop_before_pixels=True,
+                    force=True,
+                    specific_tags=["AccessionNumber"],
+                )
+                received_accession = str(
+                    getattr(dataset, "AccessionNumber", "") or ""
+                ).strip()
+            except Exception:
+                received_accession = None
+            metadata_cache[path] = (*fingerprint, received_accession)
+
+        if received_accession is None:
+            # Newly written malformed files still have to reach validation so
+            # the active accession is reported as failed instead of no-data.
+            if path in new:
+                selected.append(path)
+            continue
+
+        if received_accession == expected:
+            selected.append(path)
+        elif not received_accession and path in new:
+            # Some legacy PACS omit AccessionNumber in returned instances.  A
+            # file created during this strictly sequential C-MOVE is the only
+            # safe compatibility fallback.
+            selected.append(path)
+        elif path in new:
+            mismatched.append(path)
+    return selected, mismatched
+
+
 def _archive_dicom_files(
     files: Iterable[Path],
     destination_root: Path,
@@ -879,6 +991,8 @@ def _archive_dicom_files(
     fallback_accession: str,
     anonymizer: DicomAnonymizer | None = None,
     error_callback: ArchiveErrorCallback | None = None,
+    dcmdump: Path | None = None,
+    dcmtk_environment: dict[str, str] | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
@@ -888,6 +1002,11 @@ def _archive_dicom_files(
     values = list(files)
     if not values:
         return moved, rejected
+    validation_errors = _validate_dicom_files(
+        values,
+        dcmdump=dcmdump,
+        environment=dcmtk_environment,
+    )
     for source in values:
         temporary: Path | None = None
         metadata = {
@@ -897,6 +1016,9 @@ def _archive_dicom_files(
             "SOPInstanceUID": "",
         }
         try:
+            validation_error = validation_errors.get(source)
+            if validation_error:
+                raise ValueError(validation_error)
             if anonymizer:
                 dataset = dcmread(source, force=True)
                 if not str(getattr(dataset, "PatientID", "") or "").strip():
@@ -937,10 +1059,7 @@ def _archive_dicom_files(
         )
         try:
             destination.mkdir(parents=True, exist_ok=True)
-            target_name = (
-                f"{metadata['SOPInstanceUID']}.dcm" if anonymizer else source.name
-            )
-            target = _unique_dicom_target(destination, target_name)
+            target = destination / f"{metadata['SOPInstanceUID']}.dcm"
             if anonymizer:
                 descriptor, temporary_name = tempfile.mkstemp(
                     prefix=".dcmget-anonymous-", suffix=".tmp", dir=destination
@@ -949,16 +1068,11 @@ def _archive_dicom_files(
                 temporary = Path(temporary_name)
                 dataset.save_as(temporary, enforce_file_format=True)
                 _validate_anonymized_file(temporary, metadata["SOPInstanceUID"])
-                os.replace(temporary, target)
+                _publish_or_deduplicate(temporary, target)
                 temporary = None
-                try:
-                    source.unlink()
-                except OSError as exc:
-                    if error_callback:
-                        error_callback(source, str(exc))
-                    rejected.append(source)
+                source.unlink()
             else:
-                os.replace(source, target)
+                _publish_or_deduplicate(source, target)
         except Exception as exc:
             if temporary:
                 temporary.unlink(missing_ok=True)
@@ -966,8 +1080,126 @@ def _archive_dicom_files(
                 error_callback(source, str(exc))
             rejected.append(source)
             continue
-        moved.append(target)
+        if target not in moved:
+            moved.append(target)
     return moved, rejected
+
+
+def _validate_dicom_files(
+    files: list[Path],
+    *,
+    dcmdump: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[Path, str]:
+    if dcmdump is not None and dcmdump.is_file():
+        return _validate_dicom_files_with_dcmdump(files, dcmdump, environment)
+
+    errors: dict[Path, str] = {}
+    for path in files:
+        try:
+            _validate_dicom_stream(path)
+        except Exception as exc:
+            errors[path] = f"DICOM 文件不完整或损坏：{exc}"
+    return errors
+
+
+def _validate_dicom_files_with_dcmdump(
+    files: list[Path],
+    dcmdump: Path,
+    environment: dict[str, str] | None,
+) -> dict[Path, str]:
+    errors: dict[Path, str] = {}
+    chunks: list[list[Path]] = []
+    current: list[Path] = []
+    current_length = 0
+    for path in files:
+        argument_length = len(os.fsencode(path)) + 3
+        if current and current_length + argument_length > 24_000:
+            chunks.append(current)
+            current = []
+            current_length = 0
+        current.append(path)
+        current_length += argument_length
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        if _run_dcmdump_validation(dcmdump, chunk, environment):
+            continue
+        for path in chunk:
+            if not _run_dcmdump_validation(dcmdump, [path], environment):
+                errors[path] = "DICOM 文件未通过 dcmdump 完整性校验"
+    return errors
+
+
+def _run_dcmdump_validation(
+    dcmdump: Path,
+    files: list[Path],
+    environment: dict[str, str] | None,
+) -> bool:
+    command = [str(dcmdump), "-q", "-M", "-E", *(str(path) for path in files)]
+    kwargs: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "check": False,
+        "timeout": max(30, min(300, len(files) * 3)),
+        "env": environment,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        result = subprocess.run(command, **kwargs)  # type: ignore[arg-type]
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _validate_dicom_stream(path: Path) -> None:
+    from pydicom.filereader import (
+        _read_file_meta_info,
+        data_element_generator,
+        read_preamble,
+    )
+    from pydicom.uid import UID
+
+    file_size = path.stat().st_size
+    with path.open("rb") as handle:
+        read_preamble(handle, force=False)
+        file_meta = _read_file_meta_info(handle)
+        transfer_syntax = UID(str(getattr(file_meta, "TransferSyntaxUID", "") or ""))
+        if not transfer_syntax.is_valid:
+            raise ValueError("缺少有效的 Transfer Syntax UID")
+        if transfer_syntax.is_deflated:
+            raise ValueError("压缩数据集需要 dcmdump 完整性校验")
+        for raw in data_element_generator(
+            handle,
+            transfer_syntax.is_implicit_VR,
+            transfer_syntax.is_little_endian,
+            defer_size=1,
+        ):
+            if raw.length == 0xFFFFFFFF:
+                continue
+            if raw.value_tell + raw.length > file_size:
+                raise EOFError(
+                    f"元素 {raw.tag} 声明长度超过文件末尾"
+                )
+
+
+def _publish_or_deduplicate(source: Path, target: Path) -> None:
+    if not target.exists():
+        os.replace(source, target)
+        return
+    if _file_sha256(source) != _file_sha256(target):
+        raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+    source.unlink()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validate_anonymized_file(path: Path, expected_sop_instance_uid: str) -> None:
@@ -1003,17 +1235,6 @@ def _render_directory_template(
         if component.strip()
     ]
     return destination_root.joinpath(*(components or ["UNKNOWN"]))
-
-
-def _unique_dicom_target(destination: Path, source_name: str) -> Path:
-    base_name = source_name[:-4] if source_name.lower().endswith(".dcm") else source_name
-    safe_name = _safe_path_component(base_name, "dicom")[:180]
-    target = destination / f"{safe_name}.dcm"
-    index = 1
-    while target.exists():
-        target = destination / f"{safe_name}-{index}.dcm"
-        index += 1
-    return target
 
 
 def _safe_path_component(value: str, fallback: str) -> str:
@@ -1055,9 +1276,9 @@ def _dcmtk_environment(tools: ToolPaths) -> dict[str, str]:
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     if os.name == "nt":
+        if process.poll() is not None:
+            return
         subprocess.run(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
@@ -1070,17 +1291,53 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         except (OSError, subprocess.TimeoutExpired):
             process.kill()
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=3)
-        return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    process_group = getattr(process, "_dcmget_process_group", None)
+    if not isinstance(process_group, int) or process_group <= 0:
+        if process.poll() is not None:
+            return
+        try:
+            process_group = os.getpgid(process.pid)
+        except OSError:
+            return
+        if process_group != process.pid:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()
+            return
 
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
     except OSError:
-        process.kill()
+        if process.poll() is None:
+            process.terminate()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            break
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
 
 
 def _display_command(command: list[str]) -> str:

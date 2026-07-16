@@ -180,6 +180,7 @@ class AccessionParseResult:
     values: list[str]
     blank_count: int
     duplicate_count: int
+    invalid_values: tuple[str, ...] = ()
 
 
 def parse_accessions(lines: str | Iterable[str]) -> AccessionParseResult:
@@ -188,11 +189,15 @@ def parse_accessions(lines: str | Iterable[str]) -> AccessionParseResult:
     seen: set[str] = set()
     blank_count = 0
     duplicate_count = 0
+    invalid_values: list[str] = []
 
     for raw in source:
         value = str(raw).strip()
         if not value:
             blank_count += 1
+            continue
+        if re.search(r"[\\*?\x00-\x1f\x7f]", value):
+            invalid_values.append(value)
             continue
         if value in seen:
             duplicate_count += 1
@@ -200,7 +205,12 @@ def parse_accessions(lines: str | Iterable[str]) -> AccessionParseResult:
         seen.add(value)
         values.append(value)
 
-    return AccessionParseResult(values, blank_count, duplicate_count)
+    return AccessionParseResult(
+        values,
+        blank_count,
+        duplicate_count,
+        tuple(invalid_values),
+    )
 
 
 def load_accessions(path: str | Path) -> AccessionParseResult:

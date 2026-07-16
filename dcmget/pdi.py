@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 from pydicom import dcmread
@@ -26,8 +26,47 @@ from .runtime import resource_root
 
 
 OHIF_VERSION = "3.12.6"
-STUDY_INDEX = "DCMGET_STUDIES.json"
+OHIF_PAYLOAD_CHECKSUMS = "DCMGET_PAYLOAD.SHA256"
+# The viewer metadata is an implementation detail.  Keep it below the viewer
+# data directory so users open the PDI root, not a JSON document.
+STUDY_INDEX = "VIEWER/.dcmget/index"
+# New exports keep implementation metadata away from the user-facing PDI root.
+# RECOVERY_MARKER remains the legacy public name because older recovery/UI test
+# fixtures still use it; all new writes use RECOVERY_MARKER_PATH.
 RECOVERY_MARKER = ".DCMGET-EXPORT.JSON"
+RECOVERY_MARKER_PATH = "VIEWER/.dcmget/recovery"
+MAX_OHIF_INDEX_FRAMES = 100_000
+MAX_OHIF_INDEX_ESTIMATED_BYTES = 64 * 1024 * 1024
+OHIF_INDEX_EXCLUDED_KEYWORDS = {
+    "AdditionalPatientHistory",
+    "AdmissionID",
+    "CurrentPatientLocation",
+    "InstitutionAddress",
+    "InstitutionalDepartmentName",
+    "MedicalRecordLocator",
+    "Occupation",
+    "OperatorsName",
+    "OtherPatientIDs",
+    "OtherPatientIDsSequence",
+    "OtherPatientNames",
+    "PatientAddress",
+    "PatientBirthDate",
+    "PatientBirthName",
+    "PatientBirthTime",
+    "PatientComments",
+    "PatientInsurancePlanCodeSequence",
+    "PatientMotherBirthName",
+    "PatientTelephoneNumbers",
+    "PerformingPhysicianName",
+    "PhysiciansOfRecord",
+    "ReferringPhysicianAddress",
+    "ReferringPhysicianName",
+    "ReferringPhysicianTelephoneNumbers",
+    "RequestingPhysician",
+    "ResponsibleOrganization",
+    "ResponsiblePerson",
+    "ScheduledPerformingPhysicianName",
+}
 
 
 class PdiStatus(str, Enum):
@@ -42,8 +81,8 @@ class PdiStatus(str, Enum):
 class PdiStage(str, Enum):
     PREPARING = "整理文件"
     DICOMDIR = "生成 DICOMDIR"
-    INDEXING = "生成 OHIF 索引"
-    VIEWER = "加入 OHIF 查看器"
+    INDEXING = "整理阅片数据"
+    VIEWER = "准备离线阅片器"
     VERIFYING = "校验导出目录"
 
 
@@ -208,19 +247,19 @@ class PdiExporter:
 
             index_problem = False
             try:
-                self._progress(PdiStage.INDEXING, 0, len(items), "正在生成 OHIF 本地索引")
+                self._progress(PdiStage.INDEXING, 0, len(items), "正在整理本地阅片数据")
                 result.indexed_count = self._write_ohif_index(temporary, items)
                 self._progress(
                     PdiStage.INDEXING,
                     len(items),
                     len(items),
-                    f"OHIF 索引已生成，共 {result.indexed_count} 个图像帧",
+                    f"阅片数据已就绪，共 {result.indexed_count} 个图像帧",
                 )
             except _Cancelled:
                 raise
             except Exception as exc:
                 index_problem = True
-                warning = f"OHIF 索引生成失败，DICOMDIR 仍可使用：{exc}"
+                warning = f"阅片数据整理失败，DICOMDIR 仍可使用：{exc}"
                 result.warnings.append(warning)
                 self._emit(warning, "warning")
 
@@ -237,10 +276,11 @@ class PdiExporter:
                 except _Cancelled:
                     raise
                 except Exception as exc:
-                    shutil.rmtree(temporary / "VIEWER", ignore_errors=True)
+                    shutil.rmtree(temporary / "VIEWER" / "OHIF", ignore_errors=True)
+                    (temporary / "VIEWER" / "pdi_server.py").unlink(missing_ok=True)
                     self._remove_launchers(temporary)
                     viewer_problem = True
-                    warning = f"OHIF 查看器加入失败，DICOMDIR 仍可使用：{exc}"
+                    warning = f"离线阅片器准备失败，DICOMDIR 仍可使用：{exc}"
                     result.warnings.append(warning)
                     self._emit(warning, "warning")
 
@@ -506,9 +546,43 @@ class PdiExporter:
             )
 
     def _write_ohif_index(self, root: Path, items: list[_DicomItem]) -> int:
+        frame_counts: dict[Path, int] = {}
+        estimated_bytes = 32
+        indexed_count = 0
+        for item in items:
+            self._check_cancelled()
+            try:
+                frame_count = max(1, int(item.metadata.get("NumberOfFrames", 1)))
+            except (TypeError, ValueError):
+                frame_count = 1
+            if indexed_count + frame_count > MAX_OHIF_INDEX_FRAMES:
+                raise RuntimeError(
+                    "本批次阅片索引超过 100000 帧，请拆分批次后重新导出 PDI"
+                )
+            metadata_bytes = len(
+                json.dumps(
+                    item.metadata,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            base_url_bytes = len(
+                f"dicomweb:/{item.relative_path.as_posix()}".encode("utf-8")
+            )
+            # Each frame repeats its metadata in the DICOM JSON payload.  Add a
+            # conservative allowance for URL, keys, separators and containers.
+            estimated_bytes += frame_count * (metadata_bytes + base_url_bytes + 96)
+            estimated_bytes += 512
+            if estimated_bytes > MAX_OHIF_INDEX_ESTIMATED_BYTES:
+                raise RuntimeError(
+                    "本批次阅片索引预计超过 64 MiB，请拆分批次后重新导出 PDI"
+                )
+            frame_counts[item.relative_path] = frame_count
+            indexed_count += frame_count
+
         studies: dict[str, dict[str, Any]] = {}
         series_maps: dict[str, dict[str, dict[str, Any]]] = {}
-        indexed_count = 0
 
         for item in items:
             self._check_cancelled()
@@ -560,10 +634,7 @@ class PdiExporter:
                 studies[study_key]["series"].append(series)
 
             base_url = f"dicomweb:/{item.relative_path.as_posix()}"
-            try:
-                frame_count = max(1, int(item.metadata.get("NumberOfFrames", 1)))
-            except (TypeError, ValueError):
-                frame_count = 1
+            frame_count = frame_counts[item.relative_path]
             for frame_number in range(1, frame_count + 1):
                 series_map[series_key]["instances"].append(
                     {
@@ -575,7 +646,6 @@ class PdiExporter:
                         ),
                     }
                 )
-                indexed_count += 1
 
         for study_key, study in studies.items():
             modalities: list[str] = []
@@ -596,7 +666,9 @@ class PdiExporter:
             study["Modalities"] = "\\".join(modalities)
 
         payload = {"studies": list(studies.values())}
-        (root / STUDY_INDEX).write_text(
+        index_path = root / STUDY_INDEX
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
             encoding="utf-8",
             newline="\n",
@@ -606,9 +678,10 @@ class PdiExporter:
     def _copy_ohif(
         self, root: Path, payload: Path | None
     ) -> tuple[bool, str | None]:
-        self._progress(PdiStage.VIEWER, 0, 1, "正在加入中文 OHIF 查看器")
+        self._progress(PdiStage.VIEWER, 0, 1, "正在准备中文离线阅片器")
         if payload is None:
             return False, "未找到经过校验的 OHIF 资源，已保留 DICOMDIR 和原始 DICOM"
+        _verify_ohif_payload(payload)
         missing = [
             name
             for name in ("index.html", "app-config.js")
@@ -626,6 +699,7 @@ class PdiExporter:
         destination = root / "VIEWER" / "OHIF"
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(payload, destination, copy_function=self._copy_file)
+        _verify_ohif_payload(destination)
 
         server_script = Path(__file__).with_name("pdi_server.py")
         if not server_script.is_file():
@@ -646,7 +720,7 @@ class PdiExporter:
                 ),
             )
         self._write_launchers(root)
-        self._progress(PdiStage.VIEWER, 1, 1, "中文 OHIF 查看器已加入")
+        self._progress(PdiStage.VIEWER, 1, 1, "中文离线阅片器已就绪")
         return True, None
 
     @staticmethod
@@ -656,7 +730,7 @@ class PdiExporter:
             "setlocal\r\n"
             "cd /d \"%~dp0\"\r\n"
             "if exist \"OPEN_VIEWER.exe\" (\r\n"
-            "  start \"\" \"OPEN_VIEWER.exe\" --root \"%CD%\"\r\n"
+            "  start \"\" \"OPEN_VIEWER.exe\" --root \"%CD%\" --quiet\r\n"
             "  exit /b 0\r\n"
             ")\r\n"
             "where py >nul 2>nul && py -3 \"VIEWER\\pdi_server.py\" --root \"%CD%\" && exit /b 0\r\n"
@@ -718,21 +792,21 @@ class PdiExporter:
                 "</article>"
             )
         launch = (
-            '<div class="launch"><strong>此页仅显示检查清单，不能直接看图</strong>'
+            '<div class="launch"><strong>查看影像请从本目录启动离线阅片器</strong>'
             "<p>Windows：返回目录双击 OPEN_VIEWER.exe（推荐）或 OPEN_VIEWER.bat</p>"
             "<p>macOS：双击 OPEN_VIEWER.command</p>"
             "<p>Linux：运行 OPEN_VIEWER.sh</p></div>"
             if viewer_included
             else (
                 '<div class="warning"><strong>此页仅显示检查清单，不能直接看图。</strong> '
-                "本次导出未能加入 OHIF 运行资源，请查看 README.TXT 的警告说明，"
+                "本次导出未能加入离线阅片器，请查看 README.TXT 的警告说明，"
                 "或使用外部 DICOM 查看器打开 DICOMDIR。</div>"
             )
         )
         contents = (
-            "目录内保存标准 DICOMDIR、原始 DICOM 和本地中文 OHIF 阅片器。"
+            "目录内保存标准 DICOMDIR、原始 DICOM 和中文离线阅片器。"
             if viewer_included
-            else "目录内保存标准 DICOMDIR 和原始 DICOM；本次未加入 OHIF 阅片器。"
+            else "目录内保存标准 DICOMDIR 和原始 DICOM；本次未加入离线阅片器。"
         )
         document = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -773,7 +847,7 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
             "Linux 运行 OPEN_VIEWER.sh。阅片服务只监听本机 127.0.0.1。"
             if viewer_included
             else (
-                "本次导出未能加入 OHIF 查看器，请查看下方警告；"
+                "本次导出未能加入离线阅片器，请查看下方警告；"
                 "也可使用外部 DICOM 查看器打开 DICOMDIR。"
             )
         )
@@ -789,7 +863,7 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
 3. INDEX.HTM 只用于查看目录说明和检查清单，不能直接显示 DICOM 图像。
 
 {profile}
-OHIF 直接读取目录中的原始 DICOM，不生成 JPEG 预览，也不会连接 PACS 或公网。
+离线阅片器直接读取目录中的原始 DICOM，不生成 JPEG 预览，也不会连接 PACS 或公网。
 本目录仅供查阅，不用于诊断；DICOM 原始文件为准。
 MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
 
@@ -1003,7 +1077,9 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             "version": 2,
             "warnings": list(result.warnings),
         }
-        (root / RECOVERY_MARKER).write_text(
+        marker_path = root / RECOVERY_MARKER_PATH
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
             json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -1194,7 +1270,12 @@ def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:
         if element.tag.is_private or element.keyword == "PixelData":
             continue
         keyword = element.keyword
-        if not keyword or element.VR in binary_vrs:
+        if (
+            not keyword
+            or element.VR in binary_vrs
+            or element.VR == "PN"
+            or keyword in OHIF_INDEX_EXCLUDED_KEYWORDS
+        ):
             continue
         try:
             value = _naturalize_value(element.value, element.VR)
@@ -1259,13 +1340,14 @@ def _sort_number(value: object) -> tuple[int, float | str]:
 
 
 def _read_recovery_marker(root: Path) -> dict[str, object] | None:
-    try:
-        payload = json.loads((root / RECOVERY_MARKER).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
-        return None
-    return payload
+    for relative in (RECOVERY_MARKER_PATH, RECOVERY_MARKER):
+        try:
+            payload = json.loads((root / relative).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("version") in {1, 2}:
+            return payload
+    return None
 
 
 def _pdi_output_root(config: AppConfig) -> Path:
@@ -1317,6 +1399,44 @@ def _strict_profile(items: list[_DicomItem]) -> str:
     if syntaxes & jpeg_2000 and syntaxes <= jpeg_2000 | explicit_vr_little_endian:
         return "-Pf2"
     return "-Pgp"
+
+
+def _verify_ohif_payload(root: Path) -> None:
+    checksum_path = root / OHIF_PAYLOAD_CHECKSUMS
+    try:
+        lines = checksum_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError("离线阅片器缺少资源校验清单") from exc
+
+    expected: dict[str, str] = {}
+    for line in lines:
+        digest, separator, relative = line.partition("  ")
+        candidate = PurePosixPath(relative)
+        if (
+            not separator
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not relative
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.as_posix() in expected
+        ):
+            raise RuntimeError("离线阅片器资源校验清单格式无效")
+        expected[candidate.as_posix()] = digest
+
+    actual: dict[str, str] = {}
+    try:
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError("离线阅片器资源包含不允许的符号链接")
+            if not path.is_file() or path == checksum_path:
+                continue
+            relative = path.relative_to(root).as_posix()
+            actual[relative] = _sha256(path)
+    except OSError as exc:
+        raise RuntimeError(f"离线阅片器资源无法读取：{exc}") from exc
+    if not actual or actual != expected:
+        raise RuntimeError("离线阅片器资源校验失败，文件可能缺失或已损坏")
 
 
 def _sha256(path: Path) -> str:

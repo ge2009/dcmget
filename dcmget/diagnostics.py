@@ -24,7 +24,7 @@ class DiagnosticsError(RuntimeError):
     pass
 
 
-class _PrivateRotatingFileHandler(RotatingFileHandler):
+class PrivateRotatingFileHandler(RotatingFileHandler):
     def _open(self):
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         flags |= getattr(os, "O_NOINHERIT", 0)
@@ -99,7 +99,7 @@ def install_diagnostics(
         _make_private(log_directory, directory=True)
 
         log_path = log_directory / DIAGNOSTIC_LOG_NAME
-        handler = _PrivateRotatingFileHandler(
+        handler = PrivateRotatingFileHandler(
             log_path,
             maxBytes=max(1024, int(max_bytes)),
             backupCount=max(1, int(backup_count)),

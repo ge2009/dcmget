@@ -58,7 +58,7 @@ def run_self_test(config_path: str) -> int:
 
     from dcmget.anonymization import DicomAnonymizer
     from dcmget.config import AppConfig
-    from dcmget.pdi import PdiExporter
+    from dcmget.pdi import PdiExporter, STUDY_INDEX
 
     load_config(config_path)
     trial_status()
@@ -141,7 +141,7 @@ def run_self_test(config_path: str) -> int:
             pdi_output = Path(pdi_result.output_directory)
             required_pdi = (
                 pdi_output / "DICOMDIR",
-                pdi_output / "DCMGET_STUDIES.json",
+                pdi_output / STUDY_INDEX,
                 pdi_output / "VIEWER" / "OHIF" / "index.html",
                 pdi_output / "VIEWER" / "pdi_server.py",
                 pdi_output / "OPEN_VIEWER.exe",
@@ -153,8 +153,8 @@ def run_self_test(config_path: str) -> int:
                     f"PDI 冻结资源自检缺少文件：{'、'.join(missing_pdi)}"
                 )
             index_text = (pdi_output / "INDEX.HTM").read_text(encoding="utf-8")
-            if "本次导出未能加入 OHIF" in index_text:
-                raise RuntimeError("PDI 冻结资源自检未能加入 OHIF")
+            if "本次导出未能加入离线阅片器" in index_text:
+                raise RuntimeError("PDI 冻结资源自检未能加入离线阅片器")
     print(f"DcmGet {__version__} self-test OK; DCMTK {tools.version}; fork=yes")
     return 0
 

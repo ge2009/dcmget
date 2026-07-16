@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="放弃未完成任务恢复点并开始新任务（不删除已下载文件）",
     )
+    parser.add_argument(
+        "--accept-download-failures",
+        action="store_true",
+        help="接受恢复任务中的下载失败，保留现有文件并继续 PDI 或结束任务",
+    )
     parser.add_argument("--task-state", help=argparse.SUPPRESS)
     return parser
 
@@ -131,8 +136,20 @@ def main(argv: list[str] | None = None) -> int:
     if authorization is None:
         store.release_lease()
         return 1
+    accepting_download_failures = False
     try:
+        if args.accept_download_failures and (
+            checkpoint is None or checkpoint.phase != "download_retryable"
+        ):
+            raise ValueError("当前没有可接受的下载失败恢复任务")
         if checkpoint is not None:
+            if checkpoint.phase == "download_retryable":
+                accepting_download_failures = bool(args.accept_download_failures)
+                if accepting_download_failures:
+                    print("[恢复] 已接受当前下载结果，不再重试失败项")
+                else:
+                    checkpoint = store.prepare_download_retry(checkpoint.task_id)
+                    print("[恢复] 正在重试上次失败和部分成功的检查号")
             config = checkpoint.config
             accessions = checkpoint.pending_accessions
             print(
@@ -144,6 +161,12 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config(args.config)
             accession_path = args.accessions or config.access_numbers_file_path
             parsed = load_accessions(accession_path)
+            if parsed.invalid_values:
+                examples = "、".join(parsed.invalid_values[:3])
+                raise ValueError(
+                    "检查号不能包含 DICOM 通配符 *、?、反斜杠或控制字符："
+                    + examples
+                )
             accessions = parsed.values
     except (OSError, ValueError) as exc:
         store.release_lease()
@@ -269,6 +292,10 @@ def main(argv: list[str] | None = None) -> int:
         if summary.cancelled or cancel_requested.is_set():
             return 130
         download_exit_code = summary.exit_code
+        if download_exit_code == 2 and not accepting_download_failures:
+            store.set_phase(task_id, "download_retryable")
+            print("[恢复] 失败项已保留，下次启动将只重试失败和部分成功项。")
+            return 2
         if not config.pdi_export_enabled:
             store.clear(task_id)
             return download_exit_code

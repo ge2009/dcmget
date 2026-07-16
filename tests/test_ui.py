@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
 
 from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
-from dcmget.task_state import TaskCheckpointStore
+from dcmget.task_state import TaskCheckpoint, TaskCheckpointStore
 import dcmget.ui as ui_module
 from dcmget.ui import DcmGetWindow, DownloadWorker, PdiWorker
 
@@ -49,7 +49,7 @@ def test_paste_preview_deduplicates_and_updates_table(qtbot, tmp_path):
     window.accession_edit.setPlainText("A001\n\nA002\nA001")
 
     assert window.current_accessions == ["A001", "A002"]
-    assert window.accession_summary.text() == "有效 2 · 空行 1 · 重复 1"
+    assert window.accession_summary.text() == "有效 2 · 空行 1 · 重复 1 · 无效 0"
     assert window.task_table.rowCount() == 2
     assert window.task_table.item(1, 0).text() == "A002"
 
@@ -82,6 +82,36 @@ def test_200_accessions_keep_details_and_201_hide_them(qtbot, tmp_path):
     assert window._task_table_summary_mode
 
 
+def test_large_recovery_restores_processed_summary_and_collapsed_count(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    accessions = [f"A{index:03d}" for index in range(201)]
+    checkpoint = TaskCheckpoint(
+        task_id="a" * 32,
+        config=AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        accessions=accessions,
+        results=[
+            AccessionResult("A000", AccessionStatus.COMPLETED, file_count=2),
+            AccessionResult("A001", AccessionStatus.FAILED),
+        ],
+        partial_results={},
+        trial_required=False,
+        created_at="2026-07-16T00:00:00+00:00",
+        phase="downloading",
+    )
+
+    window._hold_download_resume(checkpoint, "已保留恢复任务")
+    window._set_task_form_expanded(False)
+
+    assert window.current_accessions == []
+    assert window.task_table.rowCount() == 0
+    assert "已处理 2/201" in window.large_batch_summary_label.text()
+    assert "完成 1" in window.large_batch_summary_label.text()
+    assert "失败 1" in window.large_batch_summary_label.text()
+    assert "201 个检查号" in window.task_form_summary.text()
+
+
 def test_large_batch_progress_is_aggregated_once_and_small_retry_restores_table(
     qtbot, tmp_path
 ):
@@ -98,7 +128,12 @@ def test_large_batch_progress_is_aggregated_once_and_small_retry_restores_table(
     window._on_worker_progress(
         1,
         len(accessions),
-        AccessionResult("A000", AccessionStatus.COMPLETED, file_count=3),
+        AccessionResult(
+            "A000",
+            AccessionStatus.COMPLETED,
+            file_count=3,
+            archived_files=[str(tmp_path / f"image-{index}.dcm") for index in range(3)],
+        ),
     )
     window._on_worker_progress(
         2,
@@ -108,6 +143,7 @@ def test_large_batch_progress_is_aggregated_once_and_small_retry_restores_table(
 
     assert window._summary_processed == 2
     assert window._summary_files == 3
+    assert window._summary_results["A000"].archived_files == []
     assert "失败 1" in window.large_batch_summary_label.text()
     assert window.task_table.rowCount() == 0
 
@@ -658,6 +694,67 @@ def test_finished_resume_merges_history_and_clears_checkpoint(
     assert window.task_store.load() is None
 
 
+def test_failed_batch_remains_retryable_and_reuses_original_task(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(), ["OK", "FAILED"], trial_required=False
+    )
+    completed = AccessionResult("OK", AccessionStatus.COMPLETED)
+    failed = AccessionResult("FAILED", AccessionStatus.FAILED, message="timeout")
+    window.task_store.record_result(checkpoint.task_id, completed)
+    window.task_store.record_result(checkpoint.task_id, failed)
+    window._active_task_id = checkpoint.task_id
+    window._display_total = 2
+    monkeypatch.setattr(window, "_show_download_completion", lambda *_args, **_kwargs: None)
+
+    window._on_worker_finished(BatchSummary([completed, failed]))
+
+    restored = window.task_store.load_required()
+    assert restored.phase == "download_retryable"
+    assert window._resume_checkpoint is not None
+    assert window._resume_checkpoint.task_id == checkpoint.task_id
+    assert window.start_button.text() == "重试失败项"
+    assert window.retry_button.isEnabled()
+
+    started = []
+    monkeypatch.setattr(
+        window,
+        "_start_download",
+        lambda override=None, **kwargs: started.append((override, kwargs)),
+    )
+    window._retry_failed()
+
+    assert started == [(None, {"resume_checkpoint": window._resume_checkpoint})]
+
+
+def test_declining_download_resume_keeps_checkpoint_for_later(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(), ["A001", "A002"], trial_required=False
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.COMPLETED),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.No,
+    )
+
+    window._offer_task_resume()
+
+    assert window.task_store.load_required().task_id == checkpoint.task_id
+    assert window._resume_checkpoint is not None
+    assert window._resume_checkpoint.task_id == checkpoint.task_id
+    assert window.start_button.text() == "继续未完成任务"
+    assert window.discard_resume_button.isVisible()
+
+
 def test_pending_resume_locks_inputs_and_disables_failed_retry_until_discarded(
     qtbot, tmp_path, monkeypatch
 ):
@@ -697,6 +794,9 @@ def test_pending_resume_locks_inputs_and_disables_failed_retry_until_discarded(
     assert window.task_store.load() is None
     assert not window.accession_edit.isReadOnly()
     assert window.start_button.text() == "开始下载"
+    assert window.last_summary is None
+    assert not window._accepted_partial_results
+    assert not window.retry_button.isEnabled()
 
 
 def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
@@ -708,6 +808,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.6.2",
         "2.6.1",
         "2.6.0",
         "2.5.2",

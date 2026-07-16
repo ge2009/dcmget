@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import sqlite3
 import uuid
 from contextlib import closing
@@ -19,7 +20,13 @@ from .runtime import ensure_application_state_dir
 
 
 TASK_STATE_VERSION = 1
-TASK_PHASES = {"downloading", "pdi_pending", "pdi_running", "pdi_retryable"}
+TASK_PHASES = {
+    "downloading",
+    "download_retryable",
+    "pdi_pending",
+    "pdi_running",
+    "pdi_retryable",
+}
 FINAL_STATUSES = {
     AccessionStatus.COMPLETED,
     AccessionStatus.NO_DATA,
@@ -154,46 +161,60 @@ class TaskCheckpointStore:
                 pass
         return self.load_required()
 
-    def load(self) -> TaskCheckpoint | None:
+    def load(self, *, include_archived_files: bool = True) -> TaskCheckpoint | None:
         if not self.path.is_file():
             return None
         try:
             with closing(sqlite3.connect(self.path)) as connection:
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT accession, result_json, partial_json
-                        FROM accessions
-                        ORDER BY position
-                        """
-                    )
+                rows = connection.execute(
+                    """
+                    SELECT accession, result_json, partial_json
+                    FROM accessions
+                    ORDER BY position
+                    """
                 )
+                if int(metadata["version"]) != TASK_STATE_VERSION:
+                    raise ValueError("unsupported version")
+                raw_config = json.loads(metadata["config"])
+                if not isinstance(raw_config, dict):
+                    raise ValueError("invalid config")
+                accessions: list[str] = []
+                results: list[AccessionResult] = []
+                partial_results: dict[str, AccessionResult] = {}
+                for accession, result_json, partial_json in rows:
+                    value = str(accession)
+                    accessions.append(value)
+                    if result_json:
+                        result = _result_from_json(
+                            str(result_json),
+                            include_archived_files=include_archived_files,
+                        )
+                        if (
+                            result.accession != value
+                            or result.status not in FINAL_STATUSES
+                        ):
+                            raise ValueError("invalid final result")
+                        results.append(result)
+                    if partial_json:
+                        partial = _result_from_json(
+                            str(partial_json),
+                            include_archived_files=include_archived_files,
+                        )
+                        if (
+                            partial.accession != value
+                            or partial.status != AccessionStatus.CANCELLED
+                        ):
+                            raise ValueError("invalid partial result")
+                        partial_results[value] = partial
         except sqlite3.Error as exc:
             raise TaskStateError(f"任务恢复点已损坏：{exc}") from exc
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TaskStateError(
+                "任务恢复点内容不完整或版本不受支持"
+            ) from exc
 
         try:
-            if int(metadata["version"]) != TASK_STATE_VERSION:
-                raise ValueError("unsupported version")
-            raw_config = json.loads(metadata["config"])
-            if not isinstance(raw_config, dict):
-                raise ValueError("invalid config")
-            accessions: list[str] = []
-            results: list[AccessionResult] = []
-            partial_results: dict[str, AccessionResult] = {}
-            for accession, result_json, partial_json in rows:
-                value = str(accession)
-                accessions.append(value)
-                if result_json:
-                    result = _result_from_json(str(result_json))
-                    if result.accession != value or result.status not in FINAL_STATUSES:
-                        raise ValueError("invalid final result")
-                    results.append(result)
-                if partial_json:
-                    partial = _result_from_json(str(partial_json))
-                    if partial.accession != value or partial.status != AccessionStatus.CANCELLED:
-                        raise ValueError("invalid partial result")
-                    partial_results[value] = partial
             task_id = metadata["task_id"]
             if not re.fullmatch(r"[0-9a-f]{32}", task_id):
                 raise ValueError("invalid task id")
@@ -219,8 +240,10 @@ class TaskCheckpointStore:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskStateError("任务恢复点内容不完整或版本不受支持") from exc
 
-    def load_required(self) -> TaskCheckpoint:
-        checkpoint = self.load()
+    def load_required(
+        self, *, include_archived_files: bool = True
+    ) -> TaskCheckpoint:
+        checkpoint = self.load(include_archived_files=include_archived_files)
         if checkpoint is None:
             raise TaskStateError("任务恢复点不存在")
         return checkpoint
@@ -297,6 +320,94 @@ class TaskCheckpointStore:
         except sqlite3.Error as exc:
             raise TaskStateError(f"无法更新任务阶段：{exc}") from exc
 
+    def prepare_download_retry(
+        self, task_id: str, *, include_archived_files: bool = True
+    ) -> TaskCheckpoint:
+        """Make failed/partial rows pending while retaining received files."""
+
+        try:
+            with closing(sqlite3.connect(self.path)) as connection, connection:
+                if _metadata_value(connection, "task_id") != task_id:
+                    raise TaskStateError("活动任务已改变，拒绝重试旧任务")
+                if _metadata_value(connection, "phase") != "download_retryable":
+                    raise TaskStateError("当前任务没有可重试的下载失败项")
+                cursor = connection.execute(
+                    "SELECT accession, result_json FROM accessions ORDER BY position"
+                )
+                retry_count = 0
+                while batch := cursor.fetchmany(500):
+                    for accession, result_json in batch:
+                        if not result_json:
+                            continue
+                        result = _result_from_json(str(result_json))
+                        if result.status not in {
+                            AccessionStatus.FAILED,
+                            AccessionStatus.PARTIAL,
+                        }:
+                            continue
+                        retained = (
+                            _result_to_json(
+                                replace(
+                                    result,
+                                    status=AccessionStatus.CANCELLED,
+                                    message="重试前已保留收到的文件",
+                                )
+                            )
+                            if result.archived_files
+                            else None
+                        )
+                        connection.execute(
+                            """
+                            UPDATE accessions
+                            SET result_json = NULL, partial_json = ?
+                            WHERE accession = ?
+                            """,
+                            (retained, str(accession)),
+                        )
+                        retry_count += 1
+                if retry_count == 0:
+                    raise TaskStateError("当前任务没有可重试的下载失败项")
+                connection.execute(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES ('phase', 'downloading')"
+                )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key = 'pdi_attempt_id'"
+                )
+        except TaskStateError:
+            raise
+        except (sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+            raise TaskStateError(f"无法准备失败项重试：{exc}") from exc
+        return self.load_required(include_archived_files=include_archived_files)
+
+    def load_archived_files(self, task_id: str) -> list[str]:
+        try:
+            with closing(sqlite3.connect(self.path)) as connection:
+                if _metadata_value(connection, "task_id") != task_id:
+                    raise TaskStateError("活动任务已改变，拒绝读取旧任务文件")
+                rows = connection.execute(
+                    """
+                    SELECT result_json, partial_json
+                    FROM accessions
+                    ORDER BY position
+                    """
+                )
+                files: list[str] = []
+                seen: set[str] = set()
+                for result_json, partial_json in rows:
+                    for payload in (result_json, partial_json):
+                        if not payload:
+                            continue
+                        result = _result_from_json(str(payload))
+                        for path in result.archived_files:
+                            if path not in seen:
+                                seen.add(path)
+                                files.append(path)
+                return files
+        except TaskStateError:
+            raise
+        except (sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
+            raise TaskStateError(f"无法读取任务归档文件：{exc}") from exc
+
     def begin_pdi_attempt(
         self,
         task_id: str,
@@ -371,14 +482,26 @@ class TaskCheckpointStore:
                     connection.execute("DELETE FROM metadata WHERE key = ?", (key,))
                     return
                 try:
-                    created_at = psutil.Process(pid).create_time()
+                    process = psutil.Process(pid)
+                    created_at = process.create_time()
+                    command_line = process.cmdline()
                 except (psutil.NoSuchProcess, psutil.ZombieProcess):
                     return
+                process_group_id = 0
+                if os.name != "nt":
+                    try:
+                        candidate_group = os.getpgid(pid)
+                    except OSError:
+                        candidate_group = 0
+                    if candidate_group == pid:
+                        process_group_id = candidate_group
                 payload = json.dumps(
                     {
+                        "command_line": command_line,
                         "created_at": created_at,
                         "executable": str(Path(executable).expanduser().resolve()),
                         "pid": int(pid),
+                        "process_group_id": process_group_id,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -455,6 +578,28 @@ class TaskCheckpointStore:
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise TaskStateError(f"{kind} 进程恢复记录已损坏") from exc
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                group_result = _cleanup_recorded_process_group(
+                    record,
+                    expected_executable,
+                    expected_created_at,
+                )
+                if group_result == "cleaned":
+                    self.record_process(
+                        task_id,
+                        kind,
+                        0,
+                        "",
+                        active=False,
+                    )
+                    messages.append(
+                        f"已清理上次异常退出遗留的 {kind} 进程组 PID {pid}"
+                    )
+                    continue
+                if group_result == "unsafe":
+                    messages.append(
+                        f"未清理 PID {pid} 的遗留进程组：进程身份无法安全确认"
+                    )
+                    continue
                 self.record_process(
                     task_id,
                     kind,
@@ -474,7 +619,11 @@ def merge_checkpoint_summary(
     current_by_accession = {result.accession: result for result in current.results}
     merged: list[AccessionResult] = []
     for accession in checkpoint.accessions:
-        result = final.get(accession) or current_by_accession.get(accession)
+        result = (
+            final.get(accession)
+            or checkpoint.partial_results.get(accession)
+            or current_by_accession.get(accession)
+        )
         if result is None:
             result = AccessionResult(
                 accession,
@@ -510,6 +659,68 @@ def _process_executable(process: psutil.Process) -> str:
         if not command:
             raise
         return _normalized_executable(command[0])
+
+
+def _cleanup_recorded_process_group(
+    record: dict[str, object],
+    expected_executable: str,
+    expected_created_at: float,
+) -> str:
+    """Clean an orphaned POSIX session only when every member is identifiable."""
+
+    if os.name == "nt":
+        return "empty"
+    try:
+        leader_pid = int(record["pid"])
+        process_group_id = int(record.get("process_group_id", 0))
+        expected_command = [str(value) for value in record.get("command_line", [])]
+    except (TypeError, ValueError):
+        return "unsafe"
+    if process_group_id != leader_pid or process_group_id <= 0 or not expected_command:
+        return "empty"
+
+    members: list[psutil.Process] = []
+    for process in psutil.process_iter():
+        try:
+            member_group_id = os.getpgid(process.pid)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            return "unsafe"
+        if member_group_id != process_group_id:
+            continue
+        try:
+            if (
+                _process_executable(process) != expected_executable
+                or process.cmdline() != expected_command
+                or process.create_time() + 1.0 < expected_created_at
+            ):
+                return "unsafe"
+            members.append(process)
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (OSError, psutil.AccessDenied):
+            return "unsafe"
+    if not members:
+        return "empty"
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return "empty"
+    except OSError:
+        return "unsafe"
+    _gone, alive = psutil.wait_procs(members, timeout=3)
+    if alive:
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            alive = []
+        except OSError:
+            return "unsafe"
+        if alive:
+            _gone, alive = psutil.wait_procs(alive, timeout=3)
+    return "cleaned" if not alive else "unsafe"
 
 
 def _merge_partial_result(
@@ -559,18 +770,27 @@ def _result_to_json(result: AccessionResult) -> str:
     )
 
 
-def _result_from_json(value: str) -> AccessionResult:
+def _result_from_json(
+    value: str, *, include_archived_files: bool = True
+) -> AccessionResult:
     raw = json.loads(value)
     if not isinstance(raw, dict):
         raise ValueError("invalid result")
+    archived_values = raw.get("archived_files", [])
+    if not isinstance(archived_values, list):
+        raise ValueError("invalid archived files")
     return AccessionResult(
         accession=str(raw["accession"]),
         status=AccessionStatus(str(raw["status"])),
-        file_count=int(raw.get("file_count", 0)),
+        file_count=max(int(raw.get("file_count", 0)), len(archived_values)),
         duration_seconds=float(raw.get("duration_seconds", 0.0)),
         message=str(raw.get("message", "")),
         output_directory=str(raw.get("output_directory", "")),
         received_bytes=int(raw.get("received_bytes", 0)),
         speed_bytes_per_second=float(raw.get("speed_bytes_per_second", 0.0)),
-        archived_files=[str(path) for path in raw.get("archived_files", [])],
+        archived_files=(
+            [str(path) for path in archived_values]
+            if include_archived_files
+            else []
+        ),
     )

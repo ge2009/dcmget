@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.6.1
+        default: 2.6.2
 
 permissions:
   contents: read
@@ -15,10 +15,16 @@ jobs:
   build:
     name: Build Windows x64 EXE and installer
     runs-on: windows-2025
-    timeout-minutes: 50
+    timeout-minutes: 75
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check out 2.6.1 upgrade baseline
+        uses: actions/checkout@v4
+        with:
+          ref: c01c83a1963a55457bef15917ddd4cfdbab81fd1
+          path: upgrade-baseline
 
       - uses: actions/setup-python@v5
         with:
@@ -91,9 +97,15 @@ jobs:
         shell: pwsh
         run: |
           $fixture = Join-Path $env:RUNNER_TEMP "dcmget-pdi-server-fixture"
-          New-Item -ItemType Directory -Force "$fixture/VIEWER/OHIF", "$fixture/DICOM" | Out-Null
+          New-Item -ItemType Directory -Force "$fixture/VIEWER/OHIF", "$fixture/VIEWER/.dcmget", "$fixture/DICOM" | Out-Null
           Set-Content "$fixture/VIEWER/OHIF/index.html" "OHIF SERVER SMOKE" -Encoding utf8NoBOM
-          Set-Content "$fixture/DCMGET_STUDIES.json" '{"studies":[]}' -Encoding utf8NoBOM
+          $viewerDigest = (Get-FileHash "$fixture/VIEWER/OHIF/index.html" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "$fixture/VIEWER/OHIF/DCMGET_PAYLOAD.SHA256",
+            "$viewerDigest  index.html`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          Set-Content "$fixture/VIEWER/.dcmget/index" '{"studies":[]}' -Encoding utf8NoBOM
           [IO.File]::WriteAllBytes("$fixture/DICOM/I000001", [byte[]](0..9))
 
           $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -101,13 +113,15 @@ jobs:
           $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
           $listener.Stop()
           $server = (Resolve-Path "build/windows/dist/DcmGetPdiServer.exe").Path
-          $process = Start-Process $server -ArgumentList @("--root", "`"$fixture`"", "--port", "$port", "--no-browser", "--quiet") -PassThru
+          # Do not pass --quiet here: the exported OPEN_VIEWER.exe is a
+          # windowed process without stderr, which is the real double-click path.
+          $process = Start-Process $server -ArgumentList @("--root", "`"$fixture`"", "--port", "$port", "--no-browser") -PassThru
           try {
             $ready = $false
             for ($attempt = 0; $attempt -lt 40; $attempt++) {
               if ($process.HasExited) { throw "PDI server exited with code $($process.ExitCode)" }
               try {
-                $response = Invoke-WebRequest "http://127.0.0.1:$port/viewer/dicomjson/?url=%2FDCMGET_STUDIES.json&lng=zh"
+                $response = Invoke-WebRequest "http://127.0.0.1:$port/viewer/dicomjson/?url=%2Fapi%2Fstudies&lng=zh"
                 if ($response.StatusCode -eq 200 -and $response.Content -match "OHIF SERVER SMOKE") {
                   $ready = $true
                   break
@@ -115,7 +129,7 @@ jobs:
               } catch { Start-Sleep -Milliseconds 250 }
             }
             if (-not $ready) { throw "PDI server did not become ready" }
-            $manifest = Invoke-WebRequest "http://127.0.0.1:$port/DCMGET_STUDIES.json"
+            $manifest = Invoke-WebRequest "http://127.0.0.1:$port/api/studies"
             if ($manifest.StatusCode -ne 200 -or $manifest.Content -notmatch '"studies"') { throw "PDI manifest request failed" }
             $range = Invoke-WebRequest "http://127.0.0.1:$port/DICOM/I000001" -Headers @{ Range = "bytes=2-5" }
             if ($range.StatusCode -ne 206 -or $range.Headers["Content-Range"] -notmatch "bytes 2-5/10") { throw "PDI byte-range request failed" }
@@ -174,7 +188,38 @@ jobs:
           $actual = (Get-FileHash $language -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) { throw "Chinese language file checksum mismatch: $actual" }
 
-      - name: Build one-click installer
+      - name: Build pinned 2.6.1 upgrade baseline installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $baselineRoot = (Resolve-Path "upgrade-baseline").Path
+          $baselineRuntime = Join-Path $baselineRoot ".runtime"
+          New-Item -ItemType Directory -Force $baselineRuntime | Out-Null
+          Copy-Item -LiteralPath ".runtime\dcmtk" -Destination $baselineRuntime -Recurse -Force
+          Copy-Item -LiteralPath ".runtime\ohif" -Destination $baselineRuntime -Recurse -Force
+          Push-Location $baselineRoot
+          try {
+            python scripts/build_windows.py --version 2.6.1
+            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 application build failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          $source = (Resolve-Path (Join-Path $baselineRoot "build\windows\dist\DcmGet")).Path
+          $icon = (Resolve-Path (Join-Path $baselineRoot "build\windows\dcmget.ico")).Path
+          $license = (Resolve-Path (Join-Path $baselineRoot "LICENSE")).Path
+          $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
+          $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
+          $fixture = (New-Item -ItemType Directory -Force "build/windows/upgrade-fixture").FullName
+          $installerScript = Join-Path $baselineRoot "packaging\windows\dcmget.iss"
+          & $iscc "/DAppVersion=2.6.1" "/DSourceDir=$source" "/DReleaseDir=$fixture" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" $installerScript
+          if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 installer compilation failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path (Join-Path $fixture "DcmGet-2.6.1-Setup-x64.exe") -PathType Leaf)) { throw "Pinned 2.6.1 installer is missing" }
+          Remove-Item (Join-Path $baselineRoot "build") -Recurse -Force
+          Remove-Item (Join-Path $baselineRoot "release") -Recurse -Force
+          Remove-Item $baselineRuntime -Recurse -Force
+
+      - name: Build current one-click installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -184,16 +229,13 @@ jobs:
           $license = (Resolve-Path "LICENSE").Path
           $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
           $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
-          $fixture = (New-Item -ItemType Directory -Force "build/windows/upgrade-fixture").FullName
-          & $iscc "/DAppVersion=2.0.0" "/DSourceDir=$source" "/DReleaseDir=$fixture" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
-          if ($LASTEXITCODE -ne 0) { throw "Upgrade fixture compilation failed with exit code $LASTEXITCODE" }
           & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
       - name: Silent install, in-place upgrade and uninstall test
         shell: pwsh
         run: |
-          $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.0.0-Setup-x64.exe").Path
+          $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.6.1-Setup-x64.exe").Path
           $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
           $configDir = Join-Path $env:APPDATA "DcmGet"
@@ -201,10 +243,15 @@ jobs:
           $licensePath = Join-Path $configDir "license.lic"
           $trialPath = Join-Path $configDir "trial.json"
           $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
+          $uninstallRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
           Remove-Item $configDir -Recurse -Force -ErrorAction SilentlyContinue
 
           $install = Start-Process $baseline -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Baseline installer failed with exit code $($install.ExitCode)" }
+          $baselineRecords = @(Get-ChildItem $uninstallRoot | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "DcmGet" })
+          if ($baselineRecords.Count -ne 1) { throw "Expected one 2.6.1 uninstall record, found $($baselineRecords.Count)" }
+          if ($baselineRecords[0].DisplayVersion -ne "2.6.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.6.1" }
+          if ($baselineRecords[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Baseline installation directory is incorrect" }
           New-Item -ItemType Directory -Force $configDir | Out-Null
           [IO.File]::WriteAllText($configPath, '{"config_version":2,"pacs_server_ip":"upgrade-preserve.invalid"}', [Text.UTF8Encoding]::new($false))
           Set-Content $licensePath "upgrade-license-sentinel"
@@ -240,15 +287,24 @@ jobs:
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Upgrade changed the existing trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Upgrade changed the machine trial anchor" }
 
-          $uninstallRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
           $records = @(Get-ChildItem $uninstallRoot | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "DcmGet" })
           if ($records.Count -ne 1) { throw "Expected one DcmGet uninstall record, found $($records.Count)" }
           if ($records[0].DisplayVersion -ne "${{ inputs.version }}") { throw "Installed version is $($records[0].DisplayVersion)" }
           if ($records[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Upgrade changed the installation directory" }
 
-          $firewall = Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction Stop
-          $portFilter = $firewall | Get-NetFirewallPortFilter
-          if ($portFilter.Protocol -ne "TCP" -or $portFilter.LocalPort -notcontains "6666") { throw "Firewall rule does not allow TCP 6666" }
+          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction Stop)
+          if ($firewallRules.Count -ne 1) { throw "Expected exactly one storescp firewall rule, found $($firewallRules.Count)" }
+          $firewall = $firewallRules[0]
+          $portFilters = @($firewall | Get-NetFirewallPortFilter)
+          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "6666") { throw "Firewall rule does not allow exactly TCP 6666" }
+          $applicationFilters = @($firewall | Get-NetFirewallApplicationFilter)
+          if ($applicationFilters.Count -ne 1) { throw "Expected one firewall application filter, found $($applicationFilters.Count)" }
+          $expectedStorescp = (Resolve-Path -LiteralPath (Join-Path $resourceRoot ".runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe") -ErrorAction Stop).ProviderPath
+          $configuredStorescp = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
+          $actualStorescp = (Resolve-Path -LiteralPath $configuredStorescp -ErrorAction Stop).ProviderPath
+          if (-not $actualStorescp.Equals($expectedStorescp, [StringComparison]::OrdinalIgnoreCase)) { throw "Firewall program is '$actualStorescp', expected '$expectedStorescp'" }
+          $profileNames = @($firewall.Profile.ToString().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($profileNames.Count -ne 2 -or $profileNames -notcontains "Domain" -or $profileNames -notcontains "Private") { throw "Firewall profiles must be exactly Domain and Private, found '$($firewall.Profile)'" }
 
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }

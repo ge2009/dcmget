@@ -134,7 +134,18 @@ def _viewer(path: Path) -> Path:
     (path / "app.js").write_bytes(b"offline-ohif")
     (path / "LICENSE-OHIF.txt").write_text("MIT")
     (path / "THIRD_PARTY-OHIF.md").write_text("third party")
+    _write_viewer_checksums(path)
     return path
+
+
+def _write_viewer_checksums(path: Path) -> None:
+    checksum_path = path / pdi.OHIF_PAYLOAD_CHECKSUMS
+    lines = [
+        f"{pdi._sha256(candidate)}  {candidate.relative_to(path).as_posix()}"
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file() and candidate != checksum_path
+    ]
+    checksum_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _fake_dcmtk(
@@ -222,6 +233,8 @@ def test_ohif_index_references_original_local_dicom_and_naturalized_metadata(
     result = exporter.export([first, second])
 
     output = Path(result.output_directory)
+    assert not (output / "DCMGET_STUDIES.json").exists()
+    assert (output / pdi.STUDY_INDEX).is_file()
     payload_text = (output / pdi.STUDY_INDEX).read_text(encoding="utf-8")
     instances = _instances(output / pdi.STUDY_INDEX)
     assert [entry["metadata"]["InstanceNumber"] for entry in instances] == [1, 2]
@@ -231,6 +244,39 @@ def test_ohif_index_references_original_local_dicom_and_naturalized_metadata(
     assert all((output / str(entry["url"])[10:]).is_file() for entry in instances)
     assert instances[0]["metadata"]["PixelSpacing"] == [0.5, 0.5]
     assert "PixelData" not in instances[0]["metadata"]
+
+
+def test_ohif_index_omits_non_rendering_identity_but_keeps_image_metadata(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "source.dcm")
+    dataset = dcmread(source)
+    dataset.PatientAddress = "SECRET PATIENT ADDRESS"
+    dataset.PatientTelephoneNumbers = "555-0100"
+    dataset.OtherPatientIDs = "LEGACY-SECRET-ID"
+    dataset.ReferringPhysicianName = "Secret^Referrer"
+    dataset.OperatorsName = "Secret^Operator"
+    dataset.save_as(source, enforce_file_format=True)
+    exporter = PdiExporter(_config(tmp_path), tools)
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    output = Path(result.output_directory)
+    raw_index = (output / pdi.STUDY_INDEX).read_text(encoding="utf-8")
+    metadata = _instances(output / pdi.STUDY_INDEX)[0]["metadata"]
+    for secret in (
+        "SECRET PATIENT ADDRESS",
+        "555-0100",
+        "LEGACY-SECRET-ID",
+        "Secret^Referrer",
+        "Secret^Operator",
+    ):
+        assert secret not in raw_index
+    assert metadata["PixelSpacing"] == [0.5, 0.5]
+    assert metadata["Rows"] == 2
+    assert metadata["Columns"] == 2
+    assert metadata["WindowCenter"] == 40.0
 
 
 def test_multiframe_object_expands_manifest_frames_without_copying_pixels(
@@ -251,6 +297,46 @@ def test_multiframe_object_expands_manifest_frames_without_copying_pixels(
         "dicomweb:/DICOM/P000001/S000001/I000001?frame=3",
     ]
     assert len([path for path in (output / "DICOM").rglob("*") if path.is_file()]) == 1
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "frames"),
+    [
+        ("MAX_OHIF_INDEX_FRAMES", 2, 3),
+        ("MAX_OHIF_INDEX_ESTIMATED_BYTES", 1, 1),
+    ],
+)
+def test_ohif_index_limit_publishes_dicomdir_only_and_requests_split_batch(
+    tmp_path: Path,
+    tools: ToolPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    frames: int,
+) -> None:
+    source = _dicom(tmp_path / "source.dcm", frames=frames)
+    viewer = _viewer(tmp_path / "ohif")
+    monkeypatch.setattr(pdi, limit_name, limit_value)
+    exporter = PdiExporter(
+        _config(tmp_path, pdi_include_ohif_viewer=True),
+        tools,
+        viewer_source=viewer,
+    )
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.PARTIAL
+    assert result.indexed_count == 0
+    assert any("请拆分批次" in warning for warning in result.warnings)
+    output = Path(result.output_directory)
+    assert (output / "DICOMDIR").is_file()
+    assert len([path for path in (output / "DICOM").rglob("*") if path.is_file()]) == 1
+    assert not (output / pdi.STUDY_INDEX).exists()
+    assert not (output / "VIEWER" / "OHIF").exists()
+    assert not any((output / name).exists() for name in ("OPEN_VIEWER.exe", "OPEN_VIEWER.bat", "OPEN_VIEWER.command", "OPEN_VIEWER.sh"))
+    index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
+    assert "此页仅显示检查清单，不能直接看图" in index_html
 
 
 def test_offline_ohif_and_cross_platform_launchers_are_included(
@@ -275,6 +361,75 @@ def test_offline_ohif_and_cross_platform_launchers_are_included(
         assert (output / name).is_file()
     assert "127.0.0.1" in (output / "README.TXT").read_text(encoding="utf-8")
     assert "Weasis" not in (output / "README.TXT").read_text(encoding="utf-8")
+
+
+def test_corrupt_viewer_payload_is_rejected_but_dicomdir_is_published(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "source.dcm")
+    viewer = _viewer(tmp_path / "ohif")
+    (viewer / "app.js").write_bytes(b"corrupt-after-checksum")
+    exporter = PdiExporter(
+        _config(tmp_path, pdi_include_ohif_viewer=True),
+        tools,
+        viewer_source=viewer,
+    )
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.PARTIAL
+    assert any("校验失败" in warning for warning in result.warnings)
+    output = Path(result.output_directory)
+    assert (output / "DICOMDIR").is_file()
+    assert not (output / "VIEWER" / "OHIF").exists()
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ["0" * 64 + "  ../escape"],
+        ["0" * 64 + "  app.js", "1" * 64 + "  app.js"],
+    ],
+)
+def test_viewer_checksum_manifest_rejects_unsafe_paths_and_duplicates(
+    tmp_path: Path, lines: list[str]
+) -> None:
+    viewer = _viewer(tmp_path / "ohif")
+    (viewer / pdi.OHIF_PAYLOAD_CHECKSUMS).write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="清单格式无效"):
+        pdi._verify_ohif_payload(viewer)
+
+
+def test_viewer_payload_is_verified_again_after_copy(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "source.dcm")
+    viewer = _viewer(tmp_path / "ohif")
+    exporter = PdiExporter(
+        _config(tmp_path, pdi_include_ohif_viewer=True),
+        tools,
+        viewer_source=viewer,
+    )
+    _fake_dcmtk(exporter, monkeypatch)
+    original_copy = exporter._copy_file
+
+    def corrupt_copy(source_path: str | Path, destination_path: str | Path) -> str:
+        copied = original_copy(source_path, destination_path)
+        if Path(destination_path).name == "app.js":
+            Path(destination_path).write_bytes(b"corrupt-during-copy")
+        return copied
+
+    monkeypatch.setattr(exporter, "_copy_file", corrupt_copy)
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.PARTIAL
+    assert any("校验失败" in warning for warning in result.warnings)
+    assert not (Path(result.output_directory) / "VIEWER" / "OHIF").exists()
 
 
 def test_frozen_windows_export_uses_bundled_physical_server_script(
@@ -312,9 +467,9 @@ def test_frozen_windows_export_uses_bundled_physical_server_script(
     assert (output / "OPEN_VIEWER.bat").is_file()
     assert (output / "MANIFEST.SHA256").is_file()
     index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
-    assert "此页仅显示检查清单，不能直接看图" in index_html
+    assert "查看影像请从本目录启动离线阅片器" in index_html
     assert "OPEN_VIEWER.exe（推荐）" in index_html
-    assert "本次导出未能加入 OHIF" not in index_html
+    assert "本次导出未能加入离线阅片器" not in index_html
 
 
 def test_missing_ohif_is_partial_but_keeps_valid_dicomdir(
@@ -338,8 +493,8 @@ def test_missing_ohif_is_partial_but_keeps_valid_dicomdir(
     assert not (output / "VIEWER" / "OHIF").exists()
     index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
     assert "此页仅显示检查清单，不能直接看图" in index_html
-    assert "本次导出未能加入 OHIF 运行资源" in index_html
-    assert "原始 DICOM 和本地中文 OHIF 阅片器" not in index_html
+    assert "本次导出未能加入离线阅片器" in index_html
+    assert "原始 DICOM 和中文离线阅片器" not in index_html
 
 
 def test_duplicate_uid_with_same_content_is_deduplicated(
@@ -456,12 +611,17 @@ def test_crash_recovery_reuses_published_directory(
 
     assert restored.status == PdiStatus.COMPLETED
     assert restored.output_directory == original.output_directory
+    output = Path(restored.output_directory)
     marker = json.loads(
-        (Path(restored.output_directory) / pdi.RECOVERY_MARKER).read_text(
+        (output / pdi.RECOVERY_MARKER_PATH).read_text(
             encoding="utf-8"
         )
     )
     assert marker["version"] == 2 and marker["indexed_count"] == 1
+    assert not (output / pdi.RECOVERY_MARKER).exists()
+    manifest = (output / "MANIFEST.SHA256").read_text(encoding="utf-8")
+    assert pdi.RECOVERY_MARKER_PATH in manifest
+    assert pdi.RECOVERY_MARKER not in manifest
 
 
 def test_restart_removes_only_matching_interrupted_partial(
@@ -474,9 +634,12 @@ def test_restart_removes_only_matching_interrupted_partial(
     other = output_root / ".DCMGET_PDI_OTHER.partial-deadbeef"
     matching.mkdir()
     other.mkdir()
-    (matching / pdi.RECOVERY_MARKER).write_text(
+    matching_marker = matching / pdi.RECOVERY_MARKER_PATH
+    matching_marker.parent.mkdir(parents=True)
+    matching_marker.write_text(
         json.dumps({"version": 1, "attempt_id": "b" * 32}), encoding="utf-8"
     )
+    # Old exports stored the marker at the root; keep that recovery path valid.
     (other / pdi.RECOVERY_MARKER).write_text(
         json.dumps({"version": 2, "attempt_id": "c" * 32}), encoding="utf-8"
     )

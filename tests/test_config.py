@@ -52,6 +52,14 @@ def test_accession_parser_ignores_blanks_and_deduplicates_in_order():
     assert result.values == ["A001", "A002", "A003"]
     assert result.blank_count == 1
     assert result.duplicate_count == 1
+    assert result.invalid_values == ()
+
+
+def test_accession_parser_rejects_dicom_wildcards_and_controls():
+    result = parse_accessions("SAFE001\n*\nA?\nA\\B\nBAD\x07VALUE\n")
+
+    assert result.values == ["SAFE001"]
+    assert result.invalid_values == ("*", "A?", "A\\B", "BAD\x07VALUE")
 
 
 def test_configuration_round_trip(tmp_path):
