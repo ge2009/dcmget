@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import time
 import socket
 from pathlib import Path
@@ -174,13 +175,13 @@ def test_real_storescp_accepts_parallel_associations(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_dcmtk_builds_valid_pdi_dicomdir_and_jpeg_preview(tmp_path):
+def test_real_dcmtk_builds_valid_pdi_dicomdir_and_ohif_index(tmp_path):
     try:
         tools = DcmtkResolver(Path(__file__).resolve().parents[1]).resolve()
     except FileNotFoundError:
         pytest.skip("本机未安装 DCMTK")
-    if tools.dcmmkdir is None or tools.dcmj2pnm is None:
-        pytest.skip("当前 DCMTK 缺少 PDI 工具")
+    if tools.dcmmkdir is None:
+        pytest.skip("当前 DCMTK 缺少 dcmmkdir")
 
     source = tmp_path / "download" / "source.dcm"
     source.parent.mkdir()
@@ -192,9 +193,7 @@ def test_real_dcmtk_builds_valid_pdi_dicomdir_and_jpeg_preview(tmp_path):
         pdi_export_enabled=True,
         pdi_institution_name="DcmGet Integration Hospital",
         pdi_output_folder=str(tmp_path / "portable"),
-        pdi_include_html_preview=True,
-        pdi_preview_mode="hybrid",
-        pdi_include_weasis_windows=False,
+        pdi_include_ohif_viewer=False,
     )
 
     result = PdiExporter(config, tools).export([source])
@@ -204,7 +203,11 @@ def test_real_dcmtk_builds_valid_pdi_dicomdir_and_jpeg_preview(tmp_path):
     assert source.read_bytes() == source_digest
     copied = [path for path in (output / "DICOM").rglob("*") if path.is_file()]
     assert len(copied) == 1 and copied[0].suffix == ""
-    assert list((output / "IHE_PDI").rglob("*.JPG"))
+    index = json.loads((output / "DCMGET_STUDIES.json").read_text(encoding="utf-8"))
+    instances = index["studies"][0]["series"][0]["instances"]
+    assert len(instances) == 1
+    assert instances[0]["url"].startswith("dicomweb:/DICOM/")
+    assert not list(output.rglob("*.JPG"))
     directory = dcmread(output / "DICOMDIR")
     references = [
         record.ReferencedFileID

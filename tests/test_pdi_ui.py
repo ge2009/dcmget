@@ -50,6 +50,9 @@ def test_pdi_settings_are_collapsed_and_disabled_by_default(qtbot, tmp_path):
     assert not page.pdi_enabled_checkbox.isChecked()
     assert page.pdi_card_body.isHidden()
     assert not page.pdi_institution_edit.isEnabled()
+    assert page.pdi_ohif_checkbox.isChecked()
+    assert not page.pdi_ohif_checkbox.isEnabled()
+    assert "不生成 JPG" in page.pdi_ohif_hint.text()
     assert not window.pdi_status_card.isVisible()
 
     qtbot.mouseClick(page.pdi_card_toggle, Qt.LeftButton)
@@ -73,7 +76,7 @@ def test_enabling_pdi_expands_options_and_validates_institution(qtbot, tmp_path)
     assert "患者隐私" in page.pdi_privacy_warning.text()
 
 
-def test_pdi_settings_round_trip_all_options(qtbot, tmp_path):
+def test_pdi_settings_round_trip_ohif_option(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
     output = tmp_path / "portable"
@@ -83,9 +86,7 @@ def test_pdi_settings_round_trip_all_options(qtbot, tmp_path):
             pdi_export_enabled=True,
             pdi_institution_name="海市中心医院",
             pdi_output_folder=str(output),
-            pdi_include_html_preview=False,
-            pdi_preview_mode="series_cover",
-            pdi_include_weasis_windows=False,
+            pdi_include_ohif_viewer=False,
         )
     )
     result = page.config()
@@ -93,10 +94,9 @@ def test_pdi_settings_round_trip_all_options(qtbot, tmp_path):
     assert result.pdi_export_enabled
     assert result.pdi_institution_name == "海市中心医院"
     assert result.pdi_output_folder == str(output)
-    assert not result.pdi_include_html_preview
-    assert result.pdi_preview_mode == "series_cover"
-    assert not result.pdi_include_weasis_windows
-    assert not page.pdi_preview_mode_combo.isEnabled()
+    assert not result.pdi_include_ohif_viewer
+    assert page.pdi_ohif_checkbox.isEnabled()
+    assert "本地只读服务" in page.pdi_ohif_hint.text()
 
 
 def test_download_completion_starts_pdi_with_exact_batch_files(
@@ -316,7 +316,7 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
     corrected = AppConfig(
         pdi_export_enabled=True,
         pdi_institution_name="海市中心医院",
-        pdi_include_weasis_windows=False,
+        pdi_include_ohif_viewer=False,
     )
 
     window._save_settings(corrected)
@@ -325,7 +325,7 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
     assert "可以重试" in window.pdi_status_label.text()
     restored = window.task_store.load_required()
     assert restored.config.pdi_institution_name == "海市中心医院"
-    assert not restored.config.pdi_include_weasis_windows
+    assert not restored.config.pdi_include_ohif_viewer
 
     restarted = make_window(qtbot, tmp_path)
     started_with = []
@@ -340,7 +340,7 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
         lambda _files=None: started_with.append(
             (
                 restarted.config.pdi_institution_name,
-                restarted.config.pdi_include_weasis_windows,
+                restarted.config.pdi_include_ohif_viewer,
             )
         ),
     )

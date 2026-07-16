@@ -138,9 +138,9 @@ def test_resolver_only_uses_current_platform_runtime(tmp_path, monkeypatch):
     assert resolved.bin_dir == current
 
 
-def test_resolver_discovers_optional_pdi_tools_next_to_dcmtk_binaries(tmp_path, monkeypatch):
+def test_resolver_discovers_dcmmkdir_next_to_dcmtk_binaries(tmp_path, monkeypatch):
     suffix = ".exe" if core.os.name == "nt" else ""
-    for name in ("movescu", "storescp", "dcmmkdir", "dcmj2pnm", "dcmdjpeg", "dcmdump"):
+    for name in ("movescu", "storescp", "dcmmkdir"):
         (tmp_path / f"{name}{suffix}").touch()
     resolver = DcmtkResolver(tmp_path)
     monkeypatch.setattr(core, "_run_probe", lambda *_args, **_kwargs: "dcmtk v3.7.0")
@@ -150,9 +150,6 @@ def test_resolver_discovers_optional_pdi_tools_next_to_dcmtk_binaries(tmp_path, 
     )
 
     assert tools.dcmmkdir == tmp_path / f"dcmmkdir{suffix}"
-    assert tools.dcmj2pnm == tmp_path / f"dcmj2pnm{suffix}"
-    assert tools.dcmdjpeg == tmp_path / f"dcmdjpeg{suffix}"
-    assert tools.dcmdump == tmp_path / f"dcmdump{suffix}"
 
 
 def test_preflight_reports_port_conflict(tmp_path):
@@ -195,14 +192,13 @@ def test_preflight_requires_pdi_dcmtk_tools_only_when_pdi_is_enabled(tmp_path):
     assert "dcmtk_bin_dir" in enabled.errors
 
 
-def test_preflight_allows_missing_optional_pdi_preview_tool(tmp_path):
+def test_preflight_ohif_does_not_require_image_conversion_tool(tmp_path):
     tools = ToolPaths(
         Path("movescu"),
         Path("storescp"),
         Path("."),
         "3.7.0",
         dcmmkdir=Path("dcmmkdir"),
-        dcmj2pnm=None,
     )
     resolver = Mock(spec=DcmtkResolver)
     resolver.resolve.return_value = tools
@@ -218,9 +214,10 @@ def test_preflight_allows_missing_optional_pdi_preview_tool(tmp_path):
 
     assert result.ok
     assert any(
-        name == "PDI 网页预览" and ok and "部分成功" in message
+        name == "PDI 网页阅片" and ok and "原始 DICOM" in message
         for name, ok, message in result.checks
     )
+    assert all(name != "PDI 网页预览" for name, _ok, _message in result.checks)
 
 
 def test_preflight_uses_configured_pdi_output_folder(tmp_path):
@@ -231,7 +228,6 @@ def test_preflight_uses_configured_pdi_output_folder(tmp_path):
         Path("."),
         "3.7.0",
         dcmmkdir=Path("dcmmkdir"),
-        dcmj2pnm=Path("dcmj2pnm"),
     )
     resolver = Mock(spec=DcmtkResolver)
     resolver.resolve.return_value = tools

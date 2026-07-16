@@ -1,5 +1,5 @@
 {
-  "config_version": 4,
+  "config_version": 5,
   "dcmtk_bin_dir": "",
   "access_numbers_file_path": "access.txt",
   "dicom_destination_folder": "Dicom/Dest",
@@ -15,8 +15,6 @@
   "pdi_export_enabled": false,
   "pdi_institution_name": "",
   "pdi_output_folder": "",
-  "pdi_include_html_preview": true,
-  "pdi_preview_mode": "hybrid",
-  "pdi_include_weasis_windows": true,
+  "pdi_include_ohif_viewer": true,
   "max_log_file_size_bytes": 104857600
 }

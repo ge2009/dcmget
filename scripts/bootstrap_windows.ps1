@@ -16,12 +16,12 @@ if ($LASTEXITCODE -ne 0) { throw "升级 pip 失败。" }
 if ($LASTEXITCODE -ne 0) { throw "安装 Python 依赖失败。" }
 & .\.venv\Scripts\python.exe scripts\download_dcmtk.py
 if ($LASTEXITCODE -ne 0) { throw "下载或校验 DCMTK 失败。" }
-if ($env:DCMGET_SKIP_WEASIS -eq "1") {
-    Write-Host "已按 DCMGET_SKIP_WEASIS=1 跳过 Weasis 便携查看器。"
+if ($env:DCMGET_SKIP_OHIF -eq "1") {
+    Write-Host "已按 DCMGET_SKIP_OHIF=1 跳过 OHIF Viewer 离线资源。"
 } else {
-    & .\.venv\Scripts\python.exe scripts\prepare_weasis.py --platform windows-x86_64
+    & .\.venv\Scripts\python.exe scripts\prepare_ohif.py
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Weasis 便携查看器准备失败；DICOMDIR 和网页预览仍可用，PDI 将标记为部分成功。"
+        Write-Warning "OHIF Viewer 离线资源准备失败；DICOMDIR 和原始 DICOM 仍可用。"
     }
 }
 if (-not (Test-Path config.json)) { Copy-Item config.example.json config.json }

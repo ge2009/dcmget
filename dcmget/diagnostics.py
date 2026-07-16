@@ -263,7 +263,8 @@ def _install_exception_hooks() -> None:
         assert _state is not None
         _state.had_unhandled_exception = True
         target = getattr(args, "object", None)
-        message = getattr(args, "err_msg", None) or "Unraisable exception"
+        detail = str(getattr(args, "err_msg", None) or "").strip()
+        message = f"Unraisable exception: {detail}" if detail else "Unraisable exception"
         _state.logger.critical(
             "%s object=%r",
             message,

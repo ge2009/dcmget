@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.5.2
+        default: 2.6.0
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
   build:
     name: Build Windows x64 EXE and installer
     runs-on: windows-2025
-    timeout-minutes: 35
+    timeout-minutes: 50
 
     steps:
       - uses: actions/checkout@v4
@@ -41,18 +41,86 @@ jobs:
         run: |
           python scripts/download_dcmtk.py --platform windows-x86_64
 
-      - name: Restore Weasis portable viewer cache
+      - name: Restore OHIF Viewer cache
         uses: actions/cache@v4
         with:
-          path: .runtime/weasis/windows-x86_64
-          key: weasis-4.7.1-windows-x86_64-${{ hashFiles('packaging/weasis/**', 'scripts/prepare_weasis.py') }}
+          path: .runtime/ohif
+          key: ohif-3.12.6-${{ hashFiles('packaging/ohif/**', 'scripts/prepare_ohif.py') }}
 
-      - name: Prepare Weasis portable viewer
+      - name: Prepare OHIF Viewer offline assets
         shell: pwsh
-        run: python scripts/prepare_weasis.py --platform windows-x86_64
+        run: python scripts/prepare_ohif.py
 
       - name: Build standalone and portable EXE
         run: python scripts/build_windows.py --version "${{ inputs.version }}"
+
+      - name: Verify embedded OHIF and PDI server resources
+        shell: pwsh
+        run: |
+          function Assert-PdiResources([string]$resourceRoot) {
+            $server = Join-Path $resourceRoot "DcmGetPdiServer.exe"
+            $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
+            if (-not (Test-Path $server -PathType Leaf)) { throw "Missing PDI server at $server" }
+            @(
+              "index.html", "app-config.js", "init-service-worker.js",
+              "LICENSE-OHIF.txt", "THIRD_PARTY-OHIF.md",
+              "DCMGET_OHIF_PAYLOAD.json", "DCMGET_PAYLOAD.SHA256"
+            ) | ForEach-Object {
+              if (-not (Test-Path (Join-Path $ohif $_) -PathType Leaf)) {
+                throw "Missing OHIF resource: $_"
+              }
+            }
+            if (Test-Path (Join-Path $ohif "sw.js")) { throw "Online service worker was packaged" }
+          }
+
+          Assert-PdiResources (Resolve-Path "build/windows/dist/DcmGet/_internal").Path
+          $expanded = Join-Path $env:RUNNER_TEMP "dcmget-standalone-expanded"
+          Expand-Archive "release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip" $expanded
+          Assert-PdiResources (Resolve-Path "$expanded/DcmGet/_internal").Path
+
+          $archiveListing = "build/windows/portable-archive.txt"
+          pyi-archive_viewer -r "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" *> $archiveListing
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect portable EXE archive" }
+          if (-not (Select-String -Path $archiveListing -Pattern "DcmGetPdiServer\.exe" -Quiet)) { throw "Portable EXE is missing PDI server" }
+          if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
+
+      - name: Smoke test standalone PDI server
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP "dcmget-pdi-server-fixture"
+          New-Item -ItemType Directory -Force "$fixture/VIEWER/OHIF", "$fixture/DICOM" | Out-Null
+          Set-Content "$fixture/VIEWER/OHIF/index.html" "OHIF SERVER SMOKE" -Encoding utf8NoBOM
+          Set-Content "$fixture/DCMGET_STUDIES.json" '{"studies":[]}' -Encoding utf8NoBOM
+          [IO.File]::WriteAllBytes("$fixture/DICOM/I000001", [byte[]](0..9))
+
+          $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $server = (Resolve-Path "build/windows/dist/DcmGetPdiServer.exe").Path
+          $process = Start-Process $server -ArgumentList @("--root", "`"$fixture`"", "--port", "$port", "--no-browser", "--quiet") -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 40; $attempt++) {
+              if ($process.HasExited) { throw "PDI server exited with code $($process.ExitCode)" }
+              try {
+                $response = Invoke-WebRequest "http://127.0.0.1:$port/viewer/dicomjson/?url=%2FDCMGET_STUDIES.json&lng=zh"
+                if ($response.StatusCode -eq 200 -and $response.Content -match "OHIF SERVER SMOKE") {
+                  $ready = $true
+                  break
+                }
+              } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if (-not $ready) { throw "PDI server did not become ready" }
+            $manifest = Invoke-WebRequest "http://127.0.0.1:$port/DCMGET_STUDIES.json"
+            if ($manifest.StatusCode -ne 200 -or $manifest.Content -notmatch '"studies"') { throw "PDI manifest request failed" }
+            $range = Invoke-WebRequest "http://127.0.0.1:$port/DICOM/I000001" -Headers @{ Range = "bytes=2-5" }
+            if ($range.StatusCode -ne 206 -or $range.Headers["Content-Range"] -notmatch "bytes 2-5/10") { throw "PDI byte-range request failed" }
+          } finally {
+            if (-not $process.HasExited) {
+              taskkill /PID $process.Id /T /F | Out-Null
+            }
+          }
 
       - name: Download VC++ Runtime for installer
         shell: pwsh
@@ -156,10 +224,12 @@ jobs:
           if (-not ($diagnosticShortcuts | Where-Object { Test-Path $_ })) { throw "Diagnostic log shortcut is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
           if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter Weasis.exe)) { throw "Installed Weasis.exe is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter LICENSE-Weasis.txt)) { throw "Installed Weasis license is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter THIRD_PARTY-Weasis.md)) { throw "Installed Weasis third-party notice is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter DCMGET_PAYLOAD.SHA256)) { throw "Installed Weasis payload checksum is missing" }
+          $resourceRoot = Join-Path $installDir "_internal"
+          $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
+          if (-not (Test-Path (Join-Path $resourceRoot "DcmGetPdiServer.exe") -PathType Leaf)) { throw "Installed PDI local server is missing" }
+          @("index.html", "app-config.js", "init-service-worker.js", "LICENSE-OHIF.txt", "THIRD_PARTY-OHIF.md", "DCMGET_OHIF_PAYLOAD.json", "DCMGET_PAYLOAD.SHA256") | ForEach-Object {
+            if (-not (Test-Path (Join-Path $ohif $_) -PathType Leaf)) { throw "Installed OHIF resource is missing: $_" }
+          }
           if (Test-Path "$installDir/_internal/obsolete-upgrade-marker.txt") { throw "Upgrade did not remove obsolete runtime files" }
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Upgrade changed the existing user configuration" }
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Upgrade changed the existing license" }

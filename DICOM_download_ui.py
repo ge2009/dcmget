@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from io import BytesIO
 import sys
+from pathlib import Path
 
 from dcmget import __version__
 from dcmget.diagnostics import (
@@ -27,7 +28,7 @@ from dcmget.core import DcmtkResolver
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
 from dcmget.release_notes import load_release_notes
 from dcmget.ui import APP_STYLESHEET, DcmGetWindow
-from dcmget.runtime import ensure_default_config, resource_root
+from dcmget.runtime import ensure_default_config, is_frozen, resource_root
 from dcmget.task_state import TaskCheckpointStore, TaskStateError
 
 
@@ -35,7 +36,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.5 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.6 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -62,6 +63,7 @@ def run_self_test(config_path: str) -> int:
     public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM)
     if not isinstance(public_key, Ed25519PublicKey):
         raise RuntimeError("授权公钥类型错误")
+    validate_frozen_pdi_resources(PROJECT_ROOT)
 
     file_meta = FileMetaDataset()
     file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
@@ -87,6 +89,37 @@ def run_self_test(config_path: str) -> int:
         )
     print(f"DcmGet {__version__} self-test OK; DCMTK {tools.version}; fork=yes")
     return 0
+
+
+def validate_frozen_pdi_resources(root: str | Path) -> None:
+    if not is_frozen():
+        return
+    base = Path(root)
+    ohif = base / ".runtime" / "ohif" / "ohif-3.12.6"
+    required = (
+        base / "DcmGetPdiServer.exe",
+        ohif / "index.html",
+        ohif / "app-config.js",
+        ohif / "init-service-worker.js",
+        ohif / "LICENSE-OHIF.txt",
+        ohif / "THIRD_PARTY-OHIF.md",
+        ohif / "DCMGET_OHIF_PAYLOAD.json",
+        ohif / "DCMGET_PAYLOAD.SHA256",
+    )
+    missing = [str(path.relative_to(base)) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"PDI 离线资源缺失：{'、'.join(missing)}")
+    prohibited = [
+        name
+        for name in ("sw.js", "google.js", "oidc-client.min.js", "silent-refresh.html")
+        if (ohif / name).exists()
+    ]
+    if prohibited:
+        raise RuntimeError(f"PDI 离线资源包含在线入口：{'、'.join(prohibited)}")
+    for name in ("app-config.js", "init-service-worker.js"):
+        content = (ohif / name).read_text(encoding="utf-8")
+        if "http://" in content or "https://" in content:
+            raise RuntimeError(f"PDI 离线资源包含外部地址：{name}")
 
 
 def create_application() -> QApplication:

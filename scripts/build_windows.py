@@ -11,9 +11,9 @@ import zipfile
 from pathlib import Path
 
 try:
-    from scripts.prepare_weasis import load_manifest, payload_is_current
+    from scripts.prepare_ohif import load_manifest, payload_is_current
 except ModuleNotFoundError:  # direct execution from the scripts directory
-    from prepare_weasis import load_manifest, payload_is_current
+    from prepare_ohif import load_manifest, payload_is_current
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +21,7 @@ BUILD_ROOT = ROOT / "build" / "windows"
 DIST_ROOT = BUILD_ROOT / "dist"
 RELEASE_ROOT = ROOT / "release" / "windows"
 PLATFORM_RUNTIME = ROOT / ".runtime" / "dcmtk" / "windows-x86_64"
-WEASIS_RUNTIME = ROOT / ".runtime" / "weasis" / "windows-x86_64" / "Weasis"
+OHIF_RUNTIME = ROOT / ".runtime" / "ohif" / "ohif-3.12.6"
 
 
 def source_version() -> str:
@@ -60,9 +60,6 @@ def find_dcmtk_bin() -> Path:
         required = (
             "storescp.exe",
             "dcmmkdir.exe",
-            "dcmj2pnm.exe",
-            "dcmdjpeg.exe",
-            "dcmdump.exe",
         )
         if all((movescu.parent / name).is_file() for name in required):
             return movescu.parent
@@ -72,13 +69,13 @@ def find_dcmtk_bin() -> Path:
     )
 
 
-def find_weasis_payload() -> Path:
-    if not payload_is_current(WEASIS_RUNTIME, load_manifest()):
+def find_ohif_payload() -> Path:
+    if not payload_is_current(OHIF_RUNTIME, load_manifest()):
         raise FileNotFoundError(
-            "未找到通过逐文件 SHA-256 校验的 Weasis 4.7.1 Windows 便携查看器。请先运行 "
-            "scripts/prepare_weasis.py --platform windows-x86_64"
+            "未找到通过逐文件 SHA-256 校验的 OHIF Viewer 3.12.6 离线资源。请先运行 "
+            "scripts/prepare_ohif.py"
         )
-    return WEASIS_RUNTIME
+    return OHIF_RUNTIME
 
 
 def make_icon() -> Path:
@@ -125,7 +122,8 @@ def pyinstaller_args(
     icon: Path,
     version_file: Path,
     runtime_root: Path,
-    weasis_root: Path | None = None,
+    ohif_root: Path | None = None,
+    pdi_server_executable: Path | None = None,
 ) -> list[str]:
     arguments = [
         str(ROOT / "DICOM_download_ui.py"),
@@ -163,21 +161,56 @@ def pyinstaller_args(
         f"{runtime_root}:.runtime/dcmtk/windows-x86_64",
         "--noupx",
     ]
-    if weasis_root is not None:
+    if ohif_root is not None:
         arguments.extend(
             [
                 "--add-data",
-                f"{weasis_root}:.runtime/weasis/windows-x86_64/Weasis",
+                f"{ohif_root}:.runtime/ohif/ohif-3.12.6",
+            ]
+        )
+    if pdi_server_executable is not None:
+        arguments.extend(
+            [
+                "--add-data",
+                f"{pdi_server_executable}:.",
             ]
         )
     return arguments
+
+
+def pdi_server_pyinstaller_args(
+    icon: Path,
+    version_file: Path,
+) -> list[str]:
+    return [
+        str(ROOT / "tools" / "dcmget_pdi_server.py"),
+        "--noconfirm",
+        "--clean",
+        "--windowed",
+        "--onefile",
+        "--name",
+        "DcmGetPdiServer",
+        "--icon",
+        str(icon),
+        "--version-file",
+        str(version_file),
+        "--distpath",
+        str(DIST_ROOT),
+        "--workpath",
+        str(BUILD_ROOT / "work" / "DcmGetPdiServer"),
+        "--specpath",
+        str(BUILD_ROOT / "spec"),
+        "--paths",
+        str(ROOT),
+        "--noupx",
+    ]
 
 
 def build_payloads(version: str) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
     find_dcmtk_bin()
-    weasis = find_weasis_payload()
+    ohif = find_ohif_payload()
     from PyInstaller.__main__ import run as run_pyinstaller
 
     if BUILD_ROOT.exists():
@@ -188,14 +221,31 @@ def build_payloads(version: str) -> None:
     icon = make_icon()
     version_file = make_version_file(version)
 
+    run_pyinstaller(pdi_server_pyinstaller_args(icon, version_file))
+    pdi_server = DIST_ROOT / "DcmGetPdiServer.exe"
+    if not pdi_server.is_file():
+        raise FileNotFoundError("PDI 本地阅片服务 DcmGetPdiServer.exe 构建失败")
+
     run_pyinstaller(
         pyinstaller_args(
-            "DcmGet", "--onedir", icon, version_file, PLATFORM_RUNTIME, weasis
+            "DcmGet",
+            "--onedir",
+            icon,
+            version_file,
+            PLATFORM_RUNTIME,
+            ohif,
+            pdi_server,
         )
     )
     run_pyinstaller(
         pyinstaller_args(
-            "DcmGet-Portable", "--onefile", icon, version_file, PLATFORM_RUNTIME
+            "DcmGet-Portable",
+            "--onefile",
+            icon,
+            version_file,
+            PLATFORM_RUNTIME,
+            ohif,
+            pdi_server,
         )
     )
 

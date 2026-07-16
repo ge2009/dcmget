@@ -28,12 +28,12 @@ if [[ -n "$PYQT_DIR" ]]; then
   chflags -R nohidden "$PYQT_DIR" 2>/dev/null || true
 fi
 .venv/bin/python scripts/download_dcmtk.py
-if [[ "${DCMGET_SKIP_WEASIS:-0}" == "1" ]]; then
-  echo "已按 DCMGET_SKIP_WEASIS=1 跳过 Weasis 资源缓存。"
-elif .venv/bin/python scripts/prepare_weasis.py --platform windows-x86_64 --download-only; then
-  echo "已缓存并校验 Windows Weasis 4.7.1 安装资源。"
+if [[ "${DCMGET_SKIP_OHIF:-0}" == "1" ]]; then
+  echo "已按 DCMGET_SKIP_OHIF=1 跳过 OHIF Viewer 离线资源。"
+elif .venv/bin/python scripts/prepare_ohif.py; then
+  echo "已下载、校验并准备 OHIF Viewer 3.12.6 离线资源。"
 else
-  echo "警告：Weasis 资源缓存失败；DICOMDIR 和网页预览仍可用，PDI 将不包含 Windows 便携查看器。" >&2
+  echo "警告：OHIF Viewer 离线资源准备失败；DICOMDIR 和原始 DICOM 仍可用。" >&2
 fi
 test -f config.json || cp config.example.json config.json
 echo "部署完成。运行 ./scripts/run_ui.sh 启动 DcmGet。"

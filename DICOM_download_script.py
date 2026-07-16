@@ -35,7 +35,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.5 DICOM 批量下载工具")
+    parser = argparse.ArgumentParser(description="DcmGet 2.6 DICOM 批量下载工具")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),

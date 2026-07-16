@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.5.2"
+  #define AppVersion "2.6.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -28,7 +28,7 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 UninstallDisplayName={#AppName}
 AppPublisher=DcmGet contributors
-AppComments=包含 DCMTK 3.7.0 与 Weasis 4.7.1 Windows 便携查看器
+AppComments=包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
 DefaultDirName={autopf}\DcmGet
 DefaultGroupName=DcmGet
 DisableProgramGroupPage=yes

@@ -7,7 +7,13 @@ import traceback
 import pytest
 from PyQt5.QtCore import QSettings, Qt, QThread
 from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTextBrowser
+from PyQt5.QtWidgets import (
+    QApplication,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTextBrowser,
+)
 
 from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
@@ -218,6 +224,57 @@ def test_settings_validation_is_inline(qtbot, tmp_path):
         page.settings_scroll
     )
     assert page.pacs_host_edit.hasFocus()
+
+
+def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    page = window.settings_page
+    page.set_config(AppConfig(pacs_server_port=104, storage_port=6666))
+
+    assert isinstance(page.pacs_port_edit, QLineEdit)
+    assert isinstance(page.storage_port_edit, QLineEdit)
+    assert page.pacs_port_edit.text() == "104"
+    assert page.storage_port_edit.text() == "6666"
+    assert page.pacs_port_edit.hasAcceptableInput()
+    assert page.storage_port_edit.hasAcceptableInput()
+
+    page.pacs_port_edit.setText("65536")
+    page.storage_port_edit.clear()
+    errors = page.config().validate()
+
+    assert "pacs_server_port" in errors
+    assert "storage_port" in errors
+
+
+def test_dcmtk_ready_status_only_appears_in_header_but_errors_remain_inline(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    tools = ToolPaths(
+        movescu=tmp_path / "movescu",
+        storescp=tmp_path / "storescp",
+        bin_dir=tmp_path,
+        version="3.7.0",
+    )
+    monkeypatch.setattr(window.resolver, "resolve", lambda *_args: tools)
+
+    window._refresh_tool_status()
+
+    assert window.tool_status.text() == "DCMTK 3.7.0 已就绪"
+    assert window.settings_page.dcmtk_hint.text() == ""
+    assert window.settings_page.dcmtk_status_label.isHidden()
+    assert window.settings_page.dcmtk_hint.isHidden()
+
+    def fail_resolve(*_args):
+        raise RuntimeError("找不到 movescu")
+
+    monkeypatch.setattr(window.resolver, "resolve", fail_resolve)
+    window._refresh_tool_status()
+
+    assert window.tool_status.text() == "DCMTK 未就绪"
+    assert window.settings_page.dcmtk_hint.text() == "找不到 movescu"
+    assert not window.settings_page.dcmtk_status_label.isHidden()
+    assert not window.settings_page.dcmtk_hint.isHidden()
 
 
 def test_settings_validation_scrolls_to_first_invalid_field(qtbot, tmp_path):
@@ -651,6 +708,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.6.0",
         "2.5.2",
         "2.5.1",
         "2.5.0",
@@ -748,6 +806,26 @@ def test_header_diagnostic_log_button_opens_private_log_directory(
     assert diagnostic_logs.is_dir()
     assert len(opened) == 1
     assert Path(opened[0]).resolve() == diagnostic_logs.resolve()
+
+
+def test_open_destination_button_opens_exact_target_directory(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    destination = tmp_path / "DICOM 结果"
+    destination.mkdir()
+    window.destination_edit.setText(str(destination))
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.open_destination_button, Qt.LeftButton)
+
+    assert len(opened) == 1
+    assert Path(opened[0]).resolve() == destination.resolve()
 
 
 def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):

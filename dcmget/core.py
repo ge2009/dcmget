@@ -44,9 +44,6 @@ class ToolPaths:
     version: str
     storescp_help: str = ""
     dcmmkdir: Path | None = None
-    dcmj2pnm: Path | None = None
-    dcmdjpeg: Path | None = None
-    dcmdump: Path | None = None
 
     @property
     def supports_fork(self) -> bool:
@@ -189,9 +186,6 @@ class DcmtkResolver:
             version,
             help_text,
             dcmmkdir=self._optional_tool(movescu.parent, "dcmmkdir"),
-            dcmj2pnm=self._optional_tool(movescu.parent, "dcmj2pnm"),
-            dcmdjpeg=self._optional_tool(movescu.parent, "dcmdjpeg"),
-            dcmdump=self._optional_tool(movescu.parent, "dcmdump"),
         )
 
     def _optional_tool(self, directory: Path, name: str) -> Path | None:
@@ -280,13 +274,9 @@ def preflight(config: AppConfig, resolver: DcmtkResolver) -> PreflightResult:
             checks.append(("PDI 导出工具", False, message))
         else:
             checks.append(("PDI 导出工具", True, "DICOMDIR 工具已就绪"))
-        if config.pdi_include_html_preview and tools.dcmj2pnm is None:
+        if config.pdi_include_ohif_viewer:
             checks.append(
-                (
-                    "PDI 网页预览",
-                    True,
-                    "缺少 dcmj2pnm；仍会生成 DICOMDIR，并标记为部分成功",
-                )
+                ("PDI 网页阅片", True, "将使用本地 OHIF 直接读取原始 DICOM")
             )
 
     destination = Path(config.dicom_destination_folder).expanduser()

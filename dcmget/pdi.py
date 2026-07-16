@@ -15,13 +15,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from pydicom import dcmread
+from pydicom.dataset import Dataset
 
 from .config import AppConfig
 from .core import ToolPaths
 from .runtime import resource_root
+
+
+OHIF_VERSION = "3.12.6"
+STUDY_INDEX = "DCMGET_STUDIES.json"
+RECOVERY_MARKER = ".DCMGET-EXPORT.JSON"
 
 
 class PdiStatus(str, Enum):
@@ -36,15 +42,9 @@ class PdiStatus(str, Enum):
 class PdiStage(str, Enum):
     PREPARING = "整理文件"
     DICOMDIR = "生成 DICOMDIR"
-    PREVIEWS = "生成网页预览"
-    VIEWER = "加入查看器"
+    INDEXING = "生成 OHIF 索引"
+    VIEWER = "加入 OHIF 查看器"
     VERIFYING = "校验导出目录"
-
-
-class PreviewMode(str, Enum):
-    HYBRID = "hybrid"
-    ALL = "all"
-    SERIES_COVER = "series_cover"
 
 
 @dataclass(slots=True)
@@ -56,8 +56,7 @@ class PdiExportResult:
     source_count: int = 0
     exported_count: int = 0
     duplicate_count: int = 0
-    preview_count: int = 0
-    unpreviewable_count: int = 0
+    indexed_count: int = 0
     strict_profile: bool | None = None
     core_tool_failure: bool = False
 
@@ -65,7 +64,6 @@ class PdiExportResult:
 ProgressCallback = Callable[[PdiStage, int, int, str], None]
 LogCallback = Callable[[str, str, str], None]
 ProcessCallback = Callable[[str, int, str, bool], None]
-RECOVERY_MARKER = ".DCMGET-EXPORT.JSON"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,8 +82,7 @@ class _DicomItem:
     modality: str
     study_description: str
     series_description: str
-    frame_count: int
-    displayable: bool
+    metadata: dict[str, object]
 
     @property
     def relative_path(self) -> Path:
@@ -107,7 +104,7 @@ class PdiCoreToolError(RuntimeError):
 
 
 class PdiExporter:
-    """Build a portable DICOM file-set from an exact list of archived files."""
+    """Build a standards-based PDI directory with an offline OHIF viewer."""
 
     def __init__(
         self,
@@ -115,7 +112,7 @@ class PdiExporter:
         tools: ToolPaths,
         project_root: str | Path | None = None,
         viewer_source: str | Path | None = None,
-        weasis_payload_dir: str | Path | None = None,
+        ohif_payload_dir: str | Path | None = None,
         log_callback: LogCallback | None = None,
         progress_callback: ProgressCallback | None = None,
         process_callback: ProcessCallback | None = None,
@@ -125,10 +122,10 @@ class PdiExporter:
         self.config = config
         self.tools = tools
         self.project_root = Path(project_root or resource_root())
-        if viewer_source is not None and weasis_payload_dir is not None:
-            raise ValueError("viewer_source 与 weasis_payload_dir 不能同时指定")
-        selected_viewer = viewer_source or weasis_payload_dir
-        self.weasis_payload_dir = (
+        if viewer_source is not None and ohif_payload_dir is not None:
+            raise ValueError("viewer_source 与 ohif_payload_dir 不能同时指定")
+        selected_viewer = ohif_payload_dir or viewer_source
+        self.ohif_payload_dir = (
             Path(selected_viewer).expanduser() if selected_viewer else None
         )
         self.log_callback = log_callback or (lambda _source, _message, _level: None)
@@ -163,16 +160,14 @@ class PdiExporter:
             source_count=len(source_paths),
         )
         temporary: Path | None = None
-        final: Path | None = None
         try:
             self._check_cancelled()
-            institution = str(getattr(self.config, "pdi_institution_name", "")).strip()
+            institution = str(self.config.pdi_institution_name).strip()
             if not institution:
                 raise ValueError("请先在设置中填写 PDI 机构名称")
             if not source_paths:
                 raise ValueError("当前批次没有可导出的 DICOM 文件")
 
-            mode = self._preview_mode()
             output_root = self._output_root()
             output_root.mkdir(parents=True, exist_ok=True)
             self._remove_recovery_partials()
@@ -184,21 +179,14 @@ class PdiExporter:
                         "success" if published.status == PdiStatus.COMPLETED else "warning",
                     )
                     return published
-            payload = self._resolve_weasis_payload()
-            preview_requested = bool(
-                getattr(self.config, "pdi_include_html_preview", True)
-            )
-            viewer_requested = bool(
-                getattr(self.config, "pdi_include_weasis_windows", True)
-            )
-            preview_allowed, viewer_allowed, space_warnings = self._check_free_space(
-                output_root,
-                source_paths,
-                payload,
-                preview_requested,
-                viewer_requested,
+
+            viewer_requested = bool(self.config.pdi_include_ohif_viewer)
+            viewer_payload = self._resolve_ohif_payload() if viewer_requested else None
+            viewer_allowed, space_warnings = self._check_free_space(
+                output_root, source_paths, viewer_payload, viewer_requested
             )
             result.warnings.extend(space_warnings)
+
             final = self._next_output_directory(output_root)
             temporary = output_root / f".{final.name}.partial-{uuid.uuid4().hex[:8]}"
             temporary.mkdir(parents=False, exist_ok=False)
@@ -218,44 +206,30 @@ class PdiExporter:
             self._verify_dicomdir(temporary, len(items))
             self._progress(PdiStage.DICOMDIR, 1, 1, "DICOMDIR 已生成")
 
-            previews: dict[tuple[str, ...], list[Path]] = {}
-            unpreviewable: list[_DicomItem] = []
-            preview_problem = preview_requested and not preview_allowed
-            if preview_problem:
-                unpreviewable = list(items)
-                result.unpreviewable_count = len(items)
-            if preview_allowed:
-                try:
-                    previews, unpreviewable = self._create_previews(
-                        temporary, items, mode
-                    )
-                    result.preview_count = sum(
-                        len(paths) for paths in previews.values()
-                    )
-                    result.unpreviewable_count = len(unpreviewable)
-                    preview_problem = bool(unpreviewable)
-                    if unpreviewable:
-                        result.warnings.append(
-                            f"{len(unpreviewable)} 个 DICOM 对象无法生成完整网页预览"
-                        )
-                except _Cancelled:
-                    raise
-                except Exception as exc:
-                    shutil.rmtree(temporary / "IHE_PDI", ignore_errors=True)
-                    previews = {}
-                    unpreviewable = list(items)
-                    result.unpreviewable_count = len(items)
-                    preview_problem = True
-                    warning = f"网页预览生成失败，DICOMDIR 仍可使用：{exc}"
-                    result.warnings.append(warning)
-                    self._emit(warning, "warning")
+            index_problem = False
+            try:
+                self._progress(PdiStage.INDEXING, 0, len(items), "正在生成 OHIF 本地索引")
+                result.indexed_count = self._write_ohif_index(temporary, items)
+                self._progress(
+                    PdiStage.INDEXING,
+                    len(items),
+                    len(items),
+                    f"OHIF 索引已生成，共 {result.indexed_count} 个图像帧",
+                )
+            except _Cancelled:
+                raise
+            except Exception as exc:
+                index_problem = True
+                warning = f"OHIF 索引生成失败，DICOMDIR 仍可使用：{exc}"
+                result.warnings.append(warning)
+                self._emit(warning, "warning")
 
-            viewer_problem = viewer_requested and not viewer_allowed
+            viewer_problem = viewer_requested and (not viewer_allowed or index_problem)
             viewer_included = False
-            if viewer_allowed:
+            if viewer_allowed and not index_problem:
                 try:
-                    viewer_included, viewer_warning = self._copy_weasis(
-                        temporary, payload
+                    viewer_included, viewer_warning = self._copy_ohif(
+                        temporary, viewer_payload
                     )
                     if viewer_warning:
                         viewer_problem = True
@@ -264,20 +238,13 @@ class PdiExporter:
                     raise
                 except Exception as exc:
                     shutil.rmtree(temporary / "VIEWER", ignore_errors=True)
-                    (temporary / "RUN.bat").unlink(missing_ok=True)
+                    self._remove_launchers(temporary)
                     viewer_problem = True
-                    warning = f"Weasis 查看器加入失败，DICOMDIR 仍可使用：{exc}"
+                    warning = f"OHIF 查看器加入失败，DICOMDIR 仍可使用：{exc}"
                     result.warnings.append(warning)
                     self._emit(warning, "warning")
 
-            self._write_index(
-                temporary,
-                institution,
-                items,
-                previews,
-                unpreviewable,
-                viewer_included,
-            )
+            self._write_index(temporary, institution, items, viewer_included)
             self._write_readme(
                 temporary,
                 institution,
@@ -286,7 +253,7 @@ class PdiExporter:
                 viewer_included,
             )
 
-            is_partial = (not strict_profile) or preview_problem or viewer_problem
+            is_partial = (not strict_profile) or index_problem or viewer_problem
             result.status = PdiStatus.PARTIAL if is_partial else PdiStatus.COMPLETED
             result.message = (
                 f"PDI 便携目录已生成，包含 {len(items)} 个 DICOM 文件"
@@ -297,14 +264,19 @@ class PdiExporter:
 
             self._progress(PdiStage.VERIFYING, 0, 1, "正在生成 SHA-256 校验清单")
             self._write_manifest(temporary)
-            self._verify_published_content(temporary, items)
+            self._verify_published_content(
+                temporary,
+                items,
+                require_index=not index_problem,
+                expected_index_count=result.indexed_count,
+            )
             self._progress(PdiStage.VERIFYING, 1, 1, "导出目录校验完成")
             self._check_cancelled()
             temporary.rename(final)
             temporary = None
 
             result.output_directory = str(final)
-            self._emit(result.message, "success" if not is_partial else "warning")
+            self._emit(result.message, "warning" if is_partial else "success")
             return result
         except _Cancelled:
             result.status = PdiStatus.CANCELLED
@@ -390,10 +362,9 @@ class PdiExporter:
             transfer_syntax = str(
                 getattr(dataset.file_meta, "TransferSyntaxUID", "")
             ).strip()
-            try:
-                frame_count = max(1, int(dataset.get("NumberOfFrames", 1) or 1))
-            except (TypeError, ValueError):
-                frame_count = 1
+            metadata = _naturalize_dataset(dataset)
+            metadata.setdefault("SOPInstanceUID", sop_uid)
+            metadata.setdefault("StudyInstanceUID", study_uid)
             item = _DicomItem(
                 source=source,
                 file_id=file_id,
@@ -409,8 +380,7 @@ class PdiExporter:
                 modality=str(dataset.get("Modality", "")),
                 study_description=str(dataset.get("StudyDescription", "")),
                 series_description=str(dataset.get("SeriesDescription", "")),
-                frame_count=frame_count,
-                displayable=bool(dataset.get("Rows", 0) and dataset.get("Columns", 0)),
+                metadata=metadata,
             )
             items.append(item)
             seen_uids[sop_uid] = item
@@ -508,10 +478,11 @@ class PdiExporter:
             value = record.get("ReferencedFileID")
             if not value:
                 continue
-            if isinstance(value, str):
-                parts = tuple(part for part in value.split("\\") if part)
-            else:
-                parts = tuple(str(part) for part in value)
+            parts = (
+                tuple(part for part in value.split("\\") if part)
+                if isinstance(value, str)
+                else tuple(str(part) for part in value)
+            )
             if not parts:
                 continue
             if any(
@@ -534,175 +505,243 @@ class PdiExporter:
                 f"DICOMDIR 引用数量不一致：期望 {expected_count}，实际 {len(references)}"
             )
 
-    def _create_previews(
-        self, root: Path, items: list[_DicomItem], mode: PreviewMode
-    ) -> tuple[dict[tuple[str, ...], list[Path]], list[_DicomItem]]:
-        tool = self._tool_path("dcmj2pnm")
-        candidates = self._preview_candidates(items, mode)
-        previews: dict[tuple[str, ...], list[Path]] = {}
-        unpreviewable: list[_DicomItem] = [item for item in items if not item.displayable]
-        self._progress(PdiStage.PREVIEWS, 0, len(candidates), "正在生成静态预览")
-        if not tool.is_file():
-            warning = f"未找到 DCMTK dcmj2pnm：{tool}"
-            self._emit(warning, "warning")
-            return {}, unpreviewable + list(candidates)
+    def _write_ohif_index(self, root: Path, items: list[_DicomItem]) -> int:
+        studies: dict[str, dict[str, Any]] = {}
+        series_maps: dict[str, dict[str, dict[str, Any]]] = {}
+        indexed_count = 0
 
-        for current, item in enumerate(candidates, 1):
+        for item in items:
             self._check_cancelled()
-            frame_total = self._preview_frame_count(item, mode)
-            generated: list[Path] = []
-            failed = False
-            for frame in range(1, frame_total + 1):
-                self._check_cancelled()
-                relative = Path(
-                    "IHE_PDI",
-                    "HTML",
-                    "PREVIEW",
-                    f"IMG{current:04d}",
-                    f"F{frame:04d}.JPG",
+            study_key = item.study_instance_uid or f"MISSING-{item.file_id[2]}"
+            if study_key not in studies:
+                metadata = item.metadata
+                study = {
+                    "StudyInstanceUID": study_key,
+                    "StudyDate": _metadata_value(metadata, "StudyDate", ""),
+                    "StudyTime": _metadata_value(metadata, "StudyTime", ""),
+                    "PatientName": _metadata_value(metadata, "PatientName", []),
+                    "PatientID": _metadata_value(metadata, "PatientID", "")
+                    or "UNKNOWN",
+                    "AccessionNumber": _metadata_value(metadata, "AccessionNumber", ""),
+                    "PatientSex": _metadata_value(metadata, "PatientSex", ""),
+                    "PatientAge": _metadata_value(metadata, "PatientAge", ""),
+                    "PatientWeight": _metadata_value(metadata, "PatientWeight", ""),
+                    "StudyDescription": _metadata_value(
+                        metadata, "StudyDescription", ""
+                    ),
+                    "InstitutionName": _metadata_value(
+                        metadata, "InstitutionName", ""
+                    ),
+                    "series": [],
+                }
+                studies[study_key] = study
+                series_maps[study_key] = {}
+
+            series_key = item.series_instance_uid or f"MISSING-{item.file_id[3]}"
+            series_map = series_maps[study_key]
+            if series_key not in series_map:
+                metadata = item.metadata
+                series = {
+                    "SeriesInstanceUID": series_key,
+                    "SeriesNumber": _metadata_value(metadata, "SeriesNumber", 0),
+                    "SeriesDate": _metadata_value(metadata, "SeriesDate", ""),
+                    "SeriesTime": _metadata_value(metadata, "SeriesTime", ""),
+                    "Modality": _metadata_value(metadata, "Modality", ""),
+                    "SliceThickness": _metadata_value(
+                        metadata, "SliceThickness", ""
+                    ),
+                    "SeriesDescription": _metadata_value(
+                        metadata, "SeriesDescription", ""
+                    ),
+                    "ProtocolName": _metadata_value(metadata, "ProtocolName", ""),
+                    "instances": [],
+                }
+                series_map[series_key] = series
+                studies[study_key]["series"].append(series)
+
+            base_url = f"dicomweb:/{item.relative_path.as_posix()}"
+            try:
+                frame_count = max(1, int(item.metadata.get("NumberOfFrames", 1)))
+            except (TypeError, ValueError):
+                frame_count = 1
+            for frame_number in range(1, frame_count + 1):
+                series_map[series_key]["instances"].append(
+                    {
+                        "metadata": item.metadata,
+                        "url": (
+                            f"{base_url}?frame={frame_number}"
+                            if frame_count > 1
+                            else base_url
+                        ),
+                    }
                 )
-                destination = root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                command = [
-                    str(tool),
-                    "+oj",
-                    "+Jq",
-                    "85",
-                    "+Wm",
-                    "+F",
-                    str(frame),
-                    str(root / item.relative_path),
-                    str(destination),
-                ]
-                converted = self._run_command(command, root)
-                if converted.returncode or not destination.is_file():
-                    destination.unlink(missing_ok=True)
-                    failed = True
-                    self._emit(
-                        f"无法生成预览：{item.source.name} 第 {frame} 帧",
-                        "warning",
+                indexed_count += 1
+
+        for study_key, study in studies.items():
+            modalities: list[str] = []
+            instance_count = 0
+            series_values = study["series"]
+            for series in series_values:
+                series["instances"].sort(
+                    key=lambda entry: _sort_number(
+                        entry["metadata"].get("InstanceNumber", 0)
                     )
-                    break
-                generated.append(relative)
-            if generated:
-                previews[item.file_id] = generated
-            if failed or not generated:
-                unpreviewable.append(item)
-            self._progress(
-                PdiStage.PREVIEWS,
-                current,
-                len(candidates),
-                f"已处理预览 {current}/{len(candidates)}",
-            )
-        return previews, unpreviewable
+                )
+                instance_count += len(series["instances"])
+                modality = str(series.get("Modality", "")).strip()
+                if modality and modality not in modalities:
+                    modalities.append(modality)
+            series_values.sort(key=lambda value: _sort_number(value.get("SeriesNumber", 0)))
+            study["NumInstances"] = instance_count
+            study["Modalities"] = "\\".join(modalities)
 
-    @staticmethod
-    def _preview_candidates(
-        items: list[_DicomItem], mode: PreviewMode
-    ) -> list[_DicomItem]:
-        displayable = [item for item in items if item.displayable]
-        if mode != PreviewMode.SERIES_COVER:
-            return displayable
-        selected: list[_DicomItem] = []
-        seen_series: set[str] = set()
-        for item in displayable:
-            series_key = item.series_instance_uid or "\\".join(item.file_id[:-1])
-            if series_key in seen_series:
-                continue
-            seen_series.add(series_key)
-            selected.append(item)
-        return selected
+        payload = {"studies": list(studies.values())}
+        (root / STUDY_INDEX).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        return indexed_count
 
-    @staticmethod
-    def _preview_frame_count(item: _DicomItem, mode: PreviewMode) -> int:
-        if mode == PreviewMode.SERIES_COVER:
-            return 1
-        if mode == PreviewMode.HYBRID:
-            return min(item.frame_count, 100)
-        return item.frame_count
-
-    def _copy_weasis(
+    def _copy_ohif(
         self, root: Path, payload: Path | None
     ) -> tuple[bool, str | None]:
-        self._progress(PdiStage.VIEWER, 0, 1, "正在加入 Windows Weasis")
+        self._progress(PdiStage.VIEWER, 0, 1, "正在加入中文 OHIF 查看器")
         if payload is None:
-            return False, "未找到 Windows Weasis 便携资源，已保留 HTML 和 DICOMDIR"
-        executable = payload / "Weasis.exe"
-        licenses = [path for path in payload.rglob("LICENSE*") if path.is_file()]
-        third_party = [
-            path for path in payload.rglob("THIRD_PARTY*") if path.is_file()
+            return False, "未找到经过校验的 OHIF 资源，已保留 DICOMDIR 和原始 DICOM"
+        missing = [
+            name
+            for name in ("index.html", "app-config.js")
+            if not (payload / name).is_file()
         ]
-        if not executable.is_file():
-            return False, f"Weasis 资源中未找到 Weasis.exe：{payload}"
-        if not licenses or not third_party:
-            return False, f"Weasis 资源缺少开源许可证或第三方声明：{payload}"
+        license_files = [path for path in payload.glob("LICENSE*") if path.is_file()]
+        third_party_files = [
+            path for path in payload.glob("THIRD_PARTY*") if path.is_file()
+        ]
+        if missing:
+            return False, f"OHIF 资源不完整，缺少：{'、'.join(missing)}"
+        if not license_files or not third_party_files:
+            return False, "OHIF 资源缺少开源许可证或第三方声明"
 
-        destination = root / "VIEWER" / "WINDOWS"
+        destination = root / "VIEWER" / "OHIF"
+        destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(payload, destination, copy_function=self._copy_file)
-        (root / "RUN.bat").write_text(
+
+        server_script = Path(__file__).with_name("pdi_server.py")
+        if not server_script.is_file():
+            server_script = self.project_root / "dcmget" / "pdi_server.py"
+        if not server_script.is_file():
+            return False, "未找到 PDI 本地服务启动脚本"
+        self._copy_file(server_script, root / "VIEWER" / "pdi_server.py")
+
+        server_executable = self._resolve_server_executable()
+        if server_executable is not None:
+            self._copy_file(
+                server_executable,
+                root
+                / (
+                    "OPEN_VIEWER.exe"
+                    if server_executable.suffix.lower() == ".exe"
+                    else "OPEN_VIEWER"
+                ),
+            )
+        self._write_launchers(root)
+        self._progress(PdiStage.VIEWER, 1, 1, "中文 OHIF 查看器已加入")
+        return True, None
+
+    @staticmethod
+    def _write_launchers(root: Path) -> None:
+        (root / "OPEN_VIEWER.bat").write_text(
             "@echo off\r\n"
+            "setlocal\r\n"
             "cd /d \"%~dp0\"\r\n"
-            'start "" "VIEWER\\WINDOWS\\Weasis.exe" '
-            '"weasis://%%24dicom%%3Aget%%20-p%%20%%24weasis%%3Aconfig%%20pro%%3D%%22weasis.portable.dir%%20.%%22"\r\n',
+            "if exist \"OPEN_VIEWER.exe\" (\r\n"
+            "  start \"\" \"OPEN_VIEWER.exe\" --root \"%CD%\"\r\n"
+            "  exit /b 0\r\n"
+            ")\r\n"
+            "where py >nul 2>nul && py -3 \"VIEWER\\pdi_server.py\" --root \"%CD%\" && exit /b 0\r\n"
+            "where python >nul 2>nul && python \"VIEWER\\pdi_server.py\" --root \"%CD%\" && exit /b 0\r\n"
+            "echo [DcmGet] Local viewer server or Python 3 was not found.\r\n"
+            "pause\r\n",
             encoding="ascii",
             newline="",
         )
-        self._progress(PdiStage.VIEWER, 1, 1, "Windows Weasis 已加入")
-        return True, None
+        unix_script = (
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "ROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+            "exec python3 \"$ROOT/VIEWER/pdi_server.py\" --root \"$ROOT\"\n"
+        )
+        command = root / "OPEN_VIEWER.command"
+        shell = root / "OPEN_VIEWER.sh"
+        command.write_text(unix_script, encoding="utf-8", newline="\n")
+        shell.write_text(unix_script, encoding="utf-8", newline="\n")
+        command.chmod(0o755)
+        shell.chmod(0o755)
+
+    @staticmethod
+    def _remove_launchers(root: Path) -> None:
+        for name in (
+            "OPEN_VIEWER.exe",
+            "OPEN_VIEWER",
+            "OPEN_VIEWER.bat",
+            "OPEN_VIEWER.command",
+            "OPEN_VIEWER.sh",
+        ):
+            (root / name).unlink(missing_ok=True)
 
     def _write_index(
         self,
         root: Path,
         institution: str,
         items: list[_DicomItem],
-        previews: dict[tuple[str, ...], list[Path]],
-        unpreviewable: list[_DicomItem],
         viewer_included: bool,
     ) -> None:
-        cards: list[str] = []
+        studies: dict[tuple[str, str], list[_DicomItem]] = {}
         for item in items:
-            images = "".join(
-                f'<img loading="lazy" src="{_escape_path(path)}" alt="DICOM 预览">'
-                for path in previews.get(item.file_id, [])
-            )
-            if not images:
-                images = '<p class="muted">该实例无静态预览，请使用 DICOM 查看器。</p>'
-            dicom_path = "/".join(item.file_id)
+            key = (item.patient_id or item.patient_name, item.study_instance_uid)
+            studies.setdefault(key, []).append(item)
+        cards: list[str] = []
+        for study_items in studies.values():
+            first = study_items[0]
+            modalities = " / ".join(
+                dict.fromkeys(item.modality for item in study_items if item.modality)
+            ) or "-"
             cards.append(
-                '<article class="card">'
-                f"<h2>{html.escape(item.patient_name or item.patient_id or '未命名患者')}</h2>"
-                f"<p>患者 ID：{html.escape(item.patient_id or '-')} &nbsp; "
-                f"检查号：{html.escape(item.accession_number or '-')} &nbsp; "
-                f"日期：{html.escape(item.study_date or '-')} &nbsp; "
-                f"类型：{html.escape(item.modality or '-')}</p>"
-                f"<p>{html.escape(item.study_description or item.series_description or '')}</p>"
-                f'<p><a href="{html.escape(dicom_path, quote=True)}">DICOM 原始文件</a></p>'
-                f'<div class="images">{images}</div>'
+                '<article class="study">'
+                f"<h2>{html.escape(first.patient_name or first.patient_id or '未命名患者')}</h2>"
+                f"<p>患者 ID：{html.escape(first.patient_id or '-')}</p>"
+                f"<p>检查号：{html.escape(first.accession_number or '-')}</p>"
+                f"<p>检查日期：{html.escape(first.study_date or '-')}　类型：{html.escape(modalities)}</p>"
+                f"<p>{html.escape(first.study_description or '-')}</p>"
+                f"<span>{len(study_items)} 个 DICOM 实例</span>"
                 "</article>"
             )
-        unsupported = "".join(
-            f"<li>{html.escape(item.source.name)} ({html.escape(item.modality or '-')})</li>"
-            for item in unpreviewable
-        ) or "<li>无</li>"
-        viewer = (
-            '<p><a class="button" href="RUN.bat">使用 Windows Weasis 打开</a></p>'
+        launch = (
+            '<div class="launch"><strong>打开阅片器</strong>'
+            "<p>Windows：双击 OPEN_VIEWER.bat</p>"
+            "<p>macOS：双击 OPEN_VIEWER.command</p>"
+            "<p>Linux：运行 OPEN_VIEWER.sh</p></div>"
             if viewer_included
-            else "<p>Windows Weasis 未包含在本目录中。</p>"
+            else '<div class="warning">本目录未包含 OHIF 运行资源，请使用外部 DICOM 查看器打开 DICOMDIR。</div>'
         )
         document = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DcmGet PDI</title><style>
-body{{margin:0;background:#f3f6f9;color:#172235;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-main{{max-width:1180px;margin:auto;padding:28px}}header,.card,.notice{{background:#fff;border:1px solid #dce4ec;border-radius:12px;padding:20px;margin-bottom:16px}}
-h1{{color:#075ea8;margin-top:0}}.warning{{color:#8a4b00;background:#fff5df}}.muted{{color:#526173}}
-.images{{display:flex;gap:10px;overflow:auto}}img{{max-width:280px;max-height:280px;object-fit:contain;background:#000}}
-a{{color:#075ea8}}.button{{display:inline-block;background:#075ea8;color:white;padding:10px 16px;border-radius:6px;text-decoration:none}}
+:root{{--bg:#07131f;--panel:#101e2d;--line:#263b4f;--text:#eaf4fb;--muted:#9bb0c1;--cyan:#5de2ef;--warn:#ffbd66}}
+*{{box-sizing:border-box}}body{{margin:0;background:linear-gradient(145deg,#07131f,#0a1825);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}}
+main{{max-width:1120px;margin:auto;padding:32px}}header,.launch,.warning,.study{{background:var(--panel);border:1px solid var(--line);border-radius:10px}}
+header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);font-size:28px}}header p,.study p{{color:var(--muted)}}
+.notice{{border-left:4px solid var(--warn);padding:14px 18px;margin:18px 0;background:#2a2117;color:#ffd9a3}}
+.launch,.warning{{padding:18px;margin:18px 0}}.launch strong{{color:var(--cyan)}}.launch p{{display:inline-block;margin:10px 24px 0 0;color:var(--muted)}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}}.study{{padding:18px}}.study h2{{margin:0 0 12px;font-size:18px}}
+.study p{{margin:7px 0}}.study span{{display:inline-block;margin-top:10px;color:var(--cyan)}}a{{color:var(--cyan)}}
 </style></head><body><main><header><h1>DcmGet PDI 便携影像</h1>
-<p>机构：{html.escape(institution)}</p>{viewer}<p><a href="README.TXT">查看使用说明</a></p></header>
-<section class="notice warning"><strong>仅供查阅，不用于诊断。</strong> DICOM 原始文件为准。</section>
-{''.join(cards)}
-<section class="card"><h2>无法生成网页预览的对象</h2><ul>{unsupported}</ul></section>
+<p>机构：{html.escape(institution)}</p><p>目录内保存标准 DICOMDIR、原始 DICOM 和本地中文 OHIF 阅片器。</p>
+<a href="README.TXT">查看使用说明</a></header>
+<section class="notice"><strong>仅供查阅，不用于诊断。</strong> 请以原始 DICOM 和医疗机构正式报告为准。</section>
+{launch}<section class="grid">{''.join(cards)}</section>
 </main></body></html>"""
         (root / "INDEX.HTM").write_text(document, encoding="utf-8", newline="\n")
 
@@ -720,9 +759,10 @@ a{{color:#075ea8}}.button{{display:inline-block;background:#075ea8;color:white;p
             else "DICOMDIR 使用兼容模式生成，不声称为严格 Profile 合规介质。"
         )
         viewer = (
-            "Windows 用户可双击 RUN.bat 启动 Weasis。"
+            "Windows 双击 OPEN_VIEWER.bat；macOS 双击 OPEN_VIEWER.command；"
+            "Linux 运行 OPEN_VIEWER.sh。阅片服务只监听本机 127.0.0.1。"
             if viewer_included
-            else "本目录未包含 Windows Weasis，可使用 INDEX.HTM 或外部 DICOM 查看器。"
+            else "本目录未包含 OHIF 查看器，请使用外部 DICOM 查看器打开 DICOMDIR。"
         )
         warning_lines = "\n".join(f"- {warning}" for warning in warnings) or "- 无"
         content = f"""DcmGet PDI 便携影像目录
@@ -732,11 +772,12 @@ a{{color:#075ea8}}.button{{display:inline-block;background:#075ea8;color:white;p
 
 使用方法：
 1. 将整个目录复制到 U 盘，不要只复制部分文件。
-2. 双击 INDEX.HTM 查看静态预览。
+2. 双击 INDEX.HTM 查看目录说明和检查清单。
 3. {viewer}
 
 {profile}
-静态网页仅供查阅，不用于诊断；DICOM 原始文件为准。
+OHIF 直接读取目录中的原始 DICOM，不生成 JPEG 预览，也不会连接 PACS 或公网。
+本目录仅供查阅，不用于诊断；DICOM 原始文件为准。
 MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
 
 警告：
@@ -753,12 +794,21 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
                 continue
             relative = path.relative_to(root).as_posix()
             lines.append(f"{self._hash_file(path)}  {relative}")
-        (root / "MANIFEST.SHA256").write_text(
+        manifest_path.write_text(
             "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
         )
 
-    def _verify_published_content(self, root: Path, items: list[_DicomItem]) -> None:
-        required = ("DICOMDIR", "INDEX.HTM", "README.TXT", "MANIFEST.SHA256")
+    def _verify_published_content(
+        self,
+        root: Path,
+        items: list[_DicomItem],
+        *,
+        require_index: bool = True,
+        expected_index_count: int | None = None,
+    ) -> None:
+        required = ["DICOMDIR", "INDEX.HTM", "README.TXT", "MANIFEST.SHA256"]
+        if require_index:
+            required.append(STUDY_INDEX)
         missing = [name for name in required if not (root / name).is_file()]
         if missing:
             raise RuntimeError(f"PDI 目录缺少文件：{'、'.join(missing)}")
@@ -766,6 +816,12 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             destination = root / item.relative_path
             if not destination.is_file() or self._hash_file(destination) != item.digest:
                 raise RuntimeError(f"PDI DICOM 文件校验失败：{destination}")
+        if require_index:
+            self._verify_ohif_index(
+                root,
+                len(items) if expected_index_count is None else expected_index_count,
+            )
+
         manifest_path = root / "MANIFEST.SHA256"
         expected: dict[str, str] = {}
         for line in manifest_path.read_text(encoding="utf-8").splitlines():
@@ -788,6 +844,44 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         }
         if expected != actual:
             raise RuntimeError("PDI SHA-256 清单与导出文件不一致")
+
+    @staticmethod
+    def _verify_ohif_index(root: Path, expected_count: int) -> None:
+        try:
+            payload = json.loads((root / STUDY_INDEX).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"OHIF 索引校验失败：{exc}") from exc
+        studies = payload.get("studies") if isinstance(payload, dict) else None
+        if not isinstance(studies, list):
+            raise RuntimeError("OHIF 索引缺少 studies 列表")
+        count = 0
+        for study in studies:
+            if not isinstance(study, dict) or not isinstance(study.get("series"), list):
+                raise RuntimeError("OHIF 索引中的检查结构无效")
+            for series in study["series"]:
+                if not isinstance(series, dict) or not isinstance(
+                    series.get("instances"), list
+                ):
+                    raise RuntimeError("OHIF 索引中的序列结构无效")
+                for instance in series["instances"]:
+                    if not isinstance(instance, dict):
+                        raise RuntimeError("OHIF 索引中的实例结构无效")
+                    url = str(instance.get("url", ""))
+                    if not url.startswith("dicomweb:/DICOM/"):
+                        raise RuntimeError("OHIF 索引包含非本地 DICOM 地址")
+                    relative = url.removeprefix("dicomweb:/").partition("?")[0]
+                    target = root.joinpath(*relative.split("/"))
+                    try:
+                        target.resolve().relative_to((root / "DICOM").resolve())
+                    except ValueError as exc:
+                        raise RuntimeError("OHIF 索引引用超出 DICOM 目录") from exc
+                    if not target.is_file():
+                        raise RuntimeError(f"OHIF 索引引用的文件不存在：{relative}")
+                    count += 1
+        if count != expected_count:
+            raise RuntimeError(
+                f"OHIF 索引实例数不一致：期望 {expected_count}，实际 {count}"
+            )
 
     def _run_command(self, command: list[str], cwd: Path) -> _CommandResult:
         self._check_cancelled()
@@ -871,13 +965,6 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         suffix = ".exe" if os.name == "nt" else ""
         return self.tools.bin_dir / f"{name}{suffix}"
 
-    def _preview_mode(self) -> PreviewMode:
-        value = str(getattr(self.config, "pdi_preview_mode", PreviewMode.HYBRID.value))
-        try:
-            return PreviewMode(value)
-        except ValueError as exc:
-            raise ValueError(f"不支持的 PDI 预览模式：{value}") from exc
-
     def _output_root(self) -> Path:
         return _pdi_output_root(self.config)
 
@@ -891,17 +978,16 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         if not self.recovery_id:
             return
         payload = {
+            "attempt_id": self.recovery_id,
             "duplicate_count": result.duplicate_count,
             "exported_count": result.exported_count,
+            "indexed_count": result.indexed_count,
             "message": result.message,
-            "preview_count": result.preview_count,
             "source_count": result.source_count,
             "state": state,
             "status": result.status.value,
             "strict_profile": result.strict_profile,
-            "attempt_id": self.recovery_id,
-            "unpreviewable_count": result.unpreviewable_count,
-            "version": 1,
+            "version": 2,
             "warnings": list(result.warnings),
         }
         (root / RECOVERY_MARKER).write_text(
@@ -937,7 +1023,13 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
                 status = PdiStatus(str(marker["status"]))
                 if status not in {PdiStatus.COMPLETED, PdiStatus.PARTIAL}:
                     continue
-                self._verify_published_content(candidate, [])
+                indexed_count = int(marker.get("indexed_count", 0))
+                self._verify_published_content(
+                    candidate,
+                    [],
+                    require_index=indexed_count > 0,
+                    expected_index_count=indexed_count,
+                )
                 warnings = marker.get("warnings", [])
                 if not isinstance(warnings, list):
                     raise ValueError("invalid warnings")
@@ -952,8 +1044,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
                     source_count=int(marker.get("source_count", 0)),
                     exported_count=int(marker.get("exported_count", 0)),
                     duplicate_count=int(marker.get("duplicate_count", 0)),
-                    preview_count=int(marker.get("preview_count", 0)),
-                    unpreviewable_count=int(marker.get("unpreviewable_count", 0)),
+                    indexed_count=indexed_count,
                     strict_profile=strict_profile,
                 )
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -966,64 +1057,72 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
     @staticmethod
     def _read_recovery_marker(root: Path) -> dict[str, object] | None:
         return _read_recovery_marker(root)
-    def _resolve_weasis_payload(self) -> Path | None:
-        if not bool(getattr(self.config, "pdi_include_weasis_windows", True)):
+
+    def _resolve_ohif_payload(self) -> Path | None:
+        if not self.config.pdi_include_ohif_viewer:
             return None
-        if self.weasis_payload_dir is not None:
-            return self.weasis_payload_dir if self.weasis_payload_dir.is_dir() else None
+        if self.ohif_payload_dir is not None:
+            return self.ohif_payload_dir if self.ohif_payload_dir.is_dir() else None
         candidates = (
-            resource_root() / ".runtime" / "weasis" / "windows-x86_64" / "Weasis",
-            self.project_root / ".runtime" / "weasis" / "windows-x86_64" / "Weasis",
-            self.project_root / "resources" / "weasis" / "windows-x86_64" / "Weasis",
+            resource_root() / ".runtime" / "ohif" / f"ohif-{OHIF_VERSION}",
+            self.project_root / ".runtime" / "ohif" / f"ohif-{OHIF_VERSION}",
+            self.project_root / "resources" / "ohif" / f"ohif-{OHIF_VERSION}",
         )
         return next((path for path in candidates if path.is_dir()), None)
+
+    def _resolve_server_executable(self) -> Path | None:
+        names = (
+            "DcmGetPdiServer.exe",
+            "DcmGetPdiServer",
+        )
+        roots = (
+            resource_root(),
+            self.project_root,
+            self.project_root / "resources",
+        )
+        return next(
+            (
+                root / name
+                for root in roots
+                for name in names
+                if (root / name).is_file()
+            ),
+            None,
+        )
 
     @staticmethod
     def _check_free_space(
         output_root: Path,
         source_paths: list[Path],
         payload: Path | None,
-        preview_requested: bool,
         viewer_requested: bool,
-    ) -> tuple[bool, bool, list[str]]:
+    ) -> tuple[bool, list[str]]:
         source_size = sum(path.stat().st_size for path in source_paths if path.is_file())
         available = shutil.disk_usage(output_root).free
-        core_reserve = max(10 * 1024 * 1024, len(source_paths) * 4096)
+        core_reserve = max(10 * 1024 * 1024, len(source_paths) * 8192)
         core_required = source_size + core_reserve
         if available < core_required:
             raise OSError(
                 f"PDI 导出空间不足：核心目录至少需要 {core_required} 字节，"
                 f"当前可用 {available} 字节"
             )
-        remaining = available - core_required
         warnings: list[str] = []
-        preview_allowed = preview_requested
-        if preview_requested:
-            preview_reserve = max(
-                10 * 1024 * 1024, min(source_size, 512 * 1024 * 1024)
+        if not viewer_requested:
+            return False, warnings
+        if payload is None:
+            warnings.append("未找到 OHIF 运行资源，PDI 将不包含网页阅片器")
+            return False, warnings
+        try:
+            payload_size = sum(
+                path.stat().st_size for path in payload.rglob("*") if path.is_file()
             )
-            if remaining < preview_reserve:
-                preview_allowed = False
-                warnings.append("可用空间不足，已跳过可选网页图像预览")
-            else:
-                remaining -= preview_reserve
-
-        viewer_allowed = viewer_requested
-        if viewer_requested and payload is not None:
-            try:
-                payload_size = sum(
-                    path.stat().st_size
-                    for path in payload.rglob("*")
-                    if path.is_file()
-                )
-            except OSError as exc:
-                viewer_allowed = False
-                warnings.append(f"无法检查 Weasis 资源，已跳过可选查看器：{exc}")
-            else:
-                if remaining < payload_size:
-                    viewer_allowed = False
-                    warnings.append("可用空间不足，已跳过可选 Windows Weasis 查看器")
-        return preview_allowed, viewer_allowed, warnings
+        except OSError as exc:
+            warnings.append(f"无法检查 OHIF 资源，已跳过可选查看器：{exc}")
+            return False, warnings
+        if available - core_required < payload_size:
+            warnings.append("可用空间不足，已跳过可选 OHIF 查看器")
+            return False, warnings
+        return True, warnings
 
     @staticmethod
     def _next_output_directory(output_root: Path) -> Path:
@@ -1051,6 +1150,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         self._check_cancelled()
         source_path = Path(source)
         destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
         with source_path.open("rb") as input_file, destination_path.open("wb") as output_file:
             while chunk := input_file.read(1024 * 1024):
                 self._check_cancelled()
@@ -1074,18 +1174,89 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "warning")
 
 
+def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    binary_vrs = {"OB", "OD", "OF", "OL", "OV", "OW", "UN"}
+    for element in dataset:
+        if element.tag.is_private or element.keyword == "PixelData":
+            continue
+        keyword = element.keyword
+        if not keyword or element.VR in binary_vrs:
+            continue
+        try:
+            value = _naturalize_value(element.value, element.VR)
+            json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        metadata[keyword] = value
+    return metadata
+
+
+def _naturalize_value(value: object, vr: str = "") -> object:
+    if vr == "SQ":
+        return [_naturalize_dataset(item) for item in value]  # type: ignore[union-attr]
+    if vr == "PN":
+        values = value if _is_sequence_value(value) else [value]
+        return [{"Alphabetic": str(item)} for item in values]
+    if isinstance(value, bytes):
+        raise TypeError("binary value")
+    if _is_sequence_value(value):
+        return [_naturalize_value(item) for item in value]  # type: ignore[union-attr]
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value
+    class_name = value.__class__.__name__
+    if class_name.startswith("IS"):
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return str(value)
+    if class_name.startswith("DS"):
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _is_sequence_value(value: object) -> bool:
+    return isinstance(value, (list, tuple)) or value.__class__.__name__ in {
+        "MultiValue",
+        "Sequence",
+    }
+
+
+def _metadata_value(
+    metadata: dict[str, object], keyword: str, default: object
+) -> object:
+    value = metadata.get(keyword, default)
+    return default if value is None else value
+
+
+def _sort_number(value: object) -> tuple[int, float | str]:
+    try:
+        return 0, float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 1, str(value)
+
+
 def _read_recovery_marker(root: Path) -> dict[str, object] | None:
     try:
         payload = json.loads((root / RECOVERY_MARKER).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
         return None
     return payload
 
 
 def _pdi_output_root(config: AppConfig) -> Path:
-    configured = str(getattr(config, "pdi_output_folder", "")).strip()
+    configured = str(config.pdi_output_folder).strip()
     if configured:
         return Path(configured).expanduser().resolve()
     destination = Path(config.dicom_destination_folder).expanduser().resolve()
@@ -1138,10 +1309,6 @@ def _strict_profile(items: list[_DicomItem]) -> str:
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
     return digest.hexdigest()
-
-
-def _escape_path(path: Path) -> str:
-    return html.escape(path.as_posix(), quote=True)

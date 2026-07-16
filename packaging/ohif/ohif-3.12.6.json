@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "product": "OHIF Viewer",
+  "package_name": "@ohif/app",
+  "version": "3.12.6",
+  "asset_name": "app-3.12.6.tgz",
+  "asset_url": "https://registry.npmjs.org/@ohif/app/-/app-3.12.6.tgz",
+  "asset_size": 48508156,
+  "sha256": "930f3334c3a347d2b8e45fbef34c0f030da976af4fd18b8c62a1967afdc3674f",
+  "archive_root": "package/dist",
+  "license": "MIT",
+  "source_url": "https://github.com/OHIF/Viewers/tree/v3.12.6"
+}

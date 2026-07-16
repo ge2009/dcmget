@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from DICOM_download_ui import build_parser
+from DICOM_download_ui import build_parser, validate_frozen_pdi_resources
 from dcmget import __version__
 from dcmget.release_notes import load_release_notes
 from scripts.build_deploy_bundle import VERSION as DEPLOY_VERSION, source_files
@@ -55,3 +55,32 @@ def test_windows_release_artifacts_are_split_to_avoid_duplicate_runtime_download
     for suffix in ("Setup-x64", "Portable-x64", "Windows-x64-ZIP"):
         assert f"DcmGet-${{{{ inputs.version }}}}-{suffix}" in workflow
     assert "name: DcmGet-${{ inputs.version }}-windows-x64\n" not in workflow
+
+
+def test_frozen_self_test_requires_offline_ohif_and_local_server(
+    tmp_path: Path, monkeypatch
+):
+    import DICOM_download_ui as entry
+
+    monkeypatch.setattr(entry, "is_frozen", lambda: True)
+    with pytest.raises(RuntimeError, match="PDI 离线资源缺失"):
+        validate_frozen_pdi_resources(tmp_path)
+
+    ohif = tmp_path / ".runtime" / "ohif" / "ohif-3.12.6"
+    ohif.mkdir(parents=True)
+    (tmp_path / "DcmGetPdiServer.exe").write_bytes(b"server")
+    for name in (
+        "index.html",
+        "app-config.js",
+        "init-service-worker.js",
+        "LICENSE-OHIF.txt",
+        "THIRD_PARTY-OHIF.md",
+        "DCMGET_OHIF_PAYLOAD.json",
+        "DCMGET_PAYLOAD.SHA256",
+    ):
+        (ohif / name).write_text("offline", encoding="utf-8")
+
+    validate_frozen_pdi_resources(tmp_path)
+    (ohif / "app-config.js").write_text("https://remote.invalid", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="外部地址"):
+        validate_frozen_pdi_resources(tmp_path)

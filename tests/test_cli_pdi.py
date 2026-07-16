@@ -76,7 +76,6 @@ def _run_cli(
         Path("."),
         "3.7.0",
         dcmmkdir=Path("dcmmkdir"),
-        dcmj2pnm=Path("dcmj2pnm"),
     )
     summary = BatchSummary(
         [
@@ -224,7 +223,6 @@ def test_cli_restart_can_retry_pdi_without_running_download(tmp_path, monkeypatc
         Path("."),
         "3.7.0",
         dcmmkdir=Path("dcmmkdir"),
-        dcmj2pnm=Path("dcmj2pnm"),
     )
     resolver = Mock()
     resolver.resolve.return_value = tools

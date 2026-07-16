@@ -6,7 +6,14 @@ import threading
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QKeySequence
+from PyQt5.QtGui import (
+    QColor,
+    QCloseEvent,
+    QDesktopServices,
+    QIcon,
+    QIntValidator,
+    QKeySequence,
+)
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,10 +55,8 @@ from .auth_ui import activate_gui, entitlement_text, prepare_download_entitlemen
 from .config import (
     ANONYMIZATION_PROFILE_OPTIONS,
     DEFAULT_ANONYMIZATION_PROFILE,
-    DEFAULT_PDI_PREVIEW_MODE,
     AppConfig,
     DIRECTORY_TEMPLATES,
-    PDI_PREVIEW_MODE_OPTIONS,
     load_config,
     parse_accessions,
     save_config,
@@ -203,26 +208,29 @@ class SettingsPage(QWidget):
         dcmtk_row_layout.addWidget(self.dcmtk_edit, 1)
         dcmtk_row_layout.addWidget(browse)
         dcmtk_form.addRow("bin 目录", dcmtk_row)
-        self.dcmtk_hint = QLabel("尚未检测")
+        self.dcmtk_status_label = QLabel("工具状态")
+        self.dcmtk_hint = QLabel()
         self.dcmtk_hint.setObjectName("FieldHint")
-        dcmtk_form.addRow("工具状态", self.dcmtk_hint)
+        dcmtk_form.addRow(self.dcmtk_status_label, self.dcmtk_hint)
+        self.dcmtk_status_label.hide()
+        self.dcmtk_hint.hide()
 
         pacs_card, pacs_form = self._card("PACS 连接")
         self.pacs_host_edit = QLineEdit()
-        self.pacs_port_spin = self._port_spin()
+        self.pacs_port_edit = self._port_edit()
         self.calling_ae_edit = QLineEdit()
         self.pacs_ae_edit = QLineEdit()
         for widget in (self.calling_ae_edit, self.pacs_ae_edit):
             widget.setMaxLength(16)
         pacs_form.addRow("PACS 地址", self.pacs_host_edit)
-        pacs_form.addRow("PACS 端口", self.pacs_port_spin)
+        pacs_form.addRow("PACS 端口", self.pacs_port_edit)
         pacs_form.addRow("本机调用 AE", self.calling_ae_edit)
         pacs_form.addRow("PACS AE", self.pacs_ae_edit)
 
         receiver_card, receiver_form = self._card("DICOM 接收器")
         self.storage_ae_edit = QLineEdit()
         self.storage_ae_edit.setMaxLength(16)
-        self.storage_port_spin = self._port_spin()
+        self.storage_port_edit = self._port_edit()
         self.directory_template_combo = QComboBox()
         self.directory_template_combo.setEditable(True)
         self.directory_template_combo.addItems(DIRECTORY_TEMPLATES)
@@ -233,7 +241,7 @@ class SettingsPage(QWidget):
         self.log_size_spin.setRange(1, 4096)
         self.log_size_spin.setSuffix(" MB")
         receiver_form.addRow("接收 AE", self.storage_ae_edit)
-        receiver_form.addRow("监听端口", self.storage_port_spin)
+        receiver_form.addRow("监听端口", self.storage_port_edit)
         receiver_form.addRow("目录模板", self.directory_template_combo)
         directory_hint = QLabel(
             "可编辑组合：{PatientID}、{AccessionNumber}、{StudyInstanceUID}"
@@ -310,21 +318,16 @@ class SettingsPage(QWidget):
         pdi_output_layout.addWidget(self.pdi_output_button)
         pdi_form.addRow("输出根目录", pdi_output_row)
 
-        self.pdi_html_checkbox = QCheckBox("生成可双击打开的静态网页预览")
-        pdi_form.addRow("网页预览", self.pdi_html_checkbox)
-        self.pdi_preview_mode_combo = QComboBox()
-        self.pdi_preview_mode_combo.setAccessibleName("PDI 网页预览范围")
-        for mode_id, label, _description in PDI_PREVIEW_MODE_OPTIONS:
-            self.pdi_preview_mode_combo.addItem(label, mode_id)
-        pdi_form.addRow("预览范围", self.pdi_preview_mode_combo)
-        self.pdi_preview_hint = QLabel()
-        self.pdi_preview_hint.setObjectName("FieldHint")
-        self.pdi_preview_hint.setWordWrap(True)
-        pdi_form.addRow("", self.pdi_preview_hint)
-        self.pdi_weasis_checkbox = QCheckBox("包含 Windows x64 Weasis 便携查看器")
-        pdi_form.addRow("DICOM 查看器", self.pdi_weasis_checkbox)
+        self.pdi_ohif_checkbox = QCheckBox("包含中文 OHIF 网页阅片器")
+        pdi_form.addRow("DICOM 查看器", self.pdi_ohif_checkbox)
+        self.pdi_ohif_hint = QLabel(
+            "直接读取原始 DICOM，不生成 JPG；通过本地只读服务打开。"
+        )
+        self.pdi_ohif_hint.setObjectName("FieldHint")
+        self.pdi_ohif_hint.setWordWrap(True)
+        pdi_form.addRow("", self.pdi_ohif_hint)
         self.pdi_privacy_warning = QLabel(
-            "PDI 会复制本批归档文件并生成网页预览。未启用匿名时，"
+            "PDI 会复制本批归档文件并可加入 OHIF 网页阅片器。未启用匿名时，"
             "导出目录可能包含患者隐私信息，请按医疗数据管理要求保管和传递。"
         )
         self.pdi_privacy_warning.setObjectName("WarningText")
@@ -333,10 +336,6 @@ class SettingsPage(QWidget):
         pdi_layout.addWidget(self.pdi_card_body)
         self._pdi_card_expanded = False
         self.pdi_enabled_checkbox.toggled.connect(self._update_pdi_state)
-        self.pdi_html_checkbox.toggled.connect(self._update_pdi_state)
-        self.pdi_preview_mode_combo.currentIndexChanged.connect(
-            self._update_pdi_state
-        )
 
         content_layout.addWidget(dcmtk_card)
         content_layout.addWidget(pacs_card)
@@ -361,16 +360,15 @@ class SettingsPage(QWidget):
         self._field_widgets = {
             "dcmtk_bin_dir": self.dcmtk_edit,
             "pacs_server_ip": self.pacs_host_edit,
-            "pacs_server_port": self.pacs_port_spin,
+            "pacs_server_port": self.pacs_port_edit,
             "calling_ae_title": self.calling_ae_edit,
             "pacs_ae_title": self.pacs_ae_edit,
             "storage_ae_title": self.storage_ae_edit,
-            "storage_port": self.storage_port_spin,
+            "storage_port": self.storage_port_edit,
             "directory_template": self.directory_template_combo,
             "anonymization_profile": self.anonymization_profile_combo,
             "pdi_institution_name": self.pdi_institution_edit,
             "pdi_output_folder": self.pdi_output_edit,
-            "pdi_preview_mode": self.pdi_preview_mode_combo,
             "max_log_file_size_bytes": self.log_size_spin,
         }
 
@@ -389,21 +387,29 @@ class SettingsPage(QWidget):
         return card, form
 
     @staticmethod
-    def _port_spin() -> QSpinBox:
-        spin = QSpinBox()
-        spin.setRange(1, 65535)
-        spin.setButtonSymbols(QSpinBox.PlusMinus)
-        return spin
+    def _port_edit() -> QLineEdit:
+        edit = QLineEdit()
+        edit.setValidator(QIntValidator(1, 65535, edit))
+        edit.setMaxLength(5)
+        edit.setInputMethodHints(Qt.ImhDigitsOnly)
+        return edit
+
+    @staticmethod
+    def _port_value(edit: QLineEdit) -> int:
+        try:
+            return int(edit.text().strip())
+        except ValueError:
+            return 0
 
     def set_config(self, config: AppConfig) -> None:
         self._config = config
         self.dcmtk_edit.setText(config.dcmtk_bin_dir)
         self.pacs_host_edit.setText(config.pacs_server_ip)
-        self.pacs_port_spin.setValue(config.pacs_server_port)
+        self.pacs_port_edit.setText(str(config.pacs_server_port))
         self.calling_ae_edit.setText(config.calling_ae_title)
         self.pacs_ae_edit.setText(config.pacs_ae_title)
         self.storage_ae_edit.setText(config.storage_ae_title)
-        self.storage_port_spin.setValue(config.storage_port)
+        self.storage_port_edit.setText(str(config.storage_port))
         self.directory_template_combo.setCurrentText(config.directory_template)
         self.anonymization_enabled_checkbox.setChecked(config.anonymization_enabled)
         profile_index = self.anonymization_profile_combo.findData(
@@ -418,14 +424,7 @@ class SettingsPage(QWidget):
         self.pdi_enabled_checkbox.setChecked(config.pdi_export_enabled)
         self.pdi_institution_edit.setText(config.pdi_institution_name)
         self.pdi_output_edit.setText(config.pdi_output_folder)
-        self.pdi_html_checkbox.setChecked(config.pdi_include_html_preview)
-        preview_index = self.pdi_preview_mode_combo.findData(config.pdi_preview_mode)
-        if preview_index < 0:
-            preview_index = self.pdi_preview_mode_combo.findData(
-                DEFAULT_PDI_PREVIEW_MODE
-            )
-        self.pdi_preview_mode_combo.setCurrentIndex(preview_index)
-        self.pdi_weasis_checkbox.setChecked(config.pdi_include_weasis_windows)
+        self.pdi_ohif_checkbox.setChecked(config.pdi_include_ohif_viewer)
         self._set_pdi_card_expanded(config.pdi_export_enabled)
         self._update_pdi_state()
         self.log_size_spin.setValue(max(1, config.max_log_file_size_bytes // (1024 * 1024)))
@@ -436,11 +435,11 @@ class SettingsPage(QWidget):
         values.update(
             dcmtk_bin_dir=self.dcmtk_edit.text().strip(),
             pacs_server_ip=self.pacs_host_edit.text().strip(),
-            pacs_server_port=self.pacs_port_spin.value(),
+            pacs_server_port=self._port_value(self.pacs_port_edit),
             calling_ae_title=self.calling_ae_edit.text().strip(),
             pacs_ae_title=self.pacs_ae_edit.text().strip(),
             storage_ae_title=self.storage_ae_edit.text().strip(),
-            storage_port=self.storage_port_spin.value(),
+            storage_port=self._port_value(self.storage_port_edit),
             directory_template=self.directory_template_combo.currentText().strip(),
             anonymization_enabled=self.anonymization_enabled_checkbox.isChecked(),
             anonymization_profile=str(
@@ -450,12 +449,7 @@ class SettingsPage(QWidget):
             pdi_export_enabled=self.pdi_enabled_checkbox.isChecked(),
             pdi_institution_name=self.pdi_institution_edit.text().strip(),
             pdi_output_folder=self.pdi_output_edit.text().strip(),
-            pdi_include_html_preview=self.pdi_html_checkbox.isChecked(),
-            pdi_preview_mode=str(
-                self.pdi_preview_mode_combo.currentData()
-                or DEFAULT_PDI_PREVIEW_MODE
-            ),
-            pdi_include_weasis_windows=self.pdi_weasis_checkbox.isChecked(),
+            pdi_include_ohif_viewer=self.pdi_ohif_checkbox.isChecked(),
             max_log_file_size_bytes=self.log_size_spin.value() * 1024 * 1024,
         )
         return AppConfig.from_dict(values)
@@ -483,27 +477,10 @@ class SettingsPage(QWidget):
             self.pdi_institution_edit,
             self.pdi_output_edit,
             self.pdi_output_button,
-            self.pdi_html_checkbox,
-            self.pdi_weasis_checkbox,
+            self.pdi_ohif_checkbox,
         ):
             widget.setEnabled(enabled)
-        self.pdi_preview_mode_combo.setEnabled(
-            enabled and self.pdi_html_checkbox.isChecked()
-        )
-        mode_id = str(
-            self.pdi_preview_mode_combo.currentData()
-            or DEFAULT_PDI_PREVIEW_MODE
-        )
-        descriptions = {
-            item_id: description
-            for item_id, _label, description in PDI_PREVIEW_MODE_OPTIONS
-        }
-        self.pdi_preview_hint.setText(
-            "预览生成：" + descriptions.get(mode_id, "请选择预览范围")
-        )
-        self.pdi_preview_hint.setEnabled(
-            enabled and self.pdi_html_checkbox.isChecked()
-        )
+        self.pdi_ohif_hint.setEnabled(enabled)
 
     def _set_pdi_card_expanded(self, expanded: bool) -> None:
         self._pdi_card_expanded = expanded
@@ -537,10 +514,12 @@ class SettingsPage(QWidget):
                 first_invalid.setFocus(Qt.OtherFocusReason)
 
     def set_dcmtk_status(self, text: str, ok: bool) -> None:
-        self.dcmtk_hint.setText(text)
+        self.dcmtk_hint.setText("" if ok else text)
         self.dcmtk_hint.setProperty("status", "ok" if ok else "error")
         self.dcmtk_hint.style().unpolish(self.dcmtk_hint)
         self.dcmtk_hint.style().polish(self.dcmtk_hint)
+        self.dcmtk_status_label.setVisible(not ok)
+        self.dcmtk_hint.setVisible(not ok)
 
     def _browse_dcmtk(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择 DCMTK bin 目录", self.dcmtk_edit.text())
@@ -937,6 +916,9 @@ class DcmGetWindow(QMainWindow):
         self.destination_button = QPushButton("选择目录")
         self.destination_button.clicked.connect(self._choose_destination)
         grid.addWidget(self.destination_button, 2, 2)
+        self.open_destination_button = QPushButton("打开目标目录")
+        self.open_destination_button.clicked.connect(self._open_destination_directory)
+        grid.addWidget(self.open_destination_button, 2, 3)
         grid.setColumnStretch(1, 1)
         input_layout.addWidget(self.task_form_body)
         self._set_task_form_expanded(self._task_form_expanded)
@@ -1423,6 +1405,17 @@ class DcmGetWindow(QMainWindow):
         )
         if selected:
             self.destination_edit.setText(selected)
+
+    def _open_destination_directory(self) -> None:
+        directory = self.destination_edit.text().strip()
+        if not directory:
+            QMessageBox.warning(self, "无法打开目录", "请先选择已存在的目标目录。")
+            return
+        path = Path(directory).expanduser()
+        if path.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+            return
+        QMessageBox.warning(self, "无法打开目录", "请先选择已存在的目标目录。")
 
     def _update_accession_preview(self) -> None:
         parsed = parse_accessions(self.accession_edit.toPlainText())
@@ -2079,7 +2072,7 @@ class DcmGetWindow(QMainWindow):
         if status_text == "完成":
             pdi_message = f"PDI 便携目录已生成：{output_directory}"
         elif status_text == "部分成功":
-            pdi_message = f"PDI 已生成，但有部分预览或查看器未完成。\n{message}"
+            pdi_message = f"PDI 已生成，但 OHIF 索引或查看器有部分未完成。\n{message}"
         elif status_text == "已取消":
             pdi_message = "PDI 生成已取消，下载的 DICOM 文件仍已保留。"
         else:
