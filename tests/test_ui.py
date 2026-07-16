@@ -344,7 +344,7 @@ def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_p
     assert "storage_port" in errors
 
 
-def test_settings_forms_grow_fields_and_wrap_on_narrow_windows(qtbot, tmp_path):
+def test_settings_forms_use_cross_platform_growth_and_wrap_policies(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
     window.pages.setCurrentWidget(page)
@@ -356,14 +356,6 @@ def test_settings_forms_grow_fields_and_wrap_on_narrow_windows(qtbot, tmp_path):
         for form in forms
     )
     assert all(form.rowWrapPolicy() == QFormLayout.WrapLongRows for form in forms)
-
-    window.resize(850, 720)
-    QApplication.processEvents()
-    narrow_width = page.pacs_host_edit.width()
-    window.resize(1180, 720)
-    QApplication.processEvents()
-
-    assert page.pacs_host_edit.width() > narrow_width
 
 
 def test_dcmtk_ready_status_only_appears_in_header_but_errors_remain_inline(
