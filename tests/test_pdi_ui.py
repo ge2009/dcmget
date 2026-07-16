@@ -738,7 +738,10 @@ def test_accept_partial_results_without_pdi_ends_recovery(
     )
     window.last_summary = BatchSummary(list(window._resume_checkpoint.results))
     window._set_running(False)
-    assert window.retry_button.isEnabled()
+    assert window.start_button.text() == "重试失败项"
+    assert window.start_button.isEnabled()
+    assert window.retry_button.isHidden()
+    assert not window.retry_button.isEnabled()
     monkeypatch.setattr(
         QMessageBox,
         "question",

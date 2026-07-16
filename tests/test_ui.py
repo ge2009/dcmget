@@ -9,6 +9,7 @@ from PyQt5.QtCore import QSettings, Qt, QThread
 from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import (
     QApplication,
+    QFormLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -242,6 +243,67 @@ def test_accession_editor_tab_moves_focus_to_next_control(qtbot, tmp_path):
     assert QApplication.focusWidget() is window.accession_button
 
 
+def test_task_page_scrolls_and_restored_geometry_stays_on_screen(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    assert window.task_scroll.widgetResizable()
+    assert window.task_scroll.widget().isAncestorOf(window.start_button)
+    assert window.minimumWidth() <= ui_module.WINDOW_MINIMUM_WIDTH
+    assert window.minimumHeight() <= ui_module.WINDOW_MINIMUM_HEIGHT
+
+    screen = window.screen() or QApplication.primaryScreen()
+    available = screen.availableGeometry()
+    window.setGeometry(
+        available.right() + 200,
+        available.bottom() + 200,
+        available.width() * 2,
+        available.height() * 2,
+    )
+
+    window._clamp_to_available_screen()
+
+    geometry = window.geometry()
+    assert geometry.left() >= available.left()
+    assert geometry.top() >= available.top()
+    assert geometry.right() <= available.right()
+    assert geometry.bottom() <= available.bottom()
+
+
+def test_task_shortcuts_only_run_on_task_page_without_reloading_settings(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        window, "_choose_accession_file", lambda: calls.append("open")
+    )
+    monkeypatch.setattr(window, "_start_download", lambda: calls.append("start"))
+    monkeypatch.setattr(window, "_show_settings", lambda: calls.append("settings"))
+
+    window.pages.setCurrentWidget(window.settings_page)
+    window.settings_page.pacs_host_edit.setText("unsaved.example")
+    window.open_accession_shortcut.activated.emit()
+    window.start_download_shortcut.activated.emit()
+    window.settings_shortcut.activated.emit()
+
+    assert calls == []
+    assert window.settings_page.pacs_host_edit.text() == "unsaved.example"
+
+    window.pages.setCurrentWidget(window.task_page)
+    window.accession_button.setEnabled(True)
+    window.start_button.setEnabled(True)
+    window.settings_button.setEnabled(True)
+    window.open_accession_shortcut.activated.emit()
+    window.start_download_shortcut.activated.emit()
+    window.settings_shortcut.activated.emit()
+
+    assert calls == ["open", "start", "settings"]
+
+    window.start_button.setEnabled(False)
+    window.start_download_shortcut.activated.emit()
+    assert calls == ["open", "start", "settings"]
+
+
 def test_settings_validation_is_inline(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
@@ -280,6 +342,28 @@ def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_p
 
     assert "pacs_server_port" in errors
     assert "storage_port" in errors
+
+
+def test_settings_forms_grow_fields_and_wrap_on_narrow_windows(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    page = window.settings_page
+    window.pages.setCurrentWidget(page)
+
+    forms = page.findChildren(QFormLayout)
+    assert forms
+    assert all(
+        form.fieldGrowthPolicy() == QFormLayout.AllNonFixedFieldsGrow
+        for form in forms
+    )
+    assert all(form.rowWrapPolicy() == QFormLayout.WrapLongRows for form in forms)
+
+    window.resize(850, 720)
+    QApplication.processEvents()
+    narrow_width = page.pacs_host_edit.width()
+    window.resize(1180, 720)
+    QApplication.processEvents()
+
+    assert page.pacs_host_edit.width() > narrow_width
 
 
 def test_dcmtk_ready_status_only_appears_in_header_but_errors_remain_inline(
@@ -399,6 +483,11 @@ def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
         [AccessionResult("OLD", AccessionStatus.FAILED)]
     )
 
+    assert window.pause_button.isHidden()
+    assert window.stop_button.isHidden()
+    assert window.retry_button.isHidden()
+    assert "QPushButton#DangerButton:disabled" in ui_module.APP_STYLESHEET
+
     window._set_running(True)
     assert window.last_summary is None
     assert window.accession_edit.isReadOnly()
@@ -406,6 +495,9 @@ def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
     assert not window.start_button.isEnabled()
     assert window.stop_button.isEnabled()
     assert window.pause_button.isEnabled()
+    assert not window.stop_button.isHidden()
+    assert not window.pause_button.isHidden()
+    assert window.retry_button.isHidden()
 
     result = AccessionResult(
         "A001",
@@ -716,7 +808,9 @@ def test_failed_batch_remains_retryable_and_reuses_original_task(
     assert window._resume_checkpoint is not None
     assert window._resume_checkpoint.task_id == checkpoint.task_id
     assert window.start_button.text() == "重试失败项"
-    assert window.retry_button.isEnabled()
+    assert window.start_button.isEnabled()
+    assert window.retry_button.isHidden()
+    assert not window.retry_button.isEnabled()
 
     started = []
     monkeypatch.setattr(
@@ -808,6 +902,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.6.4",
         "2.6.3",
         "2.6.2",
         "2.6.1",

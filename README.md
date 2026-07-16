@@ -17,9 +17,9 @@ DcmGet 是一个跨平台 DICOM C-MOVE 下载工作台。程序先启动 `stores
 
 Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
 
-- `DcmGet-2.6.3-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、离线中文 OHIF、PDI 本地只读 HTTP 启动器和 Microsoft Visual C++ x64 Runtime，并创建仅允许实际 `storescp.exe` 在域/专用网络使用默认端口 6666 的入站防火墙规则。
-- `DcmGet-2.6.3-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境，PDI 同样使用原始 DICOM 和离线 OHIF。
-- `DcmGet-2.6.3-windows-x64.zip`：解压后直接运行的独立目录版，包含与安装版一致的离线 OHIF 和 PDI 启动器。
+- `DcmGet-2.6.4-Setup-x64.exe`：默认推荐的一键安装器，内置 Python 运行时、PyQt5、DCMTK 3.7.0、离线中文 OHIF、PDI 本地只读 HTTP 启动器和 Microsoft Visual C++ x64 Runtime，并创建仅允许实际 `storescp.exe` 在域/专用网络使用默认端口 6666 的入站防火墙规则。
+- `DcmGet-2.6.4-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动需要等待程序解压运行环境，PDI 同样使用原始 DICOM 和离线 OHIF。
+- `DcmGet-2.6.4-windows-x64.zip`：解压后直接运行的独立目录版，包含与安装版一致的离线 OHIF 和 PDI 启动器。
 
 三种发布物的 PDI 阅片过程均不连接互联网：OHIF 静态资源、DICOM 清单和影像数据都从导出目录读取。
 
@@ -30,7 +30,7 @@ Windows 发布物拆分为三个独立下载项，获取安装器时不再同时
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 2.6.3
+python scripts/build_windows.py --version 2.6.4
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。

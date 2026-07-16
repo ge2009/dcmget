@@ -287,6 +287,39 @@ def test_file_archive_adds_dcm_suffix_and_uses_metadata_directory(tmp_path):
     assert target.read_bytes()[128:132] == b"DICM"
 
 
+def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    first = staging / "first.dcm"
+    second = staging / "second.dcm"
+    _write_minimal_dicom(first, "1.2.3.101", accession="ACC101")
+    _write_minimal_dicom(second, "1.2.3.102", accession="ACC101")
+    cancel = threading.Event()
+    publish = core._publish_or_deduplicate
+
+    def publish_then_cancel(source, target):
+        publish(source, target)
+        cancel.set()
+
+    monkeypatch.setattr(core, "_publish_or_deduplicate", publish_then_cancel)
+
+    moved, rejected = core._archive_dicom_files(
+        [first, second],
+        tmp_path / "dicom",
+        "{AccessionNumber}",
+        "ACC101",
+        cancel_event=cancel,
+    )
+
+    assert len(moved) == 1
+    assert rejected == []
+    assert not first.exists()
+    assert second.exists()
+    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
+
+
 def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkeypatch):
     state = tmp_path / "state"
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
@@ -371,6 +404,54 @@ def test_truncated_pixel_data_is_rejected_and_kept_in_staging(tmp_path):
     assert moved == []
     assert rejected == [source]
     assert source.exists()
+
+
+def test_dcmdump_validation_terminates_running_process_when_cancelled(
+    tmp_path, monkeypatch
+):
+    started = threading.Event()
+    terminated = threading.Event()
+    cancel = threading.Event()
+    outcomes: list[bool | None] = []
+
+    class Process:
+        pid = 4321
+        stopped = False
+
+        @classmethod
+        def poll(cls):
+            started.set()
+            return -15 if cls.stopped else None
+
+    process = Process()
+
+    def terminate(target):
+        assert target is process
+        Process.stopped = True
+        terminated.set()
+
+    monkeypatch.setattr(core.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(core, "_terminate_process", terminate)
+    worker = threading.Thread(
+        target=lambda: outcomes.append(
+            core._run_dcmdump_validation(
+                tmp_path / "dcmdump",
+                [tmp_path / "image.dcm"],
+                None,
+                cancel_event=cancel,
+            )
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(0.5)
+
+    cancel.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert terminated.is_set()
+    assert outcomes == [None]
 
 
 def test_retry_same_sop_and_content_is_idempotent(tmp_path):
@@ -610,6 +691,57 @@ def test_cancel_wakes_a_paused_runner(tmp_path, monkeypatch):
     assert not thread.is_alive()
     assert result[0].cancelled
     assert result[0].results[0].status == AccessionStatus.CANCELLED
+
+
+def test_request_cancel_returns_before_background_process_cleanup_finishes(
+    tmp_path, monkeypatch
+):
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path)),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    current = Mock(pid=101)
+    receiver = Mock(pid=102)
+    runner._current_process = current
+    runner._storescp_process = receiver
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    returned = threading.Event()
+    terminated: list[object] = []
+
+    def terminate(process):
+        terminated.append(process)
+        cleanup_entered.set()
+        assert allow_cleanup.wait(2)
+
+    monkeypatch.setattr(core, "_terminate_process", terminate)
+
+    caller = threading.Thread(
+        target=lambda: (runner.request_cancel(), returned.set()),
+        daemon=True,
+    )
+    caller.start()
+
+    assert returned.wait(0.5), "request_cancel blocked on process termination"
+    assert cleanup_entered.wait(0.5)
+    concurrent_cleanup = threading.Thread(
+        target=runner._terminate_process_safely,
+        args=(current,),
+        daemon=True,
+    )
+    concurrent_cleanup.start()
+    assert len(terminated) == 1
+
+    allow_cleanup.set()
+    caller.join(1)
+    concurrent_cleanup.join(1)
+    assert runner._cancel_cleanup_thread is not None
+    runner._cancel_cleanup_thread.join(1)
+    runner._close_file_logger()
+
+    assert not caller.is_alive()
+    assert not concurrent_cleanup.is_alive()
+    assert terminated == [current, receiver]
 
 
 def test_cancel_during_receiver_cleanup_marks_batch_cancelled(tmp_path, monkeypatch):
@@ -1186,6 +1318,22 @@ def test_windows_process_cleanup_kills_the_full_process_tree(monkeypatch):
     core._terminate_process(process)
 
     assert run.call_args.args[0] == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert run.call_args.kwargs["timeout"] == 3
+    process.wait.assert_called_once_with(timeout=3)
+
+
+def test_windows_taskkill_timeout_falls_back_to_direct_kill(monkeypatch):
+    process = Mock(pid=4321)
+    process.poll.return_value = None
+    run = Mock(side_effect=subprocess.TimeoutExpired("taskkill", 3))
+    monkeypatch.setattr(core.os, "name", "nt")
+    monkeypatch.setattr(core.subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    monkeypatch.setattr(core.subprocess, "run", run)
+
+    core._terminate_process(process)
+
+    assert run.call_args.kwargs["timeout"] == 3
+    process.kill.assert_called_once_with()
     process.wait.assert_called_once_with(timeout=3)
 
 

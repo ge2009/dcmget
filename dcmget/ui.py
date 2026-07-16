@@ -119,6 +119,8 @@ COLORS = {
 TASK_TABLE_DETAIL_LIMIT = 200
 PDI_VIEWER_PROBE_INTERVAL_MS = 250
 PDI_VIEWER_START_TIMEOUT_MS = 30_000
+WINDOW_MINIMUM_WIDTH = 800
+WINDOW_MINIMUM_HEIGHT = 520
 
 
 def pdi_viewer_command(directory: str | Path) -> tuple[str, list[str]] | None:
@@ -355,6 +357,8 @@ class SettingsPage(QWidget):
         self.pdi_card_body = QWidget()
         pdi_form = QFormLayout(self.pdi_card_body)
         pdi_form.setContentsMargins(0, 4, 0, 0)
+        pdi_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        pdi_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         pdi_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         pdi_form.setHorizontalSpacing(20)
         pdi_form.setVerticalSpacing(12)
@@ -442,6 +446,8 @@ class SettingsPage(QWidget):
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
         form.setVerticalSpacing(12)
@@ -856,7 +862,7 @@ class DcmGetWindow(QMainWindow):
         )
 
         self.setWindowTitle(f"DcmGet {__version__} - DICOM 下载工作台")
-        self.setMinimumSize(1024, 720)
+        self.setMinimumSize(WINDOW_MINIMUM_WIDTH, WINDOW_MINIMUM_HEIGHT)
         self.resize(1180, 820)
         logo = self.project_root / "logo.png"
         if logo.exists():
@@ -880,7 +886,8 @@ class DcmGetWindow(QMainWindow):
         root_layout.addWidget(self._build_header())
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_task_page())
+        self.task_page = self._build_task_page()
+        self.pages.addWidget(self.task_page)
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
         self.settings_page.back_requested.connect(self._cancel_settings)
@@ -889,9 +896,16 @@ class DcmGetWindow(QMainWindow):
         self.setCentralWidget(root)
         self.setStyleSheet(APP_STYLESHEET)
 
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self._choose_accession_file)
-        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self._start_download)
-        QShortcut(QKeySequence("Ctrl+,"), self, activated=self._show_settings)
+        self.open_accession_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        self.open_accession_shortcut.activated.connect(
+            self._choose_accession_file_from_shortcut
+        )
+        self.start_download_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.start_download_shortcut.activated.connect(
+            self._start_download_from_shortcut
+        )
+        self.settings_shortcut = QShortcut(QKeySequence("Ctrl+,"), self)
+        self.settings_shortcut.activated.connect(self._show_settings_from_shortcut)
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -944,7 +958,14 @@ class DcmGetWindow(QMainWindow):
 
     def _build_task_page(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        self.task_scroll = QScrollArea()
+        self.task_scroll.setWidgetResizable(True)
+        self.task_scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 20, 24, 24)
         layout.setSpacing(14)
 
@@ -1041,6 +1062,7 @@ class DcmGetWindow(QMainWindow):
         self.discard_resume_button.hide()
         self.retry_button = QPushButton("重试失败项")
         self.retry_button.setEnabled(False)
+        self.retry_button.hide()
         self.retry_button.clicked.connect(self._retry_failed)
         self.accept_partial_button = QPushButton("接受当前结果")
         self.accept_partial_button.setToolTip(
@@ -1054,11 +1076,13 @@ class DcmGetWindow(QMainWindow):
         self.log_toggle_button.clicked.connect(self._toggle_log_panel)
         self.pause_button = QPushButton("暂停")
         self.pause_button.setEnabled(False)
+        self.pause_button.hide()
         self.pause_button.setToolTip("当前检查号完成后暂停；继续时从下一项接着下载")
         self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button = QPushButton("停止")
         self.stop_button.setObjectName("DangerButton")
         self.stop_button.setEnabled(False)
+        self.stop_button.hide()
         self.stop_button.clicked.connect(self._stop_download)
         self.start_button = QPushButton("开始下载")
         self.start_button.setObjectName("PrimaryButton")
@@ -1156,6 +1180,8 @@ class DcmGetWindow(QMainWindow):
         self.log_panel.setVisible(self._log_panel_expanded)
         self.task_splitter.setSizes([360, 180])
         layout.addWidget(self.task_splitter, 1)
+        self.task_scroll.setWidget(content)
+        page_layout.addWidget(self.task_scroll)
         return page
 
     def _build_log_panel(self) -> QWidget:
@@ -1201,6 +1227,27 @@ class DcmGetWindow(QMainWindow):
             return
         self.settings_page.set_config(self.config)
         self.pages.setCurrentIndex(1)
+
+    def _choose_accession_file_from_shortcut(self) -> None:
+        if (
+            self.pages.currentWidget() is self.task_page
+            and self.accession_button.isEnabled()
+        ):
+            self._choose_accession_file()
+
+    def _start_download_from_shortcut(self) -> None:
+        if (
+            self.pages.currentWidget() is self.task_page
+            and self.start_button.isEnabled()
+        ):
+            self._start_download()
+
+    def _show_settings_from_shortcut(self) -> None:
+        if (
+            self.pages.currentWidget() is self.task_page
+            and self.settings_button.isEnabled()
+        ):
+            self._show_settings()
 
     def _cancel_settings(self) -> None:
         self.settings_page.set_config(self.config)
@@ -1995,7 +2042,9 @@ class DcmGetWindow(QMainWindow):
             if pdi_pending
             else "开始下载"
         )
+        self.stop_button.setVisible(running)
         self.stop_button.setEnabled(running)
+        self.pause_button.setVisible(running)
         self.pause_button.setEnabled(running and can_pause)
         if running:
             self._set_task_form_expanded(False)
@@ -2011,20 +2060,15 @@ class DcmGetWindow(QMainWindow):
         )
         self.discard_resume_button.setVisible(recovery_pending)
         self.discard_resume_button.setEnabled(recovery_pending)
-        self.retry_button.setEnabled(
-            bool(
-                not running
-                and (
-                    download_retryable
-                    or (
-                        not recovery_pending
-                        and not self._accepted_partial_results
-                        and self.last_summary
-                        and self.last_summary.failed_accessions
-                    )
-                )
-            )
+        retry_available = bool(
+            not running
+            and not recovery_pending
+            and not self._accepted_partial_results
+            and self.last_summary
+            and self.last_summary.failed_accessions
         )
+        self.retry_button.setVisible(retry_available)
+        self.retry_button.setEnabled(retry_available)
         self.accept_partial_button.setVisible(download_retryable)
         self.accept_partial_button.setEnabled(download_retryable)
         self.accession_edit.setReadOnly(running or recovery_pending)
@@ -3024,9 +3068,32 @@ class DcmGetWindow(QMainWindow):
         geometry = self.settings_store.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
+        self._clamp_to_available_screen()
         splitter = self.settings_store.value("window/splitter")
         if splitter:
             self.task_splitter.restoreState(splitter)
+
+    def _clamp_to_available_screen(self) -> None:
+        geometry = self.geometry()
+        screen = QApplication.screenAt(geometry.center())
+        if screen is None:
+            screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        if available.width() <= 0 or available.height() <= 0:
+            return
+
+        minimum_width = min(WINDOW_MINIMUM_WIDTH, available.width())
+        minimum_height = min(WINDOW_MINIMUM_HEIGHT, available.height())
+        self.setMinimumSize(minimum_width, minimum_height)
+        width = min(max(geometry.width(), minimum_width), available.width())
+        height = min(max(geometry.height(), minimum_height), available.height())
+        rightmost = available.x() + available.width() - width
+        bottommost = available.y() + available.height() - height
+        x = max(available.x(), min(geometry.x(), rightmost))
+        y = max(available.y(), min(geometry.y(), bottommost))
+        self.setGeometry(x, y, width, height)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._is_busy():
@@ -3139,6 +3206,7 @@ QPushButton#PrimaryButton {{ background: {COLORS['primary']}; color: white; bord
 QPushButton#PrimaryButton:hover {{ background: {COLORS['primary_hover']}; }}
 QPushButton#DangerButton {{ color: {COLORS['danger']}; border-color: #FCA5A5; }}
 QPushButton#DangerButton:hover {{ background: #FEF2F2; }}
+QPushButton#DangerButton:disabled {{ color: #94A3B8; border-color: {COLORS['border']}; background: #F8FAFC; }}
 QProgressBar {{ border: 0; background: #E2E8F0; border-radius: 4px; min-height: 8px; max-height: 8px; }}
 QProgressBar::chunk {{ background: {COLORS['primary']}; border-radius: 4px; }}
 QHeaderView::section {{ background: #F1F5F9; color: {COLORS['muted']}; padding: 8px; border: 0; border-bottom: 1px solid {COLORS['border']}; font-weight: 650; }}

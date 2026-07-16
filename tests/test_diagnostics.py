@@ -14,13 +14,17 @@ from PyQt5.QtWidgets import QApplication
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _run_python(source: str) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(ROOT)
+def _run_python(
+    source: str, *, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    process_environment = os.environ.copy()
+    process_environment["PYTHONPATH"] = str(ROOT)
+    if environment is not None:
+        process_environment.update(environment)
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(source)],
         cwd=ROOT,
-        env=environment,
+        env=process_environment,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -35,6 +39,107 @@ def _combined_logs(directory: Path) -> str:
         path.read_text(encoding="utf-8")
         for path in sorted(directory.glob("dcmget-diagnostics.log*"))
     )
+
+
+def test_unavailable_application_log_directory_uses_secure_temporary_directory(
+    tmp_path,
+):
+    state_root = tmp_path / "unavailable-state"
+    temporary_root = tmp_path / "system-temporary"
+    temporary_root.mkdir()
+    result = _run_python(
+        f"""
+        import os
+        from pathlib import Path
+        import stat
+        import sys
+
+        state_root = Path({str(state_root)!r})
+        if sys.platform == "win32":
+            blocked = state_root / "local" / "DcmGet"
+        elif sys.platform == "darwin":
+            blocked = state_root / "home" / "Library" / "Application Support" / "DcmGet"
+        else:
+            blocked = state_root / "xdg" / "dcmget"
+        blocked.parent.mkdir(parents=True)
+        blocked.write_text("not a directory", encoding="utf-8")
+
+        import DICOM_download_ui
+        from dcmget.diagnostics import (
+            crash_log_path,
+            diagnostic_log_path,
+            record_exception,
+        )
+
+        path = diagnostic_log_path()
+        assert path == diagnostic_log_path()
+        assert path.is_file()
+        assert path.parent != blocked
+        assert path.parent.name.startswith("DcmGet-diagnostics-")
+        assert crash_log_path().is_file()
+        if os.name != "nt":
+            assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        try:
+            raise RuntimeError("temporary fallback marker")
+        except RuntimeError as exc:
+            record_exception("temporary fallback context", exc)
+        text = path.read_text(encoding="utf-8")
+        assert "fallback is active" in text
+        assert "temporary fallback marker" in text
+        print(path)
+        """,
+        environment={
+            "HOME": str(state_root / "home"),
+            "LOCALAPPDATA": str(state_root / "local"),
+            "XDG_STATE_HOME": str(state_root / "xdg"),
+            "TMPDIR": str(temporary_root),
+            "TEMP": str(temporary_root),
+            "TMP": str(temporary_root),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    fallback_path = Path(result.stdout.strip())
+    assert fallback_path.parent.parent == temporary_root
+
+
+def test_file_and_temporary_log_failures_use_memory_without_raising():
+    result = _run_python(
+        """
+        import io
+        import sys
+        from pathlib import Path
+        import dcmget.diagnostics as diagnostics
+
+        def fail(*_args, **_kwargs):
+            raise PermissionError("diagnostic storage unavailable")
+
+        diagnostics.ensure_application_log_dir = fail
+        diagnostics.tempfile.mkdtemp = fail
+        sys.stderr = None
+
+        path = diagnostics.diagnostic_log_path()
+        assert isinstance(path, Path)
+        assert diagnostics.crash_log_path().name == diagnostics.CRASH_LOG_NAME
+        try:
+            raise ValueError("memory fallback marker")
+        except ValueError as exc:
+            diagnostics.record_exception("memory fallback context", exc)
+        diagnostics.install_qt_message_handler()
+
+        state = diagnostics._state
+        assert state is not None and not state.file_backed
+        assert isinstance(state.crash_stream, io.StringIO)
+        text = state.crash_stream.getvalue()
+        assert "系统临时目录" in text
+        assert "memory fallback marker" in text
+        sys.__stdout__.write("memory fallback ok")
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "memory fallback ok"
 
 
 def test_diagnostics_are_private_rotated_and_mark_normal_exit(tmp_path):

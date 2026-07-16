@@ -366,6 +366,10 @@ class DownloadRunner:
         self._pause_condition = threading.Condition()
         self._pause_requested = False
         self._process_lock = threading.Lock()
+        self._termination_condition = threading.Condition()
+        self._terminating_processes: set[int] = set()
+        self._cancel_cleanup_lock = threading.Lock()
+        self._cancel_cleanup_thread: threading.Thread | None = None
         self._diagnostic_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
         self._storescp_process: subprocess.Popen[str] | None = None
@@ -385,13 +389,43 @@ class DownloadRunner:
         with self._pause_condition:
             self._pause_condition.notify_all()
         self._emit("应用", "正在停止当前任务…", "warning")
+        with self._cancel_cleanup_lock:
+            if self._cancel_cleanup_thread is not None:
+                return
+            cleanup = threading.Thread(
+                target=self._cancel_running_processes,
+                name="dcmtk-cancel-cleanup",
+                daemon=True,
+            )
+            self._cancel_cleanup_thread = cleanup
+            cleanup.start()
+
+    def _cancel_running_processes(self) -> None:
         with self._process_lock:
-            process = self._current_process
-        if process:
+            processes = (self._current_process, self._storescp_process)
+        seen: set[int] = set()
+        for process in processes:
+            if process is None or id(process) in seen:
+                continue
+            seen.add(id(process))
+            self._terminate_process_safely(process)
+
+    def _terminate_process_safely(self, process: subprocess.Popen[str]) -> None:
+        """Terminate one child once when cancellation races worker cleanup."""
+
+        identity = id(process)
+        with self._termination_condition:
+            if identity in self._terminating_processes:
+                while identity in self._terminating_processes:
+                    self._termination_condition.wait(timeout=0.1)
+                return
+            self._terminating_processes.add(identity)
+        try:
             _terminate_process(process)
-        storescp = self._storescp_process
-        if storescp:
-            _terminate_process(storescp)
+        finally:
+            with self._termination_condition:
+                self._terminating_processes.discard(identity)
+                self._termination_condition.notify_all()
 
     def request_pause(self) -> None:
         with self._pause_condition:
@@ -492,7 +526,8 @@ class DownloadRunner:
         self._emit("storescp", f"接收模式：{mode}", "info")
         self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
         process = self._popen(command)
-        self._storescp_process = process
+        with self._process_lock:
+            self._storescp_process = process
         self._notify_process("storescp", getattr(process, "pid", 0), command[0], True)
         self._start_reader(process, "storescp")
 
@@ -506,7 +541,7 @@ class DownloadRunner:
                 self._emit("storescp", f"已监听端口 {self.config.storage_port}", "success")
                 return
             time.sleep(0.1)
-        _terminate_process(process)
+        self._terminate_process_safely(process)
         raise TimeoutError(f"storescp 未能在端口 {self.config.storage_port} 就绪")
 
     def _download_one(
@@ -536,7 +571,7 @@ class DownloadRunner:
             reader = self._start_reader(process, "movescu", diagnostics)
             while process.poll() is None:
                 if self._cancel.is_set():
-                    _terminate_process(process)
+                    self._terminate_process_safely(process)
                     break
                 receiver = self._storescp_process
                 if receiver is not None:
@@ -547,7 +582,7 @@ class DownloadRunner:
                             f"接收器意外退出，退出码 {receiver_exit_code}",
                             "error",
                         )
-                        _terminate_process(process)
+                        self._terminate_process_safely(process)
                         break
                 now = time.monotonic()
                 if now - last_sample_at >= 0.5:
@@ -581,7 +616,7 @@ class DownloadRunner:
         finally:
             try:
                 if process.poll() is None:
-                    _terminate_process(process)
+                    self._terminate_process_safely(process)
             finally:
                 try:
                     if reader is not None:
@@ -635,6 +670,7 @@ class DownloadRunner:
             error_callback=record_archive_error,
             dcmdump=self.tools.dcmdump,
             dcmtk_environment=_dcmtk_environment(self.tools),
+            cancel_event=self._cancel,
         )
         rejected_detail = (
             f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
@@ -785,12 +821,13 @@ class DownloadRunner:
         return thread
 
     def _stop_storescp(self) -> None:
-        process = self._storescp_process
-        self._storescp_process = None
+        with self._process_lock:
+            process = self._storescp_process
+            self._storescp_process = None
         if process:
             # ``storescp --fork`` children can outlive an exited group leader.
             # Always ask the process-group cleanup helper to drain the group.
-            _terminate_process(process)
+            self._terminate_process_safely(process)
             self._emit("storescp", "接收器已停止", "info")
             self._notify_process(
                 "storescp", getattr(process, "pid", 0), str(self.tools.storescp), False
@@ -993,6 +1030,7 @@ def _archive_dicom_files(
     error_callback: ArchiveErrorCallback | None = None,
     dcmdump: Path | None = None,
     dcmtk_environment: dict[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
@@ -1006,8 +1044,11 @@ def _archive_dicom_files(
         values,
         dcmdump=dcmdump,
         environment=dcmtk_environment,
+        cancel_event=cancel_event,
     )
     for source in values:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         temporary: Path | None = None
         metadata = {
             "PatientID": "UNKNOWN_PATIENT",
@@ -1048,6 +1089,9 @@ def _archive_dicom_files(
             rejected.append(source)
             continue
 
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
         destination = _render_directory_template(
             destination_root,
             directory_template,
@@ -1068,10 +1112,16 @@ def _archive_dicom_files(
                 temporary = Path(temporary_name)
                 dataset.save_as(temporary, enforce_file_format=True)
                 _validate_anonymized_file(temporary, metadata["SOPInstanceUID"])
+                if cancel_event is not None and cancel_event.is_set():
+                    temporary.unlink(missing_ok=True)
+                    temporary = None
+                    break
                 _publish_or_deduplicate(temporary, target)
                 temporary = None
                 source.unlink()
             else:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 _publish_or_deduplicate(source, target)
         except Exception as exc:
             if temporary:
@@ -1090,14 +1140,22 @@ def _validate_dicom_files(
     *,
     dcmdump: Path | None = None,
     environment: dict[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[Path, str]:
     if dcmdump is not None and dcmdump.is_file():
-        return _validate_dicom_files_with_dcmdump(files, dcmdump, environment)
+        return _validate_dicom_files_with_dcmdump(
+            files,
+            dcmdump,
+            environment,
+            cancel_event,
+        )
 
     errors: dict[Path, str] = {}
     for path in files:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         try:
-            _validate_dicom_stream(path)
+            _validate_dicom_stream(path, cancel_event=cancel_event)
         except Exception as exc:
             errors[path] = f"DICOM 文件不完整或损坏：{exc}"
     return errors
@@ -1107,12 +1165,15 @@ def _validate_dicom_files_with_dcmdump(
     files: list[Path],
     dcmdump: Path,
     environment: dict[str, str] | None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[Path, str]:
     errors: dict[Path, str] = {}
     chunks: list[list[Path]] = []
     current: list[Path] = []
     current_length = 0
     for path in files:
+        if cancel_event is not None and cancel_event.is_set():
+            return errors
         argument_length = len(os.fsencode(path)) + 3
         if current and current_length + argument_length > 24_000:
             chunks.append(current)
@@ -1124,10 +1185,28 @@ def _validate_dicom_files_with_dcmdump(
         chunks.append(current)
 
     for chunk in chunks:
-        if _run_dcmdump_validation(dcmdump, chunk, environment):
+        valid = _run_dcmdump_validation(
+            dcmdump,
+            chunk,
+            environment,
+            cancel_event=cancel_event,
+        )
+        if valid is None:
+            return errors
+        if valid:
             continue
         for path in chunk:
-            if not _run_dcmdump_validation(dcmdump, [path], environment):
+            if cancel_event is not None and cancel_event.is_set():
+                return errors
+            valid = _run_dcmdump_validation(
+                dcmdump,
+                [path],
+                environment,
+                cancel_event=cancel_event,
+            )
+            if valid is None:
+                return errors
+            if not valid:
                 errors[path] = "DICOM 文件未通过 dcmdump 完整性校验"
     return errors
 
@@ -1136,25 +1215,50 @@ def _run_dcmdump_validation(
     dcmdump: Path,
     files: list[Path],
     environment: dict[str, str] | None,
-) -> bool:
+    *,
+    cancel_event: threading.Event | None = None,
+) -> bool | None:
     command = [str(dcmdump), "-q", "-M", "-E", *(str(path) for path in files)]
+    timeout_seconds = max(30, min(300, len(files) * 3))
     kwargs: dict[str, object] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
-        "check": False,
-        "timeout": max(30, min(300, len(files) * 3)),
         "env": environment,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
     try:
-        result = subprocess.run(command, **kwargs)  # type: ignore[arg-type]
-    except (OSError, subprocess.SubprocessError):
+        process = subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
+    except OSError:
         return False
-    return result.returncode == 0
+    if os.name != "nt":
+        setattr(process, "_dcmget_process_group", process.pid)
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            return return_code == 0
+        if cancel_event is not None and cancel_event.is_set():
+            _terminate_process(process)
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            return False
+        if cancel_event is not None:
+            cancel_event.wait(timeout=min(0.05, remaining))
+        else:
+            time.sleep(min(0.05, remaining))
 
 
-def _validate_dicom_stream(path: Path) -> None:
+def _validate_dicom_stream(
+    path: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     from pydicom.filereader import (
         _read_file_meta_info,
         data_element_generator,
@@ -1177,6 +1281,8 @@ def _validate_dicom_stream(path: Path) -> None:
             transfer_syntax.is_little_endian,
             defer_size=1,
         ):
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if raw.length == 0xFFFFFFFF:
                 continue
             if raw.value_tell + raw.length > file_size:
@@ -1279,17 +1385,27 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
     if os.name == "nt":
         if process.poll() is not None:
             return
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
         try:
             process.wait(timeout=3)
         except (OSError, subprocess.TimeoutExpired):
-            process.kill()
+            try:
+                process.kill()
+            except OSError:
+                pass
         return
     process_group = getattr(process, "_dcmget_process_group", None)
     if not isinstance(process_group, int) or process_group <= 0:

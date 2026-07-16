@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import atexit
 import faulthandler
+import io
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import stat
 import sys
+import tempfile
 import threading
 from typing import IO
 
@@ -47,12 +49,19 @@ class _DiagnosticsState:
     def __init__(
         self,
         directory: Path,
+        log_path: Path,
+        crash_path: Path,
         logger: logging.Logger,
         crash_stream: IO[str],
+        *,
+        file_backed: bool,
     ) -> None:
         self.directory = directory
+        self.log_path = log_path
+        self.crash_path = crash_path
         self.logger = logger
         self.crash_stream = crash_stream
+        self.file_backed = file_backed
         self.had_unhandled_exception = False
         self.qt_handler = None
         self.original_excepthook = sys.excepthook
@@ -65,17 +74,22 @@ _install_lock = threading.Lock()
 
 
 def diagnostic_log_directory() -> Path:
-    if _state is not None:
-        return _state.directory
-    return ensure_application_log_dir()
+    state = _ensure_diagnostics_state()
+    return state.directory if state is not None else _emergency_log_directory()
 
 
 def diagnostic_log_path() -> Path:
-    return diagnostic_log_directory() / DIAGNOSTIC_LOG_NAME
+    state = _ensure_diagnostics_state()
+    if state is not None:
+        return state.log_path
+    return _emergency_log_directory() / DIAGNOSTIC_LOG_NAME
 
 
 def crash_log_path() -> Path:
-    return diagnostic_log_directory() / CRASH_LOG_NAME
+    state = _ensure_diagnostics_state()
+    if state is not None:
+        return state.crash_path
+    return _emergency_log_directory() / CRASH_LOG_NAME
 
 
 def install_diagnostics(
@@ -88,44 +102,56 @@ def install_diagnostics(
     global _state
     with _install_lock:
         if _state is not None:
-            return _state.directory / DIAGNOSTIC_LOG_NAME
+            return _state.log_path
 
-        log_directory = (
-            Path(directory).expanduser().resolve()
-            if directory is not None
-            else ensure_application_log_dir()
-        )
-        log_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _make_private(log_directory, directory=True)
+        failures: list[tuple[str, Exception]] = []
+        try:
+            log_directory = (
+                Path(directory).expanduser().resolve()
+                if directory is not None
+                else ensure_application_log_dir()
+            )
+            _state = _create_file_state(
+                log_directory,
+                max_bytes=max_bytes,
+                backup_count=backup_count,
+            )
+        except Exception as exc:
+            failures.append(("应用日志目录", exc))
 
-        log_path = log_directory / DIAGNOSTIC_LOG_NAME
-        handler = PrivateRotatingFileHandler(
-            log_path,
-            maxBytes=max(1024, int(max_bytes)),
-            backupCount=max(1, int(backup_count)),
-            encoding="utf-8",
-        )
-        _make_private(log_path)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
-        )
-        logger = logging.getLogger("dcmget.diagnostics")
-        for existing_handler in logger.handlers:
-            existing_handler.close()
-        logger.handlers.clear()
-        logger.setLevel(logging.DEBUG)
-        logger.propagate = False
-        logger.addHandler(handler)
+        if _state is None:
+            try:
+                temporary_directory = Path(
+                    tempfile.mkdtemp(prefix="DcmGet-diagnostics-")
+                ).resolve()
+                _state = _create_file_state(
+                    temporary_directory,
+                    max_bytes=max_bytes,
+                    backup_count=backup_count,
+                )
+            except Exception as exc:
+                failures.append(("系统临时目录", exc))
 
-        crash_path = log_directory / CRASH_LOG_NAME
-        crash_stream = _open_private_append(crash_path)
-        _state = _DiagnosticsState(log_directory, logger, crash_stream)
-        faulthandler.enable(file=crash_stream, all_threads=True)
-        _install_exception_hooks()
-        atexit.register(_mark_process_exit)
+        if _state is None:
+            _state = _create_stream_state(_emergency_log_directory())
+
+        try:
+            if _state.file_backed:
+                faulthandler.enable(file=_state.crash_stream, all_threads=True)
+        except Exception:
+            pass
+        try:
+            _install_exception_hooks()
+        except Exception:
+            pass
+        try:
+            atexit.register(_mark_process_exit)
+        except Exception:
+            pass
 
         version_text = app_version or "unknown"
-        logger.info(
+        _safe_log(
+            logging.INFO,
             "SESSION START pid=%s version=%s python=%s platform=%s frozen=%s executable=%s",
             os.getpid(),
             version_text,
@@ -134,57 +160,173 @@ def install_diagnostics(
             bool(getattr(sys, "frozen", False)),
             sys.executable,
         )
-        crash_stream.write(
+        for location, failure in failures:
+            _safe_log(
+                logging.WARNING,
+                "Diagnostic file setup failed at %s; fallback is active: %r",
+                location,
+                failure,
+            )
+        _safe_crash_write(
             f"\n--- DcmGet session start pid={os.getpid()} version={version_text} ---\n"
         )
-        crash_stream.flush()
-        return log_path
+        _flush_logs()
+        return _state.log_path
+
+
+def _create_file_state(
+    directory: Path,
+    *,
+    max_bytes: int,
+    backup_count: int,
+) -> _DiagnosticsState:
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _make_private(directory, directory=True)
+    log_path = directory / DIAGNOSTIC_LOG_NAME
+    crash_path = directory / CRASH_LOG_NAME
+    handler: logging.Handler | None = None
+    crash_stream: IO[str] | None = None
+    try:
+        handler = PrivateRotatingFileHandler(
+            log_path,
+            maxBytes=max(1024, int(max_bytes)),
+            backupCount=max(1, int(backup_count)),
+            encoding="utf-8",
+        )
+        _make_private(log_path)
+        crash_stream = _open_private_append(crash_path)
+        logger = _configure_logger(handler)
+        return _DiagnosticsState(
+            directory,
+            log_path,
+            crash_path,
+            logger,
+            crash_stream,
+            file_backed=True,
+        )
+    except Exception:
+        if crash_stream is not None:
+            try:
+                crash_stream.close()
+            except Exception:
+                pass
+        if handler is not None:
+            try:
+                handler.close()
+            except Exception:
+                pass
+        raise
+
+
+def _create_stream_state(directory: Path) -> _DiagnosticsState:
+    stream = (
+        sys.stderr
+        if getattr(sys.stderr, "write", None) is not None
+        else io.StringIO()
+    )
+    handler = logging.StreamHandler(stream)
+    logger = _configure_logger(handler)
+    return _DiagnosticsState(
+        directory,
+        directory / DIAGNOSTIC_LOG_NAME,
+        directory / CRASH_LOG_NAME,
+        logger,
+        stream,
+        file_backed=False,
+    )
+
+
+def _configure_logger(handler: logging.Handler) -> logging.Logger:
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+    )
+    logger = logging.getLogger("dcmget.diagnostics")
+    for existing_handler in logger.handlers:
+        try:
+            existing_handler.close()
+        except Exception:
+            pass
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.addHandler(handler)
+    return logger
+
+
+def _ensure_diagnostics_state() -> _DiagnosticsState | None:
+    global _state
+    if _state is not None:
+        return _state
+    try:
+        install_diagnostics()
+    except Exception:
+        try:
+            with _install_lock:
+                if _state is None:
+                    _state = _create_stream_state(_emergency_log_directory())
+        except Exception:
+            return None
+    return _state
+
+
+def _emergency_log_directory() -> Path:
+    try:
+        return Path(tempfile.gettempdir()).resolve() / "DcmGet-diagnostics-unavailable"
+    except Exception:
+        return Path("DcmGet-diagnostics-unavailable")
 
 
 def install_qt_message_handler() -> None:
-    if _state is None:
-        install_diagnostics()
-    assert _state is not None
-    if _state.qt_handler is not None:
-        return
-
-    from PyQt5 import QtCore
-
-    levels = {
-        int(QtCore.QtWarningMsg): logging.WARNING,
-        int(QtCore.QtCriticalMsg): logging.ERROR,
-        int(QtCore.QtFatalMsg): logging.CRITICAL,
-    }
-
-    def qt_message_handler(mode, context, message) -> None:
-        level = levels.get(int(mode))
-        if level is None:
+    state: _DiagnosticsState | None = None
+    try:
+        state = _ensure_diagnostics_state()
+        if state is None or state.qt_handler is not None:
             return
-        category = str(getattr(context, "category", "") or "qt")
-        source_file = str(getattr(context, "file", "") or "")
-        source_line = int(getattr(context, "line", 0) or 0)
-        location = f" {source_file}:{source_line}" if source_file else ""
-        try:
-            _state.logger.log(level, "Qt[%s]%s %s", category, location, message)
-            _flush_logs()
-        except Exception:
-            _write_crash_line(f"Qt[{category}]{location} {message}")
 
-    _state.qt_handler = qt_message_handler
-    QtCore.qInstallMessageHandler(qt_message_handler)
+        from PyQt5 import QtCore
+
+        levels = {
+            int(QtCore.QtWarningMsg): logging.WARNING,
+            int(QtCore.QtCriticalMsg): logging.ERROR,
+            int(QtCore.QtFatalMsg): logging.CRITICAL,
+        }
+
+        def qt_message_handler(mode, context, message) -> None:
+            try:
+                level = levels.get(int(mode))
+                if level is None:
+                    return
+                category = str(getattr(context, "category", "") or "qt")
+                source_file = str(getattr(context, "file", "") or "")
+                source_line = int(getattr(context, "line", 0) or 0)
+                location = f" {source_file}:{source_line}" if source_file else ""
+                _safe_log(level, "Qt[%s]%s %s", category, location, message)
+                _flush_logs()
+            except Exception:
+                _write_crash_line("Qt message logging failed")
+
+        state.qt_handler = qt_message_handler
+        QtCore.qInstallMessageHandler(qt_message_handler)
+    except Exception as exc:
+        if state is not None:
+            state.qt_handler = None
+        record_exception("无法安装 Qt 消息处理器", exc)
 
 
 def record_exception(context: str, exc: BaseException) -> None:
-    if _state is None:
-        install_diagnostics()
-    assert _state is not None
-    _state.logger.error(
-        "%s: %s",
-        context,
-        exc,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
-    _flush_logs()
+    try:
+        state = _ensure_diagnostics_state()
+        if state is None:
+            return
+        state.logger.error(
+            "%s: %s",
+            context,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        _flush_logs()
+    except Exception:
+        _write_crash_line("Exception recording failed")
 
 
 def prepare_macos_qt_plugins(plugin_root: str | Path | None = None) -> Path | None:
@@ -226,8 +368,7 @@ def prepare_macos_qt_plugins(plugin_root: str | Path | None = None) -> Path | No
             f"无法准备 macOS 图形界面组件：{exc}。诊断日志：{diagnostic_log_path()}"
         ) from exc
 
-    assert _state is not None
-    _state.logger.info("macOS Qt Cocoa plugin ready: %s", cocoa_plugin)
+    _safe_log(logging.INFO, "macOS Qt Cocoa plugin ready: %s", cocoa_plugin)
     return cocoa_plugin
 
 
@@ -235,7 +376,8 @@ def _install_exception_hooks() -> None:
     def exception_hook(exc_type, exc_value, exc_traceback) -> None:
         assert _state is not None
         _state.had_unhandled_exception = True
-        _state.logger.critical(
+        _safe_log(
+            logging.CRITICAL,
             "Unhandled main-thread exception",
             exc_info=(exc_type, exc_value, exc_traceback),
         )
@@ -247,7 +389,8 @@ def _install_exception_hooks() -> None:
         assert _state is not None
         _state.had_unhandled_exception = True
         thread_name = getattr(getattr(args, "thread", None), "name", "unknown")
-        _state.logger.critical(
+        _safe_log(
+            logging.CRITICAL,
             "Unhandled Python thread exception thread=%s",
             thread_name,
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
@@ -265,7 +408,8 @@ def _install_exception_hooks() -> None:
         target = getattr(args, "object", None)
         detail = str(getattr(args, "err_msg", None) or "").strip()
         message = f"Unraisable exception: {detail}" if detail else "Unraisable exception"
-        _state.logger.critical(
+        _safe_log(
+            logging.CRITICAL,
             "%s object=%r",
             message,
             target,
@@ -284,36 +428,46 @@ def _mark_process_exit() -> None:
     if _state is None:
         return
     status = "UNHANDLED ERROR" if _state.had_unhandled_exception else "NORMAL EXIT"
-    _state.logger.info("SESSION %s pid=%s", status, os.getpid())
+    _safe_log(logging.INFO, "SESSION %s pid=%s", status, os.getpid())
     _flush_logs()
-    try:
-        _state.crash_stream.write(
-            f"--- DcmGet session {status.lower()} pid={os.getpid()} ---\n"
-        )
-        _state.crash_stream.flush()
-    except (OSError, ValueError):
-        pass
+    _safe_crash_write(f"--- DcmGet session {status.lower()} pid={os.getpid()} ---\n")
 
 
 def _flush_logs() -> None:
     if _state is None:
         return
     for handler in _state.logger.handlers:
-        handler.flush()
+        try:
+            handler.flush()
+        except Exception:
+            pass
     try:
         _state.crash_stream.flush()
-    except (OSError, ValueError):
+    except Exception:
+        pass
+
+
+def _safe_log(level: int, message: str, *args, **kwargs) -> None:
+    if _state is None:
+        return
+    try:
+        _state.logger.log(level, message, *args, **kwargs)
+    except Exception:
+        _safe_crash_write("Diagnostic logging failed\n")
+
+
+def _safe_crash_write(message: str) -> None:
+    if _state is None:
+        return
+    try:
+        _state.crash_stream.write(message)
+        _state.crash_stream.flush()
+    except Exception:
         pass
 
 
 def _write_crash_line(message: str) -> None:
-    if _state is None:
-        return
-    try:
-        _state.crash_stream.write(message + "\n")
-        _state.crash_stream.flush()
-    except (OSError, ValueError):
-        pass
+    _safe_crash_write(message + "\n")
 
 
 def _open_private_append(path: Path) -> IO[str]:
