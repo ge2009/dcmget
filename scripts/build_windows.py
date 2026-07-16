@@ -158,6 +158,8 @@ def pyinstaller_args(
         "--add-data",
         f"{ROOT / 'THIRD_PARTY_NOTICES.md'}:.",
         "--add-data",
+        f"{ROOT / 'dcmget' / 'pdi_server.py'}:dcmget",
+        "--add-data",
         f"{runtime_root}:.runtime/dcmtk/windows-x86_64",
         "--noupx",
     ]

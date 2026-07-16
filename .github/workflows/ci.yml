@@ -70,10 +70,10 @@ jobs:
         if: matrix.dcmtk == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: dcmget-2.6.0-source-deploy
+          name: dcmget-2.6.1-source-deploy
           path: |
-            release/dcmget-2.6.0-source-deploy.zip
-            release/dcmget-2.6.0-source-deploy.zip.sha256
+            release/dcmget-2.6.1-source-deploy.zip
+            release/dcmget-2.6.1-source-deploy.zip.sha256
           if-no-files-found: error
 
   minimum-python:

@@ -69,6 +69,9 @@ def test_frozen_self_test_requires_offline_ohif_and_local_server(
     ohif = tmp_path / ".runtime" / "ohif" / "ohif-3.12.6"
     ohif.mkdir(parents=True)
     (tmp_path / "DcmGetPdiServer.exe").write_bytes(b"server")
+    server_script = tmp_path / "dcmget" / "pdi_server.py"
+    server_script.parent.mkdir()
+    server_script.write_text("# offline server\n", encoding="utf-8")
     for name in (
         "index.html",
         "app-config.js",

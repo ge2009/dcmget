@@ -48,13 +48,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_self_test(config_path: str) -> int:
+    from tempfile import TemporaryDirectory
+
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from pydicom import dcmread
     from pydicom.dataset import FileDataset, FileMetaDataset
-    from pydicom.uid import ExplicitVRLittleEndian
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
 
     from dcmget.anonymization import DicomAnonymizer
+    from dcmget.config import AppConfig
+    from dcmget.pdi import PdiExporter
 
     load_config(config_path)
     trial_status()
@@ -87,6 +91,70 @@ def run_self_test(config_path: str) -> int:
         raise RuntimeError(
             f"DCMTK 自检失败：version={tools.version}, fork={tools.supports_fork}"
         )
+    if is_frozen():
+        with TemporaryDirectory(prefix="dcmget-pdi-self-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source.dcm"
+            instance_uid = generate_uid()
+            pdi_meta = FileMetaDataset()
+            pdi_meta.MediaStorageSOPClassUID = CTImageStorage
+            pdi_meta.MediaStorageSOPInstanceUID = instance_uid
+            pdi_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            pdi_dataset = FileDataset(
+                None, {}, file_meta=pdi_meta, preamble=b"\0" * 128
+            )
+            pdi_dataset.SOPClassUID = CTImageStorage
+            pdi_dataset.SOPInstanceUID = instance_uid
+            pdi_dataset.StudyInstanceUID = generate_uid()
+            pdi_dataset.SeriesInstanceUID = generate_uid()
+            pdi_dataset.PatientName = "DcmGet^SelfTest"
+            pdi_dataset.PatientID = "SELFTEST"
+            pdi_dataset.AccessionNumber = "PDI-SELF-TEST"
+            pdi_dataset.Modality = "CT"
+            pdi_dataset.StudyDate = "20260716"
+            pdi_dataset.StudyTime = "120000"
+            pdi_dataset.StudyID = "SELFTEST"
+            pdi_dataset.SeriesNumber = 1
+            pdi_dataset.InstanceNumber = 1
+            pdi_dataset.Rows = 1
+            pdi_dataset.Columns = 1
+            pdi_dataset.SamplesPerPixel = 1
+            pdi_dataset.PhotometricInterpretation = "MONOCHROME2"
+            pdi_dataset.BitsAllocated = 8
+            pdi_dataset.BitsStored = 8
+            pdi_dataset.HighBit = 7
+            pdi_dataset.PixelRepresentation = 0
+            pdi_dataset.PixelData = b"\0"
+            pdi_dataset.save_as(source, enforce_file_format=True)
+            pdi_config = AppConfig(
+                dicom_destination_folder=str(root / "dicom"),
+                pdi_export_enabled=True,
+                pdi_institution_name="DcmGet Self Test",
+                pdi_output_folder=str(root / "pdi"),
+                pdi_include_ohif_viewer=True,
+            )
+            pdi_result = PdiExporter(
+                pdi_config, tools, project_root=PROJECT_ROOT
+            ).export([source])
+            if not pdi_result.output_directory:
+                raise RuntimeError(f"PDI 冻结资源自检失败：{pdi_result.message}")
+            pdi_output = Path(pdi_result.output_directory)
+            required_pdi = (
+                pdi_output / "DICOMDIR",
+                pdi_output / "DCMGET_STUDIES.json",
+                pdi_output / "VIEWER" / "OHIF" / "index.html",
+                pdi_output / "VIEWER" / "pdi_server.py",
+                pdi_output / "OPEN_VIEWER.exe",
+                pdi_output / "OPEN_VIEWER.bat",
+            )
+            missing_pdi = [path.name for path in required_pdi if not path.is_file()]
+            if missing_pdi:
+                raise RuntimeError(
+                    f"PDI 冻结资源自检缺少文件：{'、'.join(missing_pdi)}"
+                )
+            index_text = (pdi_output / "INDEX.HTM").read_text(encoding="utf-8")
+            if "本次导出未能加入 OHIF" in index_text:
+                raise RuntimeError("PDI 冻结资源自检未能加入 OHIF")
     print(f"DcmGet {__version__} self-test OK; DCMTK {tools.version}; fork=yes")
     return 0
 
@@ -98,6 +166,7 @@ def validate_frozen_pdi_resources(root: str | Path) -> None:
     ohif = base / ".runtime" / "ohif" / "ohif-3.12.6"
     required = (
         base / "DcmGetPdiServer.exe",
+        base / "dcmget" / "pdi_server.py",
         ohif / "index.html",
         ohif / "app-config.js",
         ohif / "init-service-worker.js",

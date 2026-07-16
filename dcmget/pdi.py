@@ -718,12 +718,21 @@ class PdiExporter:
                 "</article>"
             )
         launch = (
-            '<div class="launch"><strong>打开阅片器</strong>'
-            "<p>Windows：双击 OPEN_VIEWER.bat</p>"
+            '<div class="launch"><strong>此页仅显示检查清单，不能直接看图</strong>'
+            "<p>Windows：返回目录双击 OPEN_VIEWER.exe（推荐）或 OPEN_VIEWER.bat</p>"
             "<p>macOS：双击 OPEN_VIEWER.command</p>"
             "<p>Linux：运行 OPEN_VIEWER.sh</p></div>"
             if viewer_included
-            else '<div class="warning">本目录未包含 OHIF 运行资源，请使用外部 DICOM 查看器打开 DICOMDIR。</div>'
+            else (
+                '<div class="warning"><strong>此页仅显示检查清单，不能直接看图。</strong> '
+                "本次导出未能加入 OHIF 运行资源，请查看 README.TXT 的警告说明，"
+                "或使用外部 DICOM 查看器打开 DICOMDIR。</div>"
+            )
+        )
+        contents = (
+            "目录内保存标准 DICOMDIR、原始 DICOM 和本地中文 OHIF 阅片器。"
+            if viewer_included
+            else "目录内保存标准 DICOMDIR 和原始 DICOM；本次未加入 OHIF 阅片器。"
         )
         document = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -738,7 +747,7 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}}.study{{padding:18px}}.study h2{{margin:0 0 12px;font-size:18px}}
 .study p{{margin:7px 0}}.study span{{display:inline-block;margin-top:10px;color:var(--cyan)}}a{{color:var(--cyan)}}
 </style></head><body><main><header><h1>DcmGet PDI 便携影像</h1>
-<p>机构：{html.escape(institution)}</p><p>目录内保存标准 DICOMDIR、原始 DICOM 和本地中文 OHIF 阅片器。</p>
+<p>机构：{html.escape(institution)}</p><p>{contents}</p>
 <a href="README.TXT">查看使用说明</a></header>
 <section class="notice"><strong>仅供查阅，不用于诊断。</strong> 请以原始 DICOM 和医疗机构正式报告为准。</section>
 {launch}<section class="grid">{''.join(cards)}</section>
@@ -759,10 +768,14 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
             else "DICOMDIR 使用兼容模式生成，不声称为严格 Profile 合规介质。"
         )
         viewer = (
-            "Windows 双击 OPEN_VIEWER.bat；macOS 双击 OPEN_VIEWER.command；"
+            "Windows 双击 OPEN_VIEWER.exe（推荐）或 OPEN_VIEWER.bat；"
+            "macOS 双击 OPEN_VIEWER.command；"
             "Linux 运行 OPEN_VIEWER.sh。阅片服务只监听本机 127.0.0.1。"
             if viewer_included
-            else "本目录未包含 OHIF 查看器，请使用外部 DICOM 查看器打开 DICOMDIR。"
+            else (
+                "本次导出未能加入 OHIF 查看器，请查看下方警告；"
+                "也可使用外部 DICOM 查看器打开 DICOMDIR。"
+            )
         )
         warning_lines = "\n".join(f"- {warning}" for warning in warnings) or "- 无"
         content = f"""DcmGet PDI 便携影像目录
@@ -772,8 +785,8 @@ header{{padding:26px;margin-bottom:18px}}h1{{margin:0 0 8px;color:var(--cyan);fo
 
 使用方法：
 1. 将整个目录复制到 U 盘，不要只复制部分文件。
-2. 双击 INDEX.HTM 查看目录说明和检查清单。
-3. {viewer}
+2. {viewer}
+3. INDEX.HTM 只用于查看目录说明和检查清单，不能直接显示 DICOM 图像。
 
 {profile}
 OHIF 直接读取目录中的原始 DICOM，不生成 JPEG 预览，也不会连接 PACS 或公网。

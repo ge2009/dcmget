@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.6.0
+        default: 2.6.1
 
 permissions:
   contents: read
@@ -59,8 +59,10 @@ jobs:
         run: |
           function Assert-PdiResources([string]$resourceRoot) {
             $server = Join-Path $resourceRoot "DcmGetPdiServer.exe"
+            $serverScript = Join-Path $resourceRoot "dcmget\pdi_server.py"
             $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
             if (-not (Test-Path $server -PathType Leaf)) { throw "Missing PDI server at $server" }
+            if (-not (Test-Path $serverScript -PathType Leaf)) { throw "Missing portable PDI server script at $serverScript" }
             @(
               "index.html", "app-config.js", "init-service-worker.js",
               "LICENSE-OHIF.txt", "THIRD_PARTY-OHIF.md",
@@ -82,6 +84,7 @@ jobs:
           pyi-archive_viewer -r "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" *> $archiveListing
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect portable EXE archive" }
           if (-not (Select-String -Path $archiveListing -Pattern "DcmGetPdiServer\.exe" -Quiet)) { throw "Portable EXE is missing PDI server" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
 
       - name: Smoke test standalone PDI server
@@ -227,6 +230,7 @@ jobs:
           $resourceRoot = Join-Path $installDir "_internal"
           $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
           if (-not (Test-Path (Join-Path $resourceRoot "DcmGetPdiServer.exe") -PathType Leaf)) { throw "Installed PDI local server is missing" }
+          if (-not (Test-Path (Join-Path $resourceRoot "dcmget\pdi_server.py") -PathType Leaf)) { throw "Installed portable PDI server script is missing" }
           @("index.html", "app-config.js", "init-service-worker.js", "LICENSE-OHIF.txt", "THIRD_PARTY-OHIF.md", "DCMGET_OHIF_PAYLOAD.json", "DCMGET_PAYLOAD.SHA256") | ForEach-Object {
             if (-not (Test-Path (Join-Path $ohif $_) -PathType Leaf)) { throw "Installed OHIF resource is missing: $_" }
           }

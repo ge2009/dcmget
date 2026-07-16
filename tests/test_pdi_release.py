@@ -216,6 +216,14 @@ def test_all_windows_variants_embed_ohif_and_local_server(tmp_path: Path):
     assert any(".runtime/ohif/ohif-3.12.6" in value for value in onefile)
     assert any("DcmGetPdiServer.exe" in value for value in onedir)
     assert any("DcmGetPdiServer.exe" in value for value in onefile)
+    assert any(
+        value.replace("\\", "/").endswith("dcmget/pdi_server.py:dcmget")
+        for value in onedir
+    )
+    assert any(
+        value.replace("\\", "/").endswith("dcmget/pdi_server.py:dcmget")
+        for value in onefile
+    )
     server_args = pdi_server_pyinstaller_args(icon, version_file)
     assert "--onefile" in server_args and "--windowed" in server_args
 

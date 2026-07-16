@@ -277,6 +277,46 @@ def test_offline_ohif_and_cross_platform_launchers_are_included(
     assert "Weasis" not in (output / "README.TXT").read_text(encoding="utf-8")
 
 
+def test_frozen_windows_export_uses_bundled_physical_server_script(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "source.dcm")
+    viewer = _viewer(tmp_path / "ohif")
+    frozen_root = tmp_path / "frozen"
+    server_script = frozen_root / "dcmget" / "pdi_server.py"
+    server_script.parent.mkdir(parents=True)
+    server_script.write_text("# portable server\n", encoding="utf-8")
+    (frozen_root / "DcmGetPdiServer.exe").write_bytes(b"server")
+    project_root = tmp_path / "empty-project"
+    project_root.mkdir()
+    monkeypatch.setattr(pdi, "__file__", str(frozen_root / "dcmget" / "pdi.py"))
+    monkeypatch.setattr(pdi, "resource_root", lambda: frozen_root)
+    exporter = PdiExporter(
+        _config(tmp_path, pdi_include_ohif_viewer=True),
+        tools,
+        project_root=project_root,
+        viewer_source=viewer,
+    )
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.COMPLETED
+    assert result.warnings == []
+    output = Path(result.output_directory)
+    assert (output / "OPEN_VIEWER.exe").read_bytes() == b"server"
+    assert (output / "VIEWER" / "OHIF" / "index.html").is_file()
+    assert (output / "VIEWER" / "pdi_server.py").read_text(encoding="utf-8") == (
+        "# portable server\n"
+    )
+    assert (output / "OPEN_VIEWER.bat").is_file()
+    assert (output / "MANIFEST.SHA256").is_file()
+    index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
+    assert "此页仅显示检查清单，不能直接看图" in index_html
+    assert "OPEN_VIEWER.exe（推荐）" in index_html
+    assert "本次导出未能加入 OHIF" not in index_html
+
+
 def test_missing_ohif_is_partial_but_keeps_valid_dicomdir(
     tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,6 +336,10 @@ def test_missing_ohif_is_partial_but_keeps_valid_dicomdir(
     assert (output / "DICOMDIR").is_file()
     assert (output / pdi.STUDY_INDEX).is_file()
     assert not (output / "VIEWER" / "OHIF").exists()
+    index_html = (output / "INDEX.HTM").read_text(encoding="utf-8")
+    assert "此页仅显示检查清单，不能直接看图" in index_html
+    assert "本次导出未能加入 OHIF 运行资源" in index_html
+    assert "原始 DICOM 和本地中文 OHIF 阅片器" not in index_html
 
 
 def test_duplicate_uid_with_same_content_is_deduplicated(
