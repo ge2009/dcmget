@@ -862,6 +862,9 @@ def run_server(
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     try:
         ensure_supported_runtime()
     except ArchitectureError as exc:

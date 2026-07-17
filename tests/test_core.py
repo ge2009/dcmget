@@ -287,6 +287,7 @@ def test_resolver_discovers_validation_and_pdi_tools_next_to_dcmtk_binaries(
         (tmp_path / f"{name}{suffix}").touch()
     resolver = DcmtkResolver(tmp_path)
     monkeypatch.setattr(core, "_run_probe", lambda *_args, **_kwargs: "dcmtk v3.7.0")
+    monkeypatch.setattr(core, "require_amd64_pe", lambda *_args, **_kwargs: None)
 
     tools = resolver._probe(
         tmp_path / f"movescu{suffix}", tmp_path / f"storescp{suffix}"

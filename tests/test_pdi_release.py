@@ -247,6 +247,8 @@ def test_pdi_server_tool_entry_runs_directly_outside_repo_cwd(tmp_path: Path):
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15,
     )
 

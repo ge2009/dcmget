@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -646,8 +647,11 @@ def test_offline_ohif_and_cross_platform_launchers_are_included(
     help_result = subprocess.run(
         [sys.executable, str(output / "VIEWER" / "pdi_server.py"), "--help"],
         cwd=tmp_path,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15,
     )
     assert help_result.returncode == 0, help_result.stderr
