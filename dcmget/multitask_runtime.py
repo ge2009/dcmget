@@ -4,7 +4,6 @@ import shutil
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -220,17 +219,14 @@ class SharedDcmtkRuntime:
         config: AppConfig,
         key: tuple[str, int],
     ) -> SharedReceiverHandle:
-        session = uuid.uuid4().hex[:8]
+        session = uuid.uuid4().hex[:16]
         safe_ae = "".join(
             character if character.isalnum() else "-" for character in key[0]
         ).strip("-") or "AE"
         staging = (
             ensure_application_state_dir()
             / "staging"
-            / (
-                datetime.now().strftime("receiver-%Y%m%d-%H%M%S-%f-")
-                + f"{safe_ae}-{key[1]}-{session}"
-            )
+            / f"receiver-{session}"
         )
         staging.mkdir(parents=True, exist_ok=False, mode=0o700)
         receiver_logger = DownloadRunner(
@@ -336,7 +332,7 @@ class SharedDcmtkRuntime:
                     raise RuntimeError("DICOM 接收器池句柄已经失效")
                 receiver_handle = self._ensure_receiver(config)
                 route_directory = receiver_handle.staging_directory / (
-                    f"route-{task_id[:12]}-{uuid.uuid4().hex[:12]}"
+                    f"route-{uuid.uuid4().hex[:16]}"
                 )
                 route_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
                 if task_id in self._active_runners:

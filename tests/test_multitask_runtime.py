@@ -371,6 +371,12 @@ def test_receiver_pool_starts_distinct_receivers_staging_and_logs(
         for instance in _StorageReceiver.instances
         for route in instance.route_directories
     )
+    max_uid_filename = f"{'9' * 64}.dcm"
+    assert all(
+        len(str(route.relative_to(tmp_path) / max_uid_filename)) <= 128
+        for instance in _StorageReceiver.instances
+        for route in instance.route_directories
+    )
 
     receiver.shutdown()
 
