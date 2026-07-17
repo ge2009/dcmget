@@ -1101,6 +1101,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.7.1",
         "2.7.0",
         "2.6.5",
         "2.6.4",

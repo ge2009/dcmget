@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable
 
 from pydicom import dcmread
 from pydicom.charset import convert_encodings
-from pydicom.datadict import dictionary_VR
+from pydicom.datadict import dictionary_VR, keyword_for_tag
 from pydicom.dataelem import RawDataElement
 from pydicom.dataset import Dataset
 
@@ -1333,15 +1333,20 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
 def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:
     metadata: dict[str, object] = {}
     binary_vrs = {"OB", "OD", "OF", "OL", "OV", "OW", "UN"}
-    for element in dataset:
-        if element.tag.is_private or element.keyword == "PixelData":
+    for tag in dataset.keys():
+        # Avoid materializing private raw text: malformed private values are
+        # excluded from OHIF metadata and must not trigger charset decoding.
+        if tag.is_private:
             continue
-        keyword = element.keyword
+        keyword = keyword_for_tag(tag)
         if (
             not keyword
-            or element.VR in binary_vrs
+            or keyword == "PixelData"
             or keyword in OHIF_INDEX_EXCLUDED_KEYWORDS
         ):
+            continue
+        element = dataset[tag]
+        if element.VR in binary_vrs:
             continue
         try:
             value = _naturalize_value(element.value, element.VR)
@@ -1386,7 +1391,7 @@ def _naturalize_value(value: object, vr: str = "") -> object:
 
 
 def _repair_dataset_character_set(dataset: Dataset) -> str | None:
-    """Repair common vendor charset omissions for the generated OHIF index.
+    """Repair common vendor charset omissions or errors for the OHIF index.
 
     DICOM defaults to ISO_IR 6 when (0008,0005) is absent, but some PACS export
     GBK/GB18030 or UTF-8 bytes without a matching declaration.  Pydicom keeps
@@ -1434,6 +1439,21 @@ def _repair_dataset_character_set(dataset: Dataset) -> str | None:
             replacement = "ISO_IR 192"
         elif _cjk_count(gb18030_text) >= 2 and _has_consecutive_high_bytes(samples):
             replacement = "GB18030"
+    elif declared in {"ISO_IR 100", "ISO 2022 IR 100"} and _cjk_count(
+        declared_text
+    ) == 0:
+        # A few PACS declare a Latin character set while writing UTF-8 or
+        # GB18030 bytes.  ISO-8859 decoders accept every byte, so decode
+        # success/damage scores cannot identify this case (for example,
+        # GB18030 ``胸部`` becomes the plausible-looking ``ÐØ²¿``).  Only
+        # override the declaration when at least two independent metadata
+        # values contain dense CJK text backed by a run of multibyte data.
+        # This deliberately leaves normal Latin text, including adjacent
+        # accents, under its declared character set.
+        if _strong_cjk_encoding_evidence(samples, "utf-8"):
+            replacement = "ISO_IR 192"
+        elif _strong_cjk_encoding_evidence(samples, "gb18030"):
+            replacement = "GB18030"
 
     if replacement is None or replacement == declared:
         return None
@@ -1452,6 +1472,11 @@ def _raw_character_set_samples(dataset: Dataset) -> list[bytes]:
     total = 0
     for raw in dataset._dict.values():
         if not isinstance(raw, RawDataElement):
+            continue
+        if raw.tag.is_private:
+            continue
+        keyword = keyword_for_tag(raw.tag)
+        if not keyword or keyword in OHIF_INDEX_EXCLUDED_KEYWORDS:
             continue
         try:
             value_representation = str(raw.VR or dictionary_VR(raw.tag))
@@ -1522,6 +1547,49 @@ def _has_consecutive_high_bytes(samples: list[bytes]) -> bool:
         any(first >= 0x80 and second >= 0x80 for first, second in zip(sample, sample[1:]))
         for sample in samples
     )
+
+
+def _strong_cjk_encoding_evidence(samples: list[bytes], encoding: str) -> bool:
+    """Return true only when multiple text values strongly support encoding.
+
+    Requiring two dense CJK values and four consecutive high bytes avoids
+    treating isolated or adjacent Latin-1 accents as Chinese multibyte text.
+    Each sample is decoded independently so one malformed, unrelated value
+    cannot invalidate otherwise consistent evidence.
+    """
+
+    votes = 0
+    for sample in samples:
+        raw = sample.rstrip(b"\x00 ")
+        try:
+            decoded = raw.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+        cjk_count = _cjk_count(decoded)
+        visible_count = sum(
+            not char.isspace() and char not in "^=\\" for char in decoded
+        )
+        if (
+            _max_consecutive_high_bytes(raw) >= 4
+            and cjk_count >= 2
+            and cjk_count * 2 >= max(1, visible_count)
+        ):
+            votes += 1
+            if votes >= 2:
+                return True
+    return False
+
+
+def _max_consecutive_high_bytes(value: bytes) -> int:
+    longest = 0
+    current = 0
+    for byte in value:
+        if byte >= 0x80:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
 
 
 def _is_sequence_value(value: object) -> bool:
