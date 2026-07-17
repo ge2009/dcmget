@@ -151,22 +151,27 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     pacs.add_requested_context(CTImageStorage, ExplicitVRLittleEndian)
     move_lock = threading.Lock()
     all_moves_ready = threading.Event()
-    release_moves = threading.Event()
-    move_calls = 0
+    release_first_a001 = threading.Event()
+    release_other_moves = threading.Event()
+    duplicate_a001_ready = threading.Event()
+    release_duplicate_a001 = threading.Event()
+    a001_calls = 0
     active_handlers = 0
     peak_handlers = 0
     active_by_destination = {"STORE_A": 0, "STORE_B": 0}
     peak_by_destination = {"STORE_A": 0, "STORE_B": 0}
 
     def handle_move(event):
-        nonlocal move_calls, active_handlers, peak_handlers
+        nonlocal a001_calls, active_handlers, peak_handlers
         accession = str(event.identifier.AccessionNumber)
         destination = str(event.move_destination)
         yield "127.0.0.1", receiver_ports[destination]
         yield 1
         with move_lock:
-            move_calls += 1
-            call_number = move_calls
+            a001_call_number = 0
+            if accession == "A001":
+                a001_calls += 1
+                a001_call_number = a001_calls
             active_handlers += 1
             peak_handlers = max(peak_handlers, active_handlers)
             active_by_destination[destination] += 1
@@ -177,8 +182,14 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
             if active_handlers >= 3:
                 all_moves_ready.set()
         try:
-            if call_number <= 3:
-                assert release_moves.wait(5)
+            if accession == "A001" and a001_call_number == 1:
+                assert release_first_a001.wait(5)
+            elif accession != "A001":
+                assert release_other_moves.wait(5)
+            else:
+                assert a001_call_number == 2
+                duplicate_a001_ready.set()
+                assert release_duplicate_a001.wait(5)
             yield 0xFF00, sample_dataset(accession)
         finally:
             with move_lock:
@@ -201,6 +212,10 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     )
     config_a_second = AppConfig.from_dict(config_a.to_dict())
     config_a_second.dicom_destination_folder = str(tmp_path / "dicom-a-second")
+    config_a_duplicate = AppConfig.from_dict(config_a.to_dict())
+    config_a_duplicate.dicom_destination_folder = str(
+        tmp_path / "dicom-a-duplicate"
+    )
     config_b = AppConfig(
         dicom_destination_folder=str(tmp_path / "dicom-b"),
         pacs_server_ip="127.0.0.1",
@@ -233,7 +248,7 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     handle_ids: set[int] = set()
     staging_roots: dict[tuple[str, int], Path] = {}
     event_lock = threading.Lock()
-    route_directories: dict[str, Path] = {}
+    route_directories: list[tuple[str, Path]] = []
     instrumented_receivers: set[int] = set()
     original_ensure_receiver = runtime._ensure_receiver
 
@@ -250,7 +265,7 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
 
             def register_route(accession, directory, **kwargs):
                 with event_lock:
-                    route_directories[accession] = Path(directory)
+                    route_directories.append((accession, Path(directory)))
                 return original_register_route(accession, directory, **kwargs)
 
             receiver_handle.receiver.register_route = register_route
@@ -281,7 +296,7 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
         runtime.start,
         runtime.stop,
         execute,
-        max_concurrent_moves=3,
+        max_concurrent_moves=4,
     )
     receiver.ensure_started()
     catalog = TaskCatalog(
@@ -289,26 +304,42 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
         legacy_path=tmp_path / "unused.sqlite3",
         auto_migrate=False,
     )
-    manager = TaskManager(catalog, receiver=receiver, max_concurrent_moves=3)
+    manager = TaskManager(catalog, receiver=receiver, max_concurrent_moves=4)
     first = manager.create_task(config_a, ["A001"])
     same_key = manager.create_task(config_a_second, ["A002"])
     second_receiver = manager.create_task(config_b, ["B001"])
+    duplicate_a001 = manager.create_task(config_a_duplicate, ["A001"])
     worker_errors: list[Exception] = []
 
-    def schedule_first_pair():
-        try:
-            manager.run_next_round()
-        except Exception as exc:
-            worker_errors.append(exc)
+    def schedule_all_tasks():
+        while any(
+            item.phase in {"queued", "running"} for item in manager.list_tasks()
+        ):
+            try:
+                manager.run_next_round()
+            except Exception as exc:
+                worker_errors.append(exc)
+                return
 
-    worker = threading.Thread(target=schedule_first_pair)
+    worker = threading.Thread(target=schedule_all_tasks)
     try:
         worker.start()
         assert all_moves_ready.wait(5)
         with process_lock:
             assert active["movescu"] == 3
             assert peak["movescu"] == 3
-        release_moves.set()
+        assert not duplicate_a001_ready.is_set()
+        assert manager.get_task(duplicate_a001.task_id).summary.phase == "queued"
+
+        release_first_a001.set()
+        assert duplicate_a001_ready.wait(10)
+        assert not release_other_moves.is_set()
+        with process_lock:
+            assert active["movescu"] == 3
+            assert peak["movescu"] == 3
+
+        release_other_moves.set()
+        release_duplicate_a001.set()
         worker.join(10)
         assert not worker.is_alive()
         assert worker_errors == []
@@ -319,16 +350,19 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
             assert time.monotonic() < deadline
             manager.run_next_round()
     finally:
-        release_moves.set()
+        release_first_a001.set()
+        release_other_moves.set()
+        release_duplicate_a001.set()
         manager.shutdown()
         server.shutdown()
 
-    assert order == [
+    assert set(order[:3]) == {
         (first.task_id, "A001"),
         (same_key.task_id, "A002"),
         (second_receiver.task_id, "B001"),
-    ]
-    assert starts == {"movescu": 3}
+    }
+    assert order[-1] == (duplicate_a001.task_id, "A001")
+    assert starts == {"movescu": 4}
     assert peak == {"movescu": 3}
     assert active == {"movescu": 0}
     assert peak_handlers == 3
@@ -340,11 +374,16 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     }
     assert len(set(staging_roots.values())) == 2
     assert all(not path.exists() for path in staging_roots.values())
-    assert set(route_directories) == {"A001", "A002", "B001"}
-    assert len(set(route_directories.values())) == 3
+    assert sorted(accession for accession, _directory in route_directories) == [
+        "A001",
+        "A001",
+        "A002",
+        "B001",
+    ]
+    assert len({directory for _accession, directory in route_directories}) == 4
     task_details = [
         manager.get_task_detail(task.task_id)
-        for task in (first, same_key, second_receiver)
+        for task in (first, same_key, second_receiver, duplicate_a001)
     ]
     task_diagnostics = [
         {
@@ -367,16 +406,19 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
         "completed",
         "completed",
         "completed",
+        "completed",
     ], task_diagnostics
     received = [
         *list((tmp_path / "dicom-a").rglob("*.dcm")),
         *list((tmp_path / "dicom-a-second").rglob("*.dcm")),
         *list((tmp_path / "dicom-b").rglob("*.dcm")),
+        *list((tmp_path / "dicom-a-duplicate").rglob("*.dcm")),
     ]
-    assert len(received) == 3
+    assert len(received) == 4
     assert len(list((tmp_path / "dicom-a").rglob("*.dcm"))) == 1
     assert len(list((tmp_path / "dicom-a-second").rglob("*.dcm"))) == 1
     assert len(list((tmp_path / "dicom-b").rglob("*.dcm"))) == 1
+    assert len(list((tmp_path / "dicom-a-duplicate").rglob("*.dcm"))) == 1
     assert {path.parent.parent.name for path in received} == {
         "A001",
         "A002",

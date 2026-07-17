@@ -448,16 +448,6 @@ class TaskCatalog:
                             raise TaskStateError(
                                 f"旧任务的接收映射冲突：{mapping_conflict}"
                             )
-                        duplicates = self._active_duplicates(
-                            connection,
-                            checkpoint.accessions,
-                        )
-                        if duplicates:
-                            examples = "、".join(duplicates[:3])
-                            raise TaskStateError(
-                                "旧任务检查号已存在于现有未完成任务中："
-                                f"{examples}"
-                            )
                         self._insert_checkpoint(connection, checkpoint)
                     connection.commit()
             backup = self._backup_legacy(checkpoint.task_id)
@@ -621,12 +611,6 @@ class TaskCatalog:
                             raise TaskStateError(
                                 f"接收映射冲突：{mapping_conflict}"
                             )
-                        duplicates = self._active_duplicates(connection, values)
-                        if duplicates:
-                            examples = "、".join(duplicates[:3])
-                            raise TaskStateError(
-                                f"检查号已存在于未完成任务中：{examples}"
-                            )
                         connection.execute(
                             """
                             INSERT INTO tasks(
@@ -771,41 +755,6 @@ class TaskCatalog:
             raise
         except (OSError, sqlite3.Error) as exc:
             raise TaskStateError(f"无法校验接收映射：{exc}") from exc
-
-    @staticmethod
-    def _active_duplicates(
-        connection: sqlite3.Connection,
-        accessions: Iterable[str],
-        *,
-        exclude_task_id: str = "",
-    ) -> list[str]:
-        connection.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS candidate_accessions(accession TEXT PRIMARY KEY)"
-        )
-        connection.execute("DELETE FROM candidate_accessions")
-        connection.executemany(
-            "INSERT INTO candidate_accessions(accession) VALUES (?)",
-            ((value,) for value in accessions),
-        )
-        conditions = ["t.phase NOT IN (?, ?, ?)"]
-        parameters: list[object] = [*sorted(TERMINAL_PHASES)]
-        if exclude_task_id:
-            conditions.append("t.task_id <> ?")
-            parameters.append(exclude_task_id)
-        return [
-            str(row[0])
-            for row in connection.execute(
-                f"""
-                SELECT DISTINCT c.accession
-                FROM candidate_accessions AS c
-                JOIN accessions AS a ON a.accession = c.accession
-                JOIN tasks AS t ON t.task_id = a.task_id
-                WHERE {" AND ".join(conditions)}
-                ORDER BY c.accession
-                """,
-                parameters,
-            )
-        ]
 
     def list_tasks(self) -> list[TaskSummary]:
         try:
@@ -1779,29 +1728,6 @@ class TaskCatalog:
                         raise TaskStateError(
                             f"接收映射冲突：{mapping_conflict}"
                         )
-                    candidates = [
-                        str(row[0])
-                        for row in connection.execute(
-                            """
-                            SELECT accession FROM accessions
-                            WHERE task_id = ? AND (
-                                result_json IS NULL OR status IN (?, ?)
-                            )
-                            ORDER BY position
-                            """,
-                            (
-                                task_id,
-                                AccessionStatus.FAILED.value,
-                                AccessionStatus.PARTIAL.value,
-                            ),
-                        )
-                    ]
-                    duplicates = self._active_duplicates(
-                        connection, candidates, exclude_task_id=task_id
-                    )
-                    if duplicates:
-                        examples = "、".join(duplicates[:3])
-                        raise TaskStateError(f"检查号已存在于未完成任务中：{examples}")
                     rows = list(
                         connection.execute(
                             """
@@ -2558,6 +2484,10 @@ class TaskManager:
         with self._lock:
             if self._shutting_down:
                 return None
+            busy_routes = {
+                (receiver_key(config), accession)
+                for _task_id, accession, config in self._inflight.values()
+            }
             attempts = len(self._scheduler)
             for _ in range(attempts):
                 task_id = self._scheduler.pop_next()
@@ -2571,6 +2501,9 @@ class TaskManager:
                     self._finalize_exhausted(summary)
                     continue
                 config = self.catalog.get_config(task_id)
+                if (receiver_key(config), accession) in busy_routes:
+                    self._scheduler.add(task_id)
+                    continue
                 self.catalog.set_phase(task_id, "running")
                 self.catalog.update_runtime(
                     task_id,

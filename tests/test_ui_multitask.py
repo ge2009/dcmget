@@ -205,6 +205,61 @@ def test_running_task_starts_second_task_in_an_available_concurrency_slot(
     window.close()
 
 
+def test_duplicate_accession_can_create_a_second_task_without_warning(
+    qtbot, tmp_path, monkeypatch
+):
+    _BlockingRuntime.calls = []
+    _BlockingRuntime.starts = 0
+    _BlockingRuntime.entered = threading.Event()
+    _BlockingRuntime.release = threading.Event()
+    _BlockingRuntime.block_accession = "A001"
+    _BlockingRuntime.block_accessions = None
+    window = _window(qtbot, tmp_path, monkeypatch)
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message, *_args, **_kwargs: warnings.append(
+            (title, message)
+        )
+        or QMessageBox.Ok,
+    )
+
+    try:
+        window.accession_edit.setPlainText("A001")
+        window._start_download()
+        assert _BlockingRuntime.entered.wait(2)
+        first_id = window._selected_task_id
+
+        second_destination = tmp_path / "dicom-second"
+        second_destination.mkdir()
+        window._show_new_task_editor()
+        window.accession_edit.setPlainText("A001")
+        window.destination_edit.setText(str(second_destination))
+        window._start_download()
+        second_id = window._selected_task_id
+
+        assert second_id != first_id
+        assert warnings == []
+        assert window.task_controller.get_task(second_id).summary.phase == "queued"
+        assert _BlockingRuntime.calls == [(first_id, "A001")]
+    finally:
+        _BlockingRuntime.release.set()
+
+    qtbot.waitUntil(
+        lambda: all(
+            summary.phase == "completed"
+            for summary in window.task_controller.list_tasks()
+        ),
+        timeout=5000,
+    )
+    assert _BlockingRuntime.calls == [
+        (first_id, "A001"),
+        (second_id, "A001"),
+    ]
+    window.close()
+
+
 def test_third_task_waits_for_a_concurrency_slot_and_shows_queue_copy(
     qtbot, tmp_path, monkeypatch
 ):

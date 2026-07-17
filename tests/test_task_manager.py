@@ -65,6 +65,11 @@ def test_catalog_keeps_multiple_tasks_and_results_isolated(tmp_path):
     }
 
 
+def test_catalog_still_rejects_duplicate_accessions_within_one_task(tmp_path):
+    with pytest.raises(TaskStateError, match="同一任务"):
+        catalog(tmp_path).create_task(AppConfig(), ["A001", "A001"])
+
+
 @pytest.mark.parametrize(
     "phase",
     ["completed", "failed", "cancelled", "download_retryable", "pdi_retryable"],
@@ -460,7 +465,7 @@ def test_delayed_legacy_migration_allows_heterogeneous_receiver_config(tmp_path)
     assert list(tmp_path.glob("active-task.sqlite3.pre-multitask*.bak"))
 
 
-def test_delayed_legacy_migration_rejects_duplicate_accession(tmp_path):
+def test_delayed_legacy_migration_allows_duplicate_accession(tmp_path):
     legacy = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     checkpoint = legacy.start(AppConfig(), ["DUP"], trial_required=False)
     assert legacy.try_acquire_lease()
@@ -470,11 +475,13 @@ def test_delayed_legacy_migration_rejects_duplicate_accession(tmp_path):
     finally:
         legacy.release_lease()
 
-    with pytest.raises(TaskStateError, match="旧任务检查号已存在"):
-        store.migrate_legacy()
+    migrated = store.migrate_legacy()
 
-    assert len(store.list_tasks()) == 1
-    assert legacy.load_required().task_id == checkpoint.task_id
+    assert migrated is not None
+    assert migrated.task_id == checkpoint.task_id
+    assert len(store.list_tasks()) == 2
+    assert store.get_task(checkpoint.task_id).accessions == ["DUP"]
+    assert list(tmp_path.glob("active-task.sqlite3.pre-multitask*.bak"))
 
 
 def test_round_robin_runs_one_accession_per_task_and_shares_receiver(tmp_path):
@@ -619,6 +626,73 @@ def test_same_receiver_key_and_different_key_can_fill_concurrent_slots(tmp_path)
         same_receiver.task_id,
         different_receiver.task_id,
     }
+    manager.shutdown()
+
+
+def test_duplicate_accession_is_serialized_per_receiver_but_not_across_receivers(
+    tmp_path,
+):
+    entered: list[tuple[str, tuple[str, int], str]] = []
+    active_by_route: dict[tuple[tuple[str, int], str], int] = {}
+    peak_by_route: dict[tuple[tuple[str, int], str], int] = {}
+    lock = threading.Lock()
+    two_receivers_started = threading.Event()
+    release = threading.Event()
+
+    def execute(task_id, config, accession):
+        key = (config.storage_ae_title, config.storage_port)
+        route_key = (key, accession)
+        with lock:
+            entered.append((task_id, key, accession))
+            active_by_route[route_key] = active_by_route.get(route_key, 0) + 1
+            peak_by_route[route_key] = max(
+                peak_by_route.get(route_key, 0),
+                active_by_route[route_key],
+            )
+            if len(entered) == 2:
+                two_receivers_started.set()
+        assert release.wait(2)
+        with lock:
+            active_by_route[route_key] -= 1
+        return completed(accession)
+
+    manager = TaskManager(catalog(tmp_path), execute, max_concurrent_moves=3)
+    first = manager.create_task(
+        AppConfig(storage_ae_title="STORE_A", storage_port=6666),
+        ["SHARED"],
+    )
+    same_receiver = manager.create_task(
+        AppConfig(storage_ae_title="STORE_A", storage_port=6666),
+        ["SHARED"],
+    )
+    different_receiver = manager.create_task(
+        AppConfig(storage_ae_title="STORE_B", storage_port=7777),
+        ["SHARED"],
+    )
+    worker = threading.Thread(target=manager.run_next_round)
+    worker.start()
+
+    try:
+        assert two_receivers_started.wait(2)
+        with lock:
+            initially_started = {task_id for task_id, _key, _accession in entered}
+        assert initially_started == {first.task_id, different_receiver.task_id}
+    finally:
+        release.set()
+    worker.join(2)
+
+    deadline = time.monotonic() + 2
+    while any(item.phase in {"queued", "running"} for item in manager.list_tasks()):
+        assert time.monotonic() < deadline
+        manager.run_next_round()
+
+    assert {
+        task_id for task_id, _key, _accession in entered[:2]
+    } == {first.task_id, different_receiver.task_id}
+    assert entered[-1][0] == same_receiver.task_id
+    assert peak_by_route[(("STORE_A", 6666), "SHARED")] == 1
+    assert peak_by_route[(("STORE_B", 7777), "SHARED")] == 1
+    assert all(item.phase == "completed" for item in manager.list_tasks())
     manager.shutdown()
 
 
@@ -1026,21 +1100,17 @@ def test_catalog_rejects_unknown_tasks_and_invalid_transitions(tmp_path):
         store.set_phase("missing", "mystery")
 
 
-def test_active_tasks_reject_duplicate_accessions_but_terminal_history_does_not(
-    tmp_path,
-):
+def test_active_tasks_allow_duplicate_accessions_across_tasks(tmp_path):
     store = catalog(tmp_path)
     first = store.create_task(AppConfig(), ["A001"])
-    with pytest.raises(TaskStateError, match="A001"):
-        store.create_task(AppConfig(), ["A001", "B001"])
+    second = store.create_task(AppConfig(), ["A001", "B001"])
 
-    store.record_result(first.task_id, completed("A001"))
-    store.set_phase(first.task_id, "completed")
-    replacement = store.create_task(AppConfig(), ["A001"])
-    assert replacement.task_id != first.task_id
+    assert first.task_id != second.task_id
+    assert store.next_pending(first.task_id) == "A001"
+    assert store.next_pending(second.task_id) == "A001"
 
 
-def test_concurrent_task_creation_cannot_bypass_duplicate_check(tmp_path):
+def test_concurrent_task_creation_allows_duplicate_accessions(tmp_path):
     first = catalog(tmp_path)
     second = catalog(tmp_path)
     barrier = threading.Barrier(2)
@@ -1063,12 +1133,12 @@ def test_concurrent_task_creation_cannot_bypass_duplicate_check(tmp_path):
     for thread in threads:
         thread.join(3)
 
-    assert len(created) == 1
-    assert len(errors) == 1
-    assert "SHARED" in errors[0]
+    assert len(created) == 2
+    assert errors == []
+    assert len({item.task_id for item in created}) == 2
 
 
-def test_retry_cannot_reactivate_accession_owned_by_another_active_task(tmp_path):
+def test_retry_can_reactivate_accession_owned_by_another_active_task(tmp_path):
     store = catalog(tmp_path)
     failed = store.create_task(AppConfig(), ["SHARED"])
     store.record_result(
@@ -1082,10 +1152,10 @@ def test_retry_cannot_reactivate_accession_owned_by_another_active_task(tmp_path
         lambda _task_id, _config, accession: completed(accession),
     )
 
-    with pytest.raises(TaskStateError, match="SHARED"):
-        manager.retry_task(failed.task_id)
+    retried = manager.retry_task(failed.task_id)
 
-    assert store.get_summary(failed.task_id).phase == "failed"
+    assert retried.phase == "queued"
+    assert store.next_pending(failed.task_id) == "SHARED"
 
 
 def test_task_receiver_configuration_is_snapshotted_per_active_task(tmp_path):
