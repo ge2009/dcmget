@@ -1,5 +1,5 @@
 {
-  "config_version": 5,
+  "config_version": 6,
   "dcmtk_bin_dir": "",
   "access_numbers_file_path": "access.txt",
   "dicom_destination_folder": "Dicom/Dest",
@@ -9,6 +9,7 @@
   "pacs_ae_title": "ANY-SCP",
   "storage_ae_title": "DCMGET",
   "storage_port": 6666,
+  "max_concurrent_moves": 2,
   "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
   "anonymization_enabled": false,
   "anonymization_profile": "research",

@@ -35,13 +35,17 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.6 DICOM 批量下载工具")
+    parser = argparse.ArgumentParser(description="DcmGet 2.8.0 DICOM 批量下载工具")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
         help="配置文件路径（默认：项目目录/config.json）",
     )
     parser.add_argument("--accessions", help="覆盖配置中的检查号 TXT 文件路径")
+    parser.add_argument(
+        "--task-id",
+        help="恢复 tasks.sqlite3 中指定的未完成或可重试任务",
+    )
     parser.add_argument("--password", help=argparse.SUPPRESS)
     parser.add_argument("--license", help="注册码文件路径")
     parser.add_argument(
@@ -86,13 +90,61 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
-    store = TaskCheckpointStore(args.task_state)
+    if args.task_state:
+        if args.task_id:
+            print(
+                "--task-id 不能与旧版 --task-state 同时使用。",
+                file=sys.stderr,
+            )
+            return 1
+        store = TaskCheckpointStore(args.task_state)
+    else:
+        try:
+            from dcmget.cli_tasks import (
+                CatalogCheckpointStore,
+                MultipleTasksError,
+                format_task_list,
+                select_cli_task,
+            )
+            from dcmget.task_manager import TaskCatalog
+        except ImportError as exc:
+            print(f"多任务组件不可用：{exc}", file=sys.stderr)
+            return 1
+        try:
+            catalog = TaskCatalog()
+            selected = select_cli_task(catalog, args.task_id)
+            store = CatalogCheckpointStore(
+                catalog,
+                selected.task_id if selected is not None else None,
+            )
+        except MultipleTasksError as exc:
+            print(str(exc), file=sys.stderr)
+            for line in format_task_list(exc.tasks):
+                print(line, file=sys.stderr)
+            return 1
+        except TaskStateError as exc:
+            print(f"任务选择失败：{exc}", file=sys.stderr)
+            return 1
     checkpoint = None
-    if store.path.is_file():
+    startup_cleanup_done = False
+    has_checkpoint = getattr(store, "has_checkpoint", store.path.is_file())
+    if has_checkpoint:
         if not store.try_acquire_lease():
             print("已有 DcmGet 实例正在使用未完成任务。", file=sys.stderr)
             return 1
         try:
+            cleanup_all = getattr(store, "cleanup_startup_processes", None)
+            if callable(cleanup_all):
+                for message in cleanup_all():
+                    print(f"[恢复] {message}")
+                startup_cleanup_done = True
+            prepare_selected_retry = getattr(
+                store,
+                "prepare_selected_retry",
+                None,
+            )
+            if callable(prepare_selected_retry) and not args.discard_checkpoint:
+                prepare_selected_retry()
             if args.discard_checkpoint:
                 try:
                     discarded = store.load()
@@ -114,11 +166,16 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     for path in removed:
                         print(f"[PDI] 已删除中断的暂存目录：{path}")
+                if discarded is not None and not startup_cleanup_done:
+                    for message in store.cleanup_recorded_processes(
+                        discarded.task_id
+                    ):
+                        print(f"[恢复] {message}")
                 store.clear()
                 print("已放弃旧任务恢复点；已下载文件保持不变。")
             else:
                 checkpoint = store.load()
-                if checkpoint is not None:
+                if checkpoint is not None and not startup_cleanup_done:
                     for message in store.cleanup_recorded_processes(
                         checkpoint.task_id
                     ):
@@ -210,6 +267,11 @@ def main(argv: list[str] | None = None) -> int:
             print("另一个 DcmGet 实例正在启动任务。", file=sys.stderr)
             return 1
         try:
+            cleanup_all = getattr(store, "cleanup_startup_processes", None)
+            if callable(cleanup_all) and not startup_cleanup_done:
+                for message in cleanup_all():
+                    print(f"[恢复] {message}")
+                startup_cleanup_done = True
             checkpoint = store.start(
                 config,
                 accessions,
@@ -233,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def consume_trial_when_ready() -> None:
         trial = consume_trial(task_id=task_id)
+        mark_consumed = getattr(store, "mark_trial_consumed", None)
+        if mark_consumed is not None:
+            mark_consumed(task_id)
         print(f"[授权] 本次使用免费试用，剩余 {trial.remaining} 次")
 
     runner: DownloadRunner | None = None
@@ -252,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if accessions:
+            store.set_phase(task_id, "downloading")
             runner = DownloadRunner(
                 config,
                 tools,
@@ -331,6 +397,9 @@ def main(argv: list[str] | None = None) -> int:
         if cancel_requested.is_set():
             exporter.request_cancel()
         pdi_result = exporter.export(summary.archived_files)
+        save_pdi_result = getattr(store, "save_pdi_result", None)
+        if callable(save_pdi_result):
+            save_pdi_result(task_id, pdi_result)
         if pdi_result.output_directory:
             print(f"[PDI] 输出目录：{pdi_result.output_directory}")
         if pdi_result.status == PdiStatus.CANCELLED:

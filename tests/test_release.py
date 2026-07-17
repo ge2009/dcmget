@@ -35,6 +35,20 @@ def test_source_deploy_contains_transitive_requirement_files():
     bundled = {path.relative_to(root).as_posix() for path in source_files(root)}
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
+    assert "dcmget/storage_scp.py" in bundled
+
+
+def test_pynetdicom_is_a_runtime_and_frozen_build_dependency():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    project = (root / "pyproject.toml").read_text(encoding="utf-8")
+    build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
+    notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+
+    assert "pynetdicom>=3.0,<4" in requirements
+    assert '"pynetdicom>=3.0,<4"' in project
+    assert '"--collect-submodules",\n        "pynetdicom"' in build
+    assert "pynetdicom" in notices
 
 
 def test_brand_assets_are_real_hidpi_images_and_windows_icon_has_256px():
@@ -112,7 +126,7 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert "/DAppVersion=2.0.0" not in workflow
 
 
-def test_windows_firewall_is_limited_to_storescp_and_private_networks():
+def test_windows_firewall_is_limited_to_receiver_and_private_networks():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
     bootstrap = (root / "scripts/bootstrap_windows.ps1").read_text(encoding="utf-8")
@@ -120,24 +134,23 @@ def test_windows_firewall_is_limited_to_storescp_and_private_networks():
         encoding="utf-8"
     )
 
-    assert 'program=""{app}\\_internal\\.runtime\\dcmtk' in installer
+    assert 'program=""{app}\\{#AppExeName}""' in installer
     assert "profile=domain,private" in installer
     assert 'localport=6666' not in installer
-    assert '#define FirewallRule "DcmGet storescp TCP"' in installer
-    assert '#define LegacyFirewallRule "DcmGet storescp TCP 6666"' in installer
-    assert "-Program $Storescp.FullName" in bootstrap
+    assert '#define FirewallRule "DcmGet Receiver TCP"' in installer
+    assert '#define LegacyFirewallRule "DcmGet storescp TCP"' in installer
+    assert '#define LegacyPortFirewallRule "DcmGet storescp TCP 6666"' in installer
+    assert "-Program $ReceiverProgram" in bootstrap
     assert "-Profile Domain,Private" in bootstrap
-    assert '$RuleName = "DcmGet storescp TCP"' in bootstrap
-    assert 'Get-NetFirewallRule -DisplayName "DcmGet storescp TCP*"' in bootstrap
+    assert '$RuleName = "DcmGet Receiver TCP"' in bootstrap
+    assert 'Resolve-Path ".venv\\Scripts\\python.exe"' in bootstrap
     assert "$firewallRules.Count -ne 1" in workflow
     assert 'LocalPort.ToString() -ne "Any"' in workflow
     assert '"storage_port":16666' in workflow
+    assert "Upgrade left the legacy storescp program rule behind" in workflow
     assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
     assert "$applicationFilters.Count -ne 1" in workflow
-    assert (
-        ".runtime\\dcmtk\\windows-x86_64\\dcmtk-3.7.0-win64-dynamic"
-        "\\bin\\storescp.exe"
-    ) in workflow
+    assert 'Join-Path $installDir "DcmGet.exe"' in workflow
     assert "[StringComparison]::OrdinalIgnoreCase" in workflow
     assert "$profileNames.Count -ne 2" in workflow
     assert '$profileNames -notcontains "Domain"' in workflow

@@ -17,7 +17,7 @@ from dcmget.diagnostics import (
 
 install_diagnostics(__version__)
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 install_qt_message_handler()
@@ -29,14 +29,19 @@ from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
 from dcmget.release_notes import load_release_notes
 from dcmget.ui import APP_STYLESHEET, DcmGetWindow
 from dcmget.runtime import ensure_default_config, is_frozen, resource_root
+from dcmget.single_instance import SingleInstance
 from dcmget.task_state import TaskCheckpointStore, TaskStateError
 
 
 PROJECT_ROOT = resource_root()
 
 
+class _ActivationBridge(QObject):
+    requested = pyqtSignal()
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.6 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.8.0 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -219,8 +224,29 @@ def run_ui_self_test(config_path: str) -> int:
     return 0
 
 
+def resume_authorization_task_id(legacy_task_id: str | None) -> str | None:
+    """Find a previously charged unfinished task without loading its 40k rows."""
+
+    if legacy_task_id:
+        return legacy_task_id
+    try:
+        from dcmget.task_manager import TERMINAL_PHASES, TaskCatalog
+
+        catalog = TaskCatalog(auto_migrate=False)
+        for summary in catalog.list_tasks():
+            if summary.phase in TERMINAL_PHASES:
+                continue
+            trial_required, trial_consumed = catalog.trial_state(summary.task_id)
+            if trial_required and trial_consumed:
+                return summary.task_id
+    except (OSError, RuntimeError, TaskStateError):
+        return None
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    instance: SingleInstance | None = None
     self_test_requested = any(
         value in {"--self-test", "--ui-self-test"} for value in arguments
     )
@@ -231,28 +257,54 @@ def main(argv: list[str] | None = None) -> int:
         if args.ui_self_test:
             return run_ui_self_test(args.config)
 
+        instance = SingleInstance()
+        if not instance.start({"action": "activate"}):
+            instance.close()
+            return 0
         app = create_application()
     except Exception as exc:
+        if instance is not None:
+            instance.close()
         _report_startup_failure("DcmGet 启动失败", exc, self_test_requested)
         return 1
 
     resume_task_id = None
+    assert instance is not None
     try:
         checkpoint = TaskCheckpointStore().load()
         if checkpoint is not None:
             resume_task_id = checkpoint.task_id
     except TaskStateError:
         pass
+    resume_task_id = resume_authorization_task_id(resume_task_id)
 
     try:
         if not authorize_gui(resume_task_id):
             return 1
         window = DcmGetWindow(args.config, PROJECT_ROOT)
+        bridge = _ActivationBridge(window)
+
+        def activate_window() -> None:
+            if window.isMinimized():
+                window.showNormal()
+            else:
+                window.show()
+            window.raise_()
+            window.activateWindow()
+
+        bridge.requested.connect(activate_window)
+        instance.set_activation_handler(
+            lambda _payload: bridge.requested.emit()
+        )
+        app.aboutToQuit.connect(instance.close)
         window.show()
         return app.exec_()
     except Exception as exc:
         _report_startup_failure("DcmGet 主窗口启动失败", exc, False)
         return 1
+    finally:
+        if instance is not None:
+            instance.close()
 
 
 def _report_startup_failure(

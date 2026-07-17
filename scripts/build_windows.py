@@ -6,7 +6,6 @@ import hashlib
 import os
 import re
 import shutil
-import sys
 import zipfile
 from pathlib import Path
 
@@ -151,6 +150,8 @@ def pyinstaller_args(
         str(BUILD_ROOT / "spec"),
         "--paths",
         str(ROOT),
+        "--collect-submodules",
+        "pynetdicom",
         "--add-data",
         f"{ROOT / 'logo.png'}:.",
         "--add-data",

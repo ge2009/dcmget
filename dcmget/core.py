@@ -27,6 +27,9 @@ from .diagnostics import PrivateRotatingFileHandler
 from .runtime import ensure_application_state_dir
 
 
+_archive_publish_lock = threading.Lock()
+
+
 class AccessionStatus(str, Enum):
     WAITING = "等待"
     DOWNLOADING = "下载中"
@@ -490,7 +493,12 @@ def build_movescu_command(config: AppConfig, tools: ToolPaths, accession: str) -
     ]
 
 
-def preflight(config: AppConfig, resolver: DcmtkResolver) -> PreflightResult:
+def preflight(
+    config: AppConfig,
+    resolver: DcmtkResolver,
+    *,
+    check_port: bool = True,
+) -> PreflightResult:
     errors = config.validate()
     checks: list[tuple[str, bool, str]] = []
 
@@ -547,12 +555,14 @@ def preflight(config: AppConfig, resolver: DcmtkResolver) -> PreflightResult:
             errors["pdi_output_folder"] = message
             checks.append(("PDI 输出目录", False, message))
 
-    if "storage_port" not in errors:
+    if check_port and "storage_port" not in errors:
         available = is_port_available(config.storage_port)
         message = "端口可用" if available else f"端口 {config.storage_port} 已被占用"
         checks.append(("接收端口", available, message))
         if not available:
             errors["storage_port"] = message
+    elif "storage_port" not in errors:
+        checks.append(("接收端口", True, "将在任务获得运行机会时检查"))
 
     checks.append(
         (
@@ -585,6 +595,7 @@ class DownloadRunner:
         progress_callback: ProgressCallback | None = None,
         ready_callback: ReadyCallback | None = None,
         process_callback: ProcessCallback | None = None,
+        log_file_name: str = "dcmget.log",
     ):
         self.config = config
         self.tools = tools
@@ -592,9 +603,13 @@ class DownloadRunner:
         self.state_callback = state_callback or (lambda _state: None)
         self.progress_callback = progress_callback or (lambda _index, _total, _result: None)
         self.ready_callback = ready_callback or (lambda: None)
+        self._move_started_notified = False
         self.process_callback = process_callback or (
             lambda _kind, _pid, _executable, _active: None
         )
+        if Path(log_file_name).name != log_file_name or not log_file_name:
+            raise ValueError("日志文件名无效")
+        self._log_file_name = log_file_name
         self._cancel = threading.Event()
         self._pause_condition = threading.Condition()
         self._pause_requested = False
@@ -618,6 +633,14 @@ class DownloadRunner:
         )
 
     def request_cancel(self) -> None:
+        self._request_cancel(include_receiver=True)
+
+    def request_cancel_current_move(self) -> None:
+        """Cancel only the active C-MOVE while keeping a shared receiver alive."""
+
+        self._request_cancel(include_receiver=False)
+
+    def _request_cancel(self, *, include_receiver: bool) -> None:
         self._cancel.set()
         with self._pause_condition:
             self._pause_condition.notify_all()
@@ -627,21 +650,62 @@ class DownloadRunner:
                 return
             cleanup = threading.Thread(
                 target=self._cancel_running_processes,
+                kwargs={"include_receiver": include_receiver},
                 name="dcmtk-cancel-cleanup",
                 daemon=True,
             )
             self._cancel_cleanup_thread = cleanup
             cleanup.start()
 
-    def _cancel_running_processes(self) -> None:
+    def _cancel_running_processes(self, *, include_receiver: bool = True) -> None:
         with self._process_lock:
-            processes = (self._current_process, self._storescp_process)
+            processes = (
+                (self._current_process, self._storescp_process)
+                if include_receiver
+                else (self._current_process,)
+            )
         seen: set[int] = set()
         for process in processes:
             if process is None or id(process) in seen:
                 continue
             seen.add(id(process))
             self._terminate_process_safely(process)
+
+    def run_accession(
+        self,
+        accession: str,
+        staging: Path,
+        receiver_process: object,
+    ) -> AccessionResult:
+        """Run one C-MOVE through an already-running shared receiver.
+
+        The caller owns the receiver process and staging directory.  This
+        runner only owns its ``movescu`` child, so cancelling one task cannot
+        interrupt downloads queued for other tasks.
+        """
+
+        if not staging.is_dir():
+            raise RuntimeError(f"共享暂存目录不存在：{staging}")
+        receiver_poll = getattr(receiver_process, "poll", None)
+        if not callable(receiver_poll):
+            raise RuntimeError("共享 DICOM 接收器不支持存活检查")
+        receiver_exit_code = receiver_poll()
+        if receiver_exit_code is not None:
+            raise RuntimeError(
+                f"DICOM 接收器已退出，退出码 {receiver_exit_code}"
+            )
+        self._staging_accession_cache.clear()
+        with self._process_lock:
+            if self._storescp_process is not None:
+                raise RuntimeError("当前执行器已连接到另一个 storescp")
+            self._storescp_process = receiver_process
+        try:
+            return self._download_one(accession, staging, 1, 1)
+        finally:
+            with self._process_lock:
+                if self._storescp_process is receiver_process:
+                    self._storescp_process = None
+            self._close_file_logger()
 
     def _terminate_process_safely(self, process: subprocess.Popen[str]) -> None:
         """Terminate one child once when cancellation races worker cleanup."""
@@ -695,8 +759,6 @@ class DownloadRunner:
                     "info",
                 )
             self._start_storescp(staging)
-            if not self._cancel.is_set():
-                self.ready_callback()
             self.state_callback("downloading")
             for index, accession in enumerate(values, 1):
                 if self._cancel.is_set():
@@ -812,7 +874,7 @@ class DownloadRunner:
                     receiver_exit_code = receiver.poll()
                     if receiver_exit_code is not None:
                         self._emit(
-                            "storescp",
+                            "接收器",
                             f"接收器意外退出，退出码 {receiver_exit_code}",
                             "error",
                         )
@@ -1009,6 +1071,22 @@ class DownloadRunner:
                     self._notify_process(
                         "movescu", getattr(process, "pid", 0), command[0], True
                     )
+                    if not self._move_started_notified:
+                        try:
+                            self.ready_callback()
+                        except Exception:
+                            self._terminate_process_safely(process)
+                            with self._process_lock:
+                                if self._current_process is process:
+                                    self._current_process = None
+                            self._notify_process(
+                                "movescu",
+                                getattr(process, "pid", 0),
+                                command[0],
+                                False,
+                            )
+                            raise
+                        self._move_started_notified = True
                     return process, started
             if not self._wait_if_paused():
                 return None
@@ -1127,7 +1205,7 @@ class DownloadRunner:
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
         handler = PrivateRotatingFileHandler(
-            log_dir / "dcmget.log",
+            log_dir / self._log_file_name,
             maxBytes=self.config.max_log_file_size_bytes,
             backupCount=5,
             encoding="utf-8",
@@ -1537,12 +1615,15 @@ def _validate_dicom_stream(
 
 
 def _publish_or_deduplicate(source: Path, target: Path) -> None:
-    if not target.exists():
-        os.replace(source, target)
-        return
-    if _file_sha256(source) != _file_sha256(target):
-        raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
-    source.unlink()
+    # Separate DownloadRunner instances can archive into the same destination.
+    # Keep existence checking, conflict verification and publication atomic.
+    with _archive_publish_lock:
+        if not target.exists():
+            os.replace(source, target)
+            return
+        if _file_sha256(source) != _file_sha256(target):
+            raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+        source.unlink()
 
 
 def _file_sha256(path: Path) -> str:

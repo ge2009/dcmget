@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "2.7.1"
-description = "Cross-platform DCMTK C-MOVE download workstation"
+version = "2.8.0"
+description = "Cross-platform multi-task DCMTK C-MOVE download workstation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,7 @@ dependencies = [
   "cryptography>=44,<47",
   "filelock>=3.16,<4",
   "pydicom>=3.0,<4",
+  "pynetdicom>=3.0,<4",
   "psutil>=6.1,<8",
 ]
 

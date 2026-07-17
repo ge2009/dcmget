@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.7.1"
+  #define AppVersion "2.8.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -19,8 +19,9 @@
 
 #define AppName "DcmGet"
 #define AppExeName "DcmGet.exe"
-#define FirewallRule "DcmGet storescp TCP"
-#define LegacyFirewallRule "DcmGet storescp TCP 6666"
+#define FirewallRule "DcmGet Receiver TCP"
+#define LegacyFirewallRule "DcmGet storescp TCP"
+#define LegacyPortFirewallRule "DcmGet storescp TCP 6666"
 
 [Setup]
 AppId={{40A584F5-1E96-4BA0-92DD-4543A404B586}
@@ -29,7 +30,7 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 UninstallDisplayName={#AppName}
 AppPublisher=DcmGet contributors
-AppComments=包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
+AppComments=多任务 DICOM 下载工作台，包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
 DefaultDirName={autopf}\DcmGet
 DefaultGroupName=DcmGet
 DisableProgramGroupPage=yes
@@ -86,9 +87,11 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 #endif
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\{#AppExeName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExeName}"; Description: "启动 DcmGet"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetFirewallRule"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyPortFirewallRule"

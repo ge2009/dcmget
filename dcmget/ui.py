@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import html
-import os
 import re
 import socket
 import sys
 import threading
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PyQt5.QtCore import (
@@ -102,6 +103,9 @@ from .task_state import (
     TaskStateError,
     merge_checkpoint_summary,
 )
+from .task_manager import TaskSummary, shared_receiver_config
+from .task_controller import TaskExecutionController
+from .task_widgets import TaskWorkspace
 
 
 COLORS = {
@@ -307,10 +311,10 @@ class SettingsPage(QWidget):
         dcmtk_row_layout.setContentsMargins(0, 0, 0, 0)
         self.dcmtk_edit = QLineEdit()
         self.dcmtk_edit.setPlaceholderText("留空时自动检测系统 PATH 或 .runtime")
-        browse = QPushButton("选择目录")
-        browse.clicked.connect(self._browse_dcmtk)
+        self.dcmtk_browse_button = QPushButton("选择目录")
+        self.dcmtk_browse_button.clicked.connect(self._browse_dcmtk)
         dcmtk_row_layout.addWidget(self.dcmtk_edit, 1)
-        dcmtk_row_layout.addWidget(browse)
+        dcmtk_row_layout.addWidget(self.dcmtk_browse_button)
         dcmtk_form.addRow("bin 目录", dcmtk_row)
         self.dcmtk_status_label = QLabel("工具状态")
         self.dcmtk_hint = QLabel()
@@ -335,6 +339,17 @@ class SettingsPage(QWidget):
         self.storage_ae_edit = QLineEdit()
         self.storage_ae_edit.setMaxLength(16)
         self.storage_port_edit = self._port_edit()
+        self.max_concurrent_moves_spin = QSpinBox()
+        self.max_concurrent_moves_spin.setRange(1, 8)
+        self.max_concurrent_moves_spin.setSuffix(" 个")
+        self.max_concurrent_moves_spin.setAccessibleName("最大并发下载数")
+        concurrency_tooltip = (
+            "同时运行的 C-MOVE 数量；默认 2，过高可能增加 PACS 和网络压力"
+        )
+        self.max_concurrent_moves_spin.setToolTip(concurrency_tooltip)
+        self.max_concurrent_moves_spin.setProperty(
+            "unlockedToolTip", concurrency_tooltip
+        )
         self.directory_template_combo = QComboBox()
         self.directory_template_combo.setEditable(True)
         self.directory_template_combo.addItems(DIRECTORY_TEMPLATES)
@@ -346,6 +361,13 @@ class SettingsPage(QWidget):
         self.log_size_spin.setSuffix(" MB")
         receiver_form.addRow("接收 AE", self.storage_ae_edit)
         receiver_form.addRow("监听端口", self.storage_port_edit)
+        receiver_form.addRow("并发下载数", self.max_concurrent_moves_spin)
+        concurrency_hint = QLabel(
+            "默认同时下载 2 个检查号；其余任务会显示为“等待并发槽”。"
+        )
+        concurrency_hint.setObjectName("FieldHint")
+        concurrency_hint.setWordWrap(True)
+        receiver_form.addRow("", concurrency_hint)
         receiver_form.addRow("目录模板", self.directory_template_combo)
         directory_hint = QLabel(
             "可编辑组合：{PatientID}、{AccessionNumber}、{StudyInstanceUID}"
@@ -478,6 +500,7 @@ class SettingsPage(QWidget):
             "pacs_ae_title": self.pacs_ae_edit,
             "storage_ae_title": self.storage_ae_edit,
             "storage_port": self.storage_port_edit,
+            "max_concurrent_moves": self.max_concurrent_moves_spin,
             "directory_template": self.directory_template_combo,
             "anonymization_profile": self.anonymization_profile_combo,
             "pdi_institution_name": self.pdi_institution_edit,
@@ -525,6 +548,7 @@ class SettingsPage(QWidget):
         self.pacs_ae_edit.setText(config.pacs_ae_title)
         self.storage_ae_edit.setText(config.storage_ae_title)
         self.storage_port_edit.setText(str(config.storage_port))
+        self.max_concurrent_moves_spin.setValue(config.max_concurrent_moves)
         self.directory_template_combo.setCurrentText(config.directory_template)
         self.anonymization_enabled_checkbox.setChecked(config.anonymization_enabled)
         profile_index = self.anonymization_profile_combo.findData(
@@ -555,6 +579,7 @@ class SettingsPage(QWidget):
             pacs_ae_title=self.pacs_ae_edit.text().strip(),
             storage_ae_title=self.storage_ae_edit.text().strip(),
             storage_port=self._port_value(self.storage_port_edit),
+            max_concurrent_moves=self.max_concurrent_moves_spin.value(),
             directory_template=self.directory_template_combo.currentText().strip(),
             anonymization_enabled=self.anonymization_enabled_checkbox.isChecked(),
             anonymization_profile=str(
@@ -612,7 +637,8 @@ class SettingsPage(QWidget):
         for field, widget in self._field_widgets.items():
             message = errors.get(field, "")
             widget.setProperty("invalid", bool(message))
-            widget.setToolTip(message)
+            unlocked_tooltip = str(widget.property("unlockedToolTip") or "")
+            widget.setToolTip(message or unlocked_tooltip)
             widget.setAccessibleDescription(message)
             widget.style().unpolish(widget)
             widget.style().polish(widget)
@@ -635,6 +661,23 @@ class SettingsPage(QWidget):
         self.dcmtk_hint.style().polish(self.dcmtk_hint)
         self.dcmtk_status_label.setVisible(not ok)
         self.dcmtk_hint.setVisible(not ok)
+
+    def set_shared_settings_locked(self, locked: bool) -> None:
+        message = "有未结束任务时由应用全局锁定" if locked else ""
+        for widget in (
+            self.dcmtk_edit,
+            self.dcmtk_browse_button,
+            self.pacs_host_edit,
+            self.pacs_port_edit,
+            self.calling_ae_edit,
+            self.pacs_ae_edit,
+            self.storage_ae_edit,
+            self.storage_port_edit,
+            self.max_concurrent_moves_spin,
+        ):
+            widget.setEnabled(not locked)
+            unlocked_tooltip = str(widget.property("unlockedToolTip") or "")
+            widget.setToolTip(message if locked else unlocked_tooltip)
 
     def _browse_dcmtk(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择 DCMTK bin 目录", self.dcmtk_edit.text())
@@ -847,6 +890,7 @@ class DcmGetWindow(QMainWindow):
         task_state_path: str | Path | None = None,
         *,
         offer_task_resume: bool = True,
+        enable_multi_task: bool | None = None,
     ):
         super().__init__()
         self.config_path = Path(config_path)
@@ -854,6 +898,19 @@ class DcmGetWindow(QMainWindow):
         self.config = load_config(self.config_path)
         self.resolver = DcmtkResolver(self.project_root)
         self.task_store = TaskCheckpointStore(task_state_path)
+        self.multi_task_enabled = (
+            offer_task_resume if enable_multi_task is None else enable_multi_task
+        )
+        self.task_controller: TaskExecutionController | None = None
+        self._task_catalog_path = (
+            Path(task_state_path).expanduser().with_name("tasks.sqlite3")
+            if task_state_path is not None
+            else None
+        )
+        self._selected_task_id = ""
+        self._multi_task_editor_active = True
+        self._multi_log_events: list[tuple[str, str, str, str]] = []
+        self._last_pdi_results: dict[str, object] = {}
         self.tools: ToolPaths | None = None
         self.worker: DownloadWorker | None = None
         self.worker_thread: QThread | None = None
@@ -903,6 +960,7 @@ class DcmGetWindow(QMainWindow):
         self._summary_processed = 0
         self._summary_files = 0
         self._summary_status_counts: dict[AccessionStatus, int] = {}
+        self._workspace_task_summaries: dict[str, TaskSummary] = {}
         self._compact_action_layout: bool | None = None
         self.settings_store = QSettings("DcmGet", "DcmGet2")
         self._log_panel_expanded = self.settings_store.value(
@@ -919,6 +977,7 @@ class DcmGetWindow(QMainWindow):
         if logo.exists():
             self.setWindowIcon(QIcon(str(logo)))
         self._build_ui()
+        self.task_workspace.set_concurrency_limit(self.config.max_concurrent_moves)
         self._restore_ui_state()
         self.settings_page.set_config(self.config)
         self._reset_pdi_status_card()
@@ -927,7 +986,7 @@ class DcmGetWindow(QMainWindow):
         self._sync_quick_pdi_controls_from_config()
         self._load_configured_accessions()
         QTimer.singleShot(0, self._refresh_tool_status)
-        if offer_task_resume:
+        if offer_task_resume and not self.multi_task_enabled:
             QTimer.singleShot(0, self._offer_task_resume)
 
     def _build_ui(self) -> None:
@@ -939,7 +998,21 @@ class DcmGetWindow(QMainWindow):
         root_layout.addWidget(self.header)
 
         self.pages = QStackedWidget()
-        self.task_page = self._build_task_page()
+        self.task_detail_page = self._build_task_page()
+        self.task_workspace = TaskWorkspace(self.task_detail_page)
+        self.task_workspace.new_task_requested.connect(
+            self._show_new_task_editor
+        )
+        self.task_workspace.task_selected.connect(
+            self._on_workspace_task_selected
+        )
+        self.task_workspace.compact_mode_changed.connect(
+            lambda _compact: self._update_responsive_layouts(force=True)
+        )
+        self.task_workspace.splitter.splitterMoved.connect(
+            lambda _position, _index: self._update_responsive_layouts(force=True)
+        )
+        self.task_page = self.task_workspace
         self.pages.addWidget(self.task_page)
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
@@ -947,6 +1020,7 @@ class DcmGetWindow(QMainWindow):
         self.pages.addWidget(self.settings_page)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
+        self.task_workspace.show_detail()
         self.setStyleSheet(APP_STYLESHEET)
         for widget in (
             self.app_title,
@@ -1347,7 +1421,12 @@ class DcmGetWindow(QMainWindow):
             self._update_responsive_layouts()
 
     def _update_responsive_layouts(self, *, force: bool = False) -> None:
-        compact = self.width() < 900
+        detail_width = (
+            self.task_scroll.viewport().width()
+            if hasattr(self, "task_scroll")
+            else self.width()
+        )
+        compact = detail_width < 900
         if not force and compact == self._compact_action_layout:
             return
         self._compact_action_layout = compact
@@ -1411,12 +1490,20 @@ class DcmGetWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         header.addWidget(title)
         header.addStretch()
+        self.log_scope_combo = QComboBox()
+        self.log_scope_combo.setAccessibleName("日志范围")
+        self.log_scope_combo.addItem("本任务", "task")
+        self.log_scope_combo.addItem("全部", "all")
+        self.log_scope_combo.currentIndexChanged.connect(
+            self._refresh_multi_log_view
+        )
+        header.addWidget(self.log_scope_combo)
         open_result = QPushButton("打开结果")
         open_result.clicked.connect(self._open_selected_result)
         copy_error = QPushButton("复制详情")
         copy_error.clicked.connect(self._copy_selected_detail)
         clear = QPushButton("清空日志")
-        clear.clicked.connect(lambda: self.log_edit.clear())
+        clear.clicked.connect(self._clear_logs)
         open_logs = QPushButton("日志目录")
         open_logs.clicked.connect(self._open_log_directory)
         for button in (open_result, copy_error, clear, open_logs):
@@ -1440,10 +1527,213 @@ class DcmGetWindow(QMainWindow):
             )
         )
 
+    @staticmethod
+    def _workspace_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _workspace_task_id(self) -> str:
+        if self._active_task_id:
+            return self._active_task_id
+        if self._pdi_task_id:
+            return self._pdi_task_id
+        if self._resume_checkpoint is not None:
+            return self._resume_checkpoint.task_id
+        return self.task_workspace.selected_task_id
+
+    def _publish_workspace_summary(
+        self,
+        summary: TaskSummary,
+        *,
+        select: bool = False,
+    ) -> None:
+        self._workspace_task_summaries[summary.task_id] = summary
+        self.task_workspace.upsert_task(summary)
+        if select:
+            self.task_workspace.select_task(summary.task_id)
+
+    def _workspace_summary_from_checkpoint(
+        self,
+        checkpoint: TaskCheckpoint,
+        *,
+        phase: str | None = None,
+    ) -> TaskSummary:
+        results = list(checkpoint.results)
+        partials = list(checkpoint.partial_results.values())
+        completed_statuses = {
+            AccessionStatus.COMPLETED,
+            AccessionStatus.NO_DATA,
+        }
+        failed_statuses = {
+            AccessionStatus.FAILED,
+            AccessionStatus.PARTIAL,
+        }
+        total = len(checkpoint.accessions)
+        processed = len(results)
+        current = self._workspace_task_summaries.get(checkpoint.task_id)
+        now = self._workspace_timestamp()
+        return TaskSummary(
+            task_id=checkpoint.task_id,
+            name=f"任务 {checkpoint.task_id[:8]}",
+            phase=phase or checkpoint.phase,
+            total_count=total,
+            processed_count=processed,
+            pending_count=max(0, total - processed),
+            completed_count=sum(
+                result.status in completed_statuses for result in results
+            ),
+            failed_count=sum(result.status in failed_statuses for result in results),
+            file_count=sum(result.file_count for result in [*results, *partials]),
+            received_bytes=sum(
+                result.received_bytes for result in [*results, *partials]
+            ),
+            speed_bytes_per_second=(
+                current.speed_bytes_per_second if current is not None else 0.0
+            ),
+            queue_position=None,
+            current_accession=(current.current_accession if current is not None else ""),
+            error_message=(current.error_message if current is not None else ""),
+            created_at=checkpoint.created_at,
+            updated_at=now,
+        )
+
+    def _workspace_summary_from_batch(
+        self,
+        task_id: str,
+        batch: BatchSummary,
+        *,
+        phase: str,
+    ) -> TaskSummary:
+        current = self._workspace_task_summaries.get(task_id)
+        now = self._workspace_timestamp()
+        results = list(batch.results)
+        completed_statuses = {
+            AccessionStatus.COMPLETED,
+            AccessionStatus.NO_DATA,
+        }
+        failed_statuses = {
+            AccessionStatus.FAILED,
+            AccessionStatus.PARTIAL,
+        }
+        processed = sum(
+            result.status
+            in {
+                *completed_statuses,
+                *failed_statuses,
+            }
+            for result in results
+        )
+        total = current.total_count if current is not None else len(results)
+        return TaskSummary(
+            task_id=task_id,
+            name=(current.name if current is not None else f"任务 {task_id[:8]}"),
+            phase=phase,
+            total_count=total,
+            processed_count=processed,
+            pending_count=max(0, total - processed),
+            completed_count=sum(
+                result.status in completed_statuses for result in results
+            ),
+            failed_count=sum(result.status in failed_statuses for result in results),
+            file_count=sum(result.file_count for result in results),
+            received_bytes=sum(result.received_bytes for result in results),
+            speed_bytes_per_second=0.0,
+            queue_position=None,
+            current_accession="",
+            error_message=(current.error_message if current is not None else ""),
+            created_at=(current.created_at if current is not None else now),
+            updated_at=now,
+        )
+
+    def _update_workspace_phase(
+        self,
+        phase: str,
+        *,
+        error_message: str | None = None,
+    ) -> None:
+        task_id = self._workspace_task_id()
+        current = self._workspace_task_summaries.get(task_id)
+        if current is None:
+            return
+        self._publish_workspace_summary(
+            replace(
+                current,
+                phase=phase,
+                error_message=(
+                    current.error_message
+                    if error_message is None
+                    else error_message
+                ),
+                updated_at=self._workspace_timestamp(),
+            )
+        )
+
+    def _show_new_task_editor(self) -> None:
+        self.pages.setCurrentWidget(self.task_page)
+        self.task_workspace.show_detail()
+        if self.multi_task_enabled:
+            self.task_workspace.clear_task_selection()
+            self._selected_task_id = ""
+            self._multi_task_editor_active = True
+            self._active_task_id = ""
+            self._resume_checkpoint = None
+            self._pdi_task_id = ""
+            self.accession_edit.setReadOnly(False)
+            self.accession_edit.clear()
+            self.accession_edit.setPlaceholderText("每行一个检查号")
+            self.destination_edit.setReadOnly(False)
+            self.destination_edit.setText(self.config.dicom_destination_folder)
+            self._populate_waiting_rows([])
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("新建下载任务")
+            self.stop_button.hide()
+            self.pause_button.hide()
+            self.retry_button.hide()
+            self.start_button.show()
+            self.start_button.setEnabled(True)
+            concurrent = sum(
+                summary.phase
+                in {"preflight", "starting_receiver", "running", "pause_pending", "cancelling"}
+                for summary in self._workspace_task_summaries.values()
+            )
+            waiting = any(
+                summary.phase == "queued"
+                for summary in self._workspace_task_summaries.values()
+            )
+            if concurrent == 0 and not waiting:
+                start_text = "创建并开始"
+            elif concurrent < self.config.max_concurrent_moves and not waiting:
+                start_text = "创建并并发开始"
+            else:
+                start_text = "创建并等待并发槽"
+            self.start_button.setText(start_text)
+            self._refresh_multi_log_view()
+        self._set_task_form_expanded(True)
+        self.task_scroll.ensureWidgetVisible(self.accession_edit, 0, 24)
+        self.accession_edit.setFocus(Qt.OtherFocusReason)
+
+    def _on_workspace_task_selected(self, task_id: str) -> None:
+        self.pages.setCurrentWidget(self.task_page)
+        self.task_workspace.show_detail()
+        if self.multi_task_enabled and task_id:
+            self._selected_task_id = task_id
+            self._multi_task_editor_active = False
+            self._refresh_multi_log_view()
+            self._load_multi_task_detail(task_id)
+
     def _show_settings(self) -> None:
         if self._is_busy():
             return
+        shared_locked = bool(
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and any(
+                item.phase not in {"completed", "failed", "cancelled"}
+                for item in self.task_controller.list_tasks()
+            )
+        )
         self.settings_page.set_config(self.config)
+        self.settings_page.set_shared_settings_locked(shared_locked)
         self.pages.setCurrentIndex(1)
 
     def _choose_accession_file_from_shortcut(self) -> None:
@@ -1505,6 +1795,32 @@ class DcmGetWindow(QMainWindow):
     def _save_settings(self, config: AppConfig) -> None:
         config.access_numbers_file_path = self.config.access_numbers_file_path
         config.dicom_destination_folder = self.destination_edit.text().strip()
+        if self.multi_task_enabled and self.task_controller is not None:
+            runtime_changed = (
+                shared_receiver_config(config)
+                != shared_receiver_config(self.config)
+            )
+            if runtime_changed:
+                unfinished = [
+                    item
+                    for item in self.task_controller.list_tasks()
+                    if item.phase not in {"completed", "failed", "cancelled"}
+                ]
+                if unfinished:
+                    QMessageBox.warning(
+                        self,
+                        "运行参数已锁定",
+                        "仍有未结束任务，暂时不能修改并发数、PACS、AE、接收端口或 DCMTK 路径。",
+                    )
+                    return
+                if not self.task_controller.shutdown():
+                    QMessageBox.warning(
+                        self,
+                        "设置未保存",
+                        "后台调度器尚未完全停止，请稍后重试。",
+                    )
+                    return
+                self.task_controller = None
         recovery_task_id = (
             self._resume_checkpoint.task_id
             if self._resume_checkpoint is not None
@@ -1531,6 +1847,7 @@ class DcmGetWindow(QMainWindow):
                 self._resume_checkpoint.config = AppConfig.from_dict(config.to_dict())
         self.config = config
         save_config(self.config_path, self.config)
+        self.task_workspace.set_concurrency_limit(self.config.max_concurrent_moves)
         self._sync_quick_pdi_controls_from_config()
         self.pages.setCurrentIndex(0)
         self.pdi_status_card.setVisible(self.config.pdi_export_enabled)
@@ -1562,10 +1879,280 @@ class DcmGetWindow(QMainWindow):
             text = f"DCMTK {self.tools.version} 已就绪"
             self._set_tool_status(text, "ok")
             self.settings_page.set_dcmtk_status(text, True)
+            if self.multi_task_enabled:
+                self._ensure_task_controller()
         except Exception as exc:
             self.tools = None
             self._set_tool_status("DCMTK 未就绪", "error")
             self.settings_page.set_dcmtk_status(str(exc), False)
+
+    def _ensure_task_controller(self) -> bool:
+        if not self.multi_task_enabled:
+            return False
+        if self.task_controller is not None:
+            return True
+        if self.tools is None:
+            return False
+        try:
+            controller = TaskExecutionController(
+                self.config,
+                self.tools,
+                catalog_path=self._task_catalog_path,
+                legacy_path=self.task_store.path,
+                before_task_move=lambda task_id: consume_trial(task_id=task_id),
+                project_root=self.project_root,
+                parent=self,
+            )
+        except Exception as exc:
+            self._append_log("多任务", str(exc), "error")
+            return False
+        controller.task_updated.connect(self._on_multi_task_updated)
+        controller.tasks_updated.connect(self._on_multi_tasks_updated)
+        controller.progress.connect(self._on_multi_progress)
+        controller.log.connect(self._on_multi_log)
+        controller.scheduler_error.connect(self._on_multi_scheduler_error)
+        controller.pdi_progress.connect(self._on_multi_pdi_progress)
+        controller.pdi_finished.connect(self._on_multi_pdi_finished)
+        self.task_controller = controller
+        for message in controller.startup_messages:
+            self._append_log("恢复", message, "warning")
+        initial_tasks = controller.list_tasks()
+        self._on_multi_tasks_updated(initial_tasks)
+        if initial_tasks and not self._selected_task_id:
+            self._selected_task_id = initial_tasks[0].task_id
+            self._multi_task_editor_active = False
+            self.task_workspace.select_task(self._selected_task_id)
+        controller.start()
+        return True
+
+    def _on_multi_tasks_updated(self, summaries: object) -> None:
+        if not self.multi_task_enabled:
+            return
+        values = list(summaries) if isinstance(summaries, (list, tuple)) else []
+        self._workspace_task_summaries = {
+            summary.task_id: summary for summary in values
+        }
+        self.task_workspace.set_tasks(values)
+        if self._selected_task_id:
+            self.task_workspace.select_task(self._selected_task_id)
+
+    def _on_multi_task_updated(self, summary: TaskSummary) -> None:
+        previous = self._workspace_task_summaries.get(summary.task_id)
+        self._workspace_task_summaries[summary.task_id] = summary
+        self.task_workspace.upsert_task(summary)
+        if summary.task_id != self._selected_task_id:
+            return
+        self._render_multi_summary(summary)
+        if (
+            previous is None
+            or previous.processed_count != summary.processed_count
+            or previous.phase != summary.phase
+        ):
+            self._load_multi_task_detail(summary.task_id)
+
+    def _load_multi_task_detail(self, task_id: str) -> None:
+        controller = self.task_controller
+        if controller is None or not task_id:
+            return
+        try:
+            detail = controller.manager.get_task_detail(
+                task_id,
+                accession_limit=TASK_TABLE_DETAIL_LIMIT + 1,
+            )
+        except TaskStateError as exc:
+            self._append_log("多任务", str(exc), "error")
+            return
+        summary = detail.summary
+        self._selected_task_id = task_id
+        self._display_total = summary.total_count
+        self._active_task_id = ""
+        self.destination_edit.setText(detail.config.dicom_destination_folder)
+        self.destination_edit.setReadOnly(True)
+        self.accession_edit.setReadOnly(True)
+        previous = self.quick_pdi_checkbox.blockSignals(True)
+        self.quick_pdi_checkbox.setChecked(detail.config.pdi_export_enabled)
+        self.quick_pdi_checkbox.blockSignals(previous)
+        self.quick_pdi_checkbox.setEnabled(False)
+        self.quick_pdi_output_button.setEnabled(False)
+        self._set_task_form_expanded(False)
+
+        if summary.total_count <= TASK_TABLE_DETAIL_LIMIT:
+            self._hidden_accession_count = 0
+            blocked = self.accession_edit.blockSignals(True)
+            self.accession_edit.setPlainText("\n".join(detail.accessions))
+            self.accession_edit.blockSignals(blocked)
+            self.current_accessions = list(detail.accessions)
+            self._populate_waiting_rows(detail.accessions)
+            for result in [*detail.results, *detail.partial_results.values()]:
+                self._set_result_row(result)
+        else:
+            blocked = self.accession_edit.blockSignals(True)
+            self.accession_edit.clear()
+            self.accession_edit.setPlaceholderText(
+                f"任务包含 {summary.total_count:,} 个检查号，明细已隐藏"
+            )
+            self.accession_edit.blockSignals(blocked)
+            self.current_accessions = []
+            self._hidden_accession_count = summary.total_count
+            self._task_table_summary_mode = True
+            self.task_table.setRowCount(0)
+            self.row_by_accession.clear()
+            self._summary_results = {}
+            self._summary_processed = summary.processed_count
+            self._summary_files = summary.file_count
+            self._summary_status_counts = {
+                AccessionStatus.COMPLETED: summary.completed_only_count,
+                AccessionStatus.NO_DATA: summary.no_data_count,
+                AccessionStatus.PARTIAL: summary.partial_count,
+                AccessionStatus.FAILED: summary.failed_only_count,
+                AccessionStatus.CANCELLED: summary.cancelled_count,
+            }
+            self._update_large_batch_summary_label(summary.total_count)
+            self._sync_task_detail_visibility()
+        self._render_multi_summary(summary)
+        self.last_pdi_result = self._last_pdi_results.get(task_id)
+        if self.last_pdi_result is None:
+            try:
+                self.last_pdi_result = controller.load_pdi_result(task_id)
+            except TaskStateError as exc:
+                self._append_log("PDI", f"无法恢复 PDI 结果：{exc}", "warning")
+            if self.last_pdi_result is not None:
+                self._last_pdi_results[task_id] = self.last_pdi_result
+        self._render_multi_pdi_result(summary)
+
+    def _render_multi_summary(self, summary: TaskSummary) -> None:
+        self.progress_bar.setRange(0, max(1, summary.total_count))
+        self.progress_bar.setValue(summary.processed_count)
+        speed = format_transfer_rate(summary.speed_bytes_per_second)
+        speed_text = f" · {speed}" if speed != "—" else ""
+        current = (
+            f" · {summary.current_accession}" if summary.current_accession else ""
+        )
+        self.progress_label.setText(
+            f"{summary.processed_count:,}/{summary.total_count:,}{current}"
+            f" · {summary.file_count:,} 个文件{speed_text}"
+        )
+        phase = summary.phase
+        running = phase in {"queued", "running", "pause_pending", "cancelling"}
+        stoppable = running or phase in {"paused", "pdi_pending", "pdi_running"}
+        self.start_button.hide()
+        self.stop_button.setVisible(stoppable)
+        self.stop_button.setEnabled(phase not in {"cancelling"})
+        self.pause_button.setVisible(phase in {"queued", "running", "pause_pending", "paused"})
+        self.pause_button.setEnabled(phase not in {"pause_pending"})
+        self.pause_button.setText("继续下载" if phase == "paused" else "暂停")
+        retryable = phase in {"failed", "cancelled", "download_retryable"}
+        self.retry_button.setVisible(retryable)
+        self.retry_button.setEnabled(retryable)
+        self.retry_button.setText("重试失败项" if phase == "download_retryable" else "恢复任务")
+        self.accept_partial_button.hide()
+        self.discard_resume_button.hide()
+        self.open_existing_pdi_button.setVisible(True)
+        self.settings_button.setEnabled(True)
+        if phase == "pause_pending":
+            self.progress_label.setText(
+                self.progress_label.text() + " · 当前检查号完成后暂停"
+            )
+        elif phase == "queued":
+            queue_text = (
+                f" · 队列第 {summary.queue_position} 位"
+                if summary.queue_position
+                else ""
+            )
+            self.progress_label.setText(
+                f"等待可用并发槽{queue_text} · "
+                f"已处理 {summary.processed_count:,}/{summary.total_count:,}"
+            )
+        elif phase == "pdi_pending":
+            self.progress_label.setText("下载完成，PDI 正在排队")
+        elif phase == "pdi_running":
+            self.progress_label.setText("下载完成，正在生成 PDI")
+        elif phase == "pdi_retryable":
+            self.progress_label.setText("下载完成，PDI 可重试")
+        elif phase == "completed":
+            self.progress_label.setText(
+                f"任务完成 · {summary.file_count:,} 个文件"
+            )
+        elif phase == "failed" and summary.error_message:
+            self.progress_label.setText(f"任务失败：{summary.error_message}")
+
+    def _on_multi_progress(
+        self,
+        task_id: str,
+        result: AccessionResult,
+    ) -> None:
+        if task_id != self._selected_task_id:
+            return
+        if self._task_table_summary_mode:
+            self._record_large_batch_result(
+                result,
+                total=self._display_total,
+            )
+        else:
+            self._set_result_row(result)
+        speed = format_transfer_rate(result.speed_bytes_per_second)
+        speed_text = f" · {speed}" if speed != "—" else ""
+        self.progress_label.setText(
+            f"{result.accession} · {result.status.value} · "
+            f"{result.file_count} 个文件{speed_text}"
+        )
+
+    def _on_multi_scheduler_error(self, task_id: str, message: str) -> None:
+        self._on_multi_log(task_id, "调度器", message, "error")
+        if task_id and task_id == self._selected_task_id:
+            self.progress_label.setText(f"任务中断：{message}")
+
+    def _on_multi_pdi_progress(
+        self,
+        task_id: str,
+        stage: object,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        if task_id != self._selected_task_id:
+            return
+        self.pdi_status_card.show()
+        self._set_pdi_status(message, "generating")
+        self.pdi_progress_bar.setRange(0, max(1, total))
+        self.pdi_progress_bar.setValue(current)
+
+    def _on_multi_pdi_finished(self, task_id: str, result: object) -> None:
+        self._last_pdi_results[task_id] = result
+        if task_id != self._selected_task_id:
+            return
+        self.last_pdi_result = result
+        status = str(getattr(getattr(result, "status", ""), "value", ""))
+        message = str(getattr(result, "message", "") or status)
+        self._set_pdi_status(
+            message,
+            "ok" if status == "完成" else "warning" if status == "部分成功" else "error",
+        )
+        self._render_multi_pdi_result(
+            self._workspace_task_summaries.get(task_id)
+        )
+
+    def _render_multi_pdi_result(self, summary: TaskSummary | None) -> None:
+        result = self._last_pdi_results.get(self._selected_task_id)
+        output = str(getattr(result, "output_directory", "") or "")
+        output_exists = bool(output and Path(output).is_dir())
+        pdi_phase = summary.phase if summary is not None else ""
+        enabled = bool(result) or pdi_phase.startswith("pdi_")
+        self.pdi_status_card.setVisible(enabled)
+        if result is not None and pdi_phase not in {"pdi_pending", "pdi_running"}:
+            status = str(getattr(getattr(result, "status", ""), "value", ""))
+            message = str(getattr(result, "message", "") or status)
+            display_state = (
+                "ok"
+                if status == "完成"
+                else "warning" if status == "部分成功" else "error"
+            )
+            self._set_pdi_status(message, display_state)
+        self.pdi_open_button.setEnabled(output_exists)
+        self.pdi_view_button.setEnabled(
+            bool(output_exists and pdi_viewer_command(output))
+        )
+        self.pdi_retry_button.setEnabled(pdi_phase == "pdi_retryable")
 
     def _set_tool_status(self, text: str, status: str) -> None:
         self.tool_status.setText(text)
@@ -1618,6 +2205,17 @@ class DcmGetWindow(QMainWindow):
         if checkpoint is None:
             self.task_store.release_lease()
             return
+        self._publish_workspace_summary(
+            self._workspace_summary_from_checkpoint(
+                checkpoint,
+                phase=(
+                    "interrupted"
+                    if checkpoint.phase == "downloading"
+                    else checkpoint.phase
+                ),
+            ),
+            select=True,
+        )
         pending = checkpoint.pending_accessions
         retryable_results = [
             result
@@ -1762,6 +2360,17 @@ class DcmGetWindow(QMainWindow):
     ) -> None:
         self._apply_checkpoint_config(checkpoint)
         self._resume_checkpoint = checkpoint
+        self._publish_workspace_summary(
+            self._workspace_summary_from_checkpoint(
+                checkpoint,
+                phase=(
+                    "interrupted"
+                    if checkpoint.phase == "downloading"
+                    else checkpoint.phase
+                ),
+            ),
+            select=True,
+        )
         self.last_summary = BatchSummary(list(checkpoint.results))
         self.progress_label.setText(message)
         self.task_store.release_lease()
@@ -2076,16 +2685,31 @@ class DcmGetWindow(QMainWindow):
                 f"{current.file_count:,} 个文件"
             )
         self.large_batch_summary_label.setText("\n".join(lines))
-        failed_accessions = self._failed_accessions_for_copy()
-        self.copy_failed_button.setVisible(bool(failed_accessions))
-        self.copy_failed_button.setEnabled(bool(failed_accessions))
+        failed_count = status.get(AccessionStatus.FAILED, 0) + status.get(
+            AccessionStatus.PARTIAL, 0
+        )
+        self.copy_failed_button.setVisible(bool(failed_count))
+        self.copy_failed_button.setEnabled(bool(failed_count))
         self.copy_failed_button.setToolTip(
-            f"复制 {len(failed_accessions):,} 个失败或部分成功的检查号"
-            if failed_accessions
+            f"复制 {failed_count:,} 个失败或部分成功的检查号"
+            if failed_count
             else ""
         )
 
     def _failed_accessions_for_copy(self) -> list[str]:
+        if (
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and self._selected_task_id
+            and self._task_table_summary_mode
+        ):
+            try:
+                return self.task_controller.manager.list_failed_accessions(
+                    self._selected_task_id
+                )
+            except TaskStateError as exc:
+                self._append_log("多任务", str(exc), "error")
+                return []
         return [
             result.accession
             for result in self._summary_results.values()
@@ -2110,12 +2734,101 @@ class DcmGetWindow(QMainWindow):
             not self._task_table_summary_mode or self._log_panel_expanded
         )
 
+    def _create_multi_task(self, override: list[str] | None = None) -> None:
+        if self.invalid_accessions and override is None:
+            examples = "、".join(self.invalid_accessions[:3])
+            QMessageBox.warning(
+                self,
+                "检查号包含危险字符",
+                "检查号不能包含 DICOM 通配符 *、?、反斜杠或控制字符。"
+                f"\n\n请修正：{examples}",
+            )
+            return
+        accessions = list(
+            override if override is not None else self.current_accessions
+        )
+        if not accessions:
+            self._append_log("应用", "请先导入至少一个检查号", "error")
+            QMessageBox.warning(
+                self,
+                "没有检查号",
+                "请选择 TXT 文件或粘贴检查号后再创建任务。",
+            )
+            return
+
+        task_config = AppConfig.from_dict(self.config.to_dict())
+        task_config.access_numbers_file_path = (
+            task_config.access_numbers_file_path or "access.txt"
+        )
+        task_config.dicom_destination_folder = self.destination_edit.text().strip()
+        task_config.pdi_export_enabled = self.quick_pdi_checkbox.isChecked()
+        check = preflight(task_config, self.resolver, check_port=False)
+        self._show_preflight(check)
+        self.settings_page.apply_errors(check.errors)
+        destination_error = check.errors.get("dicom_destination_folder", "")
+        self._set_destination_error(destination_error)
+        if not check.ok or check.tools is None:
+            self._append_log("预检", "新任务静态预检未通过", "error")
+            QMessageBox.warning(
+                self,
+                "预检未通过",
+                "请查看启动预检和设置页中的错误提示。",
+            )
+            return
+
+        entitled, use_trial, entitlement_message = prepare_download_entitlement(
+            self
+        )
+        if not entitled:
+            if entitlement_message:
+                self._append_log("授权", entitlement_message, "error")
+                QMessageBox.warning(self, "无法创建任务", entitlement_message)
+            return
+        if entitlement_message == "已完成软件注册":
+            self._refresh_entitlement_status()
+
+        self.tools = check.tools
+        if not self._ensure_task_controller() or self.task_controller is None:
+            QMessageBox.warning(
+                self,
+                "多任务服务未就绪",
+                "无法启动任务调度器，请查看运行日志。",
+            )
+            return
+        try:
+            summary = self.task_controller.create_task(
+                task_config,
+                accessions,
+                trial_required=use_trial,
+            )
+        except TaskStateError as exc:
+            self._append_log("多任务", str(exc), "error")
+            QMessageBox.warning(self, "无法创建任务", str(exc))
+            return
+
+        self.config.access_numbers_file_path = task_config.access_numbers_file_path
+        self.config.dicom_destination_folder = task_config.dicom_destination_folder
+        save_config(self.config_path, self.config)
+        self._selected_task_id = summary.task_id
+        self._multi_task_editor_active = False
+        self.task_workspace.select_task(summary.task_id)
+        self._set_task_form_expanded(False)
+        self._append_log(
+            "多任务",
+            f"已创建任务 {summary.task_id[:8]}，共 {summary.total_count:,} 个检查号",
+            "success",
+        )
+        self._load_multi_task_detail(summary.task_id)
+
     def _start_download(
         self,
         override: list[str] | None = None,
         *,
         resume_checkpoint: TaskCheckpoint | None = None,
     ) -> None:
+        if self.multi_task_enabled and resume_checkpoint is None:
+            self._create_multi_task(override)
+            return
         if self._is_busy():
             return
         if (
@@ -2281,6 +2994,13 @@ class DcmGetWindow(QMainWindow):
         self._active_task_id = checkpoint.task_id
         self._resume_checkpoint = checkpoint if resume_checkpoint is not None else None
         self._prior_results = checkpoint.results
+        self._publish_workspace_summary(
+            self._workspace_summary_from_checkpoint(
+                checkpoint,
+                phase="starting_receiver",
+            ),
+            select=True,
+        )
         self._display_total = len(display_accessions)
         self._progress_offset = len(self._prior_results)
         self._pdi_source_files = []
@@ -2430,6 +3150,10 @@ class DcmGetWindow(QMainWindow):
         self.registration_button.setEnabled(not running)
 
     def _on_worker_state(self, state: str) -> None:
+        workspace_phase = {
+            "partial": "download_retryable",
+        }.get(state, state)
+        self._update_workspace_phase(workspace_phase)
         labels = {
             "starting_receiver": "正在启动 DICOM 接收器…",
             "downloading": "接收器已就绪，正在下载…",
@@ -2465,6 +3189,55 @@ class DcmGetWindow(QMainWindow):
             f"{display_index}/{display_total} · {result.accession} · {result.status.value} · "
             f"{result.file_count} 个文件{speed_text}{pause_text}"
         )
+        task_id = self._active_task_id
+        workspace_summary = self._workspace_task_summaries.get(task_id)
+        if workspace_summary is not None:
+            final_statuses = {
+                AccessionStatus.COMPLETED,
+                AccessionStatus.NO_DATA,
+                AccessionStatus.PARTIAL,
+                AccessionStatus.FAILED,
+            }
+            is_final = result.status in final_statuses
+            processed_count = (
+                max(workspace_summary.processed_count, completed)
+                if is_final
+                else workspace_summary.processed_count
+            )
+            completed_count = workspace_summary.completed_count + int(
+                is_final
+                and result.status
+                in {AccessionStatus.COMPLETED, AccessionStatus.NO_DATA}
+            )
+            failed_count = workspace_summary.failed_count + int(
+                is_final
+                and result.status
+                in {AccessionStatus.PARTIAL, AccessionStatus.FAILED}
+            )
+            self._publish_workspace_summary(
+                replace(
+                    workspace_summary,
+                    phase="downloading",
+                    total_count=display_total,
+                    processed_count=processed_count,
+                    pending_count=max(0, display_total - processed_count),
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    file_count=(
+                        workspace_summary.file_count + result.file_count
+                        if is_final
+                        else workspace_summary.file_count
+                    ),
+                    received_bytes=(
+                        workspace_summary.received_bytes + result.received_bytes
+                        if is_final
+                        else workspace_summary.received_bytes
+                    ),
+                    speed_bytes_per_second=result.speed_bytes_per_second,
+                    current_accession=result.accession,
+                    updated_at=self._workspace_timestamp(),
+                )
+            )
         if self._task_table_summary_mode:
             self._record_large_batch_result(
                 result,
@@ -2571,6 +3344,22 @@ class DcmGetWindow(QMainWindow):
             and summary.exit_code == 0
             and pdi_has_files
         )
+        workspace_phase = (
+            "cancelled"
+            if summary.cancelled
+            else "download_retryable"
+            if download_retryable
+            else "pdi_pending"
+            if pdi_should_run
+            else "completed"
+        )
+        self._publish_workspace_summary(
+            self._workspace_summary_from_batch(
+                task_id,
+                summary,
+                phase=workspace_phase,
+            )
+        )
         keep_lease_for_pdi = pdi_should_run and active_checkpoint is not None
         self._pdi_task_id = task_id if keep_lease_for_pdi else ""
         if not keep_lease_for_pdi:
@@ -2675,6 +3464,7 @@ class DcmGetWindow(QMainWindow):
         self.pdi_retry_button.setEnabled(False)
         self._set_running(True, reset_summary=False, can_pause=False)
         self.progress_label.setText("下载已完成，正在生成 PDI…")
+        self._update_workspace_phase("pdi_running")
 
         thread = QThread(self)
         worker = PdiWorker(
@@ -2744,6 +3534,13 @@ class DcmGetWindow(QMainWindow):
                 "已取消": "下载已完成，PDI 导出已取消",
             }.get(status_text, "PDI 导出已结束")
         )
+        self._update_workspace_phase(
+            "completed"
+            if status_text == "完成"
+            else "cancelled"
+            if status_text == "已取消"
+            else "pdi_retryable"
+        )
         self.pdi_progress_bar.setRange(0, 1)
         self.pdi_progress_bar.setValue(1 if status_text in {"完成", "部分成功"} else 0)
         output_exists = bool(output_directory and Path(output_directory).exists())
@@ -2771,6 +3568,7 @@ class DcmGetWindow(QMainWindow):
 
     def _on_pdi_failed(self, message: str) -> None:
         self._append_log("PDI", message, "error")
+        self._update_workspace_phase("pdi_retryable", error_message=message)
         self.progress_label.setText("下载已完成，PDI 导出失败")
         self._set_pdi_status(f"PDI 导出失败：{message}", "error")
         self.pdi_progress_bar.setRange(0, 1)
@@ -3187,12 +3985,23 @@ class DcmGetWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _retry_pdi(self) -> None:
+        if (
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and self._selected_task_id
+        ):
+            try:
+                self.task_controller.retry_pdi(self._selected_task_id)
+            except TaskStateError as exc:
+                QMessageBox.warning(self, "无法重试 PDI", str(exc))
+            return
         if self._pdi_source_files or self._pdi_task_id:
             self._start_pdi_export()
 
     def _on_worker_failed(self, message: str) -> None:
         self._worker_failure_message = message
         self._append_log("应用", message, "error")
+        self._update_workspace_phase("failed", error_message=message)
         try:
             checkpoint = self.task_store.load(include_archived_files=False)
             if checkpoint is not None and checkpoint.task_id == self._active_task_id:
@@ -3239,6 +4048,36 @@ class DcmGetWindow(QMainWindow):
             self._set_running(False)
 
     def _stop_download(self) -> None:
+        if (
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and self._selected_task_id
+        ):
+            try:
+                summary = self.task_controller.manager.get_task_detail(
+                    self._selected_task_id,
+                    accession_limit=1,
+                ).summary
+            except TaskStateError as exc:
+                QMessageBox.warning(self, "无法停止任务", str(exc))
+                return
+            answer = QMessageBox.question(
+                self,
+                "停止任务",
+                "确定停止这个任务吗？已收到的文件和恢复点都会保留。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                if summary.phase in {"pdi_pending", "pdi_running"}:
+                    self.task_controller.cancel_pdi(self._selected_task_id)
+                else:
+                    self.task_controller.cancel_task(self._selected_task_id)
+            except TaskStateError as exc:
+                QMessageBox.warning(self, "无法停止任务", str(exc))
+            return
         if self.pdi_worker is not None:
             answer = QMessageBox.question(
                 self,
@@ -3269,6 +4108,23 @@ class DcmGetWindow(QMainWindow):
             self.worker.request_cancel()
 
     def _toggle_pause(self) -> None:
+        if (
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and self._selected_task_id
+        ):
+            try:
+                summary = self.task_controller.manager.get_task_detail(
+                    self._selected_task_id,
+                    accession_limit=1,
+                ).summary
+                if summary.phase == "paused":
+                    self.task_controller.resume_task(self._selected_task_id)
+                else:
+                    self.task_controller.pause_task(self._selected_task_id)
+            except TaskStateError as exc:
+                QMessageBox.warning(self, "无法更新任务", str(exc))
+            return
         if not self.worker:
             return
         if self._pause_requested:
@@ -3311,6 +4167,8 @@ class DcmGetWindow(QMainWindow):
             return
         finally:
             self.task_store.release_lease()
+        self._workspace_task_summaries.pop(task_id, None)
+        self.task_workspace.remove_task(task_id)
         self._resume_checkpoint = None
         self._pdi_task_id = ""
         self._pdi_reuse_published = False
@@ -3326,6 +4184,16 @@ class DcmGetWindow(QMainWindow):
         self._set_task_form_expanded(True)
 
     def _retry_failed(self) -> None:
+        if (
+            self.multi_task_enabled
+            and self.task_controller is not None
+            and self._selected_task_id
+        ):
+            try:
+                self.task_controller.retry_task(self._selected_task_id)
+            except TaskStateError as exc:
+                QMessageBox.warning(self, "无法重试任务", str(exc))
+            return
         if self._accepted_partial_results:
             return
         if (
@@ -3426,6 +4294,39 @@ class DcmGetWindow(QMainWindow):
         )
         scrollbar = self.log_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _on_multi_log(
+        self,
+        task_id: str,
+        source: str,
+        message: str,
+        level: str,
+    ) -> None:
+        self._multi_log_events.append((task_id, source, message, level))
+        if len(self._multi_log_events) > 5000:
+            del self._multi_log_events[: len(self._multi_log_events) - 5000]
+        show_all = self.log_scope_combo.currentData() == "all"
+        if show_all or not task_id or task_id == self._selected_task_id:
+            display_source = (
+                f"{source} · {task_id[:8]}" if task_id else source
+            )
+            self._append_log(display_source, message, level)
+
+    def _refresh_multi_log_view(self, _index: int = 0) -> None:
+        if not self.multi_task_enabled or not hasattr(self, "log_edit"):
+            return
+        self.log_edit.clear()
+        show_all = self.log_scope_combo.currentData() == "all"
+        for task_id, source, message, level in self._multi_log_events:
+            if show_all or not task_id or task_id == self._selected_task_id:
+                display_source = (
+                    f"{source} · {task_id[:8]}" if task_id else source
+                )
+                self._append_log(display_source, message, level)
+
+    def _clear_logs(self) -> None:
+        self._multi_log_events.clear()
+        self.log_edit.clear()
 
     def _selected_result_directory(self) -> str:
         row = self.task_table.currentRow()
@@ -3530,6 +4431,43 @@ class DcmGetWindow(QMainWindow):
         self.setGeometry(x, y, width, height)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.multi_task_enabled and self.task_controller is not None:
+            summaries = self.task_controller.list_tasks()
+            active = sum(
+                item.phase in {"running", "pause_pending", "cancelling"}
+                for item in summaries
+            )
+            queued = sum(item.phase == "queued" for item in summaries)
+            paused = sum(item.phase == "paused" for item in summaries)
+            pdi = sum(
+                item.phase in {"pdi_pending", "pdi_running"}
+                for item in summaries
+            )
+            if active or queued or paused or pdi:
+                answer = QMessageBox.question(
+                    self,
+                    "退出 DcmGet",
+                    (
+                        f"当前有活动任务 {active} 个、排队任务 {queued} 个、"
+                        f"暂停任务 {paused} 个、PDI 任务 {pdi} 个。\n\n"
+                        "退出会停止当前后台进程，但会保留全部恢复点；"
+                        "下次启动将自动继续。"
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    event.ignore()
+                    return
+            if not self.task_controller.shutdown():
+                self._append_log(
+                    "多任务",
+                    "后台进程尚未完全停止，暂不退出",
+                    "error",
+                )
+                event.ignore()
+                return
+            self.task_controller = None
         if self._is_busy():
             if self._closing_after_cancel:
                 event.ignore()

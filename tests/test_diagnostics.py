@@ -373,6 +373,7 @@ def test_main_window_startup_error_shows_diagnostic_log_path(
 
     monkeypatch.setattr(entry, "create_application", lambda: app)
     monkeypatch.setattr(entry, "TaskCheckpointStore", EmptyTaskStore)
+    monkeypatch.setattr(entry, "resume_authorization_task_id", lambda value: value)
     monkeypatch.setattr(entry, "authorize_gui", lambda _task_id: True)
     monkeypatch.setattr(
         entry,
@@ -391,3 +392,55 @@ def test_main_window_startup_error_shows_diagnostic_log_path(
     assert messages
     assert "window marker" in messages[0][1]
     assert str(diagnostic) in messages[0][1]
+
+
+def test_gui_authorization_recognizes_charged_multitask_recovery(monkeypatch):
+    from types import SimpleNamespace
+
+    import DICOM_download_ui as entry
+    import dcmget.task_manager as task_manager
+
+    task_id = "a" * 32
+
+    class Catalog:
+        def __init__(self, *, auto_migrate):
+            assert auto_migrate is False
+
+        def list_tasks(self):
+            return [SimpleNamespace(task_id=task_id, phase="paused")]
+
+        def trial_state(self, selected):
+            assert selected == task_id
+            return True, True
+
+    monkeypatch.setattr(task_manager, "TaskCatalog", Catalog)
+
+    assert entry.resume_authorization_task_id(None) == task_id
+    assert entry.resume_authorization_task_id("legacy") == "legacy"
+
+
+def test_second_gui_launch_only_wakes_existing_window(monkeypatch, tmp_path):
+    import DICOM_download_ui as entry
+
+    events: list[object] = []
+
+    class ExistingInstance:
+        def __init__(self):
+            events.append("instance")
+
+        def start(self, payload):
+            events.append(("wake", payload))
+            return False
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(entry, "SingleInstance", ExistingInstance)
+    monkeypatch.setattr(
+        entry,
+        "create_application",
+        lambda: (_ for _ in ()).throw(AssertionError("created a second QApplication")),
+    )
+
+    assert entry.main(["--config", str(tmp_path / "config.json")]) == 0
+    assert events == ["instance", ("wake", {"action": "activate"}), "close"]

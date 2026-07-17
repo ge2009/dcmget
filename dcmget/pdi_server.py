@@ -70,7 +70,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 class PdiRequestHandler(BaseHTTPRequestHandler):
     """Serve one PDI directory without exposing the surrounding filesystem."""
 
-    server_version = "DcmGetPDI/2.7.1"
+    server_version = "DcmGetPDI/2.8.0"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

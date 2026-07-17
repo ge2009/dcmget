@@ -32,20 +32,28 @@ if (-not (Test-Path $Runtime)) {
 }
 
 $Config = Get-Content config.json -Raw | ConvertFrom-Json
-$RuleName = "DcmGet storescp TCP"
+$StoragePort = if ($Config.storage_port) {
+    [int]$Config.storage_port
+} elseif ($Config.network_port) {
+    [int]$Config.network_port
+} else {
+    6666
+}
+$RuleName = "DcmGet Receiver TCP"
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 if ($IsAdmin) {
-    $Storescp = Get-ChildItem ".runtime\dcmtk\windows-x86_64" -Filter "storescp.exe" -File -Recurse | Select-Object -First 1
-    if (-not $Storescp) { throw "未找到 storescp.exe，无法创建精确的防火墙规则。" }
-    Get-NetFirewallRule -DisplayName "DcmGet storescp TCP*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    $ReceiverProgram = (Resolve-Path ".venv\Scripts\python.exe").Path
+    @("DcmGet Receiver TCP", "DcmGet storescp TCP", "DcmGet storescp TCP 6666") | ForEach-Object {
+        Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    }
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
-        -Program $Storescp.FullName -Protocol TCP -LocalPort $Config.storage_port `
+        -Program $ReceiverProgram -Protocol TCP -LocalPort $StoragePort `
         -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null
-    Write-Host "已确认 storescp 防火墙规则：$RuleName"
+    Write-Host "已确认 DICOM 接收器防火墙规则：$RuleName"
 } else {
-    Write-Warning "当前不是管理员，未创建 storescp 防火墙规则。需要跨主机接收时，请以管理员身份重新运行本脚本。"
+    Write-Warning "当前不是管理员，未创建 DICOM 接收器防火墙规则。需要跨主机接收时，请以管理员身份重新运行本脚本。"
 }
 
 Write-Host "部署完成。运行 .\scripts\run_ui.ps1 启动 DcmGet。"

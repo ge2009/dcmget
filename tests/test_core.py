@@ -176,6 +176,20 @@ def test_preflight_reports_port_conflict(tmp_path):
     assert "storage_port" in result.errors
 
 
+def test_static_preflight_defers_receiver_port_check(tmp_path, monkeypatch):
+    config = AppConfig(dicom_destination_folder=str(tmp_path), storage_port=6666)
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.return_value = tools
+    monkeypatch.setattr(core, "is_port_available", lambda _port: False)
+
+    result = preflight(config, resolver, check_port=False)
+
+    assert result.ok
+    assert "storage_port" not in result.errors
+    assert ("接收端口", True, "将在任务获得运行机会时检查") in result.checks
+
+
 def test_preflight_requires_pdi_dcmtk_tools_only_when_pdi_is_enabled(tmp_path):
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
     resolver = Mock(spec=DcmtkResolver)
@@ -285,6 +299,43 @@ def test_file_archive_adds_dcm_suffix_and_uses_metadata_directory(tmp_path):
     )
     assert target.exists()
     assert target.read_bytes()[128:132] == b"DICM"
+
+
+def test_concurrent_publish_never_overwrites_conflicting_sop_instance(tmp_path):
+    first = tmp_path / "first.dcm"
+    second = tmp_path / "second.dcm"
+    target = tmp_path / "archive" / "1.2.3.dcm"
+    target.parent.mkdir()
+    first.write_bytes(b"first-content")
+    second.write_bytes(b"second-content")
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+    errors_lock = threading.Lock()
+
+    def publish(source: Path) -> None:
+        barrier.wait()
+        try:
+            core._publish_or_deduplicate(source, target)
+        except Exception as exc:
+            with errors_lock:
+                errors.append(exc)
+
+    workers = [
+        threading.Thread(target=publish, args=(source,))
+        for source in (first, second)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(errors) == 1
+    assert "SOP Instance UID 内容冲突" in str(errors[0])
+    assert target.read_bytes() in {b"first-content", b"second-content"}
+    remaining = [source for source in (first, second) if source.exists()]
+    assert len(remaining) == 1
+    assert remaining[0].read_bytes() != target.read_bytes()
 
 
 def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
@@ -798,6 +849,29 @@ def test_ready_callback_is_not_called_when_storescp_fails(tmp_path, monkeypatch)
         runner.run(["ACC001"])
 
     ready.assert_not_called()
+
+
+def test_ready_callback_runs_once_after_first_movescu_process_starts(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(dicom_destination_folder=str(tmp_path))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    ready = Mock()
+    runner = DownloadRunner(config, tools, ready_callback=ready)
+
+    class Process:
+        pid = 123
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+    monkeypatch.setattr(runner, "_notify_process", lambda *_args: None)
+
+    assert runner._start_movescu_process(["movescu"]) is not None
+    runner._current_process = None
+    assert runner._start_movescu_process(["movescu"]) is not None
+
+    ready.assert_called_once_with()
+    runner._current_process = None
+    runner._close_file_logger()
 
 
 def test_pending_move_with_aborted_store_is_failed_and_retryable(tmp_path, monkeypatch):

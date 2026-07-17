@@ -503,6 +503,24 @@ def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_p
     assert "storage_port" in errors
 
 
+def test_settings_concurrency_defaults_to_two_and_is_saved(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    page = window.settings_page
+    window._show_settings()
+
+    assert page.max_concurrent_moves_spin.minimum() == 1
+    assert page.max_concurrent_moves_spin.maximum() == 8
+    assert page.max_concurrent_moves_spin.value() == 2
+    assert "PACS" in page.max_concurrent_moves_spin.toolTip()
+
+    page.max_concurrent_moves_spin.setValue(4)
+    page._save()
+
+    saved = ui_module.load_config(tmp_path / "config.json")
+    assert saved.max_concurrent_moves == 4
+    assert window.task_workspace.sidebar._concurrency_limit == 4
+
+
 def test_settings_forms_use_cross_platform_growth_and_wrap_policies(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
@@ -1451,3 +1469,85 @@ def test_close_waits_for_running_thread_before_window_is_destroyed(
 
     assert window.worker_thread is None
     assert window.worker is None
+
+
+def test_task_page_uses_responsive_multi_task_workspace(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.resize(1180, 720)
+    QApplication.processEvents()
+
+    assert window.pages.currentWidget() is window.task_page
+    assert window.task_page is window.task_workspace
+    assert window.task_workspace.detail_content_layout.indexOf(
+        window.task_detail_page
+    ) >= 0
+    assert not window.task_workspace.is_compact
+    assert window.task_workspace.sidebar.isVisible()
+    assert window.task_workspace.detail_shell.isVisible()
+
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    QApplication.processEvents()
+
+    assert window.task_workspace.is_compact
+    assert window.task_workspace.sidebar.isHidden()
+    assert window.task_workspace.detail_shell.isVisible()
+    assert window.task_workspace.compact_toolbar.isVisible()
+
+    qtbot.mouseClick(
+        window.task_workspace.back_to_tasks_button,
+        Qt.LeftButton,
+    )
+    assert window.task_workspace.sidebar.isVisible()
+    assert window.task_workspace.detail_shell.isHidden()
+
+
+def test_workspace_new_task_button_returns_to_existing_editor(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    QApplication.processEvents()
+    window.task_workspace.show_task_list()
+    window._set_task_form_expanded(False)
+
+    window.task_workspace.sidebar.new_task_button.click()
+    QApplication.processEvents()
+
+    assert window.task_workspace.sidebar.isHidden()
+    assert window.task_workspace.detail_shell.isVisible()
+    assert window._task_form_expanded
+    assert window.task_form_body.isVisible()
+    assert window.accession_edit.hasFocus()
+
+
+def test_window_publishes_aggregate_task_summary_to_sidebar(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    now = window._workspace_timestamp()
+    summary = ui_module.TaskSummary(
+        task_id="a" * 32,
+        name="患者姓名不得显示",
+        phase="downloading",
+        total_count=40_000,
+        processed_count=123,
+        pending_count=39_877,
+        completed_count=120,
+        failed_count=3,
+        file_count=1_024,
+        received_bytes=4096,
+        speed_bytes_per_second=2 * 1024 * 1024,
+        queue_position=None,
+        current_accession="A00123",
+        error_message="",
+        created_at=now,
+        updated_at=now,
+    )
+
+    window._publish_workspace_summary(summary, select=True)
+
+    model = window.task_workspace.sidebar.model
+    assert model.rowCount() == 1
+    index = model.index(0, 0)
+    assert index.data(model.TotalCountRole) == 40_000
+    assert "40,000 个检查号" in index.data(model.TitleRole)
+    assert "患者姓名不得显示" not in index.data(Qt.DisplayRole)
+    assert window.task_workspace.selected_task_id == "a" * 32

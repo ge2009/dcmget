@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.7.1
+        default: 2.8.0
 
 permissions:
   contents: read
@@ -94,6 +94,7 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "DcmGetPdiServer\.exe" -Quiet)) { throw "Portable EXE is missing PDI server" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
+          if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom receiver modules" }
 
       - name: Smoke test standalone PDI server
         shell: pwsh
@@ -302,21 +303,22 @@ jobs:
           if ($records[0].DisplayVersion -ne "${{ inputs.version }}") { throw "Installed version is $($records[0].DisplayVersion)" }
           if ($records[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Upgrade changed the installation directory" }
 
-          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction Stop)
-          if ($firewallRules.Count -ne 1) { throw "Expected exactly one storescp firewall rule, found $($firewallRules.Count)" }
+          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction Stop)
+          if ($firewallRules.Count -ne 1) { throw "Expected exactly one DcmGet receiver firewall rule, found $($firewallRules.Count)" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Upgrade left the legacy storescp program rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Upgrade left the legacy TCP 6666 firewall rule behind" }
           $firewall = $firewallRules[0]
           if ($firewall.Direction.ToString() -ne "Inbound" -or $firewall.Action.ToString() -ne "Allow" -or $firewall.Enabled.ToString() -ne "True" -or $firewall.EdgeTraversalPolicy.ToString() -ne "Block") {
             throw "Firewall rule must be enabled inbound allow with edge traversal blocked"
           }
           $portFilters = @($firewall | Get-NetFirewallPortFilter)
-          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") { throw "Firewall rule does not allow the configured storescp TCP port" }
+          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") { throw "Firewall rule does not allow the configured receiver TCP port" }
           $applicationFilters = @($firewall | Get-NetFirewallApplicationFilter)
           if ($applicationFilters.Count -ne 1) { throw "Expected one firewall application filter, found $($applicationFilters.Count)" }
-          $expectedStorescp = (Resolve-Path -LiteralPath (Join-Path $resourceRoot ".runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe") -ErrorAction Stop).ProviderPath
-          $configuredStorescp = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
-          $actualStorescp = (Resolve-Path -LiteralPath $configuredStorescp -ErrorAction Stop).ProviderPath
-          if (-not $actualStorescp.Equals($expectedStorescp, [StringComparison]::OrdinalIgnoreCase)) { throw "Firewall program is '$actualStorescp', expected '$expectedStorescp'" }
+          $expectedReceiver = (Resolve-Path -LiteralPath (Join-Path $installDir "DcmGet.exe") -ErrorAction Stop).ProviderPath
+          $configuredReceiver = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
+          $actualReceiver = (Resolve-Path -LiteralPath $configuredReceiver -ErrorAction Stop).ProviderPath
+          if (-not $actualReceiver.Equals($expectedReceiver, [StringComparison]::OrdinalIgnoreCase)) { throw "Firewall program is '$actualReceiver', expected '$expectedReceiver'" }
           $profileNames = @($firewall.Profile.ToString().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
           if ($profileNames.Count -ne 2 -or $profileNames -notcontains "Domain" -or $profileNames -notcontains "Private") { throw "Firewall profiles must be exactly Domain and Private, found '$($firewall.Profile)'" }
 
@@ -332,7 +334,8 @@ jobs:
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
           if (-not (Test-Path $diagnosticLog)) { throw "Uninstall removed the diagnostic log" }
-          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the firewall rule behind" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the receiver firewall rule behind" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy storescp rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }
           Remove-Item $configDir -Recurse -Force
 

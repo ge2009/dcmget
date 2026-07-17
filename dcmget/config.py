@@ -42,7 +42,7 @@ ANONYMIZATION_PROFILE_IDS = {
 
 @dataclass(slots=True)
 class AppConfig:
-    config_version: int = 5
+    config_version: int = 6
     dcmtk_bin_dir: str = ""
     access_numbers_file_path: str = "access.txt"
     dicom_destination_folder: str = "Dicom"
@@ -52,6 +52,7 @@ class AppConfig:
     pacs_ae_title: str = "ANY-SCP"
     storage_ae_title: str = "DCMGET"
     storage_port: int = 6666
+    max_concurrent_moves: int = 2
     directory_template: str = DEFAULT_DIRECTORY_TEMPLATE
     anonymization_enabled: bool = False
     anonymization_profile: str = DEFAULT_ANONYMIZATION_PROFILE
@@ -70,7 +71,7 @@ class AppConfig:
         if is_legacy:
             legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
-                "config_version": 5,
+                "config_version": 6,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
                 "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
@@ -80,6 +81,7 @@ class AppConfig:
                 "pacs_ae_title": data.get("called_ae_title", "ANY-SCP"),
                 "storage_ae_title": legacy_move_destination,
                 "storage_port": data.get("network_port", 6666),
+                "max_concurrent_moves": 2,
                 "directory_template": DEFAULT_DIRECTORY_TEMPLATE,
                 "anonymization_enabled": False,
                 "anonymization_profile": DEFAULT_ANONYMIZATION_PROFILE,
@@ -101,9 +103,12 @@ class AppConfig:
             field: data.get(field, getattr(defaults, field))
             for field in asdict(defaults)
         }
-        values["config_version"] = 5
+        values["config_version"] = 6
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
+        values["max_concurrent_moves"] = _as_int(
+            values["max_concurrent_moves"], 2
+        )
         values["max_log_file_size_bytes"] = _as_int(
             values["max_log_file_size_bytes"], 104_857_600
         )
@@ -146,6 +151,8 @@ class AppConfig:
             errors["pacs_server_port"] = "端口必须在 1 到 65535 之间"
         if not 1 <= self.storage_port <= 65535:
             errors["storage_port"] = "端口必须在 1 到 65535 之间"
+        if not 1 <= self.max_concurrent_moves <= 8:
+            errors["max_concurrent_moves"] = "并发下载数必须在 1 到 8 之间"
         if self.max_log_file_size_bytes < 1024:
             errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
         if (

@@ -6,6 +6,7 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/)：由 Riverbank Computing 发布，使用者需按其 GPL 或商业许可条款使用。
 - [cryptography](https://github.com/pyca/cryptography)：Apache License 2.0 / BSD 3-Clause 双许可。
 - [pydicom](https://github.com/pydicom/pydicom)：MIT License。
+- [pynetdicom](https://github.com/pydicom/pynetdicom)：MIT License。
 - [psutil](https://github.com/giampaolo/psutil)：BSD 3-Clause License。
 - [filelock](https://github.com/tox-dev/py-filelock)：The Unlicense。
 - [PyInstaller](https://pyinstaller.org/)：GPL 2.0-or-later，并带有适用于所生成应用的 bootloader exception。
