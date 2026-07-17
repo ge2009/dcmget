@@ -156,6 +156,7 @@ class TaskExecutionController(QObject):
             raise RuntimeError("另一个 DcmGet 前台任务调度器正在运行")
         try:
             self.catalog.validate_shared_config(config)
+            self.catalog.validate_receiver_mappings()
             for summary in self.catalog.list_tasks():
                 if summary.phase not in {"pdi_pending", "pdi_running"}:
                     continue

@@ -65,13 +65,6 @@ TASK_PHASES = {
 }
 SHARED_RECEIVER_CONFIG_FIELDS = (
     "dcmtk_bin_dir",
-    "pacs_server_ip",
-    "pacs_server_port",
-    "calling_ae_title",
-    "pacs_ae_title",
-    "storage_ae_title",
-    "storage_port",
-    "max_concurrent_moves",
 )
 PROCESS_KINDS = {"storescp", "movescu", "pdi"}
 
@@ -85,9 +78,15 @@ def _utc_now() -> str:
 
 
 def shared_receiver_config(config: AppConfig) -> tuple[object, ...]:
-    """Return the settings that cannot change while one receiver is shared."""
+    """Return persisted settings that must match across unfinished tasks."""
 
     return tuple(getattr(config, field) for field in SHARED_RECEIVER_CONFIG_FIELDS)
+
+
+def receiver_key(config: AppConfig) -> tuple[str, int]:
+    """Return the PACS move-destination mapping used by one receiver service."""
+
+    return config.storage_ae_title.strip(), int(config.storage_port)
 
 
 def _capture_process(pid: int, executable: str | Path) -> dict[str, object] | None:
@@ -438,8 +437,16 @@ class TaskCatalog:
                         if conflicts:
                             fields = "、".join(conflicts)
                             raise TaskStateError(
-                                "旧任务的共享接收配置与现有未完成任务不一致："
+                                "旧任务的应用全局运行配置与现有未完成任务不一致："
                                 f"{fields}"
+                            )
+                        mapping_conflict = self._receiver_mapping_conflict(
+                            connection,
+                            checkpoint.config,
+                        )
+                        if mapping_conflict:
+                            raise TaskStateError(
+                                f"旧任务的接收映射冲突：{mapping_conflict}"
                             )
                         duplicates = self._active_duplicates(
                             connection,
@@ -604,7 +611,15 @@ class TaskCatalog:
                         if conflicts:
                             fields = "、".join(conflicts)
                             raise TaskStateError(
-                                f"共享接收配置与未完成任务不一致：{fields}"
+                                f"应用全局运行配置与未完成任务不一致：{fields}"
+                            )
+                        mapping_conflict = self._receiver_mapping_conflict(
+                            connection,
+                            config,
+                        )
+                        if mapping_conflict:
+                            raise TaskStateError(
+                                f"接收映射冲突：{mapping_conflict}"
                             )
                         duplicates = self._active_duplicates(connection, values)
                         if duplicates:
@@ -666,7 +681,7 @@ class TaskCatalog:
             try:
                 existing = AppConfig.from_dict(json.loads(str(raw_config)))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise TaskStateError("未完成任务的共享接收配置已损坏") from exc
+                raise TaskStateError("未完成任务的应用全局运行配置已损坏") from exc
             actual = shared_receiver_config(existing)
             if actual != expected:
                 return [
@@ -690,12 +705,72 @@ class TaskCatalog:
                 )
                 if conflicts:
                     raise TaskStateError(
-                        "共享接收配置与未完成任务不一致：" + "、".join(conflicts)
+                        "应用全局运行配置与未完成任务不一致：" + "、".join(conflicts)
                     )
         except TaskStateError:
             raise
         except (OSError, sqlite3.Error) as exc:
-            raise TaskStateError(f"无法校验共享接收配置：{exc}") from exc
+            raise TaskStateError(f"无法校验应用全局运行配置：{exc}") from exc
+
+    @staticmethod
+    def _receiver_mapping_conflict(
+        connection: sqlite3.Connection,
+        config: AppConfig,
+        *,
+        exclude_task_id: str = "",
+    ) -> str:
+        placeholders = ", ".join("?" for _ in RECEIVER_TASK_PHASES)
+        sql = f"SELECT task_id, config_json FROM tasks WHERE phase IN ({placeholders})"
+        parameters: list[object] = [*sorted(RECEIVER_TASK_PHASES)]
+        if exclude_task_id:
+            sql += " AND task_id <> ?"
+            parameters.append(exclude_task_id)
+        expected_ae = config.storage_ae_title.strip()
+        expected_port = int(config.storage_port)
+        for _task_id, raw_config in connection.execute(sql, parameters):
+            try:
+                existing = AppConfig.from_dict(json.loads(str(raw_config)))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise TaskStateError("未完成任务的接收映射配置已损坏") from exc
+            existing_ae = existing.storage_ae_title
+            existing_port = existing.storage_port
+            if existing_port == expected_port and existing_ae != expected_ae:
+                return (
+                    f"端口 {expected_port} 已绑定接收 AE {existing_ae}，"
+                    f"不能同时绑定 {expected_ae}"
+                )
+        return ""
+
+    def validate_receiver_mappings(self) -> None:
+        """Reject ambiguous AE-to-port mappings in restored download tasks."""
+
+        try:
+            with self._lock, closing(self._connect()) as connection:
+                placeholders = ", ".join("?" for _ in RECEIVER_TASK_PHASES)
+                rows = connection.execute(
+                    f"SELECT config_json FROM tasks WHERE phase IN ({placeholders})",
+                    [*sorted(RECEIVER_TASK_PHASES)],
+                )
+                port_to_ae: dict[int, str] = {}
+                for (raw_config,) in rows:
+                    try:
+                        config = AppConfig.from_dict(json.loads(str(raw_config)))
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise TaskStateError(
+                            "未完成任务的接收映射配置已损坏"
+                        ) from exc
+                    ae = config.storage_ae_title
+                    port = config.storage_port
+                    if port in port_to_ae and port_to_ae[port] != ae:
+                        raise TaskStateError(
+                            f"接收映射冲突：端口 {port} 同时绑定了接收 AE "
+                            f"{port_to_ae[port]} 和 {ae}"
+                        )
+                    port_to_ae[port] = ae
+        except TaskStateError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise TaskStateError(f"无法校验接收映射：{exc}") from exc
 
     @staticmethod
     def _active_duplicates(
@@ -1693,7 +1768,16 @@ class TaskCatalog:
                     )
                     if conflicts:
                         raise TaskStateError(
-                            "共享接收配置与未完成任务不一致：" + "、".join(conflicts)
+                            "应用全局运行配置与未完成任务不一致：" + "、".join(conflicts)
+                        )
+                    mapping_conflict = self._receiver_mapping_conflict(
+                        connection,
+                        config,
+                        exclude_task_id=task_id,
+                    )
+                    if mapping_conflict:
+                        raise TaskStateError(
+                            f"接收映射冲突：{mapping_conflict}"
                         )
                     candidates = [
                         str(row[0])
@@ -2423,7 +2507,7 @@ class TaskManager:
         future: Future[AccessionResult],
     ) -> tuple[TaskSummary, Exception | None]:
         with self._lock:
-            task_id, accession, _config = self._inflight[future]
+            task_id, accession, config = self._inflight[future]
             shutting_down = self._shutting_down
             shutdown_requeue = (
                 shutting_down and task_id in self._shutdown_requeue_ids
@@ -2486,6 +2570,7 @@ class TaskManager:
                 if accession is None:
                     self._finalize_exhausted(summary)
                     continue
+                config = self.catalog.get_config(task_id)
                 self.catalog.set_phase(task_id, "running")
                 self.catalog.update_runtime(
                     task_id,
@@ -2493,7 +2578,7 @@ class TaskManager:
                     speed_bytes_per_second=0,
                 )
                 self._active_task_ids.add(task_id)
-                return task_id, accession, self.catalog.get_config(task_id)
+                return task_id, accession, config
         return None
 
     def _finish_round(self, task_id: str, result: AccessionResult) -> None:

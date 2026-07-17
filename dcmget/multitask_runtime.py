@@ -16,8 +16,7 @@ from .task_state import TaskStateError
 from .task_manager import (
     MoveStarted,
     ReceiverService,
-    SHARED_RECEIVER_CONFIG_FIELDS,
-    shared_receiver_config,
+    receiver_key,
 )
 
 
@@ -40,7 +39,11 @@ def recover_orphaned_shared_staging(
     if not staging_root.is_dir():
         return []
     messages: list[str] = []
-    for staging in sorted(staging_root.glob("shared-*")):
+    candidates = {
+        *staging_root.glob("shared-*"),
+        *staging_root.glob("receiver-*"),
+    }
+    for staging in sorted(candidates):
         if not staging.is_dir():
             continue
         destination = _quarantine_or_cleanup_directory(staging, root)
@@ -81,21 +84,33 @@ class SharedReceiverHandle:
     receiver: PynetdicomStorageSCP
     staging_directory: Path
     log_runner: DownloadRunner
-
-    @property
-    def process(self) -> PynetdicomStorageSCP:
-        """Compatibility liveness handle used by ``ReceiverService``."""
-
-        return self.receiver
+    key: tuple[str, int]
 
     def poll(self) -> int | None:
-        """Expose the in-process SCP liveness to ``ReceiverService``."""
+        """Expose the in-process SCP liveness to the receiver pool."""
 
         return self.receiver.poll()
 
 
+@dataclass(slots=True)
+class ReceiverPoolHandle:
+    """Application-level handle that lazily owns one SCP per AE/port pair."""
+
+    token: str
+    closed: bool = False
+
+    def poll(self) -> int | None:
+        return 0 if self.closed else None
+
+
+@dataclass(slots=True)
+class _ActiveMove:
+    runner: DownloadRunner
+    receiver_handle: SharedReceiverHandle
+
+
 class SharedDcmtkRuntime:
-    """Bridge concurrent C-MOVEs to one routed, application-level Storage SCP."""
+    """Bridge concurrent C-MOVEs to a routed pool of Storage SCP listeners."""
 
     def __init__(
         self,
@@ -119,8 +134,11 @@ class SharedDcmtkRuntime:
         )
         self._lock = threading.RLock()
         self._active_condition = threading.Condition(self._lock)
-        self._handle: SharedReceiverHandle | None = None
-        self._active_runners: dict[str, DownloadRunner] = {}
+        self._pool_handle: ReceiverPoolHandle | None = None
+        self._receivers: dict[tuple[str, int], SharedReceiverHandle] = {}
+        self._port_owners: dict[int, tuple[str, int]] = {}
+        self._active_runners: dict[str, _ActiveMove] = {}
+        self._stopping = False
 
     def receiver_service(self) -> ReceiverService:
         return ReceiverService(
@@ -131,55 +149,107 @@ class SharedDcmtkRuntime:
         )
 
     def validate_download_config(self, config: AppConfig) -> None:
-        expected = shared_receiver_config(self.config)
-        actual = shared_receiver_config(config)
-        if actual == expected:
-            return
-        conflicts = [
-            field
-            for field, current, task_value in zip(
-                SHARED_RECEIVER_CONFIG_FIELDS,
-                expected,
-                actual,
-            )
-            if current != task_value
-        ]
-        raise TaskStateError(
-            "任务共享接收配置与应用当前设置不一致：" + "、".join(conflicts)
-        )
+        """Validate only the toolchain that is genuinely process-global.
+
+        PACS, calling AE and receiving AE/port are task snapshots.  A task with
+        a different receiving AE/port is served by another SCP in this pool.
+        """
+
+        if config.dcmtk_bin_dir != self.config.dcmtk_bin_dir:
+            raise TaskStateError("任务 DCMTK 路径与应用当前设置不一致")
 
     def validate_pdi_config(self, config: AppConfig) -> None:
         if config.dcmtk_bin_dir != self.config.dcmtk_bin_dir:
             raise TaskStateError("任务 DCMTK 路径与应用当前设置不一致")
 
-    def start(self) -> SharedReceiverHandle:
+    def start(self) -> ReceiverPoolHandle:
         with self._lock:
-            if self._handle is not None:
-                return self._handle
+            if self._pool_handle is not None and not self._pool_handle.closed:
+                return self._pool_handle
+            self._stopping = False
+            handle = ReceiverPoolHandle(uuid.uuid4().hex)
+            self._pool_handle = handle
+            return handle
+
+    def _ensure_receiver(self, config: AppConfig) -> SharedReceiverHandle:
+        key = receiver_key(config)
+        with self._active_condition:
+            pool = self._pool_handle
+            if pool is None or pool.closed or self._stopping:
+                raise RuntimeError("DICOM 接收器池未运行")
+            existing = self._receivers.get(key)
+            if existing is not None and existing.poll() is None:
+                return existing
+            if existing is not None:
+                if any(
+                    active.receiver_handle is existing
+                    for active in self._active_runners.values()
+                ):
+                    raise RuntimeError(
+                        f"DICOM 接收器 {key[0]}:{key[1]} 已意外退出"
+                    )
+                self._remove_receiver_locked(existing)
+
+            port_owner = self._port_owners.get(key[1])
+            conflicts: list[SharedReceiverHandle] = []
+            if port_owner is not None and port_owner != key:
+                conflict = self._receivers.get(port_owner)
+                if conflict is not None:
+                    conflicts.append(conflict)
+            active_conflicts = [
+                conflict
+                for conflict in conflicts
+                if self._receiver_is_active_locked(conflict)
+            ]
+            if port_owner is not None and port_owner != key and any(
+                conflict.key == port_owner for conflict in active_conflicts
+            ):
+                raise TaskStateError(
+                    f"接收端口 {key[1]} 正由 AE {port_owner[0]} 使用，"
+                    f"不能同时绑定 AE {key[0]}；请为任务设置不同接收端口"
+                )
+            for conflict in conflicts:
+                self._remove_receiver_locked(conflict)
+            handle = self._start_receiver_locked(config, key)
+            self._receivers[key] = handle
+            self._port_owners[key[1]] = key
+            return handle
+
+    def _start_receiver_locked(
+        self,
+        config: AppConfig,
+        key: tuple[str, int],
+    ) -> SharedReceiverHandle:
+        session = uuid.uuid4().hex[:8]
+        safe_ae = "".join(
+            character if character.isalnum() else "-" for character in key[0]
+        ).strip("-") or "AE"
         staging = (
             ensure_application_state_dir()
             / "staging"
             / (
-                datetime.now().strftime("shared-%Y%m%d-%H%M%S-%f-")
-                + uuid.uuid4().hex[:8]
+                datetime.now().strftime("receiver-%Y%m%d-%H%M%S-%f-")
+                + f"{safe_ae}-{key[1]}-{session}"
             )
         )
         staging.mkdir(parents=True, exist_ok=False, mode=0o700)
         receiver_logger = DownloadRunner(
-            self.config,
+            config,
             self.tools,
             log_callback=lambda source, message, level: self.log_callback(
                 "", source, message, level
             ),
-            log_file_name="receiver.log",
+            log_file_name=f"receiver-{safe_ae}-{key[1]}-{session}.log",
         )
         receiver: PynetdicomStorageSCP | None = None
         try:
             receiver = PynetdicomStorageSCP(
-                self.config.storage_ae_title,
-                self.config.storage_port,
+                key[0],
+                key[1],
                 quarantine_directory=(
-                    ensure_application_state_dir() / "quarantine" / "receiver"
+                    ensure_application_state_dir()
+                    / "quarantine"
+                    / f"receiver-{safe_ae}-{key[1]}-{session}"
                 ),
                 log_callback=receiver_logger._emit,
                 maximum_associations=max(
@@ -190,16 +260,18 @@ class SharedDcmtkRuntime:
                     self.config.max_concurrent_moves == 1
                 ),
             )
-            receiver.start()
-            handle = SharedReceiverHandle(receiver, staging, receiver_logger)
-            with self._lock:
-                if self._handle is not None:
-                    receiver.stop()
-                    receiver_logger._close_file_logger()
-                    self._quarantine_or_cleanup(staging)
-                    return self._handle
-                self._handle = handle
-            return handle
+            try:
+                receiver.start()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"接收器 AE {key[0]} 无法监听端口 {key[1]}：{exc}"
+                ) from exc
+            return SharedReceiverHandle(
+                receiver,
+                staging,
+                receiver_logger,
+                key,
+            )
         except Exception:
             if receiver is not None:
                 receiver.stop()
@@ -208,19 +280,25 @@ class SharedDcmtkRuntime:
             raise
 
     def stop(self, raw_handle: object | None) -> None:
-        handle = raw_handle if isinstance(raw_handle, SharedReceiverHandle) else None
+        handle = raw_handle if isinstance(raw_handle, ReceiverPoolHandle) else None
         with self._active_condition:
-            while self._active_runners:
-                self._active_condition.wait(timeout=0.1)
-            current = self._handle
+            current = self._pool_handle
             if current is None:
                 return
             if handle is not None and handle is not current:
                 return
-            self._handle = None
-        current.receiver.stop()
-        current.log_runner._close_file_logger()
-        self._quarantine_or_cleanup(current.staging_directory)
+            self._stopping = True
+            for active in self._active_runners.values():
+                active.runner.request_cancel_current_move()
+            while self._active_runners:
+                self._active_condition.wait(timeout=0.1)
+            receivers = list(self._receivers.values())
+            self._receivers.clear()
+            self._port_owners.clear()
+            self._pool_handle = None
+            current.closed = True
+        for receiver_handle in receivers:
+            self._stop_receiver(receiver_handle)
 
     def run_accession(
         self,
@@ -231,13 +309,9 @@ class SharedDcmtkRuntime:
         move_started: MoveStarted | None = None,
         cancel_event: threading.Event | None = None,
     ) -> AccessionResult:
-        if not isinstance(raw_handle, SharedReceiverHandle):
-            raise RuntimeError("共享 DICOM 接收器句柄无效")
+        if not isinstance(raw_handle, ReceiverPoolHandle):
+            raise RuntimeError("DICOM 接收器池句柄无效")
         self.validate_download_config(config)
-        route_directory = raw_handle.staging_directory / (
-            f"route-{task_id[:12]}-{uuid.uuid4().hex[:12]}"
-        )
-        route_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         runner = DownloadRunner(
             config,
             self.tools,
@@ -254,19 +328,35 @@ class SharedDcmtkRuntime:
             log_file_name=f"task-{task_id}.log",
         )
         route: StorageRoute | None = None
-        with self._lock:
-            if task_id in self._active_runners:
-                runner._close_file_logger()
+        route_directory: Path | None = None
+        receiver_handle: SharedReceiverHandle | None = None
+        try:
+            with self._active_condition:
+                if raw_handle is not self._pool_handle or raw_handle.closed:
+                    raise RuntimeError("DICOM 接收器池句柄已经失效")
+                receiver_handle = self._ensure_receiver(config)
+                route_directory = receiver_handle.staging_directory / (
+                    f"route-{task_id[:12]}-{uuid.uuid4().hex[:12]}"
+                )
+                route_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+                if task_id in self._active_runners:
+                    raise RuntimeError("同一任务已有 C-MOVE 正在运行")
+                self._active_runners[task_id] = _ActiveMove(
+                    runner,
+                    receiver_handle,
+                )
+                cancel_before_move = (
+                    cancel_event is not None and cancel_event.is_set()
+                )
+        except Exception:
+            runner._close_file_logger()
+            if route_directory is not None:
                 self._quarantine_or_cleanup(route_directory)
-                raise RuntimeError("同一任务已有 C-MOVE 正在运行")
-            self._active_runners[task_id] = runner
-            cancel_before_move = (
-                cancel_event is not None and cancel_event.is_set()
-            )
+            raise
         try:
             if cancel_before_move:
                 runner.request_cancel_current_move()
-            route = raw_handle.receiver.register_route(
+            route = receiver_handle.receiver.register_route(
                 accession,
                 route_directory,
             )
@@ -275,33 +365,53 @@ class SharedDcmtkRuntime:
             return runner.run_accession(
                 accession,
                 route_directory,
-                raw_handle.receiver,
+                receiver_handle.receiver,
             )
         finally:
             try:
                 if route is not None:
-                    raw_handle.receiver.unregister_route(route)
+                    receiver_handle.receiver.unregister_route(route)
             finally:
-                with self._active_condition:
-                    self._active_runners.pop(task_id, None)
-                    self._active_condition.notify_all()
-                runner._close_file_logger()
-                self._quarantine_or_cleanup(route_directory)
+                try:
+                    runner._close_file_logger()
+                    if route_directory is not None:
+                        self._quarantine_or_cleanup(route_directory)
+                finally:
+                    with self._active_condition:
+                        self._active_runners.pop(task_id, None)
+                        self._active_condition.notify_all()
 
     def cancel_accession(self, task_id: str) -> None:
         with self._lock:
-            runner = self._active_runners.get(task_id)
-        if runner is not None:
-            runner.request_cancel_current_move()
+            active = self._active_runners.get(task_id)
+        if active is not None:
+            active.runner.request_cancel_current_move()
 
     def shutdown(self) -> None:
         with self._lock:
-            active = list(self._active_runners.values())
-            handle = self._handle
+            active = [item.runner for item in self._active_runners.values()]
+            handle = self._pool_handle
         for runner in active:
             runner.request_cancel_current_move()
         if handle is not None:
             self.stop(handle)
+
+    def _remove_receiver_locked(self, handle: SharedReceiverHandle) -> None:
+        self._receivers.pop(handle.key, None)
+        if self._port_owners.get(handle.key[1]) == handle.key:
+            self._port_owners.pop(handle.key[1], None)
+        self._stop_receiver(handle)
+
+    def _receiver_is_active_locked(self, handle: SharedReceiverHandle) -> bool:
+        return any(
+            active.receiver_handle is handle
+            for active in self._active_runners.values()
+        )
+
+    def _stop_receiver(self, handle: SharedReceiverHandle) -> None:
+        handle.receiver.stop()
+        handle.log_runner._close_file_logger()
+        self._quarantine_or_cleanup(handle.staging_directory)
 
     def _quarantine_or_cleanup(self, staging: Path) -> None:
         if not staging.exists():

@@ -145,6 +145,14 @@ def _window(qtbot, tmp_path, monkeypatch):
     return window
 
 
+def _save_receiver_defaults(window, ae_title: str, port: int) -> None:
+    updated = AppConfig.from_dict(window.config.to_dict())
+    updated.storage_ae_title = ae_title
+    updated.storage_port = port
+    window._save_settings(updated)
+    QApplication.processEvents()
+
+
 def test_running_task_starts_second_task_in_an_available_concurrency_slot(
     qtbot, tmp_path, monkeypatch
 ):
@@ -162,6 +170,7 @@ def test_running_task_starts_second_task_in_an_available_concurrency_slot(
     QApplication.processEvents()
     first_id = window._selected_task_id
 
+    _save_receiver_defaults(window, "STORE_B", 7777)
     window._show_new_task_editor()
     window.accession_edit.setPlainText("B001")
     QApplication.processEvents()
@@ -209,6 +218,7 @@ def test_third_task_waits_for_a_concurrency_slot_and_shows_queue_copy(
     try:
         window.accession_edit.setPlainText("A001")
         window._start_download()
+        _save_receiver_defaults(window, "STORE_B", 7777)
         window._show_new_task_editor()
         window.accession_edit.setPlainText("B001")
         window._start_download()
@@ -723,6 +733,7 @@ def test_close_records_two_concurrent_tasks_that_finish_during_shutdown(
         window._start_download()
         first_id = window._selected_task_id
 
+        _save_receiver_defaults(window, "STORE_B", 7777)
         window._show_new_task_editor()
         window.accession_edit.setPlainText("B001")
         window._start_download()
@@ -752,7 +763,7 @@ def test_close_records_two_concurrent_tasks_that_finish_during_shutdown(
         _BlockingRuntime.block_accessions = None
 
 
-def test_unfinished_tasks_lock_concurrency_but_keep_future_task_defaults_editable(
+def test_unfinished_tasks_only_lock_global_settings_and_keep_receiver_defaults_editable(
     qtbot, tmp_path, monkeypatch
 ):
     window = _window(qtbot, tmp_path, monkeypatch)
@@ -765,10 +776,43 @@ def test_unfinished_tasks_lock_concurrency_but_keep_future_task_defaults_editabl
 
     assert not window.settings_page.max_concurrent_moves_spin.isEnabled()
     assert not window.settings_page.dcmtk_browse_button.isEnabled()
+    assert window.settings_page.pacs_host_edit.isEnabled()
+    assert window.settings_page.pacs_port_edit.isEnabled()
+    assert window.settings_page.calling_ae_edit.isEnabled()
+    assert window.settings_page.pacs_ae_edit.isEnabled()
+    assert window.settings_page.storage_ae_edit.isEnabled()
+    assert window.settings_page.storage_port_edit.isEnabled()
     assert window.settings_page.directory_template_combo.isEnabled()
     assert "全局锁定" in window.settings_page.max_concurrent_moves_spin.toolTip()
 
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *_args: warnings.append(_args[2]),
+    )
+    updated = AppConfig.from_dict(window.config.to_dict())
+    updated.pacs_server_ip = "198.51.100.20"
+    updated.pacs_server_port = 11112
+    updated.calling_ae_title = "CALLING_B"
+    updated.pacs_ae_title = "PACS_B"
+    updated.storage_ae_title = "STORE_B"
+    updated.storage_port = 7777
+    window._save_settings(updated)
+
+    assert warnings == []
+    assert window.config.storage_port == 7777
+    assert controller.catalog.get_config(task.task_id).storage_port == 6666
+    future = controller.manager.create_task(window.config, ["B001"])
+    assert controller.catalog.get_config(future.task_id).storage_port == 7777
+    window._load_multi_task_detail(task.task_id)
+    assert window.task_config_summary_label.isVisible()
+    assert "127.0.0.1:8104" in window.task_config_summary_label.text()
+    assert "接收：DCMGET:6666" in window.task_config_summary_label.text()
+    assert "STORE_B:7777" not in window.task_config_summary_label.text()
+
     controller.cancel_task(task.task_id)
+    controller.cancel_task(future.task_id)
     window.pages.setCurrentWidget(window.task_page)
     window._show_settings()
 

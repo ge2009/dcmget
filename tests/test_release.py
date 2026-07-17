@@ -141,6 +141,7 @@ def test_windows_firewall_is_limited_to_receiver_and_private_networks():
     assert '#define LegacyFirewallRule "DcmGet storescp TCP"' in installer
     assert '#define LegacyPortFirewallRule "DcmGet storescp TCP 6666"' in installer
     assert "-Program $ReceiverProgram" in bootstrap
+    assert "-LocalPort" not in bootstrap
     assert "-Profile Domain,Private" in bootstrap
     assert '$RuleName = "DcmGet Receiver TCP"' in bootstrap
     assert 'Resolve-Path ".venv\\Scripts\\python.exe"' in bootstrap

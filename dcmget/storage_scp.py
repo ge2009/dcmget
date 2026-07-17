@@ -51,7 +51,8 @@ class PynetdicomStorageSCP:
 
     Incoming objects are routed by an exact Accession Number match or a Study
     Instance UID already bound to that route. A compatibility fallback for
-    tagless legacy PACS objects must be explicitly enabled for serial mode.
+    missing legacy PACS tags must be explicitly enabled and is only used while
+    exactly one receive route exists.
     Unknown objects are preserved in the private quarantine directory and
     reported as failed C-STORE sub-operations instead of being guessed.
     """

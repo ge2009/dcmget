@@ -117,7 +117,7 @@ def test_real_storescp_movescu_cstore_round_trip(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_multitask_runs_two_moves_through_one_routed_receiver(
+def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     tmp_path, monkeypatch
 ):
     try:
@@ -133,50 +133,75 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
         lambda: tmp_path / "state",
     )
     pacs_port = unused_port()
-    storage_port = unused_port()
+    storage_port_a = unused_port()
+    storage_port_b = unused_port()
+    receiver_ports = {
+        "STORE_A": storage_port_a,
+        "STORE_B": storage_port_b,
+    }
     pacs = AE(ae_title="PACS")
     pacs.add_supported_context(StudyRootQueryRetrieveInformationModelMove)
     pacs.add_requested_context(CTImageStorage, ExplicitVRLittleEndian)
     move_lock = threading.Lock()
-    first_pair_ready = threading.Event()
-    release_first_pair = threading.Event()
+    all_moves_ready = threading.Event()
+    release_moves = threading.Event()
     move_calls = 0
     active_handlers = 0
     peak_handlers = 0
+    active_by_destination = {"STORE_A": 0, "STORE_B": 0}
+    peak_by_destination = {"STORE_A": 0, "STORE_B": 0}
 
     def handle_move(event):
         nonlocal move_calls, active_handlers, peak_handlers
         accession = str(event.identifier.AccessionNumber)
-        yield "127.0.0.1", storage_port
+        destination = str(event.move_destination)
+        yield "127.0.0.1", receiver_ports[destination]
         yield 1
         with move_lock:
             move_calls += 1
             call_number = move_calls
             active_handlers += 1
             peak_handlers = max(peak_handlers, active_handlers)
-            if active_handlers >= 2:
-                first_pair_ready.set()
+            active_by_destination[destination] += 1
+            peak_by_destination[destination] = max(
+                peak_by_destination[destination],
+                active_by_destination[destination],
+            )
+            if active_handlers >= 3:
+                all_moves_ready.set()
         try:
-            if call_number <= 2:
-                assert release_first_pair.wait(5)
+            if call_number <= 3:
+                assert release_moves.wait(5)
             yield 0xFF00, sample_dataset(accession)
         finally:
             with move_lock:
                 active_handlers -= 1
+                active_by_destination[destination] -= 1
 
     server = pacs.start_server(
         ("127.0.0.1", pacs_port),
         block=False,
         evt_handlers=[(evt.EVT_C_MOVE, handle_move)],
     )
-    config = AppConfig(
-        dicom_destination_folder=str(tmp_path / "dicom"),
+    config_a = AppConfig(
+        dicom_destination_folder=str(tmp_path / "dicom-a"),
         pacs_server_ip="127.0.0.1",
         pacs_server_port=pacs_port,
         calling_ae_title="MOVESCU",
         pacs_ae_title="PACS",
-        storage_ae_title="STORESCP",
-        storage_port=storage_port,
+        storage_ae_title="STORE_A",
+        storage_port=storage_port_a,
+    )
+    config_a_second = AppConfig.from_dict(config_a.to_dict())
+    config_a_second.dicom_destination_folder = str(tmp_path / "dicom-a-second")
+    config_b = AppConfig(
+        dicom_destination_folder=str(tmp_path / "dicom-b"),
+        pacs_server_ip="127.0.0.1",
+        pacs_server_port=pacs_port,
+        calling_ae_title="MOVESCU",
+        pacs_ae_title="PACS",
+        storage_ae_title="STORE_B",
+        storage_port=storage_port_b,
     )
     active = {"movescu": 0}
     peak = {"movescu": 0}
@@ -193,13 +218,38 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
                 peak[kind] = max(peak[kind], active[kind])
 
     runtime = SharedDcmtkRuntime(
-        config,
+        config_a,
         tools,
         process_callback=process_event,
     )
     order = []
     handle_ids: set[int] = set()
+    staging_roots: dict[tuple[str, int], Path] = {}
     event_lock = threading.Lock()
+    route_directories: dict[str, Path] = {}
+    instrumented_receivers: set[int] = set()
+    original_ensure_receiver = runtime._ensure_receiver
+
+    def ensure_receiver(task_config):
+        receiver_handle = original_ensure_receiver(task_config)
+        receiver_id = id(receiver_handle.receiver)
+        with event_lock:
+            handle_ids.add(receiver_id)
+            staging_roots[receiver_handle.key] = receiver_handle.staging_directory
+            if receiver_id in instrumented_receivers:
+                return receiver_handle
+            instrumented_receivers.add(receiver_id)
+            original_register_route = receiver_handle.receiver.register_route
+
+            def register_route(accession, directory, **kwargs):
+                with event_lock:
+                    route_directories[accession] = Path(directory)
+                return original_register_route(accession, directory, **kwargs)
+
+            receiver_handle.receiver.register_route = register_route
+        return receiver_handle
+
+    runtime._ensure_receiver = ensure_receiver
 
     def execute(
         handle,
@@ -211,7 +261,6 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
     ):
         with event_lock:
             order.append((task_id, accession))
-            handle_ids.add(id(handle.receiver))
         return runtime.run_accession(
             handle,
             task_id,
@@ -225,26 +274,18 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
         runtime.start,
         runtime.stop,
         execute,
-        max_concurrent_moves=2,
+        max_concurrent_moves=3,
     )
-    shared_handle = receiver.ensure_started()
-    route_directories: dict[str, Path] = {}
-    original_register_route = shared_handle.receiver.register_route
-
-    def register_route(accession, directory, **kwargs):
-        with event_lock:
-            route_directories[accession] = Path(directory)
-        return original_register_route(accession, directory, **kwargs)
-
-    shared_handle.receiver.register_route = register_route
+    receiver.ensure_started()
     catalog = TaskCatalog(
         tmp_path / "tasks.sqlite3",
         legacy_path=tmp_path / "unused.sqlite3",
         auto_migrate=False,
     )
-    manager = TaskManager(catalog, receiver=receiver, max_concurrent_moves=2)
-    first = manager.create_task(config, ["A001", "A002"])
-    second = manager.create_task(config, ["B001"])
+    manager = TaskManager(catalog, receiver=receiver, max_concurrent_moves=3)
+    first = manager.create_task(config_a, ["A001"])
+    same_key = manager.create_task(config_a_second, ["A002"])
+    second_receiver = manager.create_task(config_b, ["B001"])
     worker_errors: list[Exception] = []
 
     def schedule_first_pair():
@@ -256,11 +297,11 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
     worker = threading.Thread(target=schedule_first_pair)
     try:
         worker.start()
-        assert first_pair_ready.wait(5)
+        assert all_moves_ready.wait(5)
         with process_lock:
-            assert active["movescu"] == 2
-            assert peak["movescu"] == 2
-        release_first_pair.set()
+            assert active["movescu"] == 3
+            assert peak["movescu"] == 3
+        release_moves.set()
         worker.join(10)
         assert not worker.is_alive()
         assert worker_errors == []
@@ -271,26 +312,41 @@ def test_real_multitask_runs_two_moves_through_one_routed_receiver(
             assert time.monotonic() < deadline
             manager.run_next_round()
     finally:
-        release_first_pair.set()
+        release_moves.set()
         manager.shutdown()
         server.shutdown()
 
     assert order == [
         (first.task_id, "A001"),
-        (second.task_id, "B001"),
-        (first.task_id, "A002"),
+        (same_key.task_id, "A002"),
+        (second_receiver.task_id, "B001"),
     ]
     assert starts == {"movescu": 3}
-    assert peak == {"movescu": 2}
+    assert peak == {"movescu": 3}
     assert active == {"movescu": 0}
-    assert peak_handlers == 2
-    assert len(handle_ids) == 1
+    assert peak_handlers == 3
+    assert peak_by_destination == {"STORE_A": 2, "STORE_B": 1}
+    assert len(handle_ids) == 2
+    assert set(staging_roots) == {
+        ("STORE_A", storage_port_a),
+        ("STORE_B", storage_port_b),
+    }
+    assert len(set(staging_roots.values())) == 2
+    assert all(not path.exists() for path in staging_roots.values())
     assert set(route_directories) == {"A001", "A002", "B001"}
     assert len(set(route_directories.values())) == 3
     assert manager.get_task(first.task_id).summary.phase == "completed"
-    assert manager.get_task(second.task_id).summary.phase == "completed"
-    received = list((tmp_path / "dicom").rglob("*.dcm"))
+    assert manager.get_task(same_key.task_id).summary.phase == "completed"
+    assert manager.get_task(second_receiver.task_id).summary.phase == "completed"
+    received = [
+        *list((tmp_path / "dicom-a").rglob("*.dcm")),
+        *list((tmp_path / "dicom-a-second").rglob("*.dcm")),
+        *list((tmp_path / "dicom-b").rglob("*.dcm")),
+    ]
     assert len(received) == 3
+    assert len(list((tmp_path / "dicom-a").rglob("*.dcm"))) == 1
+    assert len(list((tmp_path / "dicom-a-second").rglob("*.dcm"))) == 1
+    assert len(list((tmp_path / "dicom-b").rglob("*.dcm"))) == 1
     assert {path.parent.parent.name for path in received} == {
         "A001",
         "A002",

@@ -360,7 +360,8 @@ class SettingsPage(QWidget):
         receiver_form.addRow("监听端口", self.storage_port_edit)
         receiver_form.addRow("并发下载数", self.max_concurrent_moves_spin)
         concurrency_hint = QLabel(
-            "默认同时下载 2 个检查号；其余任务会显示为“等待并发槽”。"
+            "相同接收 AE 与端口复用一个并发 SCP；改用不同端口会自动启动多个 SCP。"
+            "默认同时下载 2 个检查号，其余任务显示为“等待并发槽”。"
         )
         concurrency_hint.setObjectName("FieldHint")
         concurrency_hint.setWordWrap(True)
@@ -664,12 +665,6 @@ class SettingsPage(QWidget):
         for widget in (
             self.dcmtk_edit,
             self.dcmtk_browse_button,
-            self.pacs_host_edit,
-            self.pacs_port_edit,
-            self.calling_ae_edit,
-            self.pacs_ae_edit,
-            self.storage_ae_edit,
-            self.storage_port_edit,
             self.max_concurrent_moves_spin,
         ):
             widget.setEnabled(not locked)
@@ -1332,6 +1327,12 @@ class DcmGetWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
+        self.task_config_summary_label = QLabel()
+        self.task_config_summary_label.setObjectName("FieldHint")
+        self.task_config_summary_label.setWordWrap(True)
+        self.task_config_summary_label.setAccessibleName("任务连接配置快照")
+        self.task_config_summary_label.hide()
+        layout.addWidget(self.task_config_summary_label)
 
         self.large_batch_summary_card = QFrame()
         self.large_batch_summary_card.setObjectName("LargeBatchSummaryCard")
@@ -1712,6 +1713,8 @@ class DcmGetWindow(QMainWindow):
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("新建下载任务")
+            self.task_config_summary_label.clear()
+            self.task_config_summary_label.hide()
             self.stop_button.hide()
             self.pause_button.hide()
             self.retry_button.hide()
@@ -1824,8 +1827,9 @@ class DcmGetWindow(QMainWindow):
         config.dicom_destination_folder = self.destination_edit.text().strip()
         if self.multi_task_enabled and self.task_controller is not None:
             runtime_changed = (
-                shared_receiver_config(config)
-                != shared_receiver_config(self.config)
+                shared_receiver_config(config) != shared_receiver_config(self.config)
+                or config.max_concurrent_moves
+                != self.config.max_concurrent_moves
             )
             if runtime_changed:
                 unfinished = [
@@ -1837,7 +1841,7 @@ class DcmGetWindow(QMainWindow):
                     QMessageBox.warning(
                         self,
                         "运行参数已锁定",
-                        "仍有未结束任务，暂时不能修改并发数、PACS、AE、接收端口或 DCMTK 路径。",
+                        "仍有未结束任务，暂时不能修改并发数或 DCMTK 路径。PACS、AE 和接收端口可按新任务单独保存。",
                     )
                     return
                 if not self.task_controller.shutdown():
@@ -2042,6 +2046,16 @@ class DcmGetWindow(QMainWindow):
         self._display_total = summary.total_count
         self._active_task_id = ""
         self.destination_edit.setText(detail.config.dicom_destination_folder)
+        self.task_config_summary_label.setText(
+            f"PACS：{detail.config.pacs_ae_title} @ "
+            f"{detail.config.pacs_server_ip}:{detail.config.pacs_server_port} · "
+            f"调用 AE：{detail.config.calling_ae_title} · "
+            f"接收：{detail.config.storage_ae_title}:{detail.config.storage_port}"
+        )
+        self.task_config_summary_label.setToolTip(
+            "这是创建任务时保存的连接配置；之后修改设置不会覆盖本任务。"
+        )
+        self.task_config_summary_label.show()
         self.destination_edit.setReadOnly(True)
         self.accession_edit.setReadOnly(True)
         previous = self.quick_pdi_checkbox.blockSignals(True)

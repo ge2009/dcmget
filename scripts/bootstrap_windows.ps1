@@ -31,14 +31,6 @@ if (-not (Test-Path $Runtime)) {
     Write-Warning "未检测到 Microsoft Visual C++ Runtime。请安装：https://aka.ms/vs/17/release/vc_redist.x64.exe"
 }
 
-$Config = Get-Content config.json -Raw | ConvertFrom-Json
-$StoragePort = if ($Config.storage_port) {
-    [int]$Config.storage_port
-} elseif ($Config.network_port) {
-    [int]$Config.network_port
-} else {
-    6666
-}
 $RuleName = "DcmGet Receiver TCP"
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -49,7 +41,7 @@ if ($IsAdmin) {
         Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     }
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
-        -Program $ReceiverProgram -Protocol TCP -LocalPort $StoragePort `
+        -Program $ReceiverProgram -Protocol TCP `
         -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null
     Write-Host "已确认 DICOM 接收器防火墙规则：$RuleName"
 } else {

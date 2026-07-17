@@ -169,6 +169,28 @@ def test_single_route_safely_binds_first_tagless_accession_by_study_uid(
     assert (destination / f"{dataset.SOPInstanceUID}.dcm").is_file()
 
 
+def test_single_route_fallback_rejects_incorrect_accession_tag(tmp_path: Path):
+    quarantine = tmp_path / "quarantine"
+    receiver = PynetdicomStorageSCP(
+        "DCMGET",
+        0,
+        bind_address="127.0.0.1",
+        quarantine_directory=quarantine,
+        allow_single_route_fallback=True,
+    )
+    destination = tmp_path / "single"
+    receiver.register_route("EXPECTED", destination)
+    dataset = _dataset("WRONG-TAG", generate_uid())
+    receiver.start()
+    try:
+        assert _send(receiver.listening_port, dataset) == 0xC000
+    finally:
+        receiver.stop()
+
+    assert not list(destination.glob("*.dcm"))
+    assert len(list(quarantine.glob("*.dcm"))) == 1
+
+
 def test_default_concurrent_mode_never_guesses_a_single_remaining_route(
     tmp_path: Path,
 ):

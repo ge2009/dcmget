@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -428,31 +429,35 @@ def test_new_legacy_checkpoint_gets_its_own_matching_backup(tmp_path):
     assert TaskCheckpointStore(second_backup).load_required().task_id == second.task_id
 
 
-def test_delayed_legacy_migration_rejects_active_duplicate_and_config_conflict(
-    tmp_path,
-):
+def test_delayed_legacy_migration_allows_heterogeneous_receiver_config(tmp_path):
     legacy = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     checkpoint = legacy.start(
         AppConfig(pacs_server_port=11112, storage_port=6666),
-        ["DUP"],
+        ["LEGACY"],
         trial_required=False,
     )
     assert legacy.try_acquire_lease()
     try:
         store = catalog(tmp_path, auto_migrate=True)
-        store.create_task(
-            AppConfig(pacs_server_port=104, storage_port=7777),
-            ["DUP"],
+        current = store.create_task(
+            AppConfig(
+                pacs_server_port=104,
+                storage_ae_title="DCMGET_ALT",
+                storage_port=7777,
+            ),
+            ["CURRENT"],
         )
     finally:
         legacy.release_lease()
 
-    with pytest.raises(TaskStateError, match="旧任务的共享接收配置"):
-        store.migrate_legacy()
+    migrated = store.migrate_legacy()
 
-    assert len(store.list_tasks()) == 1
-    assert legacy.load_required().task_id == checkpoint.task_id
-    assert not list(tmp_path.glob("active-task.sqlite3.pre-multitask*.bak"))
+    assert migrated is not None
+    assert migrated.task_id == checkpoint.task_id
+    assert len(store.list_tasks()) == 2
+    assert store.get_config(current.task_id).storage_port == 7777
+    assert store.get_config(checkpoint.task_id).storage_port == 6666
+    assert list(tmp_path.glob("active-task.sqlite3.pre-multitask*.bak"))
 
 
 def test_delayed_legacy_migration_rejects_duplicate_accession(tmp_path):
@@ -552,6 +557,71 @@ def test_two_tasks_run_concurrently_but_one_task_uses_only_one_slot(tmp_path):
     manager.shutdown()
 
 
+def test_same_receiver_key_and_different_key_can_fill_concurrent_slots(tmp_path):
+    entered: list[tuple[str, tuple[str, int]]] = []
+    active_by_key: dict[tuple[str, int], int] = {}
+    peak_by_key: dict[tuple[str, int], int] = {}
+    lock = threading.Lock()
+    all_started = threading.Event()
+    release = threading.Event()
+
+    def execute(task_id, config, accession):
+        key = (config.storage_ae_title, config.storage_port)
+        with lock:
+            entered.append((task_id, key))
+            active_by_key[key] = active_by_key.get(key, 0) + 1
+            peak_by_key[key] = max(
+                peak_by_key.get(key, 0),
+                active_by_key[key],
+            )
+            if len(entered) == 3:
+                all_started.set()
+        assert release.wait(2)
+        with lock:
+            active_by_key[key] -= 1
+        return completed(accession)
+
+    manager = TaskManager(catalog(tmp_path), execute, max_concurrent_moves=3)
+    first = manager.create_task(
+        AppConfig(storage_ae_title="STORE_A", storage_port=6666),
+        ["A001"],
+    )
+    same_receiver = manager.create_task(
+        AppConfig(storage_ae_title="STORE_A", storage_port=6666),
+        ["B001"],
+    )
+    different_receiver = manager.create_task(
+        AppConfig(storage_ae_title="STORE_C", storage_port=7777),
+        ["C001"],
+    )
+    worker = threading.Thread(target=manager.run_next_round)
+    worker.start()
+
+    assert all_started.wait(2)
+    with lock:
+        started_ids = {task_id for task_id, _key in entered}
+    assert started_ids == {
+        first.task_id,
+        same_receiver.task_id,
+        different_receiver.task_id,
+    }
+
+    release.set()
+    worker.join(2)
+    deadline = time.monotonic() + 2
+    while any(item.phase in {"queued", "running"} for item in manager.list_tasks()):
+        assert time.monotonic() < deadline
+        manager.run_next_round()
+
+    assert peak_by_key[("STORE_A", 6666)] == 2
+    assert {task_id for task_id, _key in entered} == {
+        first.task_id,
+        same_receiver.task_id,
+        different_receiver.task_id,
+    }
+    manager.shutdown()
+
+
 def test_new_task_fills_free_slot_while_existing_move_is_still_running(tmp_path):
     first_started = threading.Event()
     second_started = threading.Event()
@@ -577,7 +647,10 @@ def test_new_task_fills_free_slot_while_existing_move_is_still_running(tmp_path)
     worker = threading.Thread(target=schedule)
     worker.start()
     assert first_started.wait(2)
-    manager.create_task(AppConfig(), ["B001"])
+    manager.create_task(
+        AppConfig(storage_ae_title="STORE_B", storage_port=7777),
+        ["B001"],
+    )
 
     assert second_started.wait(1)
     release_first.set()
@@ -700,7 +773,10 @@ def test_cancel_active_task_calls_only_its_canceller(tmp_path):
         max_concurrent_moves=1,
     )
     first = manager.create_task(AppConfig(), ["A001", "A002"])
-    second = manager.create_task(AppConfig(), ["B001"])
+    second = manager.create_task(
+        AppConfig(storage_ae_title="STORE_B", storage_port=7777),
+        ["B001"],
+    )
     worker = threading.Thread(target=manager.run_next_round)
     worker.start()
     assert entered.wait(2)
@@ -759,8 +835,14 @@ def test_shutdown_requeues_all_inflight_before_stopping_shared_receiver(tmp_path
         cancel_accession=cancel,
         max_concurrent_moves=2,
     )
-    first = manager.create_task(AppConfig(), ["A001", "A002"])
-    second = manager.create_task(AppConfig(), ["B001"])
+    first = manager.create_task(
+        AppConfig(storage_ae_title="DCMGET_A", storage_port=6666),
+        ["A001", "A002"],
+    )
+    second = manager.create_task(
+        AppConfig(storage_ae_title="DCMGET_B", storage_port=6667),
+        ["B001"],
+    )
     worker = threading.Thread(target=manager.run_next_round)
     worker.start()
 
@@ -1006,35 +1088,106 @@ def test_retry_cannot_reactivate_accession_owned_by_another_active_task(tmp_path
     assert store.get_summary(failed.task_id).phase == "failed"
 
 
-def test_shared_receiver_configuration_is_fixed_while_tasks_are_active(tmp_path):
+def test_task_receiver_configuration_is_snapshotted_per_active_task(tmp_path):
     store = catalog(tmp_path)
-    first_config = AppConfig(dicom_destination_folder=str(tmp_path / "one"))
-    store.create_task(first_config, ["A001"])
+    first_config = AppConfig(
+        dicom_destination_folder=str(tmp_path / "one"),
+        pacs_server_ip="192.0.2.10",
+        pacs_server_port=104,
+        calling_ae_title="CALLING_A",
+        pacs_ae_title="PACS_A",
+        storage_ae_title="STORE_A",
+        storage_port=6666,
+    )
+    first = store.create_task(first_config, ["A001"])
 
-    other_destination = AppConfig(
+    other_receiver = AppConfig(
         dicom_destination_folder=str(tmp_path / "two"),
+        pacs_server_ip="198.51.100.20",
+        pacs_server_port=11112,
+        calling_ae_title="CALLING_B",
+        pacs_ae_title="PACS_B",
+        storage_ae_title="STORE_B",
+        storage_port=7777,
         anonymization_enabled=True,
         pdi_export_enabled=True,
         pdi_institution_name="测试医院",
         pdi_output_folder=str(tmp_path / "pdi"),
     )
-    store.create_task(other_destination, ["B001"])
+    second = store.create_task(other_receiver, ["B001"])
+    store.validate_shared_config(other_receiver)
 
-    incompatible = AppConfig(
-        dicom_destination_folder=str(tmp_path / "three"),
-        pacs_server_port=first_config.pacs_server_port + 1,
+    same_receiver = AppConfig(
+        dicom_destination_folder=str(tmp_path / "same-receiver"),
+        pacs_server_ip="203.0.113.30",
+        pacs_server_port=4242,
+        calling_ae_title="CALLING_C",
+        pacs_ae_title="PACS_C",
+        storage_ae_title="STORE_A",
+        storage_port=6666,
     )
-    with pytest.raises(TaskStateError, match="pacs_server_port"):
-        store.create_task(incompatible, ["C001"])
-    with pytest.raises(TaskStateError, match="pacs_server_port"):
-        store.validate_shared_config(incompatible)
+    third = store.create_task(same_receiver, ["C001"])
+
+    reopened = TaskCatalog(store.path, auto_migrate=False)
+    assert reopened.get_config(first.task_id).to_dict() == first_config.to_dict()
+    assert reopened.get_config(second.task_id).to_dict() == other_receiver.to_dict()
+    assert reopened.get_config(third.task_id).to_dict() == same_receiver.to_dict()
+
+    same_port_different_ae = AppConfig(
+        storage_ae_title="STORE_OTHER",
+        storage_port=6666,
+    )
+    with pytest.raises(TaskStateError, match="端口 6666.*STORE_A.*STORE_OTHER"):
+        store.create_task(same_port_different_ae, ["D001"])
+
+    same_ae_different_port = AppConfig(
+        storage_ae_title="STORE_A",
+        storage_port=9999,
+    )
+    additional_receiver = store.create_task(same_ae_different_port, ["E001"])
+    assert store.get_config(additional_receiver.task_id).storage_port == 9999
 
     different_concurrency = AppConfig(
-        dicom_destination_folder=str(tmp_path / "four"),
+        dicom_destination_folder=str(tmp_path / "three"),
         max_concurrent_moves=first_config.max_concurrent_moves + 1,
+        storage_ae_title="STORE_A",
+        storage_port=6666,
     )
-    with pytest.raises(TaskStateError, match="max_concurrent_moves"):
-        store.create_task(different_concurrency, ["D001"])
+    fourth = store.create_task(different_concurrency, ["F001"])
+    assert store.get_config(fourth.task_id).max_concurrent_moves == 3
+
+    different_dcmtk = AppConfig(
+        dicom_destination_folder=str(tmp_path / "four"),
+        dcmtk_bin_dir=str(tmp_path / "other-dcmtk"),
+        storage_ae_title="STORE_A",
+        storage_port=6666,
+    )
+    with pytest.raises(TaskStateError, match="dcmtk_bin_dir"):
+        store.create_task(different_dcmtk, ["G001"])
+
+
+def test_restored_tasks_reject_ambiguous_receiver_mapping(tmp_path):
+    store = catalog(tmp_path)
+    store.create_task(
+        AppConfig(storage_ae_title="STORE_A", storage_port=6666),
+        ["A001"],
+    )
+    second = store.create_task(
+        AppConfig(storage_ae_title="STORE_B", storage_port=7777),
+        ["B001"],
+    )
+    invalid = AppConfig(storage_ae_title="STORE_B", storage_port=6666)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE tasks SET config_json = ? WHERE task_id = ?",
+            (
+                json.dumps(invalid.to_dict(), ensure_ascii=False),
+                second.task_id,
+            ),
+        )
+
+    with pytest.raises(TaskStateError, match="端口 6666.*STORE_A.*STORE_B"):
+        TaskCatalog(store.path, auto_migrate=False).validate_receiver_mappings()
 
 
 def test_trial_hook_runs_once_for_task_resume_and_retry(tmp_path):

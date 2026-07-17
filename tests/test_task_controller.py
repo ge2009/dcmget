@@ -197,26 +197,49 @@ def test_controller_create_task_wakes_idle_scheduler(qtbot, tmp_path, monkeypatc
     assert controller.shutdown()
 
 
-def test_controller_rejects_current_receiver_config_that_differs_from_recovery(
-    tmp_path,
+def test_controller_restores_tasks_with_different_receiver_snapshots(
+    tmp_path, monkeypatch
 ):
+    from dcmget import task_controller
     from dcmget.task_manager import TaskCatalog
 
+    monkeypatch.setattr(task_controller, "SharedDcmtkRuntime", _Runtime)
     path = tmp_path / "tasks.sqlite3"
     catalog = TaskCatalog(path, auto_migrate=False)
-    catalog.create_task(AppConfig(storage_port=7777), ["A001"])
+    first = catalog.create_task(
+        AppConfig(
+            pacs_server_ip="192.0.2.10",
+            calling_ae_title="CALLING_A",
+            storage_ae_title="STORE_A",
+            storage_port=7777,
+        ),
+        ["A001"],
+    )
+    second = catalog.create_task(
+        AppConfig(
+            pacs_server_ip="198.51.100.20",
+            calling_ae_title="CALLING_B",
+            storage_ae_title="STORE_B",
+            storage_port=8888,
+        ),
+        ["B001"],
+    )
 
-    with pytest.raises(RuntimeError, match="storage_port"):
-        TaskExecutionController(
-            AppConfig(storage_port=6666),
-            _tools(tmp_path),
-            catalog_path=path,
-            legacy_path=tmp_path / "unused.sqlite3",
-        )
+    controller = TaskExecutionController(
+        AppConfig(storage_port=6666, max_concurrent_moves=5),
+        _tools(tmp_path),
+        catalog_path=path,
+        legacy_path=tmp_path / "unused.sqlite3",
+    )
 
-    reopened = TaskCatalog(path, auto_migrate=False)
-    assert reopened.try_acquire_foreground_lease()
-    reopened.release_foreground_lease()
+    assert {item.task_id for item in controller.list_tasks()} == {
+        first.task_id,
+        second.task_id,
+    }
+    assert controller.catalog.get_config(first.task_id).storage_port == 7777
+    assert controller.catalog.get_config(second.task_id).storage_port == 8888
+    assert controller.manager.max_concurrent_moves == 5
+    assert controller.shutdown()
 
 
 def test_controller_rejects_pdi_resume_with_different_dcmtk_snapshot(tmp_path):
@@ -306,9 +329,11 @@ def test_controller_routes_scheduler_error_to_the_failed_task(
     assert controller.shutdown()
 
 
-def test_retry_rejects_terminal_task_with_stale_receiver_snapshot(tmp_path):
+def test_retry_uses_terminal_task_receiver_snapshot(qtbot, tmp_path, monkeypatch):
+    from dcmget import task_controller
     from dcmget.task_manager import TaskCatalog
 
+    monkeypatch.setattr(task_controller, "SharedDcmtkRuntime", _Runtime)
     path = tmp_path / "tasks.sqlite3"
     catalog = TaskCatalog(path, auto_migrate=False)
     task = catalog.create_task(AppConfig(storage_port=7777), ["A001"])
@@ -320,10 +345,13 @@ def test_retry_rejects_terminal_task_with_stale_receiver_snapshot(tmp_path):
         legacy_path=tmp_path / "unused.sqlite3",
     )
 
-    with pytest.raises(RuntimeError, match="storage_port"):
-        controller.retry_task(task.task_id)
+    controller.retry_task(task.task_id)
+    qtbot.waitUntil(
+        lambda: controller.get_task(task.task_id).summary.phase == "completed",
+        timeout=5000,
+    )
 
-    assert controller.get_task(task.task_id).summary.phase == "failed"
+    assert controller.catalog.get_config(task.task_id).storage_port == 7777
     assert controller.shutdown()
 
 

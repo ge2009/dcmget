@@ -41,7 +41,7 @@ class _ActivationBridge(QObject):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.8.1 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.8.2 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
