@@ -928,6 +928,17 @@ class DcmGetWindow(QMainWindow):
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.setStyleSheet(APP_STYLESHEET)
+        for widget in (
+            self.app_title,
+            self.app_subtitle,
+            self.tool_status,
+            self.entitlement_status,
+            self.registration_button,
+            self.release_notes_button,
+            self.diagnostic_log_button,
+            self.settings_button,
+        ):
+            widget.setMinimumWidth(widget.sizeHint().width())
         self._refresh_entitlement_status()
 
         self.open_accession_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
