@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 install_qt_message_handler()
 
 from dcmget.auth_ui import authorize_gui
+from dcmget.architecture import ensure_supported_runtime
 from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
 from dcmget.instance_profile import (
@@ -52,7 +53,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.9.1 图形界面")
+    parser = argparse.ArgumentParser(description=f"DcmGet {__version__} 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -176,6 +177,7 @@ def run_self_test(config_path: str, report_path: str | None = None) -> int:
                 pdi_output / STUDY_INDEX,
                 pdi_output / "VIEWER" / "OHIF" / "index.html",
                 pdi_output / "VIEWER" / "pdi_server.py",
+                pdi_output / "VIEWER" / "architecture.py",
                 pdi_output / "OPEN_VIEWER.exe",
                 pdi_output / "OPEN_VIEWER.bat",
             )
@@ -227,6 +229,7 @@ def validate_frozen_pdi_resources(root: str | Path) -> None:
     required = (
         base / "DcmGetPdiServer.exe",
         base / "dcmget" / "pdi_server.py",
+        base / "dcmget" / "architecture.py",
         ohif / "index.html",
         ohif / "app-config.js",
         ohif / "init-service-worker.js",
@@ -332,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         value in {"--self-test", "--ui-self-test"} for value in arguments
     )
     try:
+        ensure_supported_runtime()
         args = build_parser().parse_args(arguments)
         prepare_windows_portable_dcmtk(PROJECT_ROOT)
         if args.self_test:

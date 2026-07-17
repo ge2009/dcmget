@@ -117,6 +117,28 @@ def _request(
     return result
 
 
+def test_main_rejects_unsupported_runtime_before_starting_server(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        pdi_server,
+        "ensure_supported_runtime",
+        lambda: (_ for _ in ()).throw(
+            pdi_server.ArchitectureError("32 位运行时")
+        ),
+    )
+    started = []
+    monkeypatch.setattr(
+        pdi_server,
+        "run_server",
+        lambda *_args, **_kwargs: started.append(True),
+    )
+
+    assert pdi_server.main([]) == 1
+    assert started == []
+    assert "运行环境不受支持" in capsys.readouterr().err
+
+
 def _authenticate(server: PdiHttpServer) -> dict[str, str]:
     status, headers, body = _request(server, f"/open/{server.session_token}")
     assert status == 303 and body == b""

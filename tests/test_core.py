@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -293,6 +294,50 @@ def test_resolver_discovers_validation_and_pdi_tools_next_to_dcmtk_binaries(
 
     assert tools.dcmmkdir == tmp_path / f"dcmmkdir{suffix}"
     assert tools.dcmdump == tmp_path / f"dcmdump{suffix}"
+
+
+def test_resolver_validates_dcmtk_pe_architecture_on_windows(
+    tmp_path, monkeypatch
+):
+    movescu = tmp_path / "movescu.exe"
+    storescp = tmp_path / "storescp.exe"
+    movescu.touch()
+    storescp.touch()
+    require_amd64 = Mock()
+    monkeypatch.setattr(core, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(core, "require_amd64_pe", require_amd64)
+    monkeypatch.setattr(
+        core,
+        "_run_probe",
+        lambda command, **_kwargs: (
+            "dcmtk v3.7.0" if "--version" in command else ""
+        ),
+    )
+
+    tools = DcmtkResolver(tmp_path)._probe(movescu, storescp)
+
+    assert tools.version == "3.7.0"
+    assert require_amd64.call_args_list == [
+        ((movescu, "DCMTK movescu"),),
+        ((storescp, "DCMTK storescp"),),
+    ]
+
+
+def test_preflight_reports_unsupported_dcmtk_architecture(tmp_path):
+    config = AppConfig(dicom_destination_folder=str(tmp_path))
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.side_effect = core.ArchitectureError(
+        "DCMTK movescu 必须是 AMD64/x64"
+    )
+
+    result = preflight(config, resolver)
+
+    assert not result.ok
+    assert "AMD64/x64" in result.errors["dcmtk_bin_dir"]
+    assert any(
+        name == "DCMTK 工具" and not ok and "AMD64/x64" in message
+        for name, ok, message in result.checks
+    )
 
 
 def test_preflight_reports_port_conflict(tmp_path):
@@ -922,9 +967,10 @@ def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
     cancel = threading.Event()
     publish = core._publish_or_deduplicate
 
-    def publish_then_cancel(source, target):
-        publish(source, target)
+    def publish_then_cancel(source, target, **kwargs):
+        publication = publish(source, target, **kwargs)
         cancel.set()
+        return publication
 
     monkeypatch.setattr(core, "_publish_or_deduplicate", publish_then_cancel)
 
@@ -955,10 +1001,10 @@ def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkey
     assert core.staging_directory_root(anonymous) == state / "staging"
     assert core.log_directory(anonymous) == state / "logs"
     assert core.staging_directory_root(regular) == tmp_path / "dicom" / ".dcmget-staging"
-    assert core.log_directory(regular) == state / "logs"
+    assert core.log_directory(regular) == tmp_path / "dicom" / "_DcmGetLogs"
 
 
-def test_task_log_is_private_and_not_created_beside_dicom(tmp_path, monkeypatch):
+def test_task_log_is_created_beside_dicom_results(tmp_path, monkeypatch):
     state = tmp_path / "private-state"
     destination = tmp_path / "dicom"
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
@@ -969,11 +1015,38 @@ def test_task_log_is_private_and_not_created_beside_dicom(tmp_path, monkeypatch)
     runner._emit("应用", "private log test", "info")
     runner._close_file_logger()
 
-    log = state / "logs" / "dcmget.log"
+    log = destination / "_DcmGetLogs" / "dcmget.log"
     assert log.is_file()
-    assert not (destination / "logs").exists()
+    assert not (state / "logs" / "dcmget.log").exists()
     if os.name != "nt":
         assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_task_log_falls_back_to_instance_directory_with_visible_warning(tmp_path):
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    blocked_log_path = destination / "_DcmGetLogs"
+    blocked_log_path.write_text("not a directory", encoding="utf-8")
+    fallback = tmp_path / "instance" / "logs"
+    events = []
+
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(destination)),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda source, message, level: events.append(
+            (source, message, level)
+        ),
+        fallback_log_directory=fallback,
+    )
+    runner._close_file_logger()
+
+    assert runner.active_log_directory == fallback
+    assert runner.used_log_fallback
+    assert (fallback / "dcmget.log").is_file()
+    assert events[0][0] == "应用"
+    assert events[0][2] == "warning"
+    assert "任务日志目录不可写" in events[0][1]
+    assert str(fallback) in events[0][1]
 
 
 def test_download_runner_can_isolate_log_directory_per_process(tmp_path, monkeypatch):
@@ -1115,7 +1188,7 @@ def test_retry_same_sop_and_content_is_idempotent(tmp_path):
     assert not duplicate.exists()
 
 
-def test_same_sop_with_different_content_is_rejected_as_conflict(tmp_path):
+def test_same_sop_with_different_content_skips_valid_existing_target(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
     first = staging / "first.dcm"
@@ -1128,14 +1201,20 @@ def test_same_sop_with_different_content_is_rejected_as_conflict(tmp_path):
     moved, rejected = core._archive_dicom_files(
         [first], tmp_path / "dicom", "{AccessionNumber}", "ACC051"
     )
+    stats = core.ArchiveStats()
     conflict_moved, conflict_rejected = core._archive_dicom_files(
-        [conflict], tmp_path / "dicom", "{AccessionNumber}", "ACC051"
+        [conflict],
+        tmp_path / "dicom",
+        "{AccessionNumber}",
+        "ACC051",
+        stats=stats,
     )
 
     assert len(moved) == 1 and rejected == []
-    assert conflict_moved == []
-    assert conflict_rejected == [conflict]
-    assert conflict.exists()
+    assert conflict_moved == moved
+    assert conflict_rejected == []
+    assert stats.existing_skipped_count == 1
+    assert not conflict.exists()
     assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
 
 
@@ -1899,7 +1978,7 @@ def test_preexisting_staging_file_is_not_assigned_to_a_later_move(tmp_path, monk
 
     assert result.status == AccessionStatus.NO_DATA
     assert existing.is_file()
-    assert not (tmp_path / "dicom").exists()
+    assert list((tmp_path / "dicom").rglob("*.dcm")) == []
 
 
 def test_receiver_death_aborts_current_move_and_marks_failure(tmp_path, monkeypatch):

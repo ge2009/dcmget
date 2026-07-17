@@ -711,6 +711,7 @@ class SettingsPage(QWidget):
 
 class DownloadWorker(QObject):
     log = pyqtSignal(str, str, str)
+    log_directory_ready = pyqtSignal(str, bool)
     state = pyqtSignal(str)
     progress = pyqtSignal(int, int, object)
     finished = pyqtSignal(object)
@@ -726,6 +727,7 @@ class DownloadWorker(QObject):
         task_store: TaskCheckpointStore | None = None,
         task_id: str = "",
         log_directory: str | Path | None = None,
+        fallback_log_directory: str | Path | None = None,
     ):
         super().__init__()
         self.config = config
@@ -736,6 +738,11 @@ class DownloadWorker(QObject):
         self.task_id = task_id
         self.log_directory = (
             Path(log_directory).expanduser() if log_directory is not None else None
+        )
+        self.fallback_log_directory = (
+            Path(fallback_log_directory).expanduser()
+            if fallback_log_directory is not None
+            else None
         )
         self.runner: DownloadRunner | None = None
         self.cancel_requested = False
@@ -759,7 +766,16 @@ class DownloadWorker(QObject):
                     f"task-{self.task_id}.log" if self.task_id else "dcmget.log"
                 ),
                 log_directory=self.log_directory,
+                fallback_log_directory=self.fallback_log_directory,
             )
+            active_log_directory = getattr(
+                runner, "active_log_directory", self.log_directory
+            )
+            if active_log_directory is not None:
+                self.log_directory_ready.emit(
+                    str(active_log_directory),
+                    bool(getattr(runner, "used_log_fallback", False)),
+                )
             with self._control_lock:
                 self.runner = runner
                 if self.cancel_requested:
@@ -921,6 +937,8 @@ class DcmGetWindow(QMainWindow):
             Path(log_directory).expanduser() if log_directory is not None else None
         )
         self.instance_log_directory = self.log_directory
+        self._active_task_log_directory: Path | None = None
+        self._task_log_used_fallback = False
         self.config = load_config(self.config_path)
         self.resolver = DcmtkResolver(self.project_root)
         self.task_store = TaskCheckpointStore(task_state_path)
@@ -982,8 +1000,17 @@ class DcmGetWindow(QMainWindow):
         self.row_by_accession: dict[str, int] = {}
         self._task_table_summary_mode = False
         self._summary_results: dict[str, AccessionResult] = {}
+        self._result_stats: dict[str, tuple[int, int, int, int]] = {}
+        self._result_new_file_count = 0
+        self._result_existing_skipped_count = 0
+        self._result_conflict_preserved_count = 0
+        self._result_failed_count = 0
+        self._result_destination_directory: Path | None = None
         self._summary_processed = 0
         self._summary_files = 0
+        self._summary_new_file_count = 0
+        self._summary_existing_skipped_count = 0
+        self._summary_conflict_preserved_count = 0
         self._summary_status_counts: dict[AccessionStatus, int] = {}
         self._workspace_task_summaries: dict[str, TaskSummary] = {}
         self._compact_action_layout: bool | None = None
@@ -995,7 +1022,7 @@ class DcmGetWindow(QMainWindow):
             "window/log_detailed", False, type=bool
         )
         self._task_form_expanded = self.settings_store.value(
-            "window/task_form_expanded", True, type=bool
+            "window/task_form_expanded", False, type=bool
         )
 
         instance_title = f" - {self.instance_label}" if self.instance_label else ""
@@ -1241,9 +1268,6 @@ class DcmGetWindow(QMainWindow):
         self.destination_button = QPushButton("选择目录")
         self.destination_button.clicked.connect(self._choose_destination)
         grid.addWidget(self.destination_button, 2, 2)
-        self.open_destination_button = QPushButton("打开目标目录")
-        self.open_destination_button.clicked.connect(self._open_destination_directory)
-        grid.addWidget(self.open_destination_button, 2, 3)
         self.destination_error_label = QLabel()
         self.destination_error_label.setObjectName("InlineErrorText")
         self.destination_error_label.setWordWrap(True)
@@ -1372,6 +1396,39 @@ class DcmGetWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
+
+        self.task_result_summary = QLabel(
+            "结果：新增 0 · 已存在跳过 0 · 冲突保留 0 · 失败 0"
+        )
+        self.task_result_summary.setObjectName("ProgressText")
+        self.task_result_summary.setWordWrap(True)
+        self.task_result_summary.setAccessibleName("任务结果统计")
+        layout.addWidget(self.task_result_summary)
+
+        result_shortcuts = QHBoxLayout()
+        result_shortcuts.setSpacing(8)
+        result_shortcuts.addWidget(QLabel("结果与日志"))
+        self.open_destination_button = QPushButton("打开影像目录")
+        self.open_destination_button.clicked.connect(
+            self._open_destination_directory
+        )
+        self.open_task_log_button = QPushButton("打开任务日志")
+        self.open_task_log_button.clicked.connect(self._open_task_log_directory)
+        self.open_conflict_button = QPushButton("打开冲突目录")
+        self.open_conflict_button.clicked.connect(self._open_conflict_directory)
+        for button in (
+            self.open_destination_button,
+            self.open_task_log_button,
+            self.open_conflict_button,
+        ):
+            result_shortcuts.addWidget(button)
+        result_shortcuts.addStretch()
+        layout.addLayout(result_shortcuts)
+        self.destination_edit.textChanged.connect(
+            self._on_destination_path_changed
+        )
+        self._update_result_shortcut_state()
+
         self.task_config_summary_label = QLabel()
         self.task_config_summary_label.setObjectName("FieldHint")
         self.task_config_summary_label.setWordWrap(True)
@@ -1576,7 +1633,8 @@ class DcmGetWindow(QMainWindow):
         clear = QPushButton("清空显示")
         clear.setToolTip("只清空界面缓存，不删除磁盘日志")
         clear.clicked.connect(self._clear_logs)
-        open_logs = QPushButton("日志目录")
+        open_logs = QPushButton("任务日志")
+        open_logs.setToolTip("打开当前任务的完整磁盘日志目录")
         open_logs.clicked.connect(self._open_log_directory)
         for button in (open_result, copy_error, clear, open_logs):
             header.addWidget(button)
@@ -2465,6 +2523,13 @@ class DcmGetWindow(QMainWindow):
 
     def _apply_checkpoint_config(self, checkpoint: TaskCheckpoint) -> None:
         self.config = AppConfig.from_dict(checkpoint.config.to_dict())
+        self._result_destination_directory = Path(
+            self.config.dicom_destination_folder
+        ).expanduser()
+        self._active_task_log_directory = self._task_log_directory_for_config(
+            self.config
+        )
+        self._task_log_used_fallback = False
         self.settings_page.set_config(self.config)
         self.destination_edit.setText(self.config.dicom_destination_folder)
         self._sync_quick_pdi_controls_from_config()
@@ -2492,6 +2557,10 @@ class DcmGetWindow(QMainWindow):
                 len(checkpoint.accessions),
                 [*checkpoint.results, *checkpoint.partial_results.values()],
             )
+        self._update_task_result_summary(
+            [*checkpoint.results, *checkpoint.partial_results.values()]
+        )
+        self._update_result_shortcut_state()
 
     def _hold_download_resume(
         self, checkpoint: TaskCheckpoint, message: str
@@ -2683,15 +2752,150 @@ class DcmGetWindow(QMainWindow):
         self._append_log("应用", f"PDI 保存目录：{selected}", "info")
 
     def _open_destination_directory(self) -> None:
-        directory = self.destination_edit.text().strip()
-        if not directory:
-            QMessageBox.warning(self, "无法打开目录", "请先选择已存在的目标目录。")
+        path = self._destination_directory()
+        if path is None:
+            QMessageBox.warning(self, "无法打开影像目录", "请先选择已存在的保存目录。")
             return
-        path = Path(directory).expanduser()
         if path.is_dir():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
             return
-        QMessageBox.warning(self, "无法打开目录", "请先选择已存在的目标目录。")
+        QMessageBox.warning(self, "无法打开影像目录", "请先选择已存在的保存目录。")
+
+    def _on_destination_path_changed(self, _text: str = "") -> None:
+        if (
+            not self._is_busy()
+            and not self._result_stats
+            and self.last_summary is None
+            and self._resume_checkpoint is None
+        ):
+            self._active_task_log_directory = None
+            self._task_log_used_fallback = False
+        self._update_result_shortcut_state()
+
+    def _destination_directory(self) -> Path | None:
+        if self._result_destination_directory is not None:
+            return self._result_destination_directory
+        value = self.destination_edit.text().strip()
+        return Path(value).expanduser() if value else None
+
+    def _task_log_directory_for_config(self, config: AppConfig) -> Path:
+        if config.anonymization_enabled and self.instance_log_directory is not None:
+            return self.instance_log_directory
+        return log_directory(config)
+
+    def _expected_task_log_directory(self) -> Path | None:
+        if self.config.anonymization_enabled:
+            return self._task_log_directory_for_config(self.config)
+        destination = self._destination_directory()
+        return destination / "_DcmGetLogs" if destination is not None else None
+
+    def _conflict_directory(self) -> Path | None:
+        destination = self._destination_directory()
+        return destination / "_DcmGetConflicts" if destination is not None else None
+
+    def _update_result_shortcut_state(self) -> None:
+        if not hasattr(self, "open_destination_button"):
+            return
+        destination = self._destination_directory()
+        destination_exists = bool(destination and destination.is_dir())
+        self.open_destination_button.setEnabled(destination_exists)
+        self.open_destination_button.setToolTip(
+            f"打开本任务的 DICOM 影像根目录：{destination}"
+            if destination_exists
+            else "请先选择已存在的保存目录"
+        )
+
+        task_log = self._active_task_log_directory or self._expected_task_log_directory()
+        can_open_log = bool(
+            task_log
+            and (
+                task_log.is_dir()
+                or destination_exists
+                or self._task_log_used_fallback
+            )
+        )
+        self.open_task_log_button.setEnabled(can_open_log)
+        if self._task_log_used_fallback and task_log is not None:
+            self.open_task_log_button.setText("打开本地日志")
+            self.open_task_log_button.setToolTip(
+                f"目标日志目录不可写，任务日志已回退到：{task_log}"
+            )
+        elif can_open_log:
+            self.open_task_log_button.setText("打开任务日志")
+            self.open_task_log_button.setToolTip(
+                f"打开当前任务的下载与接收日志：{task_log}"
+            )
+        else:
+            self.open_task_log_button.setText("打开任务日志")
+            self.open_task_log_button.setToolTip("开始任务后可打开下载与接收日志")
+
+        conflict = self._conflict_directory()
+        conflict_exists = bool(conflict and conflict.is_dir())
+        self.open_conflict_button.setEnabled(conflict_exists)
+        self.open_conflict_button.setToolTip(
+            f"打开已保留的新收冲突文件：{conflict}"
+            if conflict_exists
+            else "当前保存目录没有需要人工核对的冲突文件"
+        )
+
+    def _on_task_log_directory_ready(self, directory: str, fallback: bool) -> None:
+        self._active_task_log_directory = Path(directory).expanduser()
+        self._task_log_used_fallback = fallback
+        self._update_result_shortcut_state()
+
+    def _open_task_log_directory(self) -> None:
+        path = self._active_task_log_directory or self._expected_task_log_directory()
+        if path is None:
+            QMessageBox.warning(
+                self,
+                "无法打开任务日志",
+                "请先选择 DICOM 保存目录并开始任务。",
+            )
+            return
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            fallback = self.instance_log_directory
+            if fallback is None:
+                QMessageBox.warning(
+                    self,
+                    "无法打开任务日志",
+                    f"任务日志目录不可写：{path}\n\n{exc}",
+                )
+                return
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+            except OSError as fallback_exc:
+                QMessageBox.warning(
+                    self,
+                    "无法打开任务日志",
+                    f"任务日志目录和实例回退目录均不可写：\n{path}\n{fallback}\n\n"
+                    f"{fallback_exc}",
+                )
+                return
+            self._active_task_log_directory = fallback
+            self._task_log_used_fallback = True
+            self._append_log(
+                "应用",
+                f"任务日志目录不可写：{path}（{exc}）；"
+                f"已回退到实例日志目录：{fallback}",
+                "warning",
+            )
+            path = fallback
+            self._update_result_shortcut_state()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _open_conflict_directory(self) -> None:
+        path = self._conflict_directory()
+        if path is None or not path.is_dir():
+            QMessageBox.information(
+                self,
+                "没有冲突文件",
+                "当前保存目录没有需要人工核对的冲突文件。",
+            )
+            self._update_result_shortcut_state()
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def _set_destination_error(self, message: str, *, focus: bool = False) -> None:
         self.destination_edit.setProperty("invalid", bool(message))
@@ -2749,14 +2953,32 @@ class DcmGetWindow(QMainWindow):
         self,
         total: int,
         results: list[AccessionResult] | None = None,
+        carryover_results: list[AccessionResult] | None = None,
     ) -> None:
         self._summary_results = {}
         self._summary_processed = 0
         self._summary_files = 0
+        self._summary_new_file_count = 0
+        self._summary_existing_skipped_count = 0
+        self._summary_conflict_preserved_count = 0
         self._summary_status_counts = {}
         for result in results or []:
             self._record_large_batch_result(result, update_label=False)
+        for result in carryover_results or []:
+            self._record_large_batch_carryover(result)
         self._update_large_batch_summary_label(total)
+
+    def _record_large_batch_carryover(self, result: AccessionResult) -> None:
+        if result.accession in self._summary_results:
+            return
+        carryover = replace(result, status=AccessionStatus.WAITING)
+        self._summary_results[result.accession] = carryover
+        self._summary_files += carryover.file_count
+        self._summary_new_file_count += carryover.new_file_count
+        self._summary_existing_skipped_count += carryover.existing_skipped_count
+        self._summary_conflict_preserved_count += (
+            carryover.conflict_preserved_count
+        )
 
     def _record_large_batch_result(
         self,
@@ -2775,18 +2997,37 @@ class DcmGetWindow(QMainWindow):
         previous = self._summary_results.get(result.accession)
         if previous is not None:
             self._summary_files -= previous.file_count
-            self._summary_status_counts[previous.status] = max(
-                0,
-                self._summary_status_counts.get(previous.status, 1) - 1,
+            self._summary_new_file_count -= previous.new_file_count
+            self._summary_existing_skipped_count -= (
+                previous.existing_skipped_count
             )
+            self._summary_conflict_preserved_count -= (
+                previous.conflict_preserved_count
+            )
+            if previous.status in {
+                AccessionStatus.WAITING,
+                AccessionStatus.DOWNLOADING,
+            }:
+                self._summary_processed += 1
+            else:
+                self._summary_status_counts[previous.status] = max(
+                    0,
+                    self._summary_status_counts.get(previous.status, 1) - 1,
+                )
         else:
             self._summary_processed += 1
         self._summary_results[result.accession] = AccessionResult(
             accession=result.accession,
             status=result.status,
             file_count=result.file_count,
+            new_file_count=result.new_file_count,
+            existing_skipped_count=result.existing_skipped_count,
+            conflict_preserved_count=result.conflict_preserved_count,
         )
         self._summary_files += result.file_count
+        self._summary_new_file_count += result.new_file_count
+        self._summary_existing_skipped_count += result.existing_skipped_count
+        self._summary_conflict_preserved_count += result.conflict_preserved_count
         self._summary_status_counts[result.status] = (
             self._summary_status_counts.get(result.status, 0) + 1
         )
@@ -2816,6 +3057,11 @@ class DcmGetWindow(QMainWindow):
                 f"已取消 {status.get(AccessionStatus.CANCELLED, 0):,} · "
                 f"文件 {self._summary_files:,}"
             ),
+            (
+                f"新增 {self._summary_new_file_count:,} · "
+                f"已存在跳过 {self._summary_existing_skipped_count:,} · "
+                f"冲突保留 {self._summary_conflict_preserved_count:,}"
+            ),
         ]
         if current is not None:
             lines.append(
@@ -2833,6 +3079,52 @@ class DcmGetWindow(QMainWindow):
             if failed_count
             else ""
         )
+
+    def _update_task_result_summary(
+        self,
+        results: list[AccessionResult] | None = None,
+    ) -> None:
+        if results is not None:
+            self._result_stats = {}
+            self._result_new_file_count = 0
+            self._result_existing_skipped_count = 0
+            self._result_conflict_preserved_count = 0
+            self._result_failed_count = 0
+            for result in results:
+                self._record_task_result_stats(result)
+        self.task_result_summary.setText(
+            f"结果：新增 {self._result_new_file_count:,} · "
+            f"已存在跳过 {self._result_existing_skipped_count:,} · "
+            f"冲突保留 {self._result_conflict_preserved_count:,} · "
+            f"失败 {self._result_failed_count:,}"
+        )
+
+    def _record_task_result_stats(self, result: AccessionResult) -> None:
+        if result.status in {AccessionStatus.WAITING, AccessionStatus.DOWNLOADING}:
+            return
+        previous = self._result_stats.get(result.accession)
+        if previous is not None:
+            previous_new, previous_skipped, previous_conflict, previous_failed = (
+                previous
+            )
+            self._result_new_file_count -= previous_new
+            self._result_existing_skipped_count -= previous_skipped
+            self._result_conflict_preserved_count -= previous_conflict
+            self._result_failed_count -= previous_failed
+        failed = int(
+            result.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
+        )
+        current = (
+            result.new_file_count,
+            result.existing_skipped_count,
+            result.conflict_preserved_count,
+            failed,
+        )
+        self._result_stats[result.accession] = current
+        self._result_new_file_count += current[0]
+        self._result_existing_skipped_count += current[1]
+        self._result_conflict_preserved_count += current[2]
+        self._result_failed_count += current[3]
 
     def _failed_accessions_for_copy(self) -> list[str]:
         if (
@@ -3133,6 +3425,12 @@ class DcmGetWindow(QMainWindow):
         self._active_task_id = checkpoint.task_id
         self._resume_checkpoint = checkpoint if resume_checkpoint is not None else None
         self._prior_results = checkpoint.results
+        partial_results = list(checkpoint.partial_results.values())
+        resume_display_results = [*self._prior_results, *partial_results]
+        self._result_destination_directory = Path(
+            self.config.dicom_destination_folder
+        ).expanduser()
+        self._update_task_result_summary(resume_display_results)
         self._publish_workspace_summary(
             self._workspace_summary_from_checkpoint(
                 checkpoint,
@@ -3151,10 +3449,20 @@ class DcmGetWindow(QMainWindow):
             self._reset_large_batch_summary(
                 self._display_total,
                 self._prior_results,
+                carryover_results=partial_results,
             )
         else:
             for result in self._prior_results:
                 self._set_result_row(result)
+            for result in partial_results:
+                retained_message = result.message or "已保留上次收到的文件"
+                self._set_result_row(
+                    replace(
+                        result,
+                        status=AccessionStatus.WAITING,
+                        message=f"待重试；{retained_message}",
+                    )
+                )
         self.progress_bar.setRange(0, self._display_total)
         self.progress_bar.setValue(self._progress_offset)
         action = "继续下载" if resume_checkpoint is not None else "准备下载"
@@ -3163,6 +3471,8 @@ class DcmGetWindow(QMainWindow):
         )
         self._set_running(True)
         self._worker_failure_message = None
+        task_log_directory = self._task_log_directory_for_config(self.config)
+        self._on_task_log_directory_ready(str(task_log_directory), False)
 
         thread = QThread(self)
         worker = DownloadWorker(
@@ -3172,11 +3482,13 @@ class DcmGetWindow(QMainWindow):
             consume_trial_on_ready=use_trial,
             task_store=self.task_store,
             task_id=checkpoint.task_id,
-            log_directory=self.instance_log_directory,
+            log_directory=task_log_directory,
+            fallback_log_directory=self.instance_log_directory,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.log.connect(self._append_log)
+        worker.log_directory_ready.connect(self._on_task_log_directory_ready)
         worker.state.connect(self._on_worker_state)
         worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
@@ -3385,6 +3697,10 @@ class DcmGetWindow(QMainWindow):
             )
         else:
             self._set_result_row(result)
+        if result.status not in {AccessionStatus.WAITING, AccessionStatus.DOWNLOADING}:
+            self._record_task_result_stats(result)
+            self._update_task_result_summary()
+        self._update_result_shortcut_state()
 
     def _set_result_row(self, result: AccessionResult, row: int | None = None) -> None:
         if self._task_table_summary_mode:
@@ -3426,6 +3742,7 @@ class DcmGetWindow(QMainWindow):
         self.task_table.setItem(target_row, 5, QTableWidgetItem(result.message or "等待处理"))
 
     def _on_worker_finished(self, summary: BatchSummary) -> None:
+        self._update_result_shortcut_state()
         task_id = self._active_task_id
         checkpoint: TaskCheckpoint | None = None
         active_checkpoint: TaskCheckpoint | None = None
@@ -3456,6 +3773,7 @@ class DcmGetWindow(QMainWindow):
         except TaskStateError as exc:
             self._append_log("恢复", str(exc), "error")
         self.last_summary = summary
+        self._update_task_result_summary(summary.results)
         if self._task_table_summary_mode:
             self._reset_large_batch_summary(
                 self._display_total or len(summary.results),
@@ -3552,6 +3870,12 @@ class DcmGetWindow(QMainWindow):
         else:
             title = "任务部分完成" if pdi_problem else "下载完成"
             message = "所有检查号均已处理完成。"
+        message += (
+            f"\n\n结果：新增 {summary.new_file_count:,}；"
+            f"已存在跳过 {summary.existing_skipped_count:,}；"
+            f"冲突保留 {summary.conflict_preserved_count:,}；"
+            f"失败 {len(summary.failed_accessions):,}。"
+        )
         if pdi_message:
             message += "\n\n" + pdi_message
         QMessageBox.information(self, title, message)
@@ -4139,6 +4463,7 @@ class DcmGetWindow(QMainWindow):
             self._start_pdi_export()
 
     def _on_worker_failed(self, message: str) -> None:
+        self._update_result_shortcut_state()
         self._worker_failure_message = message
         self._append_log("应用", message, "error")
         self._update_workspace_phase("failed", error_message=message)
@@ -4365,6 +4690,10 @@ class DcmGetWindow(QMainWindow):
         self._pdi_reuse_published = False
         self._pdi_source_files = []
         self.last_summary = None
+        self._update_task_result_summary([])
+        self._result_destination_directory = None
+        self._active_task_log_directory = None
+        self._task_log_used_fallback = False
         self._accepted_partial_results = False
         self.pdi_retry_button.setEnabled(False)
         self._active_task_id = ""
@@ -4373,6 +4702,7 @@ class DcmGetWindow(QMainWindow):
         self.progress_label.setText("已放弃续传记录，可以新建任务")
         self._set_running(False)
         self._set_task_form_expanded(True)
+        self._update_result_shortcut_state()
 
     def _retry_failed(self) -> None:
         if (
@@ -4568,14 +4898,7 @@ class DcmGetWindow(QMainWindow):
             QApplication.clipboard().setText(" | ".join(item.text() if item else "" for item in values))
 
     def _open_log_directory(self) -> None:
-        if self.instance_log_directory is not None:
-            path = self.instance_log_directory
-        else:
-            config = AppConfig.from_dict(self.config.to_dict())
-            config.dicom_destination_folder = self.destination_edit.text().strip()
-            path = log_directory(config)
-        path.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        self._open_task_log_directory()
 
     def _open_diagnostic_log_directory(self) -> None:
         path = diagnostic_log_directory()

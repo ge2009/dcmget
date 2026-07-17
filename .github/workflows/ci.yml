@@ -39,6 +39,9 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Reject 32-bit Python runtimes
+        run: python -c "from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime(); print('64-bit runtime verified')"
+
       - name: Install source and test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -86,20 +89,6 @@ jobs:
           tests/test_ui.py
           tests/test_ui_multitask.py
 
-      - name: Build source deployment package
-        if: matrix.dcmtk == 'linux-x86_64'
-        run: python scripts/build_deploy_bundle.py
-
-      - name: Upload source deployment package
-        if: matrix.dcmtk == 'linux-x86_64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: dcmget-2.9.1-source-deploy
-          path: |
-            release/dcmget-2.9.1-source-deploy.zip
-            release/dcmget-2.9.1-source-deploy.zip.sha256
-          if-no-files-found: error
-
   minimum-python:
     name: Python 3.10 minimum
     runs-on: ubuntu-24.04
@@ -111,6 +100,9 @@ jobs:
         with:
           python-version: "3.10"
           cache: pip
+
+      - name: Reject 32-bit Python runtimes
+        run: python -c "from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime(); print('64-bit runtime verified')"
 
       - name: Install source and test dependencies
         run: |

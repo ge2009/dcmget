@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -25,8 +26,9 @@ from typing import Callable, Iterable
 
 from filelock import FileLock, Timeout
 
-from .config import AppConfig
 from .anonymization import DicomAnonymizer
+from .architecture import ArchitectureError, require_amd64_pe
+from .config import AppConfig
 from .diagnostics import PrivateRotatingFileHandler
 from .runtime import ensure_application_state_dir, portable_dcmtk_bin
 
@@ -71,6 +73,31 @@ class AccessionResult:
     received_bytes: int = 0
     speed_bytes_per_second: float = 0.0
     archived_files: list[str] = field(default_factory=list)
+    new_file_count: int = 0
+    existing_skipped_count: int = 0
+    conflict_preserved_count: int = 0
+
+
+@dataclass(slots=True)
+class ArchiveStats:
+    """Per-archive outcome counts without changing the legacy tuple result."""
+
+    new_file_count: int = 0
+    existing_skipped_count: int = 0
+    conflict_preserved_count: int = 0
+    conflict_files: list[Path] = field(default_factory=list)
+
+
+class _ArchiveDisposition(str, Enum):
+    PUBLISHED = "published"
+    EXISTING_SKIPPED = "existing_skipped"
+    CONFLICT_PRESERVED = "conflict_preserved"
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchivePublication:
+    disposition: _ArchiveDisposition
+    path: Path
 
 
 @dataclass(slots=True)
@@ -98,6 +125,18 @@ class BatchSummary:
     @property
     def archived_files(self) -> list[str]:
         return [path for result in self.results for path in result.archived_files]
+
+    @property
+    def new_file_count(self) -> int:
+        return sum(result.new_file_count for result in self.results)
+
+    @property
+    def existing_skipped_count(self) -> int:
+        return sum(result.existing_skipped_count for result in self.results)
+
+    @property
+    def conflict_preserved_count(self) -> int:
+        return sum(result.conflict_preserved_count for result in self.results)
 
 
 @dataclass(slots=True)
@@ -421,6 +460,9 @@ class DcmtkResolver:
         return None
 
     def _probe(self, movescu: Path, storescp: Path) -> ToolPaths:
+        if os.name == "nt":
+            require_amd64_pe(movescu, "DCMTK movescu")
+            require_amd64_pe(storescp, "DCMTK storescp")
         version_text = _run_probe([str(movescu), "--version"])
         storescp_version = _run_probe([str(storescp), "--version"])
         help_text = _run_probe([str(storescp), "--help"], allow_nonzero=True)
@@ -515,7 +557,12 @@ def preflight(
     try:
         tools = resolver.resolve(config.dcmtk_bin_dir)
         checks.append(("DCMTK 工具", True, f"已就绪，版本 {tools.version}"))
-    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+    except (
+        ArchitectureError,
+        FileNotFoundError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
         errors["dcmtk_bin_dir"] = str(exc)
         checks.append(("DCMTK 工具", False, str(exc)))
 
@@ -606,6 +653,7 @@ class DownloadRunner:
         process_callback: ProcessCallback | None = None,
         log_file_name: str = "dcmget.log",
         log_directory: str | Path | None = None,
+        fallback_log_directory: str | Path | None = None,
     ):
         self.config = config
         self.tools = tools
@@ -623,6 +671,13 @@ class DownloadRunner:
         self._log_directory = (
             Path(log_directory).expanduser() if log_directory is not None else None
         )
+        self._fallback_log_directory = (
+            Path(fallback_log_directory).expanduser()
+            if fallback_log_directory is not None
+            else ensure_application_state_dir() / "logs"
+        )
+        self._active_log_directory: Path | None = None
+        self._log_fallback_reason = ""
         self._cancel = threading.Event()
         self._pause_condition = threading.Condition()
         self._pause_requested = False
@@ -638,6 +693,8 @@ class DownloadRunner:
         self._receiver_lease: FileLock | None = None
         self._storescp_abort_count = 0
         self._logger = self._build_file_logger()
+        if self._log_fallback_reason:
+            self._emit("应用", self._log_fallback_reason, "warning")
         self._anonymizer = (
             DicomAnonymizer(config.anonymization_profile)
             if config.anonymization_enabled
@@ -1021,6 +1078,7 @@ class DownloadRunner:
                 "error",
             )
 
+        archive_stats = ArchiveStats()
         moved, rejected = _archive_dicom_files(
             candidate_files,
             destination_root,
@@ -1032,19 +1090,27 @@ class DownloadRunner:
             dcmtk_environment=_dcmtk_environment(self.tools),
             cancel_event=self._cancel,
             route_accession=accession,
+            stats=archive_stats,
+        )
+        accepted_file_count = (
+            archive_stats.new_file_count
+            + archive_stats.existing_skipped_count
+            + archive_stats.conflict_preserved_count
         )
         rejected_detail = (
             f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
             if self._anonymizer
             else f"{len(rejected)} 个异常文件留在暂存目录"
         )
-        output_directory = _common_output_directory(moved, destination_root)
+        output_directory = _common_output_directory(
+            [*moved, *archive_stats.conflict_files], destination_root
+        )
         duration = time.monotonic() - started
         with self._diagnostic_lock:
             receiver_aborts = self._storescp_abort_count - aborts_before
         move_problem = _move_has_problem(diagnostics)
         move_detail = _move_diagnostic_summary(diagnostics)
-        archive_mismatch = _move_archive_mismatch(diagnostics, len(moved))
+        archive_mismatch = _move_archive_mismatch(diagnostics, accepted_file_count)
         if archive_mismatch:
             move_problem = True
             move_detail = "；".join(
@@ -1064,23 +1130,37 @@ class DownloadRunner:
             status = AccessionStatus.CANCELLED
             message = "用户已取消"
         elif receiver_exit_code is not None:
-            status = AccessionStatus.PARTIAL if moved else AccessionStatus.FAILED
+            status = (
+                AccessionStatus.PARTIAL
+                if accepted_file_count
+                else AccessionStatus.FAILED
+            )
             message = f"storescp 意外退出（退出码 {receiver_exit_code}）"
-            if moved:
-                message += f"，已保留 {len(moved)} 个完整文件"
+            if accepted_file_count:
+                message += f"，已保留 {accepted_file_count} 个完整文件"
             if rejected:
                 message += f"，{rejected_detail}"
-        elif return_code == 0 and moved and (move_problem or rejected):
+        elif return_code == 0 and accepted_file_count and (
+            move_problem or rejected or archive_stats.conflict_preserved_count
+        ):
             status = AccessionStatus.PARTIAL
             details = []
             if move_problem:
                 details.append(move_detail or "C-MOVE 未正常完成")
             if rejected:
                 details.append(rejected_detail)
-            message = f"收到 {len(moved)} 个文件，但" + "；".join(details)
-        elif return_code == 0 and moved:
+            if archive_stats.conflict_preserved_count:
+                details.append(
+                    f"{archive_stats.conflict_preserved_count} 个冲突文件需人工核对"
+                )
+            message = (
+                _archive_result_message(accepted_file_count, archive_stats)
+                + "，但"
+                + "；".join(details)
+            )
+        elif return_code == 0 and accepted_file_count:
             status = AccessionStatus.COMPLETED
-            message = f"收到 {len(moved)} 个文件"
+            message = _archive_result_message(accepted_file_count, archive_stats)
         elif return_code == 0 and (move_problem or rejected):
             status = AccessionStatus.FAILED
             details = []
@@ -1092,9 +1172,12 @@ class DownloadRunner:
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
             message = "C-MOVE 完成，但未收到文件"
-        elif moved:
+        elif accepted_file_count:
             status = AccessionStatus.PARTIAL
-            message = f"movescu 退出码 {return_code}，已保留 {len(moved)} 个文件"
+            message = (
+                f"movescu 退出码 {return_code}，"
+                f"已保留 {accepted_file_count} 个文件"
+            )
             if move_detail:
                 message += f"；{move_detail}"
             if rejected:
@@ -1114,13 +1197,16 @@ class DownloadRunner:
         return AccessionResult(
             accession=accession,
             status=status,
-            file_count=len(moved),
+            file_count=accepted_file_count,
             duration_seconds=duration,
             message=message,
-            output_directory=str(output_directory) if moved else "",
+            output_directory=str(output_directory) if accepted_file_count else "",
             received_bytes=received_bytes,
             speed_bytes_per_second=average_speed,
             archived_files=[str(path) for path in moved],
+            new_file_count=archive_stats.new_file_count,
+            existing_skipped_count=archive_stats.existing_skipped_count,
+            conflict_preserved_count=archive_stats.conflict_preserved_count,
         )
 
     def _start_movescu_process(
@@ -1272,7 +1358,21 @@ class DownloadRunner:
         self._logger.log(log_level, "[%s] %s", source, message)
 
     def _build_file_logger(self) -> logging.Logger:
-        log_dir = self._log_directory or log_directory(self.config)
+        primary = self._log_directory or log_directory(self.config)
+        try:
+            return self._build_file_logger_in(primary)
+        except OSError as exc:
+            fallback = self._fallback_log_directory
+            if fallback == primary:
+                raise
+            logger = self._build_file_logger_in(fallback)
+            self._log_fallback_reason = (
+                f"任务日志目录不可写：{primary}（{exc}）；"
+                f"已回退到实例日志目录：{fallback}"
+            )
+            return logger
+
+    def _build_file_logger_in(self, log_dir: Path) -> logging.Logger:
         log_dir.mkdir(parents=True, exist_ok=True)
         logger = logging.getLogger(f"dcmget.runner.{id(self)}")
         logger.setLevel(logging.DEBUG)
@@ -1285,7 +1385,18 @@ class DownloadRunner:
         )
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
+        self._active_log_directory = log_dir
         return logger
+
+    @property
+    def active_log_directory(self) -> Path:
+        if self._active_log_directory is None:
+            raise RuntimeError("任务日志尚未初始化")
+        return self._active_log_directory
+
+    @property
+    def used_log_fallback(self) -> bool:
+        return bool(self._log_fallback_reason)
 
     def _close_file_logger(self) -> None:
         for handler in list(self._logger.handlers):
@@ -1307,8 +1418,12 @@ def staging_directory_root(config: AppConfig) -> Path:
 
 
 def log_directory(config: AppConfig) -> Path:
-    del config
-    return ensure_application_state_dir() / "logs"
+    if config.anonymization_enabled:
+        return ensure_application_state_dir() / "logs"
+    return (
+        Path(config.dicom_destination_folder).expanduser().resolve()
+        / "_DcmGetLogs"
+    )
 
 
 def _run_probe(command: list[str], allow_nonzero: bool = False) -> str:
@@ -1366,6 +1481,17 @@ def _total_file_size(files: Iterable[Path]) -> int:
     return total
 
 
+def _archive_result_message(file_count: int, stats: ArchiveStats) -> str:
+    message = f"收到 {file_count} 个文件"
+    if not (stats.existing_skipped_count or stats.conflict_preserved_count):
+        return message
+    return (
+        f"{message}（新增 {stats.new_file_count}、"
+        f"已存在跳过 {stats.existing_skipped_count}、"
+        f"冲突保留 {stats.conflict_preserved_count}）"
+    )
+
+
 def _archive_dicom_files(
     files: Iterable[Path],
     destination_root: Path,
@@ -1377,12 +1503,14 @@ def _archive_dicom_files(
     dcmtk_environment: dict[str, str] | None = None,
     cancel_event: threading.Event | None = None,
     route_accession: str | None = None,
+    stats: ArchiveStats | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
 
     moved: list[Path] = []
     rejected: list[Path] = []
+    archive_stats = stats if stats is not None else ArchiveStats()
     routing_accession = str(route_accession or "").strip()
     values = list(files)
     if not values:
@@ -1472,19 +1600,37 @@ def _archive_dicom_files(
                     temporary.unlink(missing_ok=True)
                     temporary = None
                     break
-                _publish_or_deduplicate(temporary, target)
+                publication = _publish_or_deduplicate(
+                    temporary,
+                    target,
+                    expected_sop_instance_uid=metadata["SOPInstanceUID"],
+                    conflict_root=destination_root,
+                )
                 temporary = None
                 source.unlink()
             else:
                 if cancel_event is not None and cancel_event.is_set():
                     break
-                _publish_or_deduplicate(source, target)
+                publication = _publish_or_deduplicate(
+                    source,
+                    target,
+                    expected_sop_instance_uid=metadata["SOPInstanceUID"],
+                    conflict_root=destination_root,
+                )
         except Exception as exc:
             if temporary:
                 temporary.unlink(missing_ok=True)
             if error_callback:
                 error_callback(source, str(exc))
             rejected.append(source)
+            continue
+        if publication.disposition == _ArchiveDisposition.PUBLISHED:
+            archive_stats.new_file_count += 1
+        elif publication.disposition == _ArchiveDisposition.EXISTING_SKIPPED:
+            archive_stats.existing_skipped_count += 1
+        else:
+            archive_stats.conflict_preserved_count += 1
+            archive_stats.conflict_files.append(publication.path)
             continue
         if target not in moved:
             moved.append(target)
@@ -1639,26 +1785,35 @@ def _validate_dicom_stream(
         ):
             if cancel_event is not None and cancel_event.is_set():
                 return
-            if raw.length == 0xFFFFFFFF:
+            raw_length = getattr(raw, "length", None)
+            if raw_length is None or raw_length == 0xFFFFFFFF:
                 continue
-            if raw.value_tell + raw.length > file_size:
+            if raw.value_tell + raw_length > file_size:
                 raise EOFError(
                     f"元素 {raw.tag} 声明长度超过文件末尾"
                 )
 
 
-def _publish_or_deduplicate(source: Path, target: Path) -> None:
+def _publish_or_deduplicate(
+    source: Path,
+    target: Path,
+    *,
+    expected_sop_instance_uid: str | None = None,
+    conflict_root: Path | None = None,
+) -> _ArchivePublication:
     # Separate DownloadRunner instances can archive into the same destination.
     # Keep existence checking, conflict verification and publication atomic.
     with _locked_archive_target(target):
         if target.exists():
-            if _file_sha256(source) != _file_sha256(target):
-                raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
-            source.unlink()
-            return
+            return _resolve_existing_archive_target(
+                source,
+                target,
+                expected_sop_instance_uid=expected_sop_instance_uid,
+                conflict_root=conflict_root,
+            )
         try:
             os.replace(source, target)
-            return
+            return _ArchivePublication(_ArchiveDisposition.PUBLISHED, target)
         except OSError as exc:
             if not _is_cross_device_error(exc):
                 raise
@@ -1682,13 +1837,330 @@ def _publish_or_deduplicate(source: Path, target: Path) -> None:
             os.fsync(writer.fileno())
         with _locked_archive_target(target):
             if target.exists():
-                if _file_sha256(temporary) != _file_sha256(target):
-                    raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+                publication = _resolve_existing_archive_target(
+                    temporary,
+                    target,
+                    expected_sop_instance_uid=expected_sop_instance_uid,
+                    conflict_root=conflict_root,
+                )
             else:
                 os.replace(temporary, target)
+                publication = _ArchivePublication(
+                    _ArchiveDisposition.PUBLISHED, target
+                )
         source.unlink()
+        return publication
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _resolve_existing_archive_target(
+    source: Path,
+    target: Path,
+    *,
+    expected_sop_instance_uid: str | None,
+    conflict_root: Path | None,
+) -> _ArchivePublication:
+    if expected_sop_instance_uid is None:
+        if _file_sha256(source) != _file_sha256(target):
+            raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+        source.unlink()
+        return _ArchivePublication(_ArchiveDisposition.EXISTING_SKIPPED, target)
+
+    if _existing_target_has_sop_instance_uid(
+        target,
+        expected_sop_instance_uid,
+        source,
+    ):
+        source.unlink()
+        return _ArchivePublication(_ArchiveDisposition.EXISTING_SKIPPED, target)
+
+    if conflict_root is None:
+        raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+    conflict = _preserve_conflicting_source(
+        source,
+        conflict_root,
+        expected_sop_instance_uid,
+    )
+    return _ArchivePublication(_ArchiveDisposition.CONFLICT_PRESERVED, conflict)
+
+
+def _existing_target_has_sop_instance_uid(
+    target: Path,
+    expected_sop_instance_uid: str,
+    source: Path | None = None,
+) -> bool:
+    from pydicom import dcmread
+    from pydicom.uid import UID
+
+    if target.stem != expected_sop_instance_uid:
+        return False
+    try:
+        _validate_dicom_stream(target)
+        dataset = dcmread(
+            target,
+            defer_size=1,
+        )
+        actual_sop_instance_uid = str(
+            getattr(dataset, "SOPInstanceUID", "") or ""
+        ).strip()
+        if (
+            actual_sop_instance_uid != expected_sop_instance_uid
+            or not UID(actual_sop_instance_uid).is_valid
+        ):
+            return False
+        if source is None:
+            return True
+
+        # The incoming object has already passed the stream validator.  A
+        # syntactically readable old file can still be truncated exactly at an
+        # element boundary (for example immediately before Pixel Data).  Only
+        # discard the incoming copy when the old object contains every
+        # top-level data element carried by the new object and identifies the
+        # same SOP Class.  Otherwise preserve the new file for manual review.
+        incoming = dcmread(source, defer_size=1)
+        incoming_sop_class = str(
+            getattr(incoming, "SOPClassUID", "") or ""
+        ).strip()
+        existing_sop_class = str(
+            getattr(dataset, "SOPClassUID", "") or ""
+        ).strip()
+        if incoming_sop_class and incoming_sop_class != existing_sop_class:
+            return False
+        return (
+            set(incoming.keys()).issubset(dataset.keys())
+            and _dataset_pixel_payload_is_complete(dataset, incoming)
+            and _binary_payloads_are_safe_to_deduplicate(dataset, incoming)
+        )
+    except Exception:
+        return False
+
+
+def _dataset_pixel_payload_is_complete(
+    dataset: object,
+    incoming: object | None = None,
+) -> bool:
+    """Reject image objects whose pixel element is present but incomplete."""
+
+    from pydicom.pixels.utils import get_expected_length, get_nr_frames
+    from pydicom.tag import Tag
+    from pydicom.uid import UID
+
+    pixel_data = Tag(0x7FE0, 0x0010)
+    float_pixel_data = Tag(0x7FE0, 0x0008)
+    double_float_pixel_data = Tag(0x7FE0, 0x0009)
+    pixel_tags = [
+        tag
+        for tag in (pixel_data, float_pixel_data, double_float_pixel_data)
+        if tag in dataset  # type: ignore[operator]
+    ]
+    if not pixel_tags:
+        return True
+    if len(pixel_tags) != 1:
+        return False
+
+    tag = pixel_tags[0]
+    element = dataset[tag]  # type: ignore[index]
+    value = element.value
+    if not isinstance(value, bytes | bytearray) or not value:
+        return False
+
+    transfer_syntax = UID(
+        str(
+            getattr(
+                getattr(dataset, "file_meta", None),
+                "TransferSyntaxUID",
+                "",
+            )
+            or ""
+        )
+    )
+    if tag == pixel_data and transfer_syntax.is_compressed:
+        if not element.is_undefined_length:
+            return False
+        if not _encapsulated_pixel_data_is_structurally_complete(value):
+            return False
+        if incoming is None or pixel_data not in incoming:  # type: ignore[operator]
+            return False
+        incoming_value = incoming[pixel_data].value  # type: ignore[index]
+        # Without a decoder for every negotiated transfer syntax, differently
+        # encoded compressed payloads cannot be proven equivalent.  Preserve
+        # the incoming object for review instead of deleting potentially
+        # better image data.  Byte-identical payloads are safe to de-duplicate.
+        return isinstance(incoming_value, bytes | bytearray) and bytes(
+            incoming_value
+        ) == bytes(value)
+    if element.is_undefined_length:
+        return False
+
+    if tag == pixel_data:
+        expected_length = get_expected_length(dataset, unit="bytes")
+    else:
+        rows = int(getattr(dataset, "Rows"))
+        columns = int(getattr(dataset, "Columns"))
+        samples = int(getattr(dataset, "SamplesPerPixel", 1))
+        bytes_per_sample = 4 if tag == float_pixel_data else 8
+        expected_length = (
+            rows
+            * columns
+            * samples
+            * int(get_nr_frames(dataset))
+            * bytes_per_sample
+        )
+    padded_length = expected_length + (expected_length % 2)
+    return len(value) == padded_length
+
+
+def _encapsulated_pixel_data_is_structurally_complete(
+    value: bytes | bytearray,
+) -> bool:
+    """Validate the BOT and fragment item boundaries without decoding pixels."""
+
+    position = 0
+    item_index = 0
+    fragment_count = 0
+    size = len(value)
+    while position < size:
+        if size - position < 8:
+            return False
+        group, element, length = struct.unpack_from("<HHI", value, position)
+        position += 8
+        tag = (group, element)
+        if tag == (0xFFFE, 0xE0DD):
+            return length == 0 and position == size and fragment_count > 0
+        if tag != (0xFFFE, 0xE000) or length == 0xFFFFFFFF:
+            return False
+        if length % 2 or position + length > size:
+            return False
+        if item_index == 0:
+            if length % 4:
+                return False
+        else:
+            if length == 0:
+                return False
+            fragment_count += 1
+        position += length
+        item_index += 1
+    return item_index >= 2 and fragment_count > 0
+
+
+def _binary_payloads_are_safe_to_deduplicate(
+    existing: object,
+    incoming: object,
+) -> bool:
+    """Require non-pixel binary payloads to match before deleting incoming."""
+
+    binary_vrs = {"OB", "OD", "OF", "OL", "OV", "OW", "UN"}
+    pixel_tags = {0x7FE00008, 0x7FE00009, 0x7FE00010}
+    for incoming_element in incoming:  # type: ignore[union-attr]
+        if int(incoming_element.tag) in pixel_tags:
+            continue
+        if incoming_element.VR == "SQ":
+            incoming_items = incoming_element.value
+            if not any(
+                _dataset_contains_non_pixel_binary_payload(item)
+                for item in incoming_items
+            ):
+                continue
+            if incoming_element.tag not in existing:  # type: ignore[operator]
+                return False
+            existing_element = existing[incoming_element.tag]  # type: ignore[index]
+            if existing_element.VR != "SQ":
+                return False
+            existing_items = existing_element.value
+            if len(existing_items) < len(incoming_items):
+                return False
+            if any(
+                not _binary_payloads_are_safe_to_deduplicate(
+                    existing_items[index],
+                    incoming_item,
+                )
+                for index, incoming_item in enumerate(incoming_items)
+            ):
+                return False
+            continue
+        if incoming_element.VR not in binary_vrs:
+            continue
+        if incoming_element.tag not in existing:  # type: ignore[operator]
+            return False
+        existing_element = existing[incoming_element.tag]  # type: ignore[index]
+        if existing_element.VR not in binary_vrs:
+            return False
+        incoming_value = incoming_element.value
+        existing_value = existing_element.value
+        if not isinstance(incoming_value, bytes | bytearray) or not isinstance(
+            existing_value,
+            bytes | bytearray,
+        ):
+            return False
+        if bytes(existing_value) != bytes(incoming_value):
+            return False
+    return True
+
+
+def _dataset_contains_non_pixel_binary_payload(dataset: object) -> bool:
+    binary_vrs = {"OB", "OD", "OF", "OL", "OV", "OW", "UN"}
+    pixel_tags = {0x7FE00008, 0x7FE00009, 0x7FE00010}
+    for element in dataset:  # type: ignore[union-attr]
+        if int(element.tag) in pixel_tags:
+            continue
+        if element.VR in binary_vrs:
+            return True
+        if element.VR == "SQ" and any(
+            _dataset_contains_non_pixel_binary_payload(item)
+            for item in element.value
+        ):
+            return True
+    return False
+
+
+def _preserve_conflicting_source(
+    source: Path,
+    destination_root: Path,
+    sop_instance_uid: str,
+) -> Path:
+    conflict_directory = destination_root / "_DcmGetConflicts"
+    conflict_directory.mkdir(parents=True, exist_ok=True)
+    descriptor, reservation_name = tempfile.mkstemp(
+        prefix=f"{sop_instance_uid}-",
+        suffix=".reserve",
+        dir=conflict_directory,
+    )
+    os.close(descriptor)
+    reservation = Path(reservation_name)
+    conflict = reservation.with_suffix(".dcm")
+    preserved = False
+    temporary: Path | None = None
+    try:
+        try:
+            os.replace(source, conflict)
+            preserved = True
+            return conflict
+        except OSError as exc:
+            if not _is_cross_device_error(exc):
+                raise
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".dcmget-conflict-",
+            suffix=".part",
+            dir=conflict_directory,
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, conflict)
+        temporary = None
+        source.unlink()
+        preserved = True
+        return conflict
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        reservation.unlink(missing_ok=True)
+        if not preserved:
+            conflict.unlink(missing_ok=True)
 
 
 @contextmanager

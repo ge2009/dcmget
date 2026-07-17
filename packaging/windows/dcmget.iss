@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.9.1"
+  #define AppVersion "2.9.2"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -30,7 +30,7 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 UninstallDisplayName={#AppName}
 AppPublisher=DcmGet contributors
-AppComments=可多开运行的 DICOM 下载工具，包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
+AppComments=仅支持 64 位运行环境的 DICOM 下载工具，包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
 DefaultDirName={autopf}\DcmGet
 DefaultGroupName=DcmGet
 DisableProgramGroupPage=yes
@@ -40,6 +40,7 @@ SetupIconFile={#BuildIcon}
 UninstallDisplayIcon={app}\{#AppExeName}
 LicenseFile={#LicenseFile}
 PrivilegesRequired=admin
+; 拒绝 32 位 Windows，同时允许 Windows 11 ARM64 通过 x64 兼容层安装和运行。
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 Compression=lzma2/max

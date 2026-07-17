@@ -321,6 +321,7 @@ class PdiExporter:
                 except Exception as exc:
                     shutil.rmtree(temporary / "VIEWER" / "OHIF", ignore_errors=True)
                     (temporary / "VIEWER" / "pdi_server.py").unlink(missing_ok=True)
+                    (temporary / "VIEWER" / "architecture.py").unlink(missing_ok=True)
                     self._remove_launchers(temporary)
                     viewer_problem = True
                     warning = f"离线阅片器准备失败，DICOMDIR 仍可使用：{exc}"
@@ -759,7 +760,13 @@ class PdiExporter:
             server_script = self.project_root / "dcmget" / "pdi_server.py"
         if not server_script.is_file():
             return False, "未找到 PDI 本地服务启动脚本"
+        architecture_script = Path(__file__).with_name("architecture.py")
+        if not architecture_script.is_file():
+            architecture_script = self.project_root / "dcmget" / "architecture.py"
+        if not architecture_script.is_file():
+            return False, "未找到 PDI 运行架构校验脚本"
         self._copy_file(server_script, root / "VIEWER" / "pdi_server.py")
+        self._copy_file(architecture_script, root / "VIEWER" / "architecture.py")
 
         server_executable = self._resolve_server_executable()
         if server_executable is not None:

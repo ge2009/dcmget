@@ -1,5 +1,13 @@
 # DcmGet 版本说明
 
+## 2.9.2（2026-07-17）
+
+- 目标目录已有相同 SOP Instance UID 时保留原文件并跳过新收到的文件，不再把整项任务判为归档失败；重复信息合并为摘要，避免大量冲突逐行刷红色日志。
+- 非匿名任务的下载与接收日志随影像写入目标目录 `_DcmGetLogs`；匿名任务日志、启动和崩溃诊断日志继续保留在应用私有状态目录，目标目录不可写时也会自动回退到实例日志目录。
+- 任务结果区分新增、已存在跳过和失败数量，并提供打开影像目录、任务日志等快捷操作；输入区与详细日志默认收起，让进度和结果保持在主视区。
+- 保持 PyQt5 和“一个窗口一个任务、应用可多开”的运行方式。自动发布暂时只生成 Windows x64 安装版、便携版和 ZIP，不构建 macOS/Linux 成品包。
+- Windows 构建、源码部署和启动阶段统一拒绝 32 位运行时；发布前校验 Python、`DcmGet.exe`、`DcmGetPdiServer.exe`、`storescp.exe` 和 `movescu.exe` 均为 AMD64，PDI 的 Python 回退启动器也执行同一运行时校验。Inno Setup 6 的安装引导程序自身是 x86 兼容程序，但会拒绝 32 位 Windows，只安装 AMD64 应用载荷，并允许 Windows 11 ARM64 通过 x64 兼容层运行。
+
 ## 2.9.1（2026-07-17）
 
 - 修复 Windows 安装版启动时，PyQt5 为 `aboutToQuit` 回调创建弱引用失败并报 `cannot create weak reference to 'InstanceProfile' object` 的问题；主窗口现在可正常打开。

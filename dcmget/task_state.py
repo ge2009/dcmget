@@ -456,6 +456,13 @@ class TaskCheckpointStore:
                             AccessionStatus.PARTIAL,
                         }:
                             continue
+                        has_retained_result = bool(
+                            result.archived_files
+                            or result.file_count
+                            or result.new_file_count
+                            or result.existing_skipped_count
+                            or result.conflict_preserved_count
+                        )
                         retained = (
                             _result_to_json(
                                 replace(
@@ -464,7 +471,7 @@ class TaskCheckpointStore:
                                     message="重试前已保留收到的文件",
                                 )
                             )
-                            if result.archived_files
+                            if has_retained_result
                             else None
                         )
                         connection.execute(
@@ -826,7 +833,13 @@ def _cleanup_recorded_process_group(
 def _merge_partial_result(
     prior: AccessionResult | None, current: AccessionResult
 ) -> AccessionResult:
-    if prior is None or not prior.archived_files:
+    if prior is None or not (
+        prior.archived_files
+        or prior.file_count
+        or prior.new_file_count
+        or prior.existing_skipped_count
+        or prior.conflict_preserved_count
+    ):
         return current
     archived_files = list(dict.fromkeys([*prior.archived_files, *current.archived_files]))
     status = current.status
@@ -834,20 +847,41 @@ def _merge_partial_result(
         status = AccessionStatus.PARTIAL
     duration = prior.duration_seconds + current.duration_seconds
     received_bytes = prior.received_bytes + current.received_bytes
+    new_file_count = min(
+        len(archived_files),
+        prior.new_file_count + current.new_file_count,
+    )
+    existing_skipped_count = max(0, len(archived_files) - new_file_count)
+    conflict_preserved_count = (
+        prior.conflict_preserved_count + current.conflict_preserved_count
+    )
+    if conflict_preserved_count:
+        status = AccessionStatus.PARTIAL
     message = current.message
     retained = len(prior.archived_files)
     if retained:
         message = f"{message}；含上次中断保留的 {retained} 个文件".strip("；")
+    if conflict_preserved_count:
+        message = (
+            f"{message}；仍有 {conflict_preserved_count} 个冲突文件需人工核对"
+        ).strip("；")
     return replace(
         current,
         status=status,
-        file_count=len(archived_files),
+        file_count=max(
+            len(archived_files) + conflict_preserved_count,
+            prior.file_count,
+            current.file_count,
+        ),
         duration_seconds=duration,
         message=message,
         output_directory=current.output_directory or prior.output_directory,
         received_bytes=received_bytes,
         speed_bytes_per_second=(received_bytes / duration if duration > 0 else 0.0),
         archived_files=archived_files,
+        new_file_count=new_file_count,
+        existing_skipped_count=existing_skipped_count,
+        conflict_preserved_count=conflict_preserved_count,
     )
 
 
@@ -858,6 +892,9 @@ def _result_to_json(result: AccessionResult) -> str:
             "archived_files": list(result.archived_files),
             "duration_seconds": result.duration_seconds,
             "file_count": result.file_count,
+            "new_file_count": result.new_file_count,
+            "existing_skipped_count": result.existing_skipped_count,
+            "conflict_preserved_count": result.conflict_preserved_count,
             "message": result.message,
             "output_directory": result.output_directory,
             "received_bytes": result.received_bytes,
@@ -879,10 +916,19 @@ def _result_from_json(
     archived_values = raw.get("archived_files", [])
     if not isinstance(archived_values, list):
         raise ValueError("invalid archived files")
+    file_count = max(int(raw.get("file_count", 0)), len(archived_values))
+    archive_stats_known = any(
+        key in raw
+        for key in (
+            "new_file_count",
+            "existing_skipped_count",
+            "conflict_preserved_count",
+        )
+    )
     return AccessionResult(
         accession=str(raw["accession"]),
         status=AccessionStatus(str(raw["status"])),
-        file_count=max(int(raw.get("file_count", 0)), len(archived_values)),
+        file_count=file_count,
         duration_seconds=float(raw.get("duration_seconds", 0.0)),
         message=str(raw.get("message", "")),
         output_directory=str(raw.get("output_directory", "")),
@@ -892,5 +938,16 @@ def _result_from_json(
             [str(path) for path in archived_values]
             if include_archived_files
             else []
+        ),
+        new_file_count=(
+            max(0, int(raw.get("new_file_count", 0)))
+            if archive_stats_known
+            else file_count
+        ),
+        existing_skipped_count=max(
+            0, int(raw.get("existing_skipped_count", 0))
+        ),
+        conflict_preserved_count=max(
+            0, int(raw.get("conflict_preserved_count", 0))
         ),
     )

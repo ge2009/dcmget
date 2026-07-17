@@ -26,6 +26,10 @@ from dcmget.windows_portable_runtime import (  # noqa: E402
     MANIFEST_NAME as PORTABLE_RUNTIME_MANIFEST_NAME,
     create_portable_runtime_manifest,
 )
+from dcmget.architecture import (  # noqa: E402
+    ensure_supported_runtime,
+    require_amd64_pe,
+)
 
 
 BUILD_ROOT = ROOT / "build" / "windows"
@@ -178,6 +182,8 @@ def pyinstaller_args(
         "--add-data",
         f"{ROOT / 'dcmget' / 'pdi_server.py'}:dcmget",
         "--add-data",
+        f"{ROOT / 'dcmget' / 'architecture.py'}:dcmget",
+        "--add-data",
         f"{runtime_root}:.runtime/dcmtk/windows-x86_64",
         "--noupx",
     ]
@@ -233,10 +239,41 @@ def pdi_server_pyinstaller_args(
     ]
 
 
+def verify_built_architecture(version: str) -> tuple[Path, ...]:
+    """Verify that every executable entry point and DCMTK transport is AMD64."""
+
+    expected = [
+        DIST_ROOT / "DcmGet" / "DcmGet.exe",
+        DIST_ROOT / "DcmGetPdiServer.exe",
+        RELEASE_ROOT / f"DcmGet-{version}-windows-x64-portable.exe",
+    ]
+    for root in (PLATFORM_RUNTIME, DIST_ROOT / "DcmGet"):
+        for name in ("storescp.exe", "movescu.exe"):
+            matches = sorted(root.rglob(name)) if root.is_dir() else []
+            if not matches:
+                expected.append(root / name)
+            else:
+                expected.extend(matches)
+
+    missing = [path for path in expected if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Windows x64 架构校验缺少文件：" + "、".join(str(path) for path in missing)
+        )
+
+    unique = tuple(dict.fromkeys(path.resolve() for path in expected))
+    for path in unique:
+        require_amd64_pe(path, path.name)
+    return unique
+
+
 def build_payloads(version: str) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
+    ensure_supported_runtime()
     dcmtk_bin = find_dcmtk_bin()
+    for name in ("storescp.exe", "movescu.exe"):
+        require_amd64_pe(dcmtk_bin / name, f"DCMTK {name}")
     ohif = find_ohif_payload()
     from PyInstaller.__main__ import run as run_pyinstaller
 
@@ -289,6 +326,7 @@ def build_payloads(version: str) -> None:
         for path in sorted((DIST_ROOT / "DcmGet").rglob("*")):
             if path.is_file():
                 package.write(path, Path("DcmGet") / path.relative_to(DIST_ROOT / "DcmGet"))
+    verify_built_architecture(version)
 
 
 def file_sha256(path: Path) -> str:
@@ -320,8 +358,14 @@ def main() -> int:
     parser.add_argument(
         "--version", default=APP_VERSION, type=validate_release_version
     )
-    parser.add_argument("--checksums-only", action="store_true")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--checksums-only", action="store_true")
+    actions.add_argument("--verify-architecture-only", action="store_true")
     args = parser.parse_args()
+    if args.verify_architecture_only:
+        verified = verify_built_architecture(args.version)
+        print("\n".join(str(path) for path in verified))
+        return 0
     if not args.checksums_only:
         build_payloads(args.version)
     output = write_checksums()

@@ -5,6 +5,8 @@ import signal
 import sys
 import threading
 
+from dcmget import __version__
+from dcmget.architecture import ArchitectureError, ensure_supported_runtime
 from dcmget.config import load_accessions, load_config
 from dcmget.core import (
     AccessionStatus,
@@ -54,7 +56,9 @@ def default_legacy_catalog_was_migrated() -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.9.1 DICOM 批量下载工具")
+    parser = argparse.ArgumentParser(
+        description=f"DcmGet {__version__} DICOM 批量下载工具"
+    )
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -108,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        ensure_supported_runtime()
+    except ArchitectureError as exc:
+        print(f"运行环境不受支持：{exc}", file=sys.stderr)
+        return 1
     args = build_parser().parse_args(argv)
     if args.task_state:
         if args.task_id:

@@ -5,13 +5,15 @@ Set-Location $Root
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "未找到 Python 3.10+。请先从 https://www.python.org/downloads/windows/ 安装并勾选 Add Python to PATH。"
 }
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
-if ($LASTEXITCODE -ne 0) { throw "需要 Python 3.10 或更高版本。" }
+python -c "import sys; from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime(); raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+if ($LASTEXITCODE -ne 0) { throw "需要 AMD64/x64 Python 3.10 或更高版本；不支持 32 位或原生 ARM64 Python。Windows 11 ARM64 请安装 x64 Python 并通过兼容层运行。" }
 
 python -m venv --clear .venv
 if ($LASTEXITCODE -ne 0) { throw "创建 Python 虚拟环境失败。" }
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "升级 pip 失败。" }
+& .\.venv\Scripts\python.exe -c "from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime()"
+if ($LASTEXITCODE -ne 0) { throw "虚拟环境不是受支持的 AMD64/x64 64 位运行时。" }
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw "安装 Python 依赖失败。" }
 & .\.venv\Scripts\python.exe scripts\download_dcmtk.py

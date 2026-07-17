@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import subprocess
+import sys
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -230,8 +232,25 @@ def test_all_windows_variants_embed_ohif_and_local_server(tmp_path: Path):
         value.replace("\\", "/").endswith("dcmget/pdi_server.py:dcmget")
         for value in onefile
     )
+    assert any(
+        value.replace("\\", "/").endswith("dcmget/architecture.py:dcmget")
+        for value in onedir
+    )
     server_args = pdi_server_pyinstaller_args(icon, version_file)
     assert "--onefile" in server_args and "--windowed" in server_args
+
+
+def test_pdi_server_tool_entry_runs_directly_outside_repo_cwd(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(root / "tools" / "dcmget_pdi_server.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_source_deploy_includes_ohif_manifest_helper_config_and_license():

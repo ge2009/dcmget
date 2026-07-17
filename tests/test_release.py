@@ -8,10 +8,29 @@ import pytest
 
 from DICOM_download_ui import build_parser, validate_frozen_pdi_resources
 from dcmget import __version__
+from dcmget.architecture import (
+    ArchitectureError,
+    IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_ARM64,
+    IMAGE_FILE_MACHINE_I386,
+    ensure_supported_runtime,
+    pe_machine,
+    require_amd64_pe,
+)
 from dcmget.pdi_server import PdiRequestHandler
 from dcmget.release_notes import load_release_notes
 from scripts.build_deploy_bundle import VERSION as DEPLOY_VERSION, source_files
 from scripts.build_windows import validate_release_version
+
+
+def _write_pe(path: Path, machine: int) -> Path:
+    content = bytearray(256)
+    content[:2] = b"MZ"
+    struct.pack_into("<I", content, 0x3C, 0x80)
+    content[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<H", content, 0x84, machine)
+    path.write_bytes(content)
+    return path
 
 
 def test_root_and_packaged_release_notes_stay_in_sync():
@@ -30,11 +49,43 @@ def test_windows_build_rejects_a_version_different_from_source():
         validate_release_version("9.9.9")
 
 
+def test_pe_architecture_validation_accepts_only_amd64(tmp_path: Path):
+    amd64 = _write_pe(tmp_path / "amd64.exe", IMAGE_FILE_MACHINE_AMD64)
+    x86 = _write_pe(tmp_path / "x86.exe", IMAGE_FILE_MACHINE_I386)
+    arm64 = _write_pe(tmp_path / "arm64.exe", IMAGE_FILE_MACHINE_ARM64)
+
+    assert pe_machine(amd64) == IMAGE_FILE_MACHINE_AMD64
+    require_amd64_pe(amd64)
+    with pytest.raises(ArchitectureError, match="x86/32-bit"):
+        require_amd64_pe(x86)
+    with pytest.raises(ArchitectureError, match="ARM64"):
+        require_amd64_pe(arm64)
+    with pytest.raises(ArchitectureError, match="无法读取 Windows PE"):
+        pe_machine(tmp_path / "missing.exe")
+
+
+def test_runtime_guard_rejects_32_bit_and_native_windows_arm64(tmp_path: Path):
+    amd64 = _write_pe(tmp_path / "amd64.exe", IMAGE_FILE_MACHINE_AMD64)
+    arm64 = _write_pe(tmp_path / "arm64.exe", IMAGE_FILE_MACHINE_ARM64)
+
+    with pytest.raises(ArchitectureError, match="32 位"):
+        ensure_supported_runtime(platform_name="linux", pointer_bits=32)
+    ensure_supported_runtime(platform_name="linux", pointer_bits=64)
+    ensure_supported_runtime(
+        platform_name="win32", executable=amd64, pointer_bits=64
+    )
+    with pytest.raises(ArchitectureError, match="ARM64"):
+        ensure_supported_runtime(
+            platform_name="win32", executable=arm64, pointer_bits=64
+        )
+
+
 def test_source_deploy_contains_transitive_requirement_files():
     root = Path(__file__).resolve().parents[1]
     bundled = {path.relative_to(root).as_posix() for path in source_files(root)}
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
+    assert "dcmget/architecture.py" in bundled
     assert "dcmget/storage_scp.py" in bundled
 
 
@@ -92,6 +143,38 @@ def test_windows_release_artifacts_are_split_to_avoid_duplicate_runtime_download
     for suffix in ("Setup-x64", "Portable-x64", "Windows-x64-ZIP"):
         assert f"DcmGet-${{{{ inputs.version }}}}-{suffix}" in workflow
     assert "name: DcmGet-${{ inputs.version }}-windows-x64\n" not in workflow
+
+
+def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
+    bootstrap = (root / "scripts/bootstrap_windows.ps1").read_text(
+        encoding="utf-8"
+    )
+    entry = (root / "DICOM_download_ui.py").read_text(encoding="utf-8")
+    cli = (root / "DICOM_download_script.py").read_text(encoding="utf-8")
+    project = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "ArchitecturesAllowed=x64compatible" in installer
+    assert "ArchitecturesInstallIn64BitMode=x64compatible" in installer
+    assert "architecture: x64" in workflow
+    assert "--verify-architecture-only" in workflow
+    assert "Verify AMD64 application and DCMTK payloads" in workflow
+    assert "ensure_supported_runtime()" in build
+    assert "require_amd64_pe(dcmtk_bin / name" in build
+    assert "verify_built_architecture(version)" in build
+    assert "ensure_supported_runtime" in bootstrap
+    assert "ensure_supported_runtime()" in entry
+    assert "ensure_supported_runtime()" in cli
+    assert "Reject 32-bit Python runtimes" in ci
+    assert "actions/upload-artifact" not in ci
+    assert '"PyQt5>=5.15.10,<5.16"' in project
+    assert "PyQt6" not in project
 
 
 def test_windows_pdi_smoke_uses_authenticated_directory_entry():
@@ -186,6 +269,9 @@ def test_frozen_self_test_requires_offline_ohif_and_local_server(
     server_script = tmp_path / "dcmget" / "pdi_server.py"
     server_script.parent.mkdir()
     server_script.write_text("# offline server\n", encoding="utf-8")
+    (tmp_path / "dcmget" / "architecture.py").write_text(
+        "# architecture guard\n", encoding="utf-8"
+    )
     for name in (
         "index.html",
         "app-config.js",

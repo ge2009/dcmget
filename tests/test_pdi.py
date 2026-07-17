@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -638,8 +640,17 @@ def test_offline_ohif_and_cross_platform_launchers_are_included(
     output = Path(result.output_directory)
     assert (output / "VIEWER" / "OHIF" / "index.html").is_file()
     assert (output / "VIEWER" / "pdi_server.py").is_file()
+    assert (output / "VIEWER" / "architecture.py").is_file()
     for name in ("OPEN_VIEWER.bat", "OPEN_VIEWER.command", "OPEN_VIEWER.sh"):
         assert (output / name).is_file()
+    help_result = subprocess.run(
+        [sys.executable, str(output / "VIEWER" / "pdi_server.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert help_result.returncode == 0, help_result.stderr
     assert "127.0.0.1" in (output / "README.TXT").read_text(encoding="utf-8")
     assert "Weasis" not in (output / "README.TXT").read_text(encoding="utf-8")
 
@@ -722,6 +733,9 @@ def test_frozen_windows_export_uses_bundled_physical_server_script(
     server_script = frozen_root / "dcmget" / "pdi_server.py"
     server_script.parent.mkdir(parents=True)
     server_script.write_text("# portable server\n", encoding="utf-8")
+    (frozen_root / "dcmget" / "architecture.py").write_text(
+        "# portable architecture\n", encoding="utf-8"
+    )
     (frozen_root / "DcmGetPdiServer.exe").write_bytes(b"server")
     project_root = tmp_path / "empty-project"
     project_root.mkdir()
@@ -744,6 +758,9 @@ def test_frozen_windows_export_uses_bundled_physical_server_script(
     assert (output / "VIEWER" / "OHIF" / "index.html").is_file()
     assert (output / "VIEWER" / "pdi_server.py").read_text(encoding="utf-8") == (
         "# portable server\n"
+    )
+    assert (output / "VIEWER" / "architecture.py").read_text(encoding="utf-8") == (
+        "# portable architecture\n"
     )
     assert (output / "OPEN_VIEWER.bat").is_file()
     assert (output / "MANIFEST.SHA256").is_file()
@@ -1092,6 +1109,7 @@ def test_manifest_covers_index_viewer_launchers_and_dicom(
         pdi.STUDY_INDEX,
         "VIEWER/OHIF/index.html",
         "VIEWER/pdi_server.py",
+        "VIEWER/architecture.py",
         "OPEN_VIEWER.bat",
         "INDEX.HTM",
     ):

@@ -277,6 +277,7 @@ def test_large_batch_cancel_keeps_current_partial_file_count(
 
 def test_accession_editor_tab_moves_focus_to_next_control(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
+    window._set_task_form_expanded(True)
     window.activateWindow()
     qtbot.waitUntil(window.isActiveWindow)
     window.accession_edit.setFocus()
@@ -864,18 +865,21 @@ def test_download_worker_passes_task_specific_log_location(monkeypatch, tmp_path
 
     monkeypatch.setattr(ui_module, "DownloadRunner", Runner)
     task_id = "a" * 32
-    logs = tmp_path / "instance-logs"
+    logs = tmp_path / "dicom" / "_DcmGetLogs"
+    fallback_logs = tmp_path / "instance-logs"
     worker = DownloadWorker(
         AppConfig(dicom_destination_folder=str(tmp_path)),
         ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
         ["A001"],
         task_id=task_id,
         log_directory=logs,
+        fallback_log_directory=fallback_logs,
     )
 
     worker.run()
 
     assert captured["log_directory"] == logs
+    assert captured["fallback_log_directory"] == fallback_logs
     assert captured["log_file_name"] == f"task-{task_id}.log"
 
 
@@ -1325,12 +1329,122 @@ def test_open_destination_button_opens_exact_target_directory(
 
     qtbot.mouseClick(window.open_destination_button, Qt.LeftButton)
 
+    assert window.open_destination_button.text() == "打开影像目录"
     assert len(opened) == 1
     assert Path(opened[0]).resolve() == destination.resolve()
 
 
+def test_task_log_button_creates_and_opens_log_directory_beside_images(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    destination = tmp_path / "DICOM 结果"
+    destination.mkdir()
+    window.destination_edit.setText(str(destination))
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.open_task_log_button, Qt.LeftButton)
+
+    expected = destination / "_DcmGetLogs"
+    assert expected.is_dir()
+    assert Path(opened[0]).resolve() == expected.resolve()
+
+
+def test_anonymous_task_log_button_uses_private_instance_directory(
+    qtbot, tmp_path, monkeypatch
+):
+    instance_logs = tmp_path / "instance" / "logs"
+    window = make_window(qtbot, tmp_path, log_directory=instance_logs)
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    window.config.anonymization_enabled = True
+    window.destination_edit.setText(str(destination))
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.open_task_log_button, Qt.LeftButton)
+
+    assert instance_logs.is_dir()
+    assert Path(opened[0]).resolve() == instance_logs.resolve()
+    assert not (destination / "_DcmGetLogs").exists()
+
+
+def test_task_log_button_uses_instance_fallback_when_target_is_unwritable(
+    qtbot, tmp_path, monkeypatch
+):
+    instance_logs = tmp_path / "instance" / "logs"
+    window = make_window(qtbot, tmp_path, log_directory=instance_logs)
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    (destination / "_DcmGetLogs").write_text("blocked", encoding="utf-8")
+    window.destination_edit.setText(str(destination))
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.open_task_log_button, Qt.LeftButton)
+
+    assert window._task_log_used_fallback
+    assert window._active_task_log_directory == instance_logs
+    assert Path(opened[0]).resolve() == instance_logs.resolve()
+    assert any(
+        level == "warning" and "已回退到实例日志目录" in message
+        for _task_id, _source, message, level in window._log_events
+    )
+
+
+def test_conflict_directory_button_only_enables_for_existing_directory(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    window.destination_edit.setText(str(destination))
+
+    assert not window.open_conflict_button.isEnabled()
+    assert "没有" in window.open_conflict_button.toolTip()
+
+    conflict = destination / "_DcmGetConflicts"
+    conflict.mkdir()
+    window._update_result_shortcut_state()
+    opened = []
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()),
+    )
+
+    qtbot.mouseClick(window.open_conflict_button, Qt.LeftButton)
+
+    assert window.open_conflict_button.isEnabled()
+    assert Path(opened[0]).resolve() == conflict.resolve()
+
+
+def test_new_task_form_and_log_panel_are_collapsed_by_default(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    assert not window._task_form_expanded
+    assert window.task_form_body.isHidden()
+    assert not window._log_panel_expanded
+    assert window.log_panel.isHidden()
+    assert not window.log_detail_checkbox.isChecked()
+
+
 def test_new_task_form_can_collapse_without_losing_input(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
+    window._set_task_form_expanded(True)
     window.accession_edit.setPlainText("A001\nA002")
     window.destination_edit.setText(str(tmp_path / "dicom"))
 
@@ -1359,6 +1473,188 @@ def test_running_collapses_task_form_and_shows_summary(qtbot, tmp_path):
     assert window.task_form_summary.isVisible()
     assert "2 个检查号" in window.task_form_summary.text()
     assert destination in window.task_form_summary.toolTip()
+
+
+def test_task_result_summary_shows_new_skipped_conflict_and_failed_counts(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    window._display_total = 2
+    window._populate_waiting_rows(["A001", "A002"])
+
+    window._on_worker_progress(
+        1,
+        2,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=4,
+            new_file_count=2,
+            existing_skipped_count=1,
+            conflict_preserved_count=1,
+        ),
+    )
+    window._on_worker_progress(
+        2,
+        2,
+        AccessionResult("A002", AccessionStatus.FAILED),
+    )
+
+    assert window.task_result_summary.text() == (
+        "结果：新增 2 · 已存在跳过 1 · 冲突保留 1 · 失败 1"
+    )
+
+
+def test_result_counters_update_without_rescanning_all_prior_results(
+    qtbot, tmp_path
+):
+    class ValuesForbiddenDict(dict):
+        def values(self):
+            raise AssertionError("incremental counters must not scan all results")
+
+    window = make_window(qtbot, tmp_path)
+    window._result_stats = ValuesForbiddenDict()
+    window._summary_results = ValuesForbiddenDict()
+
+    result = AccessionResult(
+        "A001",
+        AccessionStatus.COMPLETED,
+        file_count=2,
+        new_file_count=1,
+        existing_skipped_count=1,
+    )
+    window._record_task_result_stats(result)
+    window._update_task_result_summary()
+    window._record_large_batch_result(result, total=40_000)
+
+    assert "新增 1" in window.task_result_summary.text()
+    assert "新增 1" in window.large_batch_summary_label.text()
+
+
+def test_recovery_restores_final_and_partial_archive_statistics(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = TaskCheckpoint(
+        task_id="b" * 32,
+        config=AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        accessions=["DONE", "CONFLICT"],
+        results=[
+            AccessionResult(
+                "DONE",
+                AccessionStatus.COMPLETED,
+                file_count=2,
+                new_file_count=2,
+            )
+        ],
+        partial_results={
+            "CONFLICT": AccessionResult(
+                "CONFLICT",
+                AccessionStatus.CANCELLED,
+                file_count=1,
+                conflict_preserved_count=1,
+            )
+        },
+        trial_required=False,
+        created_at="2026-07-17T00:00:00+00:00",
+        phase="downloading",
+    )
+
+    window._hold_download_resume(checkpoint, "已保留恢复任务")
+
+    assert window.task_result_summary.text() == (
+        "结果：新增 2 · 已存在跳过 0 · 冲突保留 1 · 失败 0"
+    )
+
+
+@pytest.mark.parametrize("total", [2, 201])
+def test_starting_retry_keeps_partial_results_in_detail_and_large_summary(
+    qtbot, tmp_path, monkeypatch, total
+):
+    window = make_window(qtbot, tmp_path)
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    accessions = [f"A{index:03d}" for index in range(total)]
+    checkpoint = window.task_store.start(
+        AppConfig(dicom_destination_folder=str(destination)),
+        accessions,
+        trial_required=False,
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            accessions[0],
+            AccessionStatus.COMPLETED,
+            file_count=2,
+            new_file_count=2,
+            archived_files=["/dicom/one.dcm", "/dicom/two.dcm"],
+        ),
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            accessions[1],
+            AccessionStatus.PARTIAL,
+            file_count=1,
+            conflict_preserved_count=1,
+            message="冲突文件需人工核对",
+        ),
+    )
+    window.task_store.set_phase(checkpoint.task_id, "download_retryable")
+    checkpoint = window.task_store.load_required()
+    tools = ToolPaths(
+        tmp_path / "movescu",
+        tmp_path / "storescp",
+        tmp_path,
+        "3.7.0",
+    )
+    monkeypatch.setattr(
+        ui_module,
+        "preflight",
+        lambda *_args, **_kwargs: PreflightResult(tools, {}, []),
+    )
+    monkeypatch.setattr(
+        ui_module,
+        "prepare_download_entitlement",
+        lambda _parent: (True, False, ""),
+    )
+    monkeypatch.setattr(QThread, "start", lambda _thread: None)
+
+    window._start_download(resume_checkpoint=checkpoint)
+
+    assert window.progress_bar.value() == 1
+    assert "新增 2" in window.task_result_summary.text()
+    assert "冲突保留 1" in window.task_result_summary.text()
+    if total > 200:
+        assert "已处理 1/201" in window.large_batch_summary_label.text()
+        assert "文件 3" in window.large_batch_summary_label.text()
+        assert "冲突保留 1" in window.large_batch_summary_label.text()
+        assert "已取消 0" in window.large_batch_summary_label.text()
+    else:
+        assert window.task_table.item(0, 1).text() == "完成"
+        assert window.task_table.item(1, 1).text() == "等待"
+        assert window.task_table.item(1, 2).text() == "1"
+        assert "待重试" in window.task_table.item(1, 5).text()
+
+    window.worker = None
+    window.worker_thread = None
+    window.task_store.release_lease()
+
+
+def test_result_shortcuts_keep_last_task_destination_while_editing_next_task(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    previous = tmp_path / "previous"
+    upcoming = tmp_path / "upcoming"
+    previous.mkdir()
+    upcoming.mkdir()
+    window._result_destination_directory = previous
+    window._record_task_result_stats(
+        AccessionResult("DONE", AccessionStatus.COMPLETED, new_file_count=1)
+    )
+    window.destination_edit.setText(str(upcoming))
+
+    assert window._destination_directory() == previous
+    assert str(previous) in window.open_destination_button.toolTip()
 
 
 def test_finish_worker_uses_active_retry_batch_for_progress_range(qtbot, tmp_path):

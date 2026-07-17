@@ -19,6 +19,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PurePosixPath
 
+try:
+    from .architecture import ArchitectureError, ensure_supported_runtime
+except ImportError:  # Standalone copy in an exported PDI VIEWER directory.
+    from architecture import ArchitectureError, ensure_supported_runtime
+
 
 VIEWER_PATH = "/viewer/directory/"
 LEGACY_VIEWER_PATH = "/viewer/dicomjson/"
@@ -41,6 +46,7 @@ MAX_STUDY_INDEX_BYTES = 64 * 1024 * 1024
 MAX_STUDY_INDEX_INSTANCES = 100_000
 SESSION_TOKEN_BYTES = 32
 DEFAULT_IDLE_TIMEOUT_SECONDS = 4 * 60 * 60
+SERVER_VERSION = "2.9.2"
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
@@ -70,7 +76,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 class PdiRequestHandler(BaseHTTPRequestHandler):
     """Serve one PDI directory without exposing the surrounding filesystem."""
 
-    server_version = "DcmGetPDI/2.9.1"
+    server_version = f"DcmGetPDI/{SERVER_VERSION}"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -856,6 +862,12 @@ def run_server(
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        ensure_supported_runtime()
+    except ArchitectureError as exc:
+        if sys.stderr is not None:
+            print(f"运行环境不受支持：{exc}", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description="打开 DcmGet PDI 本地 OHIF 阅片器")
     default_root = (
         Path(sys.executable).resolve().parent

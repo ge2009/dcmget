@@ -246,6 +246,39 @@ def test_failed_and_partial_results_can_be_retried_after_restart(tmp_path):
     assert merged.archived_files == ["/dicom/kept.dcm", "/dicom/new.dcm"]
 
 
+def test_conflict_only_partial_result_remains_visible_after_retry(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["CONFLICT"], trial_required=False)
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "CONFLICT",
+            AccessionStatus.PARTIAL,
+            file_count=1,
+            conflict_preserved_count=1,
+            message="冲突文件需人工核对",
+        ),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+
+    retry = store.prepare_download_retry(checkpoint.task_id)
+
+    assert retry.partial_results["CONFLICT"].conflict_preserved_count == 1
+    merged = store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "CONFLICT",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            existing_skipped_count=1,
+            archived_files=["/dicom/fixed.dcm"],
+        ),
+    )
+    assert merged.status == AccessionStatus.PARTIAL
+    assert merged.conflict_preserved_count == 1
+    assert "需人工核对" in merged.message
+
+
 def test_each_manual_pdi_retry_gets_a_new_attempt_id(tmp_path):
     store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
