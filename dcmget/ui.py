@@ -13,6 +13,7 @@ from PyQt5.QtCore import (
     QObject,
     QProcess,
     QSettings,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
@@ -69,6 +70,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QHeaderView,
     QAbstractItemView,
+    QInputDialog,
 )
 
 from . import __version__
@@ -94,6 +96,12 @@ from .core import (
     preflight,
 )
 from .diagnostics import diagnostic_log_directory, record_exception
+from .instance_shortcut import (
+    InstanceShortcutError,
+    ShortcutExistsError,
+    create_instance_shortcut,
+    default_instance_shortcut_name,
+)
 from .licensing import consume_trial, trial_task_consumed
 from .release_notes import load_release_notes
 from .runtime import is_frozen, resource_root
@@ -916,6 +924,8 @@ class PdiWorker(QObject):
 
 
 class DcmGetWindow(QMainWindow):
+    external_activation_requested = pyqtSignal(object)
+
     def __init__(
         self,
         config_path: str | Path,
@@ -924,6 +934,7 @@ class DcmGetWindow(QMainWindow):
         *,
         offer_task_resume: bool = True,
         enable_multi_task: bool | None = None,
+        profile_number: int | None = None,
         instance_label: str = "",
         settings_name: str = "DcmGet2",
         log_directory: str | Path | None = None,
@@ -931,6 +942,7 @@ class DcmGetWindow(QMainWindow):
         super().__init__()
         self.config_path = Path(config_path)
         self.project_root = Path(project_root)
+        self.profile_number = int(profile_number) if profile_number is not None else None
         self.instance_label = instance_label.strip()
         self.settings_name = settings_name.strip() or "DcmGet2"
         self.log_directory = (
@@ -1024,6 +1036,9 @@ class DcmGetWindow(QMainWindow):
         self._task_form_expanded = self.settings_store.value(
             "window/task_form_expanded", False, type=bool
         )
+        self.external_activation_requested.connect(
+            self._activate_from_external_launch
+        )
 
         instance_title = f" - {self.instance_label}" if self.instance_label else ""
         self.setWindowTitle(
@@ -1100,6 +1115,7 @@ class DcmGetWindow(QMainWindow):
             self.registration_button,
             self.release_notes_button,
             self.diagnostic_log_button,
+            self.instance_shortcut_button,
             self.settings_button,
         ):
             widget.setMinimumWidth(widget.sizeHint().width())
@@ -1191,6 +1207,18 @@ class DcmGetWindow(QMainWindow):
             self._open_diagnostic_log_directory
         )
         action_row.addWidget(self.diagnostic_log_button)
+        self.instance_shortcut_button = QToolButton()
+        self.instance_shortcut_button.setText("实例快捷方式")
+        self.instance_shortcut_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.instance_shortcut_button.setToolTip(
+            "在桌面创建固定打开当前实例的快捷方式"
+        )
+        self.instance_shortcut_button.setAccessibleName("创建当前实例桌面快捷方式")
+        self.instance_shortcut_button.clicked.connect(
+            self._create_current_instance_shortcut
+        )
+        self.instance_shortcut_button.setVisible(self.profile_number is not None)
+        action_row.addWidget(self.instance_shortcut_button)
         self.settings_button = QToolButton()
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -1898,6 +1926,79 @@ class DcmGetWindow(QMainWindow):
             and self.settings_button.isEnabled()
         ):
             self._show_settings()
+
+    def _create_current_instance_shortcut(self) -> None:
+        if self.profile_number is None:
+            return
+        default_name = default_instance_shortcut_name(
+            self.config.storage_port,
+            self.config.storage_ae_title,
+        )
+        name, accepted = QInputDialog.getText(
+            self,
+            "创建实例快捷方式",
+            (
+                f"为 {self.instance_label or f'实例 {self.profile_number}'} 创建桌面快捷方式。\n"
+                f"它会固定使用启动参数 --profile {self.profile_number}，下次直接打开本实例。\n\n"
+                "快捷方式名称："
+            ),
+            QLineEdit.Normal,
+            default_name,
+        )
+        if not accepted:
+            return
+        desktop_text = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        desktop = Path(desktop_text) if desktop_text else Path.home() / "Desktop"
+        try:
+            shortcut = create_instance_shortcut(
+                self.profile_number,
+                name,
+                desktop,
+                project_root=self.project_root,
+            )
+        except ShortcutExistsError as exc:
+            overwrite = QMessageBox.question(
+                self,
+                "快捷方式已存在",
+                f"桌面上已存在同名快捷方式：\n{exc.path}\n\n是否替换？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if overwrite != QMessageBox.Yes:
+                return
+            try:
+                shortcut = create_instance_shortcut(
+                    self.profile_number,
+                    name,
+                    desktop,
+                    project_root=self.project_root,
+                    overwrite=True,
+                )
+            except InstanceShortcutError as retry_exc:
+                QMessageBox.critical(self, "创建快捷方式失败", str(retry_exc))
+                return
+        except InstanceShortcutError as exc:
+            QMessageBox.critical(self, "创建快捷方式失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "快捷方式已创建",
+            (
+                f"已创建：\n{shortcut}\n\n"
+                f"此快捷方式固定打开实例 {self.profile_number}。"
+                "如果移动便携版程序文件，需重新创建快捷方式。"
+            ),
+        )
+
+    @pyqtSlot(object)
+    def _activate_from_external_launch(self, _payload: object = None) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        QApplication.alert(self, 1200)
 
     def _cancel_settings(self) -> None:
         self.settings_page.set_config(self.config)

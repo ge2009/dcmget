@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +43,36 @@ def test_notification_waits_until_window_handler_is_registered(tmp_path):
         assert received == [{"action": "activate"}]
     finally:
         secondary.close()
+        primary.close()
+
+
+def test_notify_existing_never_claims_an_absent_primary(tmp_path):
+    path = tmp_path / "gui-instance.json"
+    notifier = SingleInstance(path, startup_timeout=0.1, connect_timeout=0.05)
+
+    assert not notifier.notify_existing({"action": "activate", "profile": 3})
+    assert not notifier.is_primary
+    assert not path.exists()
+    assert not Path(str(path) + ".lock").exists()
+
+
+def test_notify_existing_wakes_matching_profile(tmp_path):
+    path = tmp_path / "gui-instance.json"
+    received = []
+    notified = threading.Event()
+    primary = SingleInstance(
+        path,
+        activation_handler=lambda payload: (received.append(payload), notified.set()),
+    )
+    notifier = SingleInstance(path)
+    try:
+        assert primary.start()
+        assert notifier.notify_existing({"action": "activate", "profile": 5})
+        assert notified.wait(2)
+        assert received == [{"action": "activate", "profile": 5}]
+        assert not notifier.is_primary
+    finally:
+        notifier.close()
         primary.close()
 
 

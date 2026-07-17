@@ -49,6 +49,10 @@ class InstanceProfileError(RuntimeError):
     pass
 
 
+class ProfileInUseError(InstanceProfileError):
+    pass
+
+
 @dataclass
 class InstanceProfile:
     number: int
@@ -75,6 +79,10 @@ class InstanceProfile:
     @property
     def lock_held(self) -> bool:
         return self._slot_lock.is_locked
+
+    @property
+    def activation_path(self) -> Path:
+        return self.state_directory / "gui-instance.json"
 
     def close(self) -> None:
         if self._slot_lock.is_locked:
@@ -160,7 +168,7 @@ def acquire_instance_profile(
         if requested is not None:
             slot_lock = _try_acquire_slot_lock(roots, requested)
             if slot_lock is None:
-                raise InstanceProfileError(f"实例 {requested} 已在运行")
+                raise ProfileInUseError(f"实例 {requested} 已在运行")
             return _initialize_claimed_profile(roots, requested, slot_lock)
 
         known_numbers = _known_profile_numbers(roots)
@@ -181,6 +189,16 @@ def acquire_instance_profile(
         raise InstanceProfileError("没有可用的 DcmGet 实例槽位")
     finally:
         allocation_lock.release()
+
+
+def instance_activation_path(
+    profile_number: int | str,
+    *,
+    state_root: str | Path | None = None,
+) -> Path:
+    number = _normalize_profile_number(profile_number)
+    root = Path(state_root or application_state_dir()).expanduser().resolve()
+    return root / PROFILE_DIRECTORY_NAME / f"i{number}" / "gui-instance.json"
 
 
 def migrate_task_catalog_to_profiles(
@@ -353,9 +371,10 @@ def _profile_roots(
     template_config_path: str | Path | None,
 ) -> _ProfileRoots:
     template = Path(template_config_path or default_config_path()).expanduser()
+    canonical_config_root = Path(config_root or default_config_path().parent)
     return _ProfileRoots(
         state_root=Path(state_root or application_state_dir()).expanduser().resolve(),
-        config_root=Path(config_root or template.parent).expanduser().resolve(),
+        config_root=canonical_config_root.expanduser().resolve(),
         template_config_path=template.resolve(),
     )
 
@@ -452,11 +471,21 @@ def _ensure_profile_config(
 ) -> None:
     if target.is_file():
         return
-    source = (
-        _config_path(roots, 1)
-        if number > 1 and _config_path(roots, 1).is_file()
-        else roots.template_config_path
+    legacy_custom_profile = (
+        roots.template_config_path.parent
+        / PROFILE_DIRECTORY_NAME
+        / f"i{number}"
+        / "config.json"
     )
+    if (
+        legacy_custom_profile.is_file()
+        and legacy_custom_profile.resolve() != target.resolve()
+    ):
+        source = legacy_custom_profile
+    elif number > 1 and _config_path(roots, 1).is_file():
+        source = _config_path(roots, 1)
+    else:
+        source = roots.template_config_path
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not source.is_file():
         save_config(target, AppConfig())

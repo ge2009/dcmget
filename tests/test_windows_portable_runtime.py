@@ -15,7 +15,15 @@ from dcmget.windows_portable_runtime import (
     prepare_windows_portable_dcmtk,
     publish_portable_dcmtk,
 )
-from scripts.build_windows import pyinstaller_args
+from scripts.build_windows import (
+    DCMTK_PACKAGE_DIRECTORY,
+    WINDOWS_DCMTK_DATA_DIRECTORIES,
+    WINDOWS_DCMTK_DATA_FILES,
+    WINDOWS_DCMTK_PE_FILES,
+    pyinstaller_args,
+    stage_minimal_windows_dcmtk,
+    verify_packaged_dcmtk_tree,
+)
 
 
 def _make_bundle(root: Path, marker: bytes = b"first") -> tuple[Path, Path]:
@@ -24,6 +32,8 @@ def _make_bundle(root: Path, marker: bytes = b"first") -> tuple[Path, Path]:
     bin_directory.mkdir(parents=True)
     (bin_directory / "movescu.exe").write_bytes(b"movescu-" + marker)
     (bin_directory / "storescp.exe").write_bytes(b"storescp-" + marker)
+    (bin_directory / "dcmmkdir.exe").write_bytes(b"dcmmkdir-" + marker)
+    (bin_directory / "dcmdump.exe").write_bytes(b"dcmdump-" + marker)
     (bin_directory / "dcmtk.dll").write_bytes(b"dll-" + marker)
     data = runtime / "dcmtk-3.7.0-win64-dynamic" / "share" / "dicom.dic"
     data.parent.mkdir(parents=True)
@@ -62,6 +72,122 @@ def test_manifest_is_deterministic_and_covers_every_payload_file(tmp_path: Path)
     assert (bundle / MANIFEST_NAME).read_bytes() == first
     assert [record["path"] for record in manifest["files"]] == sorted(expected)
     assert all(len(record["sha256"]) == 64 for record in manifest["files"])
+
+
+def test_minimal_windows_runtime_contains_only_the_release_allowlist(tmp_path: Path):
+    source = tmp_path / "official-runtime"
+    package = source / DCMTK_PACKAGE_DIRECTORY
+    for name in WINDOWS_DCMTK_PE_FILES:
+        path = package / "bin" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(name.encode("ascii"))
+    for relative in WINDOWS_DCMTK_DATA_FILES:
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
+    expected_mapping_files = []
+    for index, relative in enumerate(WINDOWS_DCMTK_DATA_DIRECTORIES):
+        path = package / relative / f"mapping-{index}.dat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mapping")
+        expected_mapping_files.append(path.relative_to(source))
+    (package / "bin" / "dcmj2pnm.exe").write_bytes(b"unused")
+    (package / "bin" / "dcmdjpeg.exe").write_bytes(b"unused")
+    man = package / "man" / "storescp.txt"
+    man.parent.mkdir()
+    man.write_text("unused", encoding="utf-8")
+
+    staged, staged_bin = stage_minimal_windows_dcmtk(
+        source, tmp_path / "staged-runtime"
+    )
+
+    actual = {
+        path.relative_to(staged)
+        for path in staged.rglob("*")
+        if path.is_file()
+    }
+    expected = {
+        Path(DCMTK_PACKAGE_DIRECTORY) / "bin" / name
+        for name in WINDOWS_DCMTK_PE_FILES
+    }
+    expected.update(
+        Path(DCMTK_PACKAGE_DIRECTORY) / relative
+        for relative in WINDOWS_DCMTK_DATA_FILES
+    )
+    expected.update(expected_mapping_files)
+    assert actual == expected
+    assert staged_bin == staged / DCMTK_PACKAGE_DIRECTORY / "bin"
+    assert not list(staged.rglob("dcmj2pnm.exe"))
+    assert not list(staged.rglob("dcmdjpeg.exe"))
+    assert not list(staged.rglob("man"))
+
+
+def test_minimal_windows_runtime_rejects_missing_required_dll(tmp_path: Path):
+    source = tmp_path / "official-runtime"
+    package = source / DCMTK_PACKAGE_DIRECTORY
+    for relative in WINDOWS_DCMTK_DATA_DIRECTORIES:
+        path = package / relative / "mapping.dat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mapping")
+    for relative in WINDOWS_DCMTK_DATA_FILES:
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"data")
+
+    with pytest.raises(FileNotFoundError, match="dcmdata.dll"):
+        stage_minimal_windows_dcmtk(source, tmp_path / "staged-runtime")
+
+
+def test_minimal_windows_runtime_rejects_symlinks(tmp_path: Path):
+    source = tmp_path / "official-runtime"
+    package = source / DCMTK_PACKAGE_DIRECTORY
+    for name in WINDOWS_DCMTK_PE_FILES:
+        path = package / "bin" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(name.encode("ascii"))
+    for relative in WINDOWS_DCMTK_DATA_FILES:
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"data")
+    for relative in WINDOWS_DCMTK_DATA_DIRECTORIES:
+        path = package / relative / "mapping.dat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mapping")
+    linked = package / WINDOWS_DCMTK_DATA_DIRECTORIES[0] / "linked.dat"
+    linked.symlink_to("mapping.dat")
+
+    with pytest.raises(RuntimeError, match="符号链接"):
+        stage_minimal_windows_dcmtk(source, tmp_path / "staged-runtime")
+
+
+def test_packaged_runtime_must_exactly_match_the_minimal_staging_tree(tmp_path: Path):
+    reference = tmp_path / "reference"
+    packaged = tmp_path / "packaged"
+    for root in (reference, packaged):
+        path = root / DCMTK_PACKAGE_DIRECTORY / "bin" / "movescu.exe"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"same")
+
+    verify_packaged_dcmtk_tree(packaged, reference)
+
+    (packaged / DCMTK_PACKAGE_DIRECTORY / "bin" / "dcmj2pnm.exe").write_bytes(
+        b"extra"
+    )
+    with pytest.raises(RuntimeError, match="文件集合"):
+        verify_packaged_dcmtk_tree(packaged, reference)
+
+
+def test_portable_manifest_requires_pdi_and_validation_tools(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    runtime, bin_directory = _make_bundle(bundle)
+    (bin_directory / "dcmmkdir.exe").unlink()
+
+    with pytest.raises(PortableRuntimeError, match="必需"):
+        create_portable_runtime_manifest(
+            runtime,
+            bin_directory,
+            bundle / "invalid-manifest.json",
+        )
 
 
 def test_publish_uses_stable_user_runtime_and_repairs_tampering(tmp_path: Path):

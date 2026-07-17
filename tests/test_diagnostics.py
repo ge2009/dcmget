@@ -13,6 +13,28 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class _StubActivationSignal:
+    def emit(self, _payload):
+        pass
+
+
+class _StubSingleInstance:
+    def __init__(self, _path):
+        self.closed = False
+
+    def start(self, _payload=None):
+        return True
+
+    def notify_existing(self, _payload=None):
+        return False
+
+    def set_activation_handler(self, _handler):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 def _run_python(
     source: str, *, environment: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -385,6 +407,7 @@ def test_ui_self_test_no_longer_constructs_daily_password_dialog(monkeypatch):
             events.append("close")
 
     class FakeProfile:
+        number = 1
         config_path = Path("profile/config.json")
         task_state_path = Path("profile/active-task.sqlite3")
         log_directory = Path("profile/logs")
@@ -419,6 +442,7 @@ def test_ui_self_test_no_longer_constructs_daily_password_dialog(monkeypatch):
     assert observed["window_kwargs"] == {
         "offer_task_resume": False,
         "enable_multi_task": False,
+        "profile_number": profile.number,
         "instance_label": profile.label,
         "settings_name": profile.settings_name,
         "log_directory": profile.log_directory,
@@ -486,8 +510,10 @@ def test_main_window_startup_error_shows_diagnostic_log_path(monkeypatch, tmp_pa
     app = Application()
 
     class Profile:
+        number = 1
         config_path = tmp_path / "instances" / "i1" / "config.json"
         task_state_path = tmp_path / "state" / "i1" / "active-task.sqlite3"
+        activation_path = tmp_path / "state" / "i1" / "gui-instance.json"
         log_directory = tmp_path / "state" / "i1" / "logs"
         label = "实例 1"
         settings_name = "DcmGet2-i1"
@@ -497,6 +523,7 @@ def test_main_window_startup_error_shows_diagnostic_log_path(monkeypatch, tmp_pa
 
     monkeypatch.setattr(entry, "QApplication", Application)
     monkeypatch.setattr(entry, "create_application", lambda: app)
+    monkeypatch.setattr(entry, "SingleInstance", _StubSingleInstance)
     monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
     monkeypatch.setattr(
         entry, "acquire_instance_profile", lambda *_args, **_kwargs: Profile()
@@ -568,6 +595,8 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
             return 0
 
     class Window:
+        external_activation_requested = _StubActivationSignal()
+
         def __init__(self, *args, **kwargs):
             events.append(("window", args, kwargs))
 
@@ -581,6 +610,7 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
             config_path=tmp_path / "config" / f"i{number}" / "config.json",
             task_state_path=tmp_path / "state" / f"i{number}" / "active-task.sqlite3",
             log_directory=tmp_path / "state" / f"i{number}" / "logs",
+            activation_path=tmp_path / "state" / f"i{number}" / "gui-instance.json",
             label=f"实例 {number}",
             settings_name=f"DcmGet2-i{number}",
             close=lambda number=number: events.append(("close", number)),
@@ -589,6 +619,7 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
         return profile
 
     monkeypatch.setattr(entry, "create_application", Application)
+    monkeypatch.setattr(entry, "SingleInstance", _StubSingleInstance)
     monkeypatch.setattr(
         entry,
         "migrate_legacy_task_state",
@@ -624,6 +655,7 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
         assert kwargs == {
             "offer_task_resume": True,
             "enable_multi_task": False,
+            "profile_number": profile.number,
             "instance_label": profile.label,
             "settings_name": profile.settings_name,
             "log_directory": profile.log_directory,
@@ -632,7 +664,112 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
     assert ("authorize", "resume-i2") in events
     assert events.count(("close", 1)) == 1
     assert events.count(("close", 2)) == 1
-    assert not hasattr(entry, "SingleInstance")
+    assert hasattr(entry, "SingleInstance")
+
+
+def test_explicit_busy_profile_wakes_existing_window_without_authorization(
+    monkeypatch, tmp_path
+):
+    import DICOM_download_ui as entry
+
+    notifications = []
+
+    class Application:
+        pass
+
+    class Notifier(_StubSingleInstance):
+        def notify_existing(self, payload=None):
+            notifications.append(payload)
+            return True
+
+    monkeypatch.setattr(entry, "create_application", Application)
+    monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
+    monkeypatch.setattr(
+        entry,
+        "acquire_instance_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            entry.ProfileInUseError("实例 8 已在运行")
+        ),
+    )
+    monkeypatch.setattr(
+        entry,
+        "instance_activation_path",
+        lambda number: tmp_path / f"i{number}" / "gui-instance.json",
+    )
+    monkeypatch.setattr(entry, "SingleInstance", Notifier)
+    monkeypatch.setattr(
+        entry,
+        "authorize_gui",
+        lambda _task_id: (_ for _ in ()).throw(
+            AssertionError("唤醒已有实例不应再次授权")
+        ),
+    )
+    monkeypatch.setattr(
+        entry,
+        "DcmGetWindow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("唤醒已有实例不应创建第二个窗口")
+        ),
+    )
+
+    assert entry.main(["--profile", "8"]) == 0
+    assert notifications == [{"action": "activate", "profile": 8}]
+
+
+def test_explicit_profile_retries_claim_when_previous_instance_finishes_closing(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    import DICOM_download_ui as entry
+
+    calls = []
+    profile = SimpleNamespace(
+        number=9,
+        config_path=tmp_path / "config.json",
+        task_state_path=tmp_path / "active-task.sqlite3",
+        activation_path=tmp_path / "gui-instance.json",
+        log_directory=tmp_path / "logs",
+        label="实例 9",
+        settings_name="DcmGet2-i9",
+        close=lambda: None,
+    )
+
+    class Signal:
+        def connect(self, _callback):
+            pass
+
+    class Application:
+        aboutToQuit = Signal()
+
+        def exec_(self):
+            return 0
+
+    class Window:
+        external_activation_requested = _StubActivationSignal()
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def show(self):
+            pass
+
+    def acquire(*_args, **_kwargs):
+        calls.append("acquire")
+        if len(calls) == 1:
+            raise entry.ProfileInUseError("实例 9 已在运行")
+        return profile
+
+    monkeypatch.setattr(entry, "create_application", Application)
+    monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
+    monkeypatch.setattr(entry, "acquire_instance_profile", acquire)
+    monkeypatch.setattr(entry, "SingleInstance", _StubSingleInstance)
+    monkeypatch.setattr(entry, "resume_authorization_task_id", lambda _path: None)
+    monkeypatch.setattr(entry, "authorize_gui", lambda _task_id: True)
+    monkeypatch.setattr(entry, "DcmGetWindow", Window)
+
+    assert entry.main(["--profile", "9"]) == 0
+    assert calls == ["acquire", "acquire"]
 
 
 def test_gui_authorization_rejection_releases_profile(monkeypatch, tmp_path):
@@ -646,10 +783,13 @@ def test_gui_authorization_rejection_releases_profile(monkeypatch, tmp_path):
         pass
 
     profile = SimpleNamespace(
+        number=1,
+        activation_path=tmp_path / "state" / "i1" / "gui-instance.json",
         task_state_path=tmp_path / "state" / "i1" / "active-task.sqlite3",
         close=lambda: closed.append(True),
     )
     monkeypatch.setattr(entry, "create_application", Application)
+    monkeypatch.setattr(entry, "SingleInstance", _StubSingleInstance)
     monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
     monkeypatch.setattr(
         entry,

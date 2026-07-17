@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -37,6 +38,35 @@ DIST_ROOT = BUILD_ROOT / "dist"
 RELEASE_ROOT = ROOT / "release" / "windows"
 PLATFORM_RUNTIME = ROOT / ".runtime" / "dcmtk" / "windows-x86_64"
 OHIF_RUNTIME = ROOT / ".runtime" / "ohif" / "ohif-3.12.6"
+MINIMAL_DCMTK_RUNTIME = BUILD_ROOT / "dcmtk-runtime"
+DCMTK_PACKAGE_DIRECTORY = "dcmtk-3.7.0-win64-dynamic"
+WINDOWS_DCMTK_PE_FILES = (
+    "movescu.exe",
+    "storescp.exe",
+    "dcmmkdir.exe",
+    "dcmdump.exe",
+    "dcmdata.dll",
+    "dcmimage.dll",
+    "dcmimgle.dll",
+    "dcmjpeg.dll",
+    "dcmnet.dll",
+    "dcmtls.dll",
+    "ijg8.dll",
+    "ijg12.dll",
+    "ijg16.dll",
+    "oficonv.dll",
+    "oflog.dll",
+    "ofstd.dll",
+)
+WINDOWS_DCMTK_DATA_DIRECTORIES = (
+    "share/dcmtk-3.7.0/csmapper",
+    "share/dcmtk-3.7.0/esdb",
+)
+WINDOWS_DCMTK_DATA_FILES = (
+    "share/dcmtk-3.7.0/dicom.dic",
+    "share/doc/dcmtk-3.7.0/COPYRIGHT",
+    "share/doc/dcmtk-3.7.0/VERSION",
+)
 
 
 def source_version() -> str:
@@ -87,6 +117,66 @@ def find_ohif_payload() -> Path:
             "scripts/prepare_ohif.py"
         )
     return OHIF_RUNTIME
+
+
+def stage_minimal_windows_dcmtk(
+    source_runtime: str | Path,
+    destination: str | Path = MINIMAL_DCMTK_RUNTIME,
+) -> tuple[Path, Path]:
+    """Copy the verified OFFIS runtime subset used by DcmGet releases."""
+
+    source = Path(source_runtime).expanduser().resolve()
+    package = source / DCMTK_PACKAGE_DIRECTORY
+    selected: list[Path] = [
+        Path(DCMTK_PACKAGE_DIRECTORY) / "bin" / name
+        for name in WINDOWS_DCMTK_PE_FILES
+    ]
+    selected.extend(
+        Path(DCMTK_PACKAGE_DIRECTORY) / relative
+        for relative in WINDOWS_DCMTK_DATA_FILES
+    )
+    for relative in WINDOWS_DCMTK_DATA_DIRECTORIES:
+        directory = package / relative
+        if not directory.is_dir() or directory.is_symlink():
+            raise FileNotFoundError(f"DCMTK 字符集目录缺失：{directory}")
+        for path in sorted(directory.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError(f"DCMTK 最小运行时不允许符号链接：{path}")
+            if path.is_file():
+                selected.append(path.relative_to(source))
+            elif not path.is_dir():
+                raise RuntimeError(f"DCMTK 最小运行时包含特殊文件：{path}")
+
+    selected = sorted(dict.fromkeys(selected))
+    missing = [relative for relative in selected if not (source / relative).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "DCMTK 最小运行时缺少文件：" + "、".join(str(path) for path in missing)
+        )
+
+    output = Path(destination).expanduser().resolve()
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        for relative in selected:
+            target = temporary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / relative, target)
+        actual = sorted(
+            path.relative_to(temporary)
+            for path in temporary.rglob("*")
+            if path.is_file()
+        )
+        if actual != selected:
+            raise RuntimeError("DCMTK 最小运行时文件集合校验失败")
+        if output.exists():
+            shutil.rmtree(output)
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+    return output, output / DCMTK_PACKAGE_DIRECTORY / "bin"
 
 
 def make_icon() -> Path:
@@ -247,8 +337,8 @@ def verify_built_architecture(version: str) -> tuple[Path, ...]:
         DIST_ROOT / "DcmGetPdiServer.exe",
         RELEASE_ROOT / f"DcmGet-{version}-windows-x64-portable.exe",
     ]
-    for root in (PLATFORM_RUNTIME, DIST_ROOT / "DcmGet"):
-        for name in ("storescp.exe", "movescu.exe"):
+    for root in (MINIMAL_DCMTK_RUNTIME, DIST_ROOT / "DcmGet"):
+        for name in WINDOWS_DCMTK_PE_FILES:
             matches = sorted(root.rglob(name)) if root.is_dir() else []
             if not matches:
                 expected.append(root / name)
@@ -264,7 +354,48 @@ def verify_built_architecture(version: str) -> tuple[Path, ...]:
     unique = tuple(dict.fromkeys(path.resolve() for path in expected))
     for path in unique:
         require_amd64_pe(path, path.name)
+    verify_packaged_dcmtk_tree(
+        DIST_ROOT
+        / "DcmGet"
+        / "_internal"
+        / ".runtime"
+        / "dcmtk"
+        / "windows-x86_64"
+    )
     return unique
+
+
+def verify_packaged_dcmtk_tree(
+    packaged_runtime: str | Path,
+    reference_runtime: str | Path = MINIMAL_DCMTK_RUNTIME,
+) -> None:
+    reference = Path(reference_runtime).resolve()
+    packaged = Path(packaged_runtime).resolve()
+    expected = {
+        path.relative_to(reference): (path.stat().st_size, file_sha256(path))
+        for path in reference.rglob("*")
+        if path.is_file()
+    }
+    actual = {
+        path.relative_to(packaged): (path.stat().st_size, file_sha256(path))
+        for path in packaged.rglob("*")
+        if path.is_file()
+    }
+    if not expected:
+        raise FileNotFoundError(f"DCMTK 最小运行时为空：{reference}")
+    if actual != expected:
+        missing = sorted(expected.keys() - actual.keys())
+        extra = sorted(actual.keys() - expected.keys())
+        changed = sorted(
+            path
+            for path in expected.keys() & actual.keys()
+            if expected[path] != actual[path]
+        )
+        detail = missing[:1] or extra[:1] or changed[:1]
+        raise RuntimeError(
+            "Windows 发布包 DCMTK 文件集合或内容不匹配"
+            + (f"：{detail[0]}" if detail else "")
+        )
 
 
 def build_payloads(version: str) -> None:
@@ -272,7 +403,7 @@ def build_payloads(version: str) -> None:
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
     ensure_supported_runtime()
     dcmtk_bin = find_dcmtk_bin()
-    for name in ("storescp.exe", "movescu.exe"):
+    for name in WINDOWS_DCMTK_PE_FILES:
         require_amd64_pe(dcmtk_bin / name, f"DCMTK {name}")
     ohif = find_ohif_payload()
     from PyInstaller.__main__ import run as run_pyinstaller
@@ -284,9 +415,10 @@ def build_payloads(version: str) -> None:
     RELEASE_ROOT.mkdir(parents=True)
     icon = make_icon()
     version_file = make_version_file(version)
+    minimal_runtime, minimal_bin = stage_minimal_windows_dcmtk(PLATFORM_RUNTIME)
     portable_runtime_manifest = create_portable_runtime_manifest(
-        PLATFORM_RUNTIME,
-        dcmtk_bin,
+        minimal_runtime,
+        minimal_bin,
         BUILD_ROOT / PORTABLE_RUNTIME_MANIFEST_NAME,
     )
 
@@ -301,7 +433,7 @@ def build_payloads(version: str) -> None:
             "--onedir",
             icon,
             version_file,
-            PLATFORM_RUNTIME,
+            minimal_runtime,
             ohif,
             pdi_server,
         )
@@ -312,7 +444,7 @@ def build_payloads(version: str) -> None:
             "--onefile",
             icon,
             version_file,
-            PLATFORM_RUNTIME,
+            minimal_runtime,
             ohif,
             pdi_server,
             portable_runtime_manifest,

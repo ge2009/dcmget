@@ -31,7 +31,9 @@ from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
 from dcmget.instance_profile import (
     InstanceProfile,
+    ProfileInUseError,
     acquire_instance_profile,
+    instance_activation_path,
     migrate_legacy_checkpoint_to_profile,
     migrate_task_catalog_to_profiles,
 )
@@ -45,6 +47,7 @@ from dcmget.runtime import (
     portable_dcmtk_bin,
     resource_root,
 )
+from dcmget.single_instance import SingleInstance
 from dcmget.task_state import TaskCheckpointStore, TaskStateError
 from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
 
@@ -75,8 +78,8 @@ def _positive_profile_number(value: str) -> int:
         number = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("实例编号必须是正整数") from exc
-    if number < 1:
-        raise argparse.ArgumentTypeError("实例编号必须是正整数")
+    if number < 1 or number > 9999:
+        raise argparse.ArgumentTypeError("实例编号必须在 1 到 9999 之间")
     return number
 
 
@@ -284,6 +287,7 @@ def run_ui_self_test(config_path: str) -> int:
                 profile.task_state_path,
                 offer_task_resume=False,
                 enable_multi_task=False,
+                profile_number=profile.number,
                 instance_label=profile.label,
                 settings_name=profile.settings_name,
                 log_directory=profile.log_directory,
@@ -331,6 +335,7 @@ def migrate_legacy_task_state(config_template_path: str | Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     profile: InstanceProfile | None = None
+    activation: SingleInstance | None = None
     self_test_requested = any(
         value in {"--self-test", "--ui-self-test"} for value in arguments
     )
@@ -347,17 +352,48 @@ def main(argv: list[str] | None = None) -> int:
 
         app = create_application()
         migrate_legacy_task_state(args.config)
-        profile = acquire_instance_profile(
-            args.profile,
-            template_config_path=args.config,
-        )
+        try:
+            profile = acquire_instance_profile(
+                args.profile,
+                template_config_path=args.config,
+            )
+        except ProfileInUseError as busy_error:
+            if args.profile is None:
+                raise
+            notifier = SingleInstance(instance_activation_path(args.profile))
+            try:
+                if notifier.notify_existing(
+                    {"action": "activate", "profile": args.profile}
+                ):
+                    return 0
+            finally:
+                notifier.close()
+            try:
+                profile = acquire_instance_profile(
+                    args.profile,
+                    template_config_path=args.config,
+                )
+            except ProfileInUseError:
+                raise busy_error
+        activation = SingleInstance(profile.activation_path)
+        if not activation.start(
+            {"action": "activate", "profile": profile.number}
+        ):
+            profile.close()
+            profile = None
+            activation.close()
+            activation = None
+            return 0
     except Exception as exc:
+        if activation is not None:
+            activation.close()
         if profile is not None:
             profile.close()
         _report_startup_failure("DcmGet 启动失败", exc, self_test_requested)
         return 1
 
     assert profile is not None
+    assert activation is not None
     try:
         resume_task_id = resume_authorization_task_id(profile.task_state_path)
         if not authorize_gui(resume_task_id):
@@ -368,10 +404,15 @@ def main(argv: list[str] | None = None) -> int:
             profile.task_state_path,
             offer_task_resume=True,
             enable_multi_task=False,
+            profile_number=profile.number,
             instance_label=profile.label,
             settings_name=profile.settings_name,
             log_directory=profile.log_directory,
         )
+        activation.set_activation_handler(
+            window.external_activation_requested.emit
+        )
+        app.aboutToQuit.connect(activation.close)
         app.aboutToQuit.connect(profile.close)
         window.show()
         return app.exec_()
@@ -379,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
         _report_startup_failure("DcmGet 主窗口启动失败", exc, False)
         return 1
     finally:
+        activation.close()
         profile.close()
 
 

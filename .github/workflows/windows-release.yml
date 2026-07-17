@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.9.2
+        default: 2.10.0
 
 permissions:
   contents: read
@@ -70,6 +70,61 @@ jobs:
       - name: Verify AMD64 application and DCMTK payloads
         run: python scripts/build_windows.py --version "${{ inputs.version }}" --verify-architecture-only
 
+      - name: Verify minimal DCMTK runtime and tools
+        shell: pwsh
+        run: |
+          function Assert-MinimalDcmtk([string]$runtimeRoot, [bool]$startTools) {
+            $bin = (Resolve-Path (Join-Path $runtimeRoot "dcmtk-3.7.0-win64-dynamic/bin")).Path
+            $expected = @(
+              "movescu.exe", "storescp.exe", "dcmmkdir.exe", "dcmdump.exe",
+              "dcmdata.dll", "dcmimage.dll", "dcmimgle.dll", "dcmjpeg.dll",
+              "dcmnet.dll", "dcmtls.dll", "ijg8.dll", "ijg12.dll", "ijg16.dll",
+              "oficonv.dll", "oflog.dll", "ofstd.dll"
+            ) | Sort-Object
+            $actual = @(Get-ChildItem $bin -File | ForEach-Object Name | Sort-Object)
+            $difference = @(Compare-Object $expected $actual)
+            if ($difference.Count -ne 0) {
+              throw "Packaged DCMTK bin allowlist mismatch: $($difference | Out-String)"
+            }
+            if (Test-Path (Join-Path $bin "dcmj2pnm.exe") -PathType Leaf) { throw "Unused dcmj2pnm.exe was packaged" }
+            if (Test-Path (Join-Path $bin "dcmdjpeg.exe") -PathType Leaf) { throw "Unused dcmdjpeg.exe was packaged" }
+            if ($startTools) {
+              foreach ($tool in @("movescu.exe", "storescp.exe", "dcmmkdir.exe", "dcmdump.exe")) {
+                & (Join-Path $bin $tool) --version | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "$tool failed to start from the minimal runtime" }
+              }
+            }
+          }
+
+          $onedirRuntime = "build/windows/dist/DcmGet/_internal/.runtime/dcmtk/windows-x86_64"
+          Assert-MinimalDcmtk $onedirRuntime $true
+          $expanded = Join-Path $env:RUNNER_TEMP "dcmget-minimal-runtime-zip"
+          Remove-Item $expanded -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive "release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip" $expanded
+          Assert-MinimalDcmtk (Join-Path $expanded "DcmGet/_internal/.runtime/dcmtk/windows-x86_64") $true
+          Remove-Item $expanded -Recurse -Force
+
+      - name: Verify real profile desktop shortcut
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP "DcmGet Shortcut Test"
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          $env:DCMGET_TEST_EXE = Join-Path $fixture "DcmGet.exe"
+          $env:DCMGET_TEST_DESKTOP = Join-Path $fixture "Desktop"
+          Copy-Item "build/windows/dist/DcmGet/DcmGet.exe" $env:DCMGET_TEST_EXE -Force
+          python -c "import os; from dcmget.instance_shortcut import create_instance_shortcut, default_instance_shortcut_name; create_instance_shortcut(6, default_instance_shortcut_name(6666, 'DCMGET'), os.environ['DCMGET_TEST_DESKTOP'], executable=os.environ['DCMGET_TEST_EXE'], frozen=True, platform='win32')"
+          if ($LASTEXITCODE -ne 0) { throw "Could not create profile shortcut" }
+          $link = Join-Path $env:DCMGET_TEST_DESKTOP "dcmget-6666-DCMGET.lnk"
+          if (-not (Test-Path $link -PathType Leaf)) { throw "Profile shortcut was not created" }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+          if (-not [IO.Path]::GetFullPath($shortcut.TargetPath).Equals([IO.Path]::GetFullPath($env:DCMGET_TEST_EXE), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Profile shortcut target is incorrect: $($shortcut.TargetPath)"
+          }
+          if ($shortcut.Arguments -ne "--profile 6") { throw "Profile shortcut arguments are incorrect: $($shortcut.Arguments)" }
+          if (-not [IO.Path]::GetFullPath($shortcut.WorkingDirectory).Equals([IO.Path]::GetFullPath($fixture), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Profile shortcut working directory is incorrect: $($shortcut.WorkingDirectory)"
+          }
+
       - name: Verify embedded OHIF and PDI server resources
         shell: pwsh
         run: |
@@ -112,6 +167,7 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "DcmGetPdiServer\.exe" -Quiet)) { throw "Portable EXE is missing PDI server" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*architecture\.py" -Quiet)) { throw "Portable EXE is missing PDI architecture guard" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*instance_shortcut" -Quiet)) { throw "Portable EXE is missing profile shortcut support" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
           if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom compatibility modules" }
           if (-not (Select-String -Path $archiveListing -Pattern "DCMGET_PORTABLE_RUNTIME\.json" -Quiet)) { throw "Portable EXE is missing the stable DCMTK runtime manifest" }
@@ -227,6 +283,17 @@ jobs:
             throw "Portable storescp does not come from the reported stable bin directory"
           }
           if (-not (Test-Path $storescp -PathType Leaf)) { throw "Stable portable storescp does not exist" }
+          $expectedDcmtkBin = @(
+            "movescu.exe", "storescp.exe", "dcmmkdir.exe", "dcmdump.exe",
+            "dcmdata.dll", "dcmimage.dll", "dcmimgle.dll", "dcmjpeg.dll",
+            "dcmnet.dll", "dcmtls.dll", "ijg8.dll", "ijg12.dll", "ijg16.dll",
+            "oficonv.dll", "oflog.dll", "ofstd.dll"
+          ) | Sort-Object
+          $portableDcmtkBin = @(Get-ChildItem $portableBin -File | ForEach-Object Name | Sort-Object)
+          $portableDifference = @(Compare-Object $expectedDcmtkBin $portableDcmtkBin)
+          if ($portableDifference.Count -ne 0) {
+            throw "Portable DCMTK bin allowlist mismatch: $($portableDifference | Out-String)"
+          }
           $published = @(Get-ChildItem $runtimeRoot -Directory | Where-Object { $_.Name -notlike ".*" })
           if ($published.Count -ne 1) { throw "Expected one atomically published portable runtime, found $($published.Count)" }
           if (@(Get-ChildItem $runtimeRoot -Directory -Force | Where-Object { $_.Name -like ".*.tmp-*" }).Count -ne 0) {
@@ -344,8 +411,18 @@ jobs:
             (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\DcmGet 诊断日志.lnk")
           )
           if (-not ($diagnosticShortcuts | Where-Object { Test-Path $_ })) { throw "Diagnostic log shortcut is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter movescu.exe)) { throw "Installed movescu.exe is missing" }
-          if (-not (Get-ChildItem $installDir -Recurse -Filter storescp.exe)) { throw "Installed storescp.exe is missing" }
+          $installedDcmtkBin = (Resolve-Path "$installDir/_internal/.runtime/dcmtk/windows-x86_64/dcmtk-3.7.0-win64-dynamic/bin").Path
+          $expectedDcmtkBin = @(
+            "movescu.exe", "storescp.exe", "dcmmkdir.exe", "dcmdump.exe",
+            "dcmdata.dll", "dcmimage.dll", "dcmimgle.dll", "dcmjpeg.dll",
+            "dcmnet.dll", "dcmtls.dll", "ijg8.dll", "ijg12.dll", "ijg16.dll",
+            "oficonv.dll", "oflog.dll", "ofstd.dll"
+          ) | Sort-Object
+          $installedDcmtkFiles = @(Get-ChildItem $installedDcmtkBin -File | ForEach-Object Name | Sort-Object)
+          $installedDcmtkDifference = @(Compare-Object $expectedDcmtkBin $installedDcmtkFiles)
+          if ($installedDcmtkDifference.Count -ne 0) {
+            throw "Installed DCMTK bin allowlist mismatch: $($installedDcmtkDifference | Out-String)"
+          }
           $resourceRoot = Join-Path $installDir "_internal"
           $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
           if (-not (Test-Path (Join-Path $resourceRoot "DcmGetPdiServer.exe") -PathType Leaf)) { throw "Installed PDI local server is missing" }

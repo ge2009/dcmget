@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from dcmget.config import AppConfig
+from dcmget.instance_shortcut import ShortcutExistsError
 from dcmget.core import (
     AccessionResult,
     AccessionStatus,
@@ -464,6 +465,119 @@ def test_task_shortcuts_only_run_on_task_page_without_reloading_settings(
     window.start_button.setEnabled(False)
     window.start_download_shortcut.activated.emit()
     assert calls == ["open", "start", "settings"]
+
+
+def test_profile_shortcut_uses_saved_receiver_config_and_fixed_profile(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(
+        qtbot,
+        tmp_path,
+        profile_number=6,
+        instance_label="实例 6",
+    )
+    window.config.storage_port = 7788
+    window.config.storage_ae_title = "RECEIVER6"
+    desktop = tmp_path / "Desktop"
+    captured = {}
+    notices = []
+
+    def get_text(_parent, _title, label, _mode, default):
+        captured["label"] = label
+        captured["default"] = default
+        return default, True
+
+    def create(profile_number, name, destination, **kwargs):
+        captured["create"] = (profile_number, name, Path(destination), kwargs)
+        return desktop / f"{name}.lnk"
+
+    monkeypatch.setattr(ui_module.QInputDialog, "getText", get_text)
+    monkeypatch.setattr(
+        ui_module.QStandardPaths,
+        "writableLocation",
+        lambda _location: str(desktop),
+    )
+    monkeypatch.setattr(ui_module, "create_instance_shortcut", create)
+    monkeypatch.setattr(
+        ui_module.QMessageBox,
+        "information",
+        lambda _parent, title, message: notices.append((title, message)),
+    )
+
+    qtbot.mouseClick(window.instance_shortcut_button, Qt.LeftButton)
+
+    assert captured["default"] == "dcmget-7788-RECEIVER6"
+    assert "--profile 6" in captured["label"]
+    profile_number, name, destination, kwargs = captured["create"]
+    assert profile_number == 6
+    assert name == "dcmget-7788-RECEIVER6"
+    assert destination == desktop
+    assert "config_path" not in kwargs
+    assert notices and "固定打开实例 6" in notices[0][1]
+
+
+def test_profile_shortcut_can_be_created_while_download_is_running(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path, profile_number=2)
+    window.worker = object()
+
+    window._set_running(True)
+
+    assert window.instance_shortcut_button.isVisible()
+    assert window.instance_shortcut_button.isEnabled()
+    window.worker = None
+    window._set_running(False)
+
+
+def test_profile_shortcut_requires_confirmation_before_replacing(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path, profile_number=2)
+    desktop = tmp_path / "Desktop"
+    shortcut = desktop / "dcmget-6666-DCMGET.lnk"
+    calls = []
+
+    monkeypatch.setattr(
+        ui_module.QInputDialog,
+        "getText",
+        lambda *_args: ("dcmget-6666-DCMGET", True),
+    )
+    monkeypatch.setattr(
+        ui_module.QStandardPaths,
+        "writableLocation",
+        lambda _location: str(desktop),
+    )
+
+    def create(*_args, **kwargs):
+        calls.append(bool(kwargs.get("overwrite")))
+        if not kwargs.get("overwrite"):
+            raise ShortcutExistsError(shortcut)
+        return shortcut
+
+    monkeypatch.setattr(ui_module, "create_instance_shortcut", create)
+    monkeypatch.setattr(
+        ui_module.QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(ui_module.QMessageBox, "information", lambda *_args: None)
+
+    window._create_current_instance_shortcut()
+
+    assert calls == [False, True]
+
+
+def test_external_profile_activation_restores_and_raises_window(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path, profile_number=4)
+    window.showMinimized()
+    QApplication.processEvents()
+
+    window.external_activation_requested.emit({"action": "activate", "profile": 4})
+    QApplication.processEvents()
+
+    assert window.isVisible()
+    assert not window.isMinimized()
 
 
 def test_settings_validation_is_inline(qtbot, tmp_path):

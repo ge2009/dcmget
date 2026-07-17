@@ -216,9 +216,11 @@ def _validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     required = {
         (bin_relative / "movescu.exe").as_posix(),
         (bin_relative / "storescp.exe").as_posix(),
+        (bin_relative / "dcmmkdir.exe").as_posix(),
+        (bin_relative / "dcmdump.exe").as_posix(),
     }
     if not required <= records.keys():
-        raise PortableRuntimeError("便携运行时清单缺少 movescu.exe 或 storescp.exe")
+        raise PortableRuntimeError("便携运行时清单缺少 DcmGet 必需的 DCMTK 工具")
     expected_payload_hash = _payload_sha256(manifest)
     if manifest.get("payload_sha256") != expected_payload_hash:
         raise PortableRuntimeError("便携运行时清单整体哈希不匹配")

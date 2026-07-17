@@ -134,6 +134,17 @@ def test_release_version_sources_and_ui_self_test_flag_stay_in_sync():
     assert build_parser().parse_args(["--ui-self-test"]).ui_self_test
 
 
+def test_gui_profile_argument_uses_the_persistent_slot_range():
+    parser = build_parser()
+
+    assert parser.parse_args(["--profile", "1"]).profile == 1
+    assert parser.parse_args(["--profile", "9999"]).profile == 9999
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--profile", "0"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--profile", "10000"])
+
+
 def test_windows_release_artifacts_are_split_to_avoid_duplicate_runtime_downloads():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
@@ -175,6 +186,41 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     assert "actions/upload-artifact" not in ci
     assert '"PyQt5>=5.15.10,<5.16"' in project
     assert "PyQt6" not in project
+
+
+def test_windows_release_packages_only_the_required_dcmtk_runtime():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    downloader = (root / "scripts/download_dcmtk.py").read_text(encoding="utf-8")
+
+    assert "stage_minimal_windows_dcmtk(PLATFORM_RUNTIME)" in build
+    assert "verify_packaged_dcmtk_tree(" in build
+    for name in ("movescu.exe", "storescp.exe", "dcmmkdir.exe", "dcmdump.exe"):
+        assert name in build
+        assert name in workflow
+    assert '"dcmj2pnm",' not in downloader
+    assert '"dcmdjpeg",' not in downloader
+    assert "Unused dcmj2pnm.exe was packaged" in workflow
+    assert "Unused dcmdjpeg.exe was packaged" in workflow
+    assert "Assert-MinimalDcmtk $onedirRuntime $true" in workflow
+    assert "Portable DCMTK bin allowlist mismatch" in workflow
+    assert "Installed DCMTK bin allowlist mismatch" in workflow
+
+
+def test_windows_release_validates_real_profile_shortcut_properties():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Verify real profile desktop shortcut" in workflow
+    assert "default_instance_shortcut_name(6666, 'DCMGET')" in workflow
+    assert 'shortcut.Arguments -ne "--profile 6"' in workflow
+    assert "WScript.Shell" in workflow
+    assert "Portable EXE is missing profile shortcut support" in workflow
 
 
 def test_windows_pdi_smoke_uses_authenticated_directory_entry():

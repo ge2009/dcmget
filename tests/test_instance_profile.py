@@ -19,7 +19,9 @@ from dcmget.config import AppConfig, load_config, save_config
 from dcmget.core import AccessionResult, AccessionStatus
 from dcmget.instance_profile import (
     InstanceProfileError,
+    ProfileInUseError,
     acquire_instance_profile,
+    instance_activation_path,
     migrate_legacy_checkpoint_to_profile,
     migrate_task_catalog_to_profiles,
 )
@@ -154,6 +156,7 @@ def test_profile_slots_keep_config_state_logs_and_settings_isolated(tmp_path):
         assert first.state_directory == kwargs["state_root"] / "instances" / "i1"
         assert first.task_state_path == first.state_directory / "active-task.sqlite3"
         assert first.log_directory == first.state_directory / "logs"
+        assert first.activation_path == first.state_directory / "gui-instance.json"
         assert first.log_directory.is_dir()
         assert first.config_path == kwargs["config_root"] / "instances" / "i1" / "config.json"
         assert load_config(first.config_path).storage_ae_title == "TEMPLATE"
@@ -189,6 +192,80 @@ def test_profile_slots_keep_config_state_logs_and_settings_isolated(tmp_path):
     explicit = acquire_instance_profile("2", **kwargs)
     assert explicit.number == 2
     explicit.close()
+
+
+def test_instance_activation_path_is_stable_without_claiming_profile(tmp_path):
+    path = instance_activation_path(7, state_root=tmp_path / "state")
+
+    assert path == (tmp_path / "state" / "instances" / "i7" / "gui-instance.json").resolve()
+    assert not path.exists()
+
+
+def test_custom_config_is_only_a_template_for_the_canonical_profile_root(
+    tmp_path, monkeypatch
+):
+    canonical_template = tmp_path / "canonical" / "config.json"
+    custom_template = tmp_path / "custom" / "site.json"
+    save_config(custom_template, AppConfig(storage_ae_title="CUSTOM"))
+    monkeypatch.setattr(
+        instance_profile_module,
+        "default_config_path",
+        lambda: canonical_template,
+    )
+
+    profile = acquire_instance_profile(
+        2,
+        state_root=tmp_path / "state",
+        template_config_path=custom_template,
+    )
+    try:
+        assert profile.config_path == (
+            canonical_template.parent / "instances" / "i2" / "config.json"
+        ).resolve()
+        assert load_config(profile.config_path).storage_ae_title == "CUSTOM"
+    finally:
+        profile.close()
+
+
+def test_old_custom_profile_config_is_migrated_to_canonical_root(
+    tmp_path, monkeypatch
+):
+    canonical_template = tmp_path / "canonical" / "config.json"
+    custom_template = tmp_path / "custom" / "site.json"
+    save_config(custom_template, AppConfig(storage_ae_title="TEMPLATE"))
+    legacy_profile = custom_template.parent / "instances" / "i3" / "config.json"
+    save_config(
+        legacy_profile,
+        AppConfig(storage_ae_title="LEGACY", storage_port=7003),
+    )
+    monkeypatch.setattr(
+        instance_profile_module,
+        "default_config_path",
+        lambda: canonical_template,
+    )
+
+    profile = acquire_instance_profile(
+        3,
+        state_root=tmp_path / "state",
+        template_config_path=custom_template,
+    )
+    try:
+        migrated = load_config(profile.config_path)
+        assert migrated.storage_ae_title == "LEGACY"
+        assert migrated.storage_port == 7003
+        assert legacy_profile.is_file()
+    finally:
+        profile.close()
+
+
+def test_explicit_busy_profile_uses_specific_error_type(tmp_path):
+    kwargs = _profile_kwargs(tmp_path)
+    profile = acquire_instance_profile(4, **kwargs)
+    try:
+        with pytest.raises(ProfileInUseError, match="实例 4 已在运行"):
+            acquire_instance_profile(4, **kwargs)
+    finally:
+        profile.close()
 
 
 def test_profile_close_supports_weak_method_on_python_310(tmp_path):

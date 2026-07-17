@@ -97,6 +97,21 @@ class SingleInstance:
             for payload in pending:
                 self._dispatch(handler, payload)
 
+    def notify_existing(
+        self,
+        payload: Mapping[str, object] | None = None,
+    ) -> bool:
+        """Notify an existing primary without ever claiming the endpoint."""
+
+        message = dict(payload or {"action": "activate"})
+        deadline = time.monotonic() + self._startup_timeout
+        while True:
+            if self._notify_primary(message):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
     def close(self) -> None:
         with self._state_lock:
             was_primary = self._primary
