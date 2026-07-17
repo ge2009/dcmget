@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -135,7 +136,8 @@ def test_macos_shortcut_contains_quoted_profile_launch_and_is_executable(tmp_pat
     content = result.read_text(encoding="utf-8")
     assert "--profile 4" in content
     assert "Project With Spaces" in content
-    assert result.stat().st_mode & 0o111
+    if os.name != "nt":
+        assert result.stat().st_mode & 0o111
 
 
 def test_existing_shortcut_requires_explicit_overwrite(tmp_path):
