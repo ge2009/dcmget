@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.8.3
+        default: 2.9.0
 
 permissions:
   contents: read
@@ -83,10 +83,18 @@ jobs:
             if (Test-Path (Join-Path $ohif "sw.js")) { throw "Online service worker was packaged" }
           }
 
-          Assert-PdiResources (Resolve-Path "build/windows/dist/DcmGet/_internal").Path
+          $unpackedResourceRoot = (Resolve-Path "build/windows/dist/DcmGet/_internal").Path
+          Assert-PdiResources $unpackedResourceRoot
+          if (Test-Path (Join-Path $unpackedResourceRoot "DCMGET_PORTABLE_RUNTIME.json")) {
+            throw "Unpacked application must not publish DCMTK to the portable user runtime"
+          }
           $expanded = Join-Path $env:RUNNER_TEMP "dcmget-standalone-expanded"
           Expand-Archive "release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip" $expanded
-          Assert-PdiResources (Resolve-Path "$expanded/DcmGet/_internal").Path
+          $zipResourceRoot = (Resolve-Path "$expanded/DcmGet/_internal").Path
+          Assert-PdiResources $zipResourceRoot
+          if (Test-Path (Join-Path $zipResourceRoot "DCMGET_PORTABLE_RUNTIME.json")) {
+            throw "ZIP application must not publish DCMTK to the portable user runtime"
+          }
 
           $archiveListing = "build/windows/portable-archive.txt"
           pyi-archive_viewer -r "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" *> $archiveListing
@@ -94,7 +102,8 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "DcmGetPdiServer\.exe" -Quiet)) { throw "Portable EXE is missing PDI server" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
-          if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom receiver modules" }
+          if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom compatibility modules" }
+          if (-not (Select-String -Path $archiveListing -Pattern "DCMGET_PORTABLE_RUNTIME\.json" -Quiet)) { throw "Portable EXE is missing the stable DCMTK runtime manifest" }
 
       - name: Smoke test standalone PDI server
         shell: pwsh
@@ -170,8 +179,49 @@ jobs:
         shell: pwsh
         run: |
           $portable = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe").Path
-          $process = Start-Process $portable -ArgumentList "--self-test" -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "Portable self-test failed with code $($process.ExitCode)" }
+          $runtimeRoot = Join-Path $env:LOCALAPPDATA "DcmGet\runtime\dcmtk"
+          if (Test-Path $runtimeRoot) { Remove-Item $runtimeRoot -Recurse -Force }
+          $reportA = Join-Path $env:RUNNER_TEMP "dcmget-portable-self-test-a.json"
+          $reportB = Join-Path $env:RUNNER_TEMP "dcmget-portable-self-test-b.json"
+          Remove-Item $reportA, $reportB -Force -ErrorAction SilentlyContinue
+
+          $first = Start-Process $portable -ArgumentList @("--self-test", "--self-test-report", "`"$reportA`"") -PassThru
+          $second = Start-Process $portable -ArgumentList @("--self-test", "--self-test-report", "`"$reportB`"") -PassThru
+          $first.WaitForExit()
+          $second.WaitForExit()
+          if ($first.ExitCode -ne 0) { throw "First portable self-test failed with code $($first.ExitCode)" }
+          if ($second.ExitCode -ne 0) { throw "Second portable self-test failed with code $($second.ExitCode)" }
+          if (-not (Test-Path $reportA -PathType Leaf) -or -not (Test-Path $reportB -PathType Leaf)) {
+            throw "Portable self-test did not write both runtime reports"
+          }
+
+          $firstReport = Get-Content $reportA -Raw | ConvertFrom-Json
+          $secondReport = Get-Content $reportB -Raw | ConvertFrom-Json
+          if (-not [String]::Equals($firstReport.storescp, $secondReport.storescp, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Simultaneous portable launches resolved different storescp paths"
+          }
+          if (-not [String]::Equals($firstReport.portable_dcmtk_bin, $secondReport.portable_dcmtk_bin, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Simultaneous portable launches published different DCMTK directories"
+          }
+          $stableRoot = [IO.Path]::GetFullPath((Resolve-Path $runtimeRoot).Path)
+          $storescp = [IO.Path]::GetFullPath([string]$firstReport.storescp)
+          $portableBin = [IO.Path]::GetFullPath([string]$firstReport.portable_dcmtk_bin)
+          if (-not $storescp.StartsWith($stableRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Portable storescp is outside the per-user stable runtime: $storescp"
+          }
+          if ($storescp -match '(?i)[\\/]_MEI[^\\/]*[\\/]') {
+            throw "Portable storescp still runs from PyInstaller temporary extraction: $storescp"
+          }
+          if (-not [String]::Equals((Split-Path $storescp -Parent), $portableBin, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Portable storescp does not come from the reported stable bin directory"
+          }
+          if (-not (Test-Path $storescp -PathType Leaf)) { throw "Stable portable storescp does not exist" }
+          $published = @(Get-ChildItem $runtimeRoot -Directory | Where-Object { $_.Name -notlike ".*" })
+          if ($published.Count -ne 1) { throw "Expected one atomically published portable runtime, found $($published.Count)" }
+          if (@(Get-ChildItem $runtimeRoot -Directory -Force | Where-Object { $_.Name -like ".*.tmp-*" }).Count -ne 0) {
+            throw "Portable runtime left a temporary publish directory"
+          }
+
           $env:QT_QPA_PLATFORM = "offscreen"
           $config = Join-Path $env:RUNNER_TEMP "dcmget-portable-ui-self-test.json"
           $ui = Start-Process $portable -ArgumentList @("--ui-self-test", "--config", $config) -Wait -PassThru
@@ -315,7 +365,7 @@ jobs:
           if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") { throw "Firewall rule does not allow the configured receiver TCP port" }
           $applicationFilters = @($firewall | Get-NetFirewallApplicationFilter)
           if ($applicationFilters.Count -ne 1) { throw "Expected one firewall application filter, found $($applicationFilters.Count)" }
-          $expectedReceiver = (Resolve-Path -LiteralPath (Join-Path $installDir "DcmGet.exe") -ErrorAction Stop).ProviderPath
+          $expectedReceiver = (Resolve-Path -LiteralPath (Join-Path $installDir "_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe") -ErrorAction Stop).ProviderPath
           $configuredReceiver = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
           $actualReceiver = (Resolve-Path -LiteralPath $configuredReceiver -ErrorAction Stop).ProviderPath
           if (-not $actualReceiver.Equals($expectedReceiver, [StringComparison]::OrdinalIgnoreCase)) { throw "Firewall program is '$actualReceiver', expected '$expectedReceiver'" }
@@ -324,8 +374,11 @@ jobs:
 
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
-          $diagnosticLog = Join-Path $env:LOCALAPPDATA "DcmGet\logs\dcmget-diagnostics.log"
-          if (-not (Test-Path $diagnosticLog) -or (Get-Item $diagnosticLog).Length -eq 0) { throw "Installed self-test did not write a diagnostic log" }
+          $diagnosticLogs = @(
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA "DcmGet\logs") -Filter "dcmget-diagnostics-*.log" -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -gt 0 }
+          )
+          if ($diagnosticLogs.Count -lt 1) { throw "Installed self-test did not write a process-specific diagnostic log" }
           $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
@@ -333,7 +386,7 @@ jobs:
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Uninstall removed or changed the license" }
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
-          if (-not (Test-Path $diagnosticLog)) { throw "Uninstall removed the diagnostic log" }
+          if (-not ($diagnosticLogs | Where-Object { Test-Path $_.FullName })) { throw "Uninstall removed the diagnostic log" }
           if (Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the receiver firewall rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy storescp rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }

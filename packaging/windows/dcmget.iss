@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.8.3"
+  #define AppVersion "2.9.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -30,7 +30,7 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 UninstallDisplayName={#AppName}
 AppPublisher=DcmGet contributors
-AppComments=多任务 DICOM 下载工作台，包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
+AppComments=可多开运行的 DICOM 下载工具，包含 DCMTK 3.7.0 与离线中文 OHIF 网页阅片器
 DefaultDirName={autopf}\DcmGet
 DefaultGroupName=DcmGet
 DisableProgramGroupPage=yes
@@ -88,7 +88,7 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\{#AppExeName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExeName}"; Description: "启动 DcmGet"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

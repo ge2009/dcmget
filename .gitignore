@@ -25,6 +25,8 @@ dcmtk/
 logs/
 .dcmget-staging/
 /config.json
+/config.json.lock
+/instances/
 /access.txt
 config.local.json
 trial.json

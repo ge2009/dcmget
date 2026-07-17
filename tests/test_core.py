@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import multiprocessing
 import os
 import socket
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from pydicom import dcmread
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian
 
@@ -28,6 +30,122 @@ from dcmget.core import (
     preflight,
     safe_accession_dir,
 )
+
+
+def _publish_dicom_process(
+    source: str,
+    target: str,
+    state_directory: str,
+    start_event,
+    result_queue,
+) -> None:
+    core.ensure_application_state_dir = lambda: Path(state_directory)
+    start_event.wait(10)
+    try:
+        core._publish_or_deduplicate(Path(source), Path(target))
+        result_queue.put((source, "ok", ""))
+    except Exception as exc:  # pragma: no cover - asserted in parent process
+        result_queue.put((source, "error", str(exc)))
+
+
+def _run_publish_processes(
+    sources: list[Path],
+    target: Path,
+    state_directory: Path,
+) -> list[tuple[str, str, str]]:
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_publish_dicom_process,
+            args=(
+                str(source),
+                str(target),
+                str(state_directory),
+                start_event,
+                result_queue,
+            ),
+        )
+        for source in sources
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(20)
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+    return [result_queue.get(timeout=2) for _process in processes]
+
+
+def _claim_receiver_lease_process(
+    state_directory: str,
+    port: int,
+    begin_event,
+    release_event,
+    result_queue,
+) -> None:
+    core.ensure_application_state_dir = lambda: Path(state_directory)
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(Path(state_directory) / f"dicom-{port}"),
+            storage_port=port,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=Path(state_directory) / f"logs-{os.getpid()}",
+    )
+    try:
+        if not begin_event.wait(10):
+            raise TimeoutError("waiting for receiver lease race timed out")
+        runner._acquire_receiver_lease()
+        result_queue.put(("ok", port, ""))
+        if not release_event.wait(20):
+            raise TimeoutError("waiting to release receiver lease timed out")
+    except Exception as exc:  # pragma: no cover - asserted in parent process
+        result_queue.put(("error", port, str(exc)))
+    finally:
+        runner._release_receiver_lease()
+        runner._close_file_logger()
+
+
+def _run_receiver_lease_processes(
+    state_directory: Path,
+    ports: list[int],
+) -> list[tuple[str, int, str]]:
+    context = multiprocessing.get_context("spawn")
+    begin_event = context.Event()
+    release_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_receiver_lease_process,
+            args=(
+                str(state_directory),
+                port,
+                begin_event,
+                release_event,
+                result_queue,
+            ),
+        )
+        for port in ports
+    ]
+    outcomes: list[tuple[str, int, str]] = []
+    try:
+        for process in processes:
+            process.start()
+        begin_event.set()
+        outcomes = [result_queue.get(timeout=20) for _process in processes]
+    finally:
+        release_event.set()
+        for process in processes:
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        result_queue.close()
+        result_queue.join_thread()
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+    return outcomes
 
 
 @pytest.mark.parametrize(
@@ -209,6 +327,199 @@ def test_static_preflight_defers_receiver_port_check(tmp_path, monkeypatch):
     assert ("接收端口", True, "将在任务获得运行机会时检查") in result.checks
 
 
+def test_receiver_lease_rejects_same_port_across_processes(tmp_path):
+    outcomes = _run_receiver_lease_processes(
+        tmp_path / "state",
+        [16666, 16666],
+    )
+
+    assert sorted(status for status, _port, _message in outcomes) == ["error", "ok"]
+    error = next(message for status, _port, message in outcomes if status == "error")
+    assert "16666" in error
+    assert "另一个 DcmGet 实例" in error
+
+
+def test_receiver_lease_allows_different_ports_across_processes(tmp_path):
+    outcomes = _run_receiver_lease_processes(
+        tmp_path / "state",
+        [16666, 16667],
+    )
+
+    assert sorted(outcomes) == [("ok", 16666, ""), ("ok", 16667, "")]
+
+
+def test_receiver_lease_failure_stops_before_starting_dcmtk(tmp_path, monkeypatch):
+    state_directory = tmp_path / "state"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    holder = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "holder"),
+            storage_port=16666,
+        ),
+        tools,
+        log_directory=tmp_path / "holder-logs",
+    )
+    contender = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "contender"),
+            storage_port=16666,
+        ),
+        tools,
+        log_directory=tmp_path / "contender-logs",
+    )
+    popen = Mock()
+    monkeypatch.setattr(contender, "_popen", popen)
+    holder._acquire_receiver_lease()
+    try:
+        with pytest.raises(RuntimeError, match="另一个 DcmGet 实例"):
+            contender.run(["ACC001"])
+    finally:
+        holder._release_receiver_lease()
+        holder._close_file_logger()
+
+    popen.assert_not_called()
+
+
+def test_receiver_start_rejects_unrelated_existing_listener(tmp_path, monkeypatch):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    state_directory = tmp_path / "state"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            storage_port=port,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    popen = Mock()
+    monkeypatch.setattr(runner, "_popen", popen)
+    try:
+        with pytest.raises(RuntimeError, match=f"接收端口 {port} 已被其他程序占用"):
+            runner.run(["ACC001"])
+    finally:
+        listener.close()
+
+    popen.assert_not_called()
+    assert runner._receiver_lease is None
+
+
+def test_receiver_start_rejects_process_that_exits_after_port_appears(
+    tmp_path, monkeypatch
+):
+    state_directory = tmp_path / "state"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
+    listening_checks = 0
+
+    def port_is_listening(_port):
+        nonlocal listening_checks
+        listening_checks += 1
+        return listening_checks > 1
+
+    class Receiver:
+        pid = 123
+        returncode = 98
+        poll_calls = 0
+
+        def poll(self):
+            self.poll_calls += 1
+            return None if self.poll_calls == 1 else self.returncode
+
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            storage_port=16666,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    receiver = Receiver()
+    monkeypatch.setattr(core, "_port_is_listening", port_is_listening)
+    monkeypatch.setattr(runner, "_popen", lambda _command: receiver)
+    monkeypatch.setattr(runner, "_start_reader", lambda *_args: None)
+    monkeypatch.setattr(runner, "_terminate_process_safely", lambda _process: None)
+
+    with pytest.raises(RuntimeError, match="端口就绪后意外退出"):
+        runner.run(["ACC001"])
+
+    assert runner._receiver_lease is None
+
+
+def test_receiver_lease_is_held_until_cancel_cleanup_finishes(tmp_path, monkeypatch):
+    state_directory = tmp_path / "state"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
+    receiver_started = threading.Event()
+    receiver_stopped = threading.Event()
+    download_started = threading.Event()
+    allow_download_to_finish = threading.Event()
+
+    class Receiver:
+        pid = 123
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0 if receiver_stopped.is_set() else None
+
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            storage_port=16666,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    receiver = Receiver()
+
+    def start_receiver(_command):
+        receiver_started.set()
+        return receiver
+
+    def download_one(accession, *_args):
+        download_started.set()
+        assert runner._cancel.wait(2)
+        assert allow_download_to_finish.wait(2)
+        return AccessionResult(accession, AccessionStatus.CANCELLED)
+
+    monkeypatch.setattr(
+        core,
+        "_port_is_listening",
+        lambda _port: receiver_started.is_set() and not receiver_stopped.is_set(),
+    )
+    monkeypatch.setattr(runner, "_popen", start_receiver)
+    monkeypatch.setattr(runner, "_start_reader", lambda *_args: None)
+    monkeypatch.setattr(
+        runner,
+        "_terminate_process_safely",
+        lambda _process: receiver_stopped.set(),
+    )
+    monkeypatch.setattr(runner, "_download_one", download_one)
+    summaries: list[BatchSummary] = []
+    worker = threading.Thread(
+        target=lambda: summaries.append(runner.run(["ACC001"])),
+        daemon=True,
+    )
+    worker.start()
+    assert download_started.wait(2)
+
+    runner.request_cancel()
+    assert receiver_stopped.wait(2)
+    assert runner._receiver_lease is not None
+
+    allow_download_to_finish.set()
+    worker.join(2)
+    if runner._cancel_cleanup_thread is not None:
+        runner._cancel_cleanup_thread.join(2)
+
+    assert not worker.is_alive()
+    assert summaries[0].cancelled
+    assert runner._receiver_lease is None
+
+
 def test_preflight_rejects_invalid_ae_titles_before_starting_tools(tmp_path):
     config = AppConfig(
         dicom_destination_folder=str(tmp_path),
@@ -371,6 +682,56 @@ def test_concurrent_publish_never_overwrites_conflicting_sop_instance(tmp_path):
     assert len(errors) == 1
     assert "SOP Instance UID 内容冲突" in str(errors[0])
     assert target.read_bytes() in {b"first-content", b"second-content"}
+    remaining = [source for source in (first, second) if source.exists()]
+    assert len(remaining) == 1
+    assert remaining[0].read_bytes() != target.read_bytes()
+
+
+def test_concurrent_processes_deduplicate_identical_sop_content(tmp_path):
+    first = tmp_path / "process-a" / "same.dcm"
+    second = tmp_path / "process-b" / "same.dcm"
+    target = tmp_path / "archive" / "1.2.3.dcm"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    target.parent.mkdir()
+    first.write_bytes(b"identical-dicom-content")
+    second.write_bytes(first.read_bytes())
+
+    results = _run_publish_processes(
+        [first, second],
+        target,
+        tmp_path / "state",
+    )
+
+    assert sorted(status for _source, status, _message in results) == ["ok", "ok"]
+    assert target.read_bytes() == b"identical-dicom-content"
+    assert not first.exists()
+    assert not second.exists()
+
+
+def test_concurrent_processes_never_overwrite_conflicting_sop_content(tmp_path):
+    first = tmp_path / "process-a" / "conflict.dcm"
+    second = tmp_path / "process-b" / "conflict.dcm"
+    target = tmp_path / "archive" / "1.2.3.dcm"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    target.parent.mkdir()
+    first.write_bytes(b"first-dicom-content")
+    second.write_bytes(b"second-dicom-content")
+
+    results = _run_publish_processes(
+        [first, second],
+        target,
+        tmp_path / "state",
+    )
+
+    assert sorted(status for _source, status, _message in results) == [
+        "error",
+        "ok",
+    ]
+    error = next(message for _source, status, message in results if status == "error")
+    assert "SOP Instance UID 内容冲突" in error
+    assert target.read_bytes() in {b"first-dicom-content", b"second-dicom-content"}
     remaining = [source for source in (first, second) if source.exists()]
     assert len(remaining) == 1
     assert remaining[0].read_bytes() != target.read_bytes()
@@ -540,6 +901,23 @@ def test_task_log_is_private_and_not_created_beside_dicom(tmp_path, monkeypatch)
     assert not (destination / "logs").exists()
     if os.name != "nt":
         assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_download_runner_can_isolate_log_directory_per_process(tmp_path, monkeypatch):
+    state = tmp_path / "private-state"
+    override = tmp_path / "instance-2" / "logs"
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_file_name="task-instance-2.log",
+        log_directory=override,
+    )
+    runner._emit("应用", "isolated log test", "info")
+    runner._close_file_logger()
+
+    assert (override / "task-instance-2.log").is_file()
+    assert not (state / "logs" / "task-instance-2.log").exists()
 
 
 def test_file_archive_uses_safe_fallbacks_and_does_not_overwrite(tmp_path):
@@ -1378,15 +1756,58 @@ def test_invalid_received_file_is_failed_and_left_in_staging(tmp_path, monkeypat
     assert (staging / "broken.dcm").exists()
 
 
-def test_received_accession_is_not_assigned_by_timing_and_is_recovered_later(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("returned_accession", ["A001", ""])
+def test_received_file_is_accepted_despite_missing_or_different_accession(
+    tmp_path, monkeypatch, returned_accession
 ):
     staging = tmp_path / "staging"
     staging.mkdir()
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
     runner = DownloadRunner(config, tools)
-    calls = 0
+    class Process:
+        stdout = iter(())
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            _write_minimal_dicom(
+                staging / "returned.dcm",
+                "1.2.3.60",
+                accession=returned_accession,
+            )
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("B001", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.file_count == 1
+    assert not list(staging.glob("*.dcm"))
+    archived = list((tmp_path / "dicom").rglob("*.dcm"))
+    assert len(archived) == 1
+    assert "B001" in archived[0].parts
+    archived_dataset = dcmread(archived[0])
+    assert (
+        str(getattr(archived_dataset, "AccessionNumber", ""))
+        == returned_accession
+    )
+
+
+def test_preexisting_staging_file_is_not_assigned_to_a_later_move(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    existing = staging / "existing.dcm"
+    _write_minimal_dicom(existing, "1.2.3.61", accession="ANY")
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
 
     class Process:
         stdout = iter(())
@@ -1395,70 +1816,17 @@ def test_received_accession_is_not_assigned_by_timing_and_is_recovered_later(
         def poll():
             return 0
 
-        def wait(self):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                _write_minimal_dicom(
-                    staging / "foreign.dcm",
-                    "1.2.3.60",
-                    accession="A001",
-                )
+        @staticmethod
+        def wait():
             return 0
 
     monkeypatch.setattr(runner, "_popen", lambda _command: Process())
-
-    wrong_window = runner._download_one("B001", staging, 1, 2)
-    recovered = runner._download_one("A001", staging, 2, 2)
+    result = runner._download_one("B001", staging, 1, 1)
     runner._close_file_logger()
 
-    assert wrong_window.status == AccessionStatus.NO_DATA
-    assert recovered.status == AccessionStatus.COMPLETED
-    assert recovered.file_count == 1
-    assert not list(staging.glob("*.dcm"))
-    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
-
-
-def test_unchanged_staging_file_metadata_is_cached_between_accessions(
-    tmp_path, monkeypatch
-):
-    import pydicom
-
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    foreign = staging / "foreign.dcm"
-    _write_minimal_dicom(foreign, "1.2.3.61", accession="LATER")
-    real_dcmread = pydicom.dcmread
-    reads = 0
-
-    def counted_dcmread(*args, **kwargs):
-        nonlocal reads
-        reads += 1
-        return real_dcmread(*args, **kwargs)
-
-    monkeypatch.setattr(pydicom, "dcmread", counted_dcmread)
-    cache: dict[Path, tuple[int, int, int, str | None]] = {}
-
-    selected, mismatched = core._select_files_for_accession(
-        {foreign}, {foreign}, "EARLY", cache=cache
-    )
-    assert selected == []
-    assert mismatched == [foreign]
-
-    for index in range(100):
-        selected, mismatched = core._select_files_for_accession(
-            {foreign}, set(), f"OTHER-{index}", cache=cache
-        )
-        assert selected == []
-        assert mismatched == []
-
-    selected, mismatched = core._select_files_for_accession(
-        {foreign}, set(), "LATER", cache=cache
-    )
-
-    assert selected == [foreign]
-    assert mismatched == []
-    assert reads == 1
+    assert result.status == AccessionStatus.NO_DATA
+    assert existing.is_file()
+    assert not (tmp_path / "dicom").exists()
 
 
 def test_receiver_death_aborts_current_move_and_marks_failure(tmp_path, monkeypatch):

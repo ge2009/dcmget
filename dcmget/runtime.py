@@ -5,6 +5,9 @@ import sys
 from pathlib import Path
 
 
+_portable_dcmtk_bin: Path | None = None
+
+
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
@@ -13,6 +16,15 @@ def resource_root() -> Path:
     if is_frozen():
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
     return Path(__file__).resolve().parents[1]
+
+
+def set_portable_dcmtk_bin(path: str | Path | None) -> None:
+    global _portable_dcmtk_bin
+    _portable_dcmtk_bin = None if path is None else Path(path).resolve()
+
+
+def portable_dcmtk_bin() -> Path | None:
+    return _portable_dcmtk_bin
 
 
 def default_config_path() -> Path:

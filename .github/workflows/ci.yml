@@ -45,7 +45,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip install .
 
-      - name: Verify runtime DICOM networking dependency
+      - name: Verify retained pynetdicom compatibility dependency
         run: python -c "import pynetdicom; assert pynetdicom.__version__.split('.')[0] == '3'"
 
       - name: Cache DCMTK 3.7.0
@@ -94,10 +94,10 @@ jobs:
         if: matrix.dcmtk == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: dcmget-2.8.3-source-deploy
+          name: dcmget-2.9.0-source-deploy
           path: |
-            release/dcmget-2.8.3-source-deploy.zip
-            release/dcmget-2.8.3-source-deploy.zip.sha256
+            release/dcmget-2.9.0-source-deploy.zip
+            release/dcmget-2.9.0-source-deploy.zip.sha256
           if-no-files-found: error
 
   minimum-python:
@@ -118,7 +118,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip install .
 
-      - name: Verify runtime DICOM networking dependency
+      - name: Verify retained pynetdicom compatibility dependency
         run: python -c "import pynetdicom; assert pynetdicom.__version__.split('.')[0] == '3'"
 
       - name: Verify minimum supported Python and UI startup

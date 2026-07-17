@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
+from filelock import FileLock
 from pydicom import dcmread
 from pydicom.charset import convert_encodings
 from pydicom.datadict import dictionary_VR, keyword_for_tag
@@ -25,7 +26,7 @@ from pydicom.dataset import Dataset
 
 from .config import AppConfig
 from .core import ToolPaths
-from .runtime import resource_root
+from .runtime import ensure_application_state_dir, resource_root
 
 
 OHIF_VERSION = "3.12.6"
@@ -268,8 +269,8 @@ class PdiExporter:
             )
             result.warnings.extend(space_warnings)
 
-            final = self._next_output_directory(output_root)
-            temporary = output_root / f".{final.name}.partial-{uuid.uuid4().hex[:8]}"
+            proposed = self._next_output_directory(output_root)
+            temporary = output_root / f".{proposed.name}.partial-{uuid.uuid4().hex[:8]}"
             temporary.mkdir(parents=False, exist_ok=False)
             self._write_recovery_marker(temporary, result, state="building")
 
@@ -354,7 +355,7 @@ class PdiExporter:
             )
             self._progress(PdiStage.VERIFYING, 1, 1, "导出目录校验完成")
             self._check_cancelled()
-            temporary.rename(final)
+            final = self._publish_directory(temporary, output_root)
             temporary = None
 
             result.output_directory = str(final)
@@ -1289,6 +1290,26 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             candidate = output_root / f"{base}-{suffix}"
             suffix += 1
         return candidate
+
+    @staticmethod
+    def _publish_directory(temporary: Path, output_root: Path) -> Path:
+        """Atomically choose and publish a unique PDI directory across processes."""
+
+        try:
+            normalized = os.path.normcase(str(output_root.resolve(strict=False)))
+        except OSError:
+            normalized = os.path.normcase(os.path.abspath(os.fspath(output_root)))
+        digest = hashlib.sha256(os.fsencode(normalized)).hexdigest()
+        lock_directory = ensure_application_state_dir() / "pdi-publish-locks"
+        lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            lock_directory.chmod(0o700)
+        except OSError:
+            pass
+        with FileLock(str(lock_directory / f"{digest}.lock"), timeout=300):
+            final = PdiExporter._next_output_directory(output_root)
+            temporary.rename(final)
+            return final
 
     def _check_cancelled(self) -> None:
         if self._cancel.is_set():

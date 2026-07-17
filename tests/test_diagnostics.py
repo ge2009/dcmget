@@ -8,7 +8,6 @@ import sys
 import textwrap
 
 import pytest
-from PyQt5.QtWidgets import QApplication
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +36,7 @@ def _run_python(
 def _combined_logs(directory: Path) -> str:
     return "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(directory.glob("dcmget-diagnostics.log*"))
+        for path in sorted(directory.glob("dcmget-diagnostics-*.log*"))
     )
 
 
@@ -121,7 +120,8 @@ def test_file_and_temporary_log_failures_use_memory_without_raising():
 
         path = diagnostics.diagnostic_log_path()
         assert isinstance(path, Path)
-        assert diagnostics.crash_log_path().name == diagnostics.CRASH_LOG_NAME
+        assert diagnostics.crash_log_path().name.startswith("dcmget-crash-")
+        assert diagnostics.crash_log_path().suffix == ".log"
         try:
             raise ValueError("memory fallback marker")
         except ValueError as exc:
@@ -160,13 +160,16 @@ def test_diagnostics_are_private_rotated_and_mark_normal_exit(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert (logs / "dcmget-diagnostics.log").is_file()
-    assert (logs / "dcmget-diagnostics.log.1").is_file()
-    assert (logs / "dcmget-crash.log").is_file()
+    log_path = Path(result.stdout.strip())
+    rotated_path = Path(f"{log_path}.1")
+    crash_paths = list(logs.glob("dcmget-crash-*.log"))
+    assert log_path.is_file()
+    assert rotated_path.is_file()
+    assert len(crash_paths) == 1
     if os.name != "nt":
         assert stat.S_IMODE(logs.stat().st_mode) == 0o700
-        assert stat.S_IMODE((logs / "dcmget-diagnostics.log").stat().st_mode) == 0o600
-        assert stat.S_IMODE((logs / "dcmget-crash.log").stat().st_mode) == 0o600
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(crash_paths[0].stat().st_mode) == 0o600
     combined = _combined_logs(logs)
     assert "rotation marker" in combined
     assert "SESSION NORMAL EXIT" in combined
@@ -212,9 +215,14 @@ def test_python_exception_hooks_and_record_exception_keep_tracebacks(tmp_path):
     assert result.returncode == 0
     log = _combined_logs(logs)
     assert "record context" in log and "ValueError: record marker" in log
-    assert "Unhandled main-thread exception" in log and "KeyError: 'main hook marker'" in log
+    assert (
+        "Unhandled main-thread exception" in log
+        and "KeyError: 'main hook marker'" in log
+    )
     assert "diagnostic-test-thread" in log and "RuntimeError: thread hook marker" in log
-    assert "Unraisable exception" in log and "LookupError: unraisable hook marker" in log
+    assert (
+        "Unraisable exception" in log and "LookupError: unraisable hook marker" in log
+    )
     assert "SESSION UNHANDLED ERROR" in log
 
 
@@ -238,9 +246,55 @@ def test_qt_messages_and_faulthandler_use_diagnostic_files(tmp_path):
     log = _combined_logs(logs)
     assert "qt warning marker" in log
     assert "qt critical marker" in log
-    crash = (logs / "dcmget-crash.log").read_text(encoding="utf-8")
+    crash_path = next(logs.glob("dcmget-crash-*.log"))
+    crash = crash_path.read_text(encoding="utf-8")
     assert "DcmGet session start" in crash
     assert "session normal exit" in crash
+
+
+def test_parallel_processes_use_independent_rotating_diagnostic_files(tmp_path):
+    logs = tmp_path / "logs"
+    source = textwrap.dedent(
+        """
+        import logging
+        import sys
+        from dcmget.diagnostics import diagnostic_log_path, install_diagnostics
+
+        marker = sys.argv[1]
+        path = install_diagnostics(
+            marker, directory=sys.argv[2], max_bytes=1024, backup_count=2
+        )
+        logger = logging.getLogger("dcmget.diagnostics")
+        for index in range(80):
+            logger.warning("%s %03d %s", marker, index, "x" * 80)
+        assert diagnostic_log_path() == path
+        print(path)
+        """
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT)
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", source, marker, str(logs)],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for marker in ("diagnostic-process-a", "diagnostic-process-b")
+    ]
+    outputs = [process.communicate(timeout=20) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0]
+    paths = [Path(stdout.strip()) for stdout, _stderr in outputs]
+    assert paths[0] != paths[1]
+    assert all(path.is_file() and path.parent == logs for path in paths)
+    combined = _combined_logs(logs)
+    assert "diagnostic-process-a" in combined
+    assert "diagnostic-process-b" in combined
 
 
 def test_macos_plugin_failure_is_logged_with_readable_log_path(tmp_path):
@@ -357,23 +411,43 @@ def test_self_test_startup_error_does_not_open_modal_dialog(
     assert str(diagnostic) in capsys.readouterr().err
 
 
-def test_main_window_startup_error_shows_diagnostic_log_path(
-    qtbot, monkeypatch, tmp_path
-):
+def test_main_window_startup_error_shows_diagnostic_log_path(monkeypatch, tmp_path):
     import DICOM_download_ui as entry
 
-    app = QApplication.instance()
-    assert app is not None
     diagnostic = tmp_path / "dcmget-diagnostics.log"
     messages = []
+    closes = []
 
-    class EmptyTaskStore:
-        def load(self):
-            return None
+    class Signal:
+        def connect(self, _callback):
+            pass
 
+    class Application:
+        aboutToQuit = Signal()
+
+        @staticmethod
+        def instance():
+            return app
+
+    app = Application()
+
+    class Profile:
+        config_path = tmp_path / "instances" / "i1" / "config.json"
+        task_state_path = tmp_path / "state" / "i1" / "active-task.sqlite3"
+        log_directory = tmp_path / "state" / "i1" / "logs"
+        label = "实例 1"
+        settings_name = "DcmGet2-i1"
+
+        def close(self):
+            closes.append(True)
+
+    monkeypatch.setattr(entry, "QApplication", Application)
     monkeypatch.setattr(entry, "create_application", lambda: app)
-    monkeypatch.setattr(entry, "TaskCheckpointStore", EmptyTaskStore)
-    monkeypatch.setattr(entry, "resume_authorization_task_id", lambda value: value)
+    monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
+    monkeypatch.setattr(
+        entry, "acquire_instance_profile", lambda *_args, **_kwargs: Profile()
+    )
+    monkeypatch.setattr(entry, "resume_authorization_task_id", lambda _path: None)
     monkeypatch.setattr(entry, "authorize_gui", lambda _task_id: True)
     monkeypatch.setattr(
         entry,
@@ -392,55 +466,163 @@ def test_main_window_startup_error_shows_diagnostic_log_path(
     assert messages
     assert "window marker" in messages[0][1]
     assert str(diagnostic) in messages[0][1]
+    assert closes == [True]
 
 
-def test_gui_authorization_recognizes_charged_multitask_recovery(monkeypatch):
+def test_gui_authorization_reads_only_selected_profile_checkpoint(
+    monkeypatch, tmp_path
+):
     from types import SimpleNamespace
 
     import DICOM_download_ui as entry
-    import dcmget.task_manager as task_manager
 
     task_id = "a" * 32
+    task_state_path = tmp_path / "instances" / "i7" / "active-task.sqlite3"
+    observed = []
 
-    class Catalog:
-        def __init__(self, *, auto_migrate):
-            assert auto_migrate is False
+    class Store:
+        def __init__(self, path):
+            observed.append(Path(path))
 
-        def list_tasks(self):
-            return [SimpleNamespace(task_id=task_id, phase="paused")]
+        def load(self):
+            return SimpleNamespace(task_id=task_id)
 
-        def trial_state(self, selected):
-            assert selected == task_id
-            return True, True
+    monkeypatch.setattr(entry, "TaskCheckpointStore", Store)
 
-    monkeypatch.setattr(task_manager, "TaskCatalog", Catalog)
-
-    assert entry.resume_authorization_task_id(None) == task_id
-    assert entry.resume_authorization_task_id("legacy") == "legacy"
+    assert entry.resume_authorization_task_id(task_state_path) == task_id
+    assert observed == [task_state_path]
 
 
-def test_second_gui_launch_only_wakes_existing_window(monkeypatch, tmp_path):
+def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
     import DICOM_download_ui as entry
 
     events: list[object] = []
+    profiles = []
 
-    class ExistingInstance:
+    class Signal:
+        def connect(self, callback):
+            events.append(("quit-handler", callback))
+
+    class Application:
         def __init__(self):
-            events.append("instance")
+            self.aboutToQuit = Signal()
 
-        def start(self, payload):
-            events.append(("wake", payload))
-            return False
+        def exec_(self):
+            events.append("exec")
+            return 0
 
-        def close(self):
-            events.append("close")
+    class Window:
+        def __init__(self, *args, **kwargs):
+            events.append(("window", args, kwargs))
 
-    monkeypatch.setattr(entry, "SingleInstance", ExistingInstance)
+        def show(self):
+            events.append("show")
+
+    def acquire(requested, *, template_config_path):
+        number = len(profiles) + 1
+        profile = SimpleNamespace(
+            number=number,
+            config_path=tmp_path / "config" / f"i{number}" / "config.json",
+            task_state_path=tmp_path / "state" / f"i{number}" / "active-task.sqlite3",
+            log_directory=tmp_path / "state" / f"i{number}" / "logs",
+            label=f"实例 {number}",
+            settings_name=f"DcmGet2-i{number}",
+            close=lambda number=number: events.append(("close", number)),
+        )
+        profiles.append((requested, Path(template_config_path), profile))
+        return profile
+
+    monkeypatch.setattr(entry, "create_application", Application)
     monkeypatch.setattr(
         entry,
-        "create_application",
-        lambda: (_ for _ in ()).throw(AssertionError("created a second QApplication")),
+        "migrate_legacy_task_state",
+        lambda path: events.append(("migrate", Path(path))),
+    )
+    monkeypatch.setattr(entry, "acquire_instance_profile", acquire)
+    monkeypatch.setattr(
+        entry,
+        "resume_authorization_task_id",
+        lambda path: f"resume-{Path(path).parent.name}",
+    )
+    monkeypatch.setattr(
+        entry,
+        "authorize_gui",
+        lambda task_id: events.append(("authorize", task_id)) or True,
+    )
+    monkeypatch.setattr(entry, "DcmGetWindow", Window)
+
+    template = tmp_path / "config.json"
+    assert entry.main(["--config", str(template)]) == 0
+    assert entry.main(["--config", str(template), "--profile", "7"]) == 0
+
+    assert [requested for requested, _template, _profile in profiles] == [None, 7]
+    windows = [event for event in events if event[0] == "window"]
+    assert len(windows) == 2
+    for index, (_kind, args, kwargs) in enumerate(windows, start=1):
+        profile = profiles[index - 1][2]
+        assert args == (
+            profile.config_path,
+            entry.PROJECT_ROOT,
+            profile.task_state_path,
+        )
+        assert kwargs == {
+            "offer_task_resume": True,
+            "enable_multi_task": False,
+            "instance_label": profile.label,
+            "settings_name": profile.settings_name,
+            "log_directory": profile.log_directory,
+        }
+    assert ("authorize", "resume-i1") in events
+    assert ("authorize", "resume-i2") in events
+    assert events.count(("close", 1)) == 1
+    assert events.count(("close", 2)) == 1
+    assert not hasattr(entry, "SingleInstance")
+
+
+def test_gui_authorization_rejection_releases_profile(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import DICOM_download_ui as entry
+
+    closed = []
+
+    class Application:
+        pass
+
+    profile = SimpleNamespace(
+        task_state_path=tmp_path / "state" / "i1" / "active-task.sqlite3",
+        close=lambda: closed.append(True),
+    )
+    monkeypatch.setattr(entry, "create_application", Application)
+    monkeypatch.setattr(entry, "migrate_legacy_task_state", lambda _path: None)
+    monkeypatch.setattr(
+        entry,
+        "acquire_instance_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+    monkeypatch.setattr(
+        entry,
+        "resume_authorization_task_id",
+        lambda _path: "a" * 32,
+    )
+    monkeypatch.setattr(entry, "authorize_gui", lambda _task_id: False)
+    monkeypatch.setattr(
+        entry,
+        "DcmGetWindow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("authorization rejection must not create a window")
+        ),
     )
 
-    assert entry.main(["--config", str(tmp_path / "config.json")]) == 0
-    assert events == ["instance", ("wake", {"action": "activate"}), "close"]
+    assert entry.main(["--config", str(tmp_path / "config.json")]) == 1
+    assert closed == [True]
+
+
+def test_profile_argument_requires_positive_integer():
+    import DICOM_download_ui as entry
+
+    assert entry.build_parser().parse_args(["--profile", "3"]).profile == 3
+    with pytest.raises(SystemExit):
+        entry.build_parser().parse_args(["--profile", "0"])

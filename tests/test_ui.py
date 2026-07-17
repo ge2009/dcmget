@@ -39,12 +39,14 @@ def isolated_settings(monkeypatch, tmp_path):
     )
 
 
-def make_window(qtbot, tmp_path):
+def make_window(qtbot, tmp_path, **window_kwargs):
     window = DcmGetWindow(
         tmp_path / "config.json",
         tmp_path,
         tmp_path / "active-task.sqlite3",
         offer_task_resume=False,
+        enable_multi_task=False,
+        **window_kwargs,
     )
     qtbot.addWidget(window)
     window.show()
@@ -524,22 +526,19 @@ def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_p
     assert "storage_port" in errors
 
 
-def test_settings_concurrency_defaults_to_two_and_is_saved(qtbot, tmp_path):
+def test_single_task_settings_hide_concurrency_and_explain_multi_open_ports(
+    qtbot, tmp_path
+):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
     window._show_settings()
 
-    assert page.max_concurrent_moves_spin.minimum() == 1
-    assert page.max_concurrent_moves_spin.maximum() == 8
-    assert page.max_concurrent_moves_spin.value() == 2
-    assert "PACS" in page.max_concurrent_moves_spin.toolTip()
-
-    page.max_concurrent_moves_spin.setValue(4)
-    page._save()
-
-    saved = ui_module.load_config(tmp_path / "config.json")
-    assert saved.max_concurrent_moves == 4
-    assert window.task_workspace.sidebar._concurrency_limit == 4
+    label = page.receiver_form.labelForField(page.max_concurrent_moves_spin)
+    assert page.max_concurrent_moves_spin.isHidden()
+    assert label is not None and label.isHidden()
+    assert page.concurrency_hint.isVisible()
+    assert "多开实例" in page.concurrency_hint.text()
+    assert "不同的接收 AE/端口" in page.concurrency_hint.text()
 
 
 def test_settings_forms_use_cross_platform_growth_and_wrap_policies(qtbot, tmp_path):
@@ -851,6 +850,33 @@ def test_worker_does_not_lose_resume_during_startup(monkeypatch, tmp_path):
     assert resumed.is_set()
     assert not worker.pause_requested
     assert not instance[0].paused
+
+
+def test_download_worker_passes_task_specific_log_location(monkeypatch, tmp_path):
+    captured = {}
+
+    class Runner:
+        def __init__(self, *_args, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, _accessions):
+            return BatchSummary()
+
+    monkeypatch.setattr(ui_module, "DownloadRunner", Runner)
+    task_id = "a" * 32
+    logs = tmp_path / "instance-logs"
+    worker = DownloadWorker(
+        AppConfig(dicom_destination_folder=str(tmp_path)),
+        ToolPaths(tmp_path / "movescu", tmp_path / "storescp", tmp_path, "3.7.0"),
+        ["A001"],
+        task_id=task_id,
+        log_directory=logs,
+    )
+
+    worker.run()
+
+    assert captured["log_directory"] == logs
+    assert captured["log_file_name"] == f"task-{task_id}.log"
 
 
 def test_worker_persists_final_result_before_emitting_progress(tmp_path):
@@ -1528,83 +1554,72 @@ def test_close_waits_for_running_thread_before_window_is_destroyed(
     assert window.worker is None
 
 
-def test_task_page_uses_responsive_multi_task_workspace(qtbot, tmp_path):
+def test_single_task_page_has_no_task_workspace_at_wide_or_narrow_width(
+    qtbot, tmp_path
+):
     window = make_window(qtbot, tmp_path)
     window.resize(1180, 720)
     QApplication.processEvents()
 
     assert window.pages.currentWidget() is window.task_page
-    assert window.task_page is window.task_workspace
-    assert window.task_workspace.detail_content_layout.indexOf(
-        window.task_detail_page
-    ) >= 0
-    assert not window.task_workspace.is_compact
-    assert window.task_workspace.sidebar.isVisible()
-    assert window.task_workspace.detail_shell.isVisible()
+    assert window.task_page is window.task_detail_page
+    assert window.task_workspace is None
+    assert window.findChildren(ui_module.TaskWorkspace) == []
+    assert window.task_detail_page.isVisible()
 
     window.setMinimumSize(1, 1)
     window.resize(683, 480)
     QApplication.processEvents()
 
-    assert window.task_workspace.is_compact
-    assert window.task_workspace.sidebar.isHidden()
-    assert window.task_workspace.detail_shell.isVisible()
-    assert window.task_workspace.compact_toolbar.isVisible()
+    assert window.task_workspace is None
+    assert window.task_detail_page.isVisible()
+    assert window.task_scroll.isVisible()
 
-    qtbot.mouseClick(
-        window.task_workspace.back_to_tasks_button,
-        Qt.LeftButton,
+
+def test_instance_label_settings_namespace_and_log_scope_are_independent(
+    qtbot, tmp_path, monkeypatch
+):
+    settings_calls = []
+
+    def settings(_organization, name):
+        settings_calls.append(name)
+        return QSettings(str(tmp_path / f"{name}.ini"), QSettings.IniFormat)
+
+    monkeypatch.setattr(ui_module, "QSettings", settings)
+    first = DcmGetWindow(
+        tmp_path / "first-config.json",
+        tmp_path,
+        tmp_path / "first-task.sqlite3",
+        offer_task_resume=False,
+        enable_multi_task=False,
+        instance_label="任务窗口 A",
+        settings_name="DcmGet-Instance-A",
+        log_directory=tmp_path / "logs-a",
     )
-    assert window.task_workspace.sidebar.isVisible()
-    assert window.task_workspace.detail_shell.isHidden()
+    qtbot.addWidget(first)
+    first.show()
+    first._on_log_detail_toggled(True)
 
-
-def test_workspace_new_task_button_returns_to_existing_editor(qtbot, tmp_path):
-    window = make_window(qtbot, tmp_path)
-    window.setMinimumSize(1, 1)
-    window.resize(683, 480)
-    QApplication.processEvents()
-    window.task_workspace.show_task_list()
-    window._set_task_form_expanded(False)
-
-    window.task_workspace.sidebar.new_task_button.click()
-    QApplication.processEvents()
-
-    assert window.task_workspace.sidebar.isHidden()
-    assert window.task_workspace.detail_shell.isVisible()
-    assert window._task_form_expanded
-    assert window.task_form_body.isVisible()
-    assert window.accession_edit.hasFocus()
-
-
-def test_window_publishes_aggregate_task_summary_to_sidebar(qtbot, tmp_path):
-    window = make_window(qtbot, tmp_path)
-    now = window._workspace_timestamp()
-    summary = ui_module.TaskSummary(
-        task_id="a" * 32,
-        name="患者姓名不得显示",
-        phase="downloading",
-        total_count=40_000,
-        processed_count=123,
-        pending_count=39_877,
-        completed_count=120,
-        failed_count=3,
-        file_count=1_024,
-        received_bytes=4096,
-        speed_bytes_per_second=2 * 1024 * 1024,
-        queue_position=None,
-        current_accession="A00123",
-        error_message="",
-        created_at=now,
-        updated_at=now,
+    second = DcmGetWindow(
+        tmp_path / "second-config.json",
+        tmp_path,
+        tmp_path / "second-task.sqlite3",
+        offer_task_resume=False,
+        enable_multi_task=False,
+        instance_label="任务窗口 B",
+        settings_name="DcmGet-Instance-B",
+        log_directory=tmp_path / "logs-b",
     )
+    qtbot.addWidget(second)
+    second.show()
 
-    window._publish_workspace_summary(summary, select=True)
-
-    model = window.task_workspace.sidebar.model
-    assert model.rowCount() == 1
-    index = model.index(0, 0)
-    assert index.data(model.TotalCountRole) == 40_000
-    assert "40,000 个检查号" in index.data(model.TitleRole)
-    assert "患者姓名不得显示" not in index.data(Qt.DisplayRole)
-    assert window.task_workspace.selected_task_id == "a" * 32
+    assert settings_calls == ["DcmGet-Instance-A", "DcmGet-Instance-B"]
+    assert "任务窗口 A" in first.windowTitle()
+    assert "任务窗口 A" in first.app_title.text()
+    assert "任务窗口 A" in first.app_subtitle.text()
+    assert first._show_detailed_logs
+    assert not second._show_detailed_logs
+    assert first.log_scope_combo.isHidden()
+    assert second.log_scope_combo.isHidden()
+    assert first.instance_log_directory == tmp_path / "logs-a"
+    assert second.instance_log_directory == tmp_path / "logs-b"

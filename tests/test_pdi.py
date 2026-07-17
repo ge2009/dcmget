@@ -983,6 +983,53 @@ def test_crash_recovery_reuses_published_directory(
     assert pdi.RECOVERY_MARKER not in manifest
 
 
+def test_concurrent_pdi_publication_uses_unique_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "portable"
+    output_root.mkdir()
+    temporary_directories = []
+    for number in (1, 2):
+        temporary = output_root / f".export-{number}.partial"
+        temporary.mkdir()
+        (temporary / "source.txt").write_text(str(number), encoding="utf-8")
+        temporary_directories.append(temporary)
+    monkeypatch.setattr(
+        pdi,
+        "ensure_application_state_dir",
+        lambda: tmp_path / "state",
+    )
+
+    barrier = threading.Barrier(2)
+    published: list[Path] = []
+    failures: list[BaseException] = []
+
+    def publish(temporary: Path) -> None:
+        try:
+            barrier.wait(timeout=2)
+            published.append(PdiExporter._publish_directory(temporary, output_root))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    workers = [
+        threading.Thread(target=publish, args=(temporary,))
+        for temporary in temporary_directories
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert failures == []
+    assert len(published) == 2
+    assert len({path.name for path in published}) == 2
+    assert all(path.is_dir() for path in published)
+    assert {path.joinpath("source.txt").read_text(encoding="utf-8") for path in published} == {
+        "1",
+        "2",
+    }
+
+
 def test_restart_removes_only_matching_interrupted_partial(
     tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:

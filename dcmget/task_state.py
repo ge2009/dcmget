@@ -101,9 +101,90 @@ class TaskCheckpointStore:
         if len(values) != len(set(values)):
             raise TaskStateError("活动任务检查号不能重复")
 
+        checkpoint = TaskCheckpoint(
+            task_id=uuid.uuid4().hex,
+            config=config,
+            accessions=values,
+            results=[],
+            partial_results={},
+            trial_required=trial_required,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            phase="downloading",
+        )
+        self._write_checkpoint(checkpoint)
+        return self.load_required()
+
+    def import_checkpoint(self, checkpoint: TaskCheckpoint) -> TaskCheckpoint:
+        """Atomically import a checkpoint while preserving its task identity.
+
+        This is intentionally stricter than :meth:`start`: an existing recovery
+        point for another task is never replaced.  Re-importing the same task is
+        idempotent so an interrupted catalog migration can safely be retried.
+        """
+
+        self._validate_checkpoint(checkpoint)
+        acquired_here = False
+        if not self.lease_held:
+            if not self.try_acquire_lease():
+                raise TaskStateError("任务恢复点正在被另一个 DcmGet 实例使用")
+            acquired_here = True
+        try:
+            if self.path.is_file():
+                existing = self.load_required()
+                if existing.task_id == checkpoint.task_id:
+                    return existing
+                raise TaskStateError("任务恢复点已包含另一个未完成任务")
+            self._write_checkpoint(checkpoint)
+            return self.load_required()
+        finally:
+            if acquired_here:
+                self.release_lease()
+
+    @staticmethod
+    def _validate_checkpoint(checkpoint: TaskCheckpoint) -> None:
+        if not re.fullmatch(r"[0-9a-f]{32}", checkpoint.task_id):
+            raise TaskStateError("导入任务编号格式不正确")
+        values = list(checkpoint.accessions)
+        if not values or any(not str(value) for value in values):
+            raise TaskStateError("导入任务至少需要一个检查号")
+        if len(values) != len(set(values)):
+            raise TaskStateError("导入任务检查号不能重复")
+        if checkpoint.phase not in TASK_PHASES:
+            raise TaskStateError(f"不支持的任务阶段：{checkpoint.phase}")
+        if not checkpoint.created_at:
+            raise TaskStateError("导入任务缺少创建时间")
+        if checkpoint.pdi_attempt_id and not re.fullmatch(
+            r"[0-9a-f]{32}", checkpoint.pdi_attempt_id
+        ):
+            raise TaskStateError("导入任务的 PDI 恢复编号格式不正确")
+
+        accession_set = set(values)
+        result_accessions: set[str] = set()
+        for result in checkpoint.results:
+            if result.accession not in accession_set:
+                raise TaskStateError(
+                    f"导入结果不属于当前任务：{result.accession}"
+                )
+            if result.accession in result_accessions:
+                raise TaskStateError(
+                    f"导入任务包含重复结果：{result.accession}"
+                )
+            if result.status not in FINAL_STATUSES:
+                raise TaskStateError(
+                    f"导入结果状态不受支持：{result.status.value}"
+                )
+            result_accessions.add(result.accession)
+        for accession, partial in checkpoint.partial_results.items():
+            if accession not in accession_set or partial.accession != accession:
+                raise TaskStateError(f"导入的部分结果不属于当前任务：{accession}")
+            if partial.status != AccessionStatus.CANCELLED:
+                raise TaskStateError(
+                    f"导入的部分结果状态不受支持：{partial.status.value}"
+                )
+
+    def _write_checkpoint(self, checkpoint: TaskCheckpoint) -> None:
+        self._validate_checkpoint(checkpoint)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        task_id = uuid.uuid4().hex
-        created_at = datetime.now(timezone.utc).isoformat()
         temporary = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
@@ -126,26 +207,57 @@ class TaskCheckpointStore:
                 )
                 connection.executemany(
                     "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                    (
+                    [
                         ("version", str(TASK_STATE_VERSION)),
-                        ("task_id", task_id),
-                        ("created_at", created_at),
-                        ("trial_required", "1" if trial_required else "0"),
-                        ("phase", "downloading"),
+                        ("task_id", checkpoint.task_id),
+                        ("created_at", checkpoint.created_at),
+                        (
+                            "trial_required",
+                            "1" if checkpoint.trial_required else "0",
+                        ),
+                        ("phase", checkpoint.phase),
                         (
                             "config",
                             json.dumps(
-                                config.to_dict(),
+                                checkpoint.config.to_dict(),
                                 ensure_ascii=False,
                                 sort_keys=True,
                                 separators=(",", ":"),
                             ),
                         ),
-                    ),
+                        *(
+                            [("pdi_attempt_id", checkpoint.pdi_attempt_id)]
+                            if checkpoint.pdi_attempt_id
+                            else []
+                        ),
+                    ],
                 )
+                results = checkpoint.result_by_accession
                 connection.executemany(
-                    "INSERT INTO accessions(position, accession) VALUES (?, ?)",
-                    enumerate(values),
+                    """
+                    INSERT INTO accessions(
+                        position, accession, result_json, partial_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            position,
+                            accession,
+                            (
+                                _result_to_json(results[accession])
+                                if accession in results
+                                else None
+                            ),
+                            (
+                                _result_to_json(
+                                    checkpoint.partial_results[accession]
+                                )
+                                if accession in checkpoint.partial_results
+                                else None
+                            ),
+                        )
+                        for position, accession in enumerate(checkpoint.accessions)
+                    ),
                 )
             try:
                 temporary.chmod(0o600)
@@ -159,7 +271,6 @@ class TaskCheckpointStore:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-        return self.load_required()
 
     def load(self, *, include_archived_files: bool = True) -> TaskCheckpoint | None:
         if not self.path.is_file():
@@ -537,78 +648,15 @@ class TaskCheckpointStore:
                 continue
             try:
                 record = json.loads(raw)
-                pid = int(record["pid"])
-                expected_created_at = float(record["created_at"])
-                expected_executable = _normalized_executable(record["executable"])
-                process = psutil.Process(pid)
-                if abs(process.create_time() - expected_created_at) > 0.01:
-                    messages.append(f"未清理 PID {pid}：进程标识已经变化")
+                if not isinstance(record, dict):
+                    raise TypeError("invalid process record")
+                remove, message = _cleanup_process_identity(record, kind)
+                if remove:
                     self.record_process(task_id, kind, 0, "", active=False)
-                    continue
-                actual_executable = _process_executable(process)
-                if actual_executable != expected_executable:
-                    messages.append(f"未清理 PID {pid}：可执行文件与恢复记录不一致")
-                    self.record_process(task_id, kind, 0, "", active=False)
-                    continue
-                targets = [*process.children(recursive=True), process]
-                for target in targets:
-                    try:
-                        target.terminate()
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        pass
-                _gone, alive = psutil.wait_procs(targets, timeout=3)
-                for target in alive:
-                    try:
-                        target.kill()
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        pass
-                if alive:
-                    _gone, alive = psutil.wait_procs(alive, timeout=3)
-                if alive:
-                    messages.append(f"未能清理上次的 {kind} 进程 PID {pid}")
-                    continue
-                self.record_process(
-                    task_id,
-                    kind,
-                    pid,
-                    expected_executable,
-                    active=False,
-                )
-                messages.append(f"已清理上次异常退出遗留的 {kind} 进程 PID {pid}")
+                if message:
+                    messages.append(message)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise TaskStateError(f"{kind} 进程恢复记录已损坏") from exc
-            except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                group_result = _cleanup_recorded_process_group(
-                    record,
-                    expected_executable,
-                    expected_created_at,
-                )
-                if group_result == "cleaned":
-                    self.record_process(
-                        task_id,
-                        kind,
-                        0,
-                        "",
-                        active=False,
-                    )
-                    messages.append(
-                        f"已清理上次异常退出遗留的 {kind} 进程组 PID {pid}"
-                    )
-                    continue
-                if group_result == "unsafe":
-                    messages.append(
-                        f"未清理 PID {pid} 的遗留进程组：进程身份无法安全确认"
-                    )
-                    continue
-                self.record_process(
-                    task_id,
-                    kind,
-                    0,
-                    "",
-                    active=False,
-                )
-            except (OSError, psutil.Error) as exc:
-                messages.append(f"未能清理上次的 {kind} 进程：{exc}")
         return messages
 
 
@@ -659,6 +707,58 @@ def _process_executable(process: psutil.Process) -> str:
         if not command:
             raise
         return _normalized_executable(command[0])
+
+
+def _cleanup_process_identity(
+    record: dict[str, object], label: str
+) -> tuple[bool, str]:
+    """Terminate a recorded process only after PID identity verification.
+
+    The returned boolean indicates whether the recovery record is resolved and
+    may be discarded.  A stale/reused PID is resolved without terminating the
+    unrelated process, while an identity that cannot be safely inspected or
+    stopped remains unresolved.
+    """
+
+    try:
+        pid = int(record["pid"])
+        expected_created_at = float(record["created_at"])
+        expected_executable = _normalized_executable(record["executable"])
+        process = psutil.Process(pid)
+        if abs(process.create_time() - expected_created_at) > 0.01:
+            return True, f"未清理 PID {pid}：进程标识已经变化"
+        if _process_executable(process) != expected_executable:
+            return True, f"未清理 PID {pid}：可执行文件与恢复记录不一致"
+        targets = [*process.children(recursive=True), process]
+        for target in targets:
+            try:
+                target.terminate()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                pass
+        _gone, alive = psutil.wait_procs(targets, timeout=3)
+        for target in alive:
+            try:
+                target.kill()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                pass
+        if alive:
+            _gone, alive = psutil.wait_procs(alive, timeout=3)
+        if alive:
+            return False, f"未能清理上次的 {label} 进程 PID {pid}"
+        return True, f"已清理上次异常退出遗留的 {label} 进程 PID {pid}"
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        group_result = _cleanup_recorded_process_group(
+            record,
+            expected_executable,
+            expected_created_at,
+        )
+        if group_result == "cleaned":
+            return True, f"已清理上次异常退出遗留的 {label} 进程组 PID {pid}"
+        if group_result == "unsafe":
+            return False, f"未清理 PID {pid} 的遗留进程组：进程身份无法安全确认"
+        return True, ""
+    except (OSError, psutil.Error) as exc:
+        return False, f"未能清理上次的 {label} 进程：{exc}"
 
 
 def _cleanup_recorded_process_group(

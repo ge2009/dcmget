@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -30,6 +31,68 @@ def catalog(tmp_path) -> TaskCatalog:
         tmp_path / "tasks.sqlite3",
         legacy_path=tmp_path / "missing-active-task.sqlite3",
     )
+
+
+def write_catalog_migration_marker(state_root: Path) -> None:
+    marker_path = state_root / "instances" / ".tasks-migrated-v1.json"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "catalog": str((state_root / "tasks.sqlite3").resolve()),
+                "migrated_at": "2026-07-17T00:00:00+00:00",
+                "task_ids": ["a" * 32],
+                "version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cli_rejects_default_catalog_after_profile_migration(
+    tmp_path, monkeypatch, capsys
+):
+    state_root = tmp_path / "state"
+    write_catalog_migration_marker(state_root)
+    monkeypatch.setattr(cli, "application_state_dir", lambda: state_root)
+    monkeypatch.setattr(
+        task_manager_module,
+        "TaskCatalog",
+        lambda: pytest.fail("migrated catalog must not be opened"),
+    )
+
+    assert cli.main([]) == 1
+
+    error = capsys.readouterr().err
+    assert "已迁移到 DcmGet 2.9 实例恢复点" in error
+    assert "--task-state" in error
+
+
+def test_explicit_task_state_remains_usable_after_catalog_migration(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "state"
+    write_catalog_migration_marker(state_root)
+    monkeypatch.setattr(cli, "application_state_dir", lambda: state_root)
+    task_state = tmp_path / "independent" / "active-task.sqlite3"
+    store = cli.TaskCheckpointStore(task_state)
+    store.start(AppConfig(), ["A001"], trial_required=False)
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    runner = Mock()
+    runner.run.return_value = BatchSummary(
+        [AccessionResult("A001", AccessionStatus.COMPLETED)]
+    )
+    monkeypatch.setattr(cli, "authorize_cli", lambda *_args: "licensed")
+    monkeypatch.setattr(
+        cli,
+        "preflight",
+        lambda *_args: PreflightResult(tools, {}, [("DCMTK", True, "就绪")]),
+    )
+    monkeypatch.setattr(cli, "DownloadRunner", Mock(return_value=runner))
+
+    assert cli.main(["--task-state", str(task_state)]) == 0
+
+    runner.run.assert_called_once_with(["A001"])
 
 
 def test_selects_only_unfinished_task_without_explicit_id(tmp_path):

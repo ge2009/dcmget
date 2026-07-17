@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from filelock import FileLock
 
 
 DEFAULT_DIRECTORY_TEMPLATE = "{PatientID}/{AccessionNumber}/{StudyInstanceUID}"
@@ -259,11 +263,20 @@ def load_config(path: str | Path) -> AppConfig:
 def save_config(path: str | Path, config: AppConfig) -> None:
     config_path = Path(path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = config_path.with_suffix(config_path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(config.to_dict(), handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    temporary.replace(config_path)
+    lock_path = config_path.with_name(f"{config_path.name}.lock")
+    temporary = config_path.with_name(
+        f".{config_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    with FileLock(str(lock_path), timeout=10):
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(config.to_dict(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, config_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _legacy_dcmtk_dir(value: Any) -> str:

@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -82,14 +83,14 @@ def diagnostic_log_path() -> Path:
     state = _ensure_diagnostics_state()
     if state is not None:
         return state.log_path
-    return _emergency_log_directory() / DIAGNOSTIC_LOG_NAME
+    return _emergency_log_directory() / _session_file_name(DIAGNOSTIC_LOG_NAME)
 
 
 def crash_log_path() -> Path:
     state = _ensure_diagnostics_state()
     if state is not None:
         return state.crash_path
-    return _emergency_log_directory() / CRASH_LOG_NAME
+    return _emergency_log_directory() / _session_file_name(CRASH_LOG_NAME)
 
 
 def install_diagnostics(
@@ -98,6 +99,7 @@ def install_diagnostics(
     directory: str | Path | None = None,
     max_bytes: int = DEFAULT_MAX_LOG_BYTES,
     backup_count: int = DEFAULT_BACKUP_COUNT,
+    instance_id: str | int | None = None,
 ) -> Path:
     global _state
     with _install_lock:
@@ -115,6 +117,7 @@ def install_diagnostics(
                 log_directory,
                 max_bytes=max_bytes,
                 backup_count=backup_count,
+                instance_id=instance_id,
             )
         except Exception as exc:
             failures.append(("应用日志目录", exc))
@@ -128,12 +131,15 @@ def install_diagnostics(
                     temporary_directory,
                     max_bytes=max_bytes,
                     backup_count=backup_count,
+                    instance_id=instance_id,
                 )
             except Exception as exc:
                 failures.append(("系统临时目录", exc))
 
         if _state is None:
-            _state = _create_stream_state(_emergency_log_directory())
+            _state = _create_stream_state(
+                _emergency_log_directory(), instance_id=instance_id
+            )
 
         try:
             if _state.file_backed:
@@ -179,11 +185,12 @@ def _create_file_state(
     *,
     max_bytes: int,
     backup_count: int,
+    instance_id: str | int | None = None,
 ) -> _DiagnosticsState:
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     _make_private(directory, directory=True)
-    log_path = directory / DIAGNOSTIC_LOG_NAME
-    crash_path = directory / CRASH_LOG_NAME
+    log_path = directory / _session_file_name(DIAGNOSTIC_LOG_NAME, instance_id)
+    crash_path = directory / _session_file_name(CRASH_LOG_NAME, instance_id)
     handler: logging.Handler | None = None
     crash_stream: IO[str] | None = None
     try:
@@ -218,7 +225,11 @@ def _create_file_state(
         raise
 
 
-def _create_stream_state(directory: Path) -> _DiagnosticsState:
+def _create_stream_state(
+    directory: Path,
+    *,
+    instance_id: str | int | None = None,
+) -> _DiagnosticsState:
     stream = (
         sys.stderr
         if getattr(sys.stderr, "write", None) is not None
@@ -228,8 +239,8 @@ def _create_stream_state(directory: Path) -> _DiagnosticsState:
     logger = _configure_logger(handler)
     return _DiagnosticsState(
         directory,
-        directory / DIAGNOSTIC_LOG_NAME,
-        directory / CRASH_LOG_NAME,
+        directory / _session_file_name(DIAGNOSTIC_LOG_NAME, instance_id),
+        directory / _session_file_name(CRASH_LOG_NAME, instance_id),
         logger,
         stream,
         file_backed=False,
@@ -274,6 +285,21 @@ def _emergency_log_directory() -> Path:
         return Path(tempfile.gettempdir()).resolve() / "DcmGet-diagnostics-unavailable"
     except Exception:
         return Path("DcmGet-diagnostics-unavailable")
+
+
+def _session_file_name(
+    base_name: str,
+    instance_id: str | int | None = None,
+) -> str:
+    """Return a process-private filename so rotating handlers never collide."""
+
+    raw = str(os.getpid() if instance_id is None else instance_id).strip()
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("._-")
+    if not token:
+        token = str(os.getpid())
+    token = token[:64]
+    path = Path(base_name)
+    return f"{path.stem}-{token}{path.suffix}"
 
 
 def install_qt_message_handler() -> None:

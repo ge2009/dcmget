@@ -36,7 +36,14 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 if ($IsAdmin) {
-    $ReceiverProgram = (Resolve-Path ".venv\Scripts\python.exe").Path
+    $ReceiverCandidates = @(
+        Get-ChildItem -LiteralPath (Join-Path $Root ".runtime\dcmtk\windows-x86_64") `
+            -Recurse -Filter "storescp.exe" -File
+    )
+    if ($ReceiverCandidates.Count -ne 1) {
+        throw "无法唯一确定 storescp.exe，找到 $($ReceiverCandidates.Count) 个候选文件。"
+    }
+    $ReceiverProgram = $ReceiverCandidates[0].FullName
     @("DcmGet Receiver TCP", "DcmGet storescp TCP", "DcmGet storescp TCP 6666") | ForEach-Object {
         Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     }

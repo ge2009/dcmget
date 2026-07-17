@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 
@@ -18,6 +19,15 @@ except ModuleNotFoundError:  # direct execution from the scripts directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from dcmget.windows_portable_runtime import (  # noqa: E402
+    MANIFEST_NAME as PORTABLE_RUNTIME_MANIFEST_NAME,
+    create_portable_runtime_manifest,
+)
+
+
 BUILD_ROOT = ROOT / "build" / "windows"
 DIST_ROOT = BUILD_ROOT / "dist"
 RELEASE_ROOT = ROOT / "release" / "windows"
@@ -129,6 +139,7 @@ def pyinstaller_args(
     runtime_root: Path,
     ohif_root: Path | None = None,
     pdi_server_executable: Path | None = None,
+    portable_runtime_manifest: Path | None = None,
 ) -> list[str]:
     arguments = [
         str(ROOT / "DICOM_download_ui.py"),
@@ -184,6 +195,13 @@ def pyinstaller_args(
                 f"{pdi_server_executable}:.",
             ]
         )
+    if portable_runtime_manifest is not None:
+        arguments.extend(
+            [
+                "--add-data",
+                f"{portable_runtime_manifest}:.",
+            ]
+        )
     return arguments
 
 
@@ -218,7 +236,7 @@ def pdi_server_pyinstaller_args(
 def build_payloads(version: str) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
-    find_dcmtk_bin()
+    dcmtk_bin = find_dcmtk_bin()
     ohif = find_ohif_payload()
     from PyInstaller.__main__ import run as run_pyinstaller
 
@@ -229,6 +247,11 @@ def build_payloads(version: str) -> None:
     RELEASE_ROOT.mkdir(parents=True)
     icon = make_icon()
     version_file = make_version_file(version)
+    portable_runtime_manifest = create_portable_runtime_manifest(
+        PLATFORM_RUNTIME,
+        dcmtk_bin,
+        BUILD_ROOT / PORTABLE_RUNTIME_MANIFEST_NAME,
+    )
 
     run_pyinstaller(pdi_server_pyinstaller_args(icon, version_file))
     pdi_server = DIST_ROOT / "DcmGetPdiServer.exe"
@@ -255,6 +278,7 @@ def build_payloads(version: str) -> None:
             PLATFORM_RUNTIME,
             ohif,
             pdi_server,
+            portable_runtime_manifest,
         )
     )
 

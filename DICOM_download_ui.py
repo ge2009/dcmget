@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 from io import BytesIO
+import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 from dcmget import __version__
@@ -17,7 +20,7 @@ from dcmget.diagnostics import (
 
 install_diagnostics(__version__)
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 install_qt_message_handler()
@@ -25,34 +28,58 @@ install_qt_message_handler()
 from dcmget.auth_ui import authorize_gui
 from dcmget.config import load_config
 from dcmget.core import DcmtkResolver
+from dcmget.instance_profile import (
+    InstanceProfile,
+    acquire_instance_profile,
+    migrate_legacy_checkpoint_to_profile,
+    migrate_task_catalog_to_profiles,
+)
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
 from dcmget.release_notes import load_release_notes
 from dcmget.ui import APP_STYLESHEET, DcmGetWindow
-from dcmget.runtime import ensure_default_config, is_frozen, resource_root
-from dcmget.single_instance import SingleInstance
+from dcmget.runtime import (
+    application_state_dir,
+    ensure_default_config,
+    is_frozen,
+    portable_dcmtk_bin,
+    resource_root,
+)
 from dcmget.task_state import TaskCheckpointStore, TaskStateError
+from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
 
 
 PROJECT_ROOT = resource_root()
 
 
-class _ActivationBridge(QObject):
-    requested = pyqtSignal()
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.8.3 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.9.0 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
-        help="配置文件路径",
+        help="实例配置初始化模板路径",
+    )
+    parser.add_argument(
+        "--profile",
+        type=_positive_profile_number,
+        help="指定实例编号（正整数）；未指定时自动选择空闲实例",
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--self-test-report", help=argparse.SUPPRESS)
     parser.add_argument("--ui-self-test", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
-def run_self_test(config_path: str) -> int:
+def _positive_profile_number(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("实例编号必须是正整数") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("实例编号必须是正整数")
+    return number
+
+
+def run_self_test(config_path: str, report_path: str | None = None) -> int:
     from tempfile import TemporaryDirectory
 
     from cryptography.hazmat.primitives import serialization
@@ -80,9 +107,9 @@ def run_self_test(config_path: str) -> int:
     dataset.SOPInstanceUID = "1.2.826.0.1.3680043.10.999.1"
     dataset.PatientID = "SELF-TEST-PATIENT"
     dataset.AccessionNumber = "SELF-TEST"
-    DicomAnonymizer("research", secret=b"dcmget-self-test-key-material-32b").anonymize_dataset(
-        dataset
-    )
+    DicomAnonymizer(
+        "research", secret=b"dcmget-self-test-key-material-32b"
+    ).anonymize_dataset(dataset)
     if not str(dataset.PatientID).startswith("ANON-"):
         raise RuntimeError("pydicom 匿名处理自检失败")
     buffer = BytesIO()
@@ -160,8 +187,36 @@ def run_self_test(config_path: str) -> int:
             index_text = (pdi_output / "INDEX.HTM").read_text(encoding="utf-8")
             if "本次导出未能加入离线阅片器" in index_text:
                 raise RuntimeError("PDI 冻结资源自检未能加入离线阅片器")
+    if report_path:
+        _write_self_test_report(
+            report_path,
+            {
+                "resource_root": str(PROJECT_ROOT.resolve()),
+                "storescp": str(tools.storescp.resolve()),
+                "portable_dcmtk_bin": (
+                    str(portable_dcmtk_bin()) if portable_dcmtk_bin() else None
+                ),
+            },
+        )
     print(f"DcmGet {__version__} self-test OK; DCMTK {tools.version}; fork=yes")
     return 0
+
+
+def _write_self_test_report(path: str | Path, report: dict[str, object]) -> None:
+    output = Path(path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(
+        f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def validate_frozen_pdi_resources(root: str | Path) -> None:
@@ -208,103 +263,110 @@ def create_application() -> QApplication:
 
 
 def run_ui_self_test(config_path: str) -> int:
+    from tempfile import TemporaryDirectory
+
     app = create_application()
-    window = DcmGetWindow(
-        config_path,
-        PROJECT_ROOT,
-        offer_task_resume=False,
-    )
-    window.show()
-    app.processEvents()
-    if not window.isVisible() or window.centralWidget() is None:
-        raise RuntimeError("主窗口未能显示")
-    window.close()
-    app.processEvents()
+    with TemporaryDirectory(prefix="dcmget-ui-self-test-") as temporary:
+        temporary_root = Path(temporary)
+        window = DcmGetWindow(
+            config_path,
+            PROJECT_ROOT,
+            temporary_root / "active-task.sqlite3",
+            offer_task_resume=False,
+            enable_multi_task=False,
+            instance_label="界面自检",
+            settings_name=f"DcmGet2-self-test-{os.getpid()}",
+            log_directory=temporary_root / "logs",
+        )
+        window.show()
+        app.processEvents()
+        if not window.isVisible() or window.centralWidget() is None:
+            raise RuntimeError("主窗口未能显示")
+        window.close()
+        app.processEvents()
     print(f"DcmGet {__version__} UI self-test OK")
     return 0
 
 
-def resume_authorization_task_id(legacy_task_id: str | None) -> str | None:
-    """Find a previously charged unfinished task without loading its 40k rows."""
+def resume_authorization_task_id(task_state_path: str | Path) -> str | None:
+    """Return only the unfinished task assigned to the selected instance."""
 
-    if legacy_task_id:
-        return legacy_task_id
     try:
-        from dcmget.task_manager import TERMINAL_PHASES, TaskCatalog
-
-        catalog = TaskCatalog(auto_migrate=False)
-        for summary in catalog.list_tasks():
-            if summary.phase in TERMINAL_PHASES:
-                continue
-            trial_required, trial_consumed = catalog.trial_state(summary.task_id)
-            if trial_required and trial_consumed:
-                return summary.task_id
-    except (OSError, RuntimeError, TaskStateError):
+        checkpoint = TaskCheckpointStore(task_state_path).load()
+    except TaskStateError:
         return None
-    return None
+    return checkpoint.task_id if checkpoint is not None else None
+
+
+def migrate_legacy_task_state(config_template_path: str | Path) -> None:
+    """Copy unfinished pre-2.9 tasks into persistent instance slots once."""
+
+    state_root = application_state_dir()
+    migration_options = {
+        "state_root": state_root,
+        "template_config_path": config_template_path,
+    }
+    migrate_task_catalog_to_profiles(
+        state_root / "tasks.sqlite3",
+        **migration_options,
+    )
+    migrate_legacy_checkpoint_to_profile(
+        state_root / "active-task.sqlite3",
+        **migration_options,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    instance: SingleInstance | None = None
+    profile: InstanceProfile | None = None
     self_test_requested = any(
         value in {"--self-test", "--ui-self-test"} for value in arguments
     )
     try:
         args = build_parser().parse_args(arguments)
+        prepare_windows_portable_dcmtk(PROJECT_ROOT)
         if args.self_test:
+            if args.self_test_report:
+                return run_self_test(args.config, args.self_test_report)
             return run_self_test(args.config)
         if args.ui_self_test:
             return run_ui_self_test(args.config)
 
-        instance = SingleInstance()
-        if not instance.start({"action": "activate"}):
-            instance.close()
-            return 0
         app = create_application()
+        migrate_legacy_task_state(args.config)
+        profile = acquire_instance_profile(
+            args.profile,
+            template_config_path=args.config,
+        )
     except Exception as exc:
-        if instance is not None:
-            instance.close()
+        if profile is not None:
+            profile.close()
         _report_startup_failure("DcmGet 启动失败", exc, self_test_requested)
         return 1
 
-    resume_task_id = None
-    assert instance is not None
+    assert profile is not None
     try:
-        checkpoint = TaskCheckpointStore().load()
-        if checkpoint is not None:
-            resume_task_id = checkpoint.task_id
-    except TaskStateError:
-        pass
-    resume_task_id = resume_authorization_task_id(resume_task_id)
-
-    try:
+        resume_task_id = resume_authorization_task_id(profile.task_state_path)
         if not authorize_gui(resume_task_id):
             return 1
-        window = DcmGetWindow(args.config, PROJECT_ROOT)
-        bridge = _ActivationBridge(window)
-
-        def activate_window() -> None:
-            if window.isMinimized():
-                window.showNormal()
-            else:
-                window.show()
-            window.raise_()
-            window.activateWindow()
-
-        bridge.requested.connect(activate_window)
-        instance.set_activation_handler(
-            lambda _payload: bridge.requested.emit()
+        window = DcmGetWindow(
+            profile.config_path,
+            PROJECT_ROOT,
+            profile.task_state_path,
+            offer_task_resume=True,
+            enable_multi_task=False,
+            instance_label=profile.label,
+            settings_name=profile.settings_name,
+            log_directory=profile.log_directory,
         )
-        app.aboutToQuit.connect(instance.close)
+        app.aboutToQuit.connect(profile.close)
         window.show()
         return app.exec_()
     except Exception as exc:
         _report_startup_failure("DcmGet 主窗口启动失败", exc, False)
         return 1
     finally:
-        if instance is not None:
-            instance.close()
+        profile.close()
 
 
 def _report_startup_failure(

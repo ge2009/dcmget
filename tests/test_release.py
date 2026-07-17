@@ -134,7 +134,10 @@ def test_windows_firewall_is_limited_to_receiver_and_private_networks():
         encoding="utf-8"
     )
 
-    assert 'program=""{app}\\{#AppExeName}""' in installer
+    assert (
+        'program=""{app}\\_internal\\.runtime\\dcmtk\\windows-x86_64'
+        '\\dcmtk-3.7.0-win64-dynamic\\bin\\storescp.exe""' in installer
+    )
     assert "profile=domain,private" in installer
     assert 'localport=6666' not in installer
     assert '#define FirewallRule "DcmGet Receiver TCP"' in installer
@@ -144,14 +147,17 @@ def test_windows_firewall_is_limited_to_receiver_and_private_networks():
     assert "-LocalPort" not in bootstrap
     assert "-Profile Domain,Private" in bootstrap
     assert '$RuleName = "DcmGet Receiver TCP"' in bootstrap
-    assert 'Resolve-Path ".venv\\Scripts\\python.exe"' in bootstrap
+    assert '-Filter "storescp.exe" -File' in bootstrap
     assert "$firewallRules.Count -ne 1" in workflow
     assert 'LocalPort.ToString() -ne "Any"' in workflow
     assert '"storage_port":16666' in workflow
     assert "Upgrade left the legacy storescp program rule behind" in workflow
     assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
     assert "$applicationFilters.Count -ne 1" in workflow
-    assert 'Join-Path $installDir "DcmGet.exe"' in workflow
+    assert (
+        'Join-Path $installDir "_internal\\.runtime\\dcmtk\\windows-x86_64'
+        '\\dcmtk-3.7.0-win64-dynamic\\bin\\storescp.exe"' in workflow
+    )
     assert "[StringComparison]::OrdinalIgnoreCase" in workflow
     assert "$profileNames.Count -ne 2" in workflow
     assert '$profileNames -notcontains "Domain"' in workflow

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from pathlib import Path
 import sys
 
@@ -17,6 +18,28 @@ from dcmget.config import (
     validate_ae_title,
 )
 from dcmget import runtime
+
+
+def _save_config_process(
+    path: str,
+    storage_port: int,
+    start_event,
+    result_queue,
+) -> None:
+    start_event.wait(10)
+    try:
+        for index in range(12):
+            save_config(
+                path,
+                AppConfig(
+                    storage_port=storage_port,
+                    storage_ae_title=f"STORE{storage_port}",
+                    dicom_destination_folder=f"Dicom-{storage_port}-{index}",
+                ),
+            )
+        result_queue.put("")
+    except Exception as exc:  # pragma: no cover - reported in parent process
+        result_queue.put(repr(exc))
 
 
 def test_migrates_legacy_configuration(tmp_path):
@@ -73,6 +96,36 @@ def test_configuration_round_trip(tmp_path):
 
     assert load_config(path) == expected
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_concurrent_processes_save_complete_atomic_configuration(tmp_path):
+    path = tmp_path / "config.json"
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    ports = (16661, 16662, 16663, 16664)
+    processes = [
+        context.Process(
+            target=_save_config_process,
+            args=(str(path), port, start_event, result_queue),
+        )
+        for port in ports
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(20)
+
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+    assert [result_queue.get(timeout=2) for _process in processes] == [""] * len(
+        processes
+    )
+    saved = load_config(path)
+    assert saved.storage_port in ports
+    assert saved.storage_ae_title == f"STORE{saved.storage_port}"
+    assert saved.dicom_destination_folder.startswith(f"Dicom-{saved.storage_port}-")
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
 def test_new_configuration_uses_dcmget_receiver_and_metadata_layout():

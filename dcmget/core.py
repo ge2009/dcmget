@@ -16,19 +16,23 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
+from filelock import FileLock, Timeout
+
 from .config import AppConfig
 from .anonymization import DicomAnonymizer
 from .diagnostics import PrivateRotatingFileHandler
-from .runtime import ensure_application_state_dir
+from .runtime import ensure_application_state_dir, portable_dcmtk_bin
 
 
 _archive_publish_lock = threading.Lock()
+_RECEIVER_BIND_ADDRESS = "0.0.0.0"
 
 
 class AccessionStatus(str, Enum):
@@ -379,6 +383,10 @@ class DcmtkResolver:
             configured = Path(configured_dir).expanduser()
             candidates.append(configured.parent if configured.is_file() else configured)
 
+        portable_bin = portable_dcmtk_bin()
+        if portable_bin is not None:
+            candidates.append(portable_bin)
+
         runtime = self.project_root / ".runtime" / "dcmtk"
         platform_key = current_platform_key()
         platform_runtime = runtime / platform_key
@@ -597,6 +605,7 @@ class DownloadRunner:
         ready_callback: ReadyCallback | None = None,
         process_callback: ProcessCallback | None = None,
         log_file_name: str = "dcmget.log",
+        log_directory: str | Path | None = None,
     ):
         self.config = config
         self.tools = tools
@@ -611,6 +620,9 @@ class DownloadRunner:
         if Path(log_file_name).name != log_file_name or not log_file_name:
             raise ValueError("日志文件名无效")
         self._log_file_name = log_file_name
+        self._log_directory = (
+            Path(log_directory).expanduser() if log_directory is not None else None
+        )
         self._cancel = threading.Event()
         self._pause_condition = threading.Condition()
         self._pause_requested = False
@@ -622,10 +634,9 @@ class DownloadRunner:
         self._diagnostic_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
         self._storescp_process: subprocess.Popen[str] | None = None
+        self._receiver_lease_guard = threading.Lock()
+        self._receiver_lease: FileLock | None = None
         self._storescp_abort_count = 0
-        self._staging_accession_cache: dict[
-            Path, tuple[int, int, int, str | None]
-        ] = {}
         self._logger = self._build_file_logger()
         self._anonymizer = (
             DicomAnonymizer(config.anonymization_profile)
@@ -695,7 +706,6 @@ class DownloadRunner:
             raise RuntimeError(
                 f"DICOM 接收器已退出，退出码 {receiver_exit_code}"
             )
-        self._staging_accession_cache.clear()
         with self._process_lock:
             if self._storescp_process is not None:
                 raise RuntimeError("当前执行器已连接到另一个 storescp")
@@ -744,7 +754,6 @@ class DownloadRunner:
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
-        self._staging_accession_cache.clear()
         staging = staging_directory_root(self.config) / datetime.now().strftime(
             "%Y%m%d-%H%M%S-%f"
         )
@@ -817,28 +826,88 @@ class DownloadRunner:
             return True
 
     def _start_storescp(self, staging: Path) -> None:
-        command = build_storescp_command(self.config, self.tools, staging)
-        mode = "多进程并发（--fork）" if self.tools.supports_fork else "单进程兼容模式"
-        self._emit("storescp", f"接收模式：{mode}", "info")
-        self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
-        process = self._popen(command)
-        with self._process_lock:
-            self._storescp_process = process
-        self._notify_process("storescp", getattr(process, "pid", 0), command[0], True)
-        self._start_reader(process, "storescp")
-
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if self._cancel.is_set():
-                return
-            if process.poll() is not None:
-                raise RuntimeError(f"storescp 启动失败，退出码 {process.returncode}")
+        self._acquire_receiver_lease()
+        try:
             if _port_is_listening(self.config.storage_port):
-                self._emit("storescp", f"已监听端口 {self.config.storage_port}", "success")
-                return
-            time.sleep(0.1)
-        self._terminate_process_safely(process)
-        raise TimeoutError(f"storescp 未能在端口 {self.config.storage_port} 就绪")
+                raise RuntimeError(
+                    f"接收端口 {self.config.storage_port} 已被其他程序占用；"
+                    "请关闭占用程序或为此 DcmGet 实例配置不同的监听端口"
+                )
+            command = build_storescp_command(self.config, self.tools, staging)
+            mode = (
+                "多进程并发（--fork）"
+                if self.tools.supports_fork
+                else "单进程兼容模式"
+            )
+            self._emit("storescp", f"接收模式：{mode}", "info")
+            self._emit("storescp", f"启动接收器：{_display_command(command)}", "info")
+            process = self._popen(command)
+            with self._process_lock:
+                self._storescp_process = process
+            self._notify_process(
+                "storescp", getattr(process, "pid", 0), command[0], True
+            )
+            self._start_reader(process, "storescp")
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self._cancel.is_set():
+                    return
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"storescp 启动失败，退出码 {process.returncode}"
+                    )
+                if _port_is_listening(self.config.storage_port):
+                    stable_until = min(deadline, time.monotonic() + 0.3)
+                    while time.monotonic() < stable_until:
+                        if self._cancel.is_set():
+                            return
+                        time.sleep(0.05)
+                        if process.poll() is not None:
+                            raise RuntimeError(
+                                "storescp 端口就绪后意外退出，"
+                                f"退出码 {process.returncode}"
+                            )
+                    if _port_is_listening(self.config.storage_port):
+                        self._emit(
+                            "storescp",
+                            f"已监听端口 {self.config.storage_port}",
+                            "success",
+                        )
+                        return
+                time.sleep(0.1)
+            raise TimeoutError(f"storescp 未能在端口 {self.config.storage_port} 就绪")
+        except BaseException:
+            self._stop_storescp()
+            raise
+
+    def _acquire_receiver_lease(self) -> None:
+        with self._receiver_lease_guard:
+            if self._receiver_lease is not None:
+                raise RuntimeError("当前执行器已经持有 DICOM 接收端口")
+            lease = FileLock(
+                str(
+                    _receiver_port_lock_path(
+                        _RECEIVER_BIND_ADDRESS,
+                        self.config.storage_port,
+                    )
+                )
+            )
+            try:
+                lease.acquire(timeout=0)
+            except Timeout as exc:
+                raise RuntimeError(
+                    f"接收端口 {self.config.storage_port} 已被另一个 DcmGet 实例占用；"
+                    "请在设置中为每个实例配置不同的监听端口"
+                ) from exc
+            self._receiver_lease = lease
+
+    def _release_receiver_lease(self) -> None:
+        with self._receiver_lease_guard:
+            lease = self._receiver_lease
+            self._receiver_lease = None
+        if lease is not None and lease.is_locked:
+            lease.release()
 
     def _download_one(
         self, accession: str, staging: Path, index: int, total: int
@@ -926,21 +995,11 @@ class DownloadRunner:
 
         all_files = _files_in(staging)
         new_files = all_files - before
-        candidate_files, mismatched_files = _select_files_for_accession(
-            all_files,
-            new_files,
-            accession,
-            cache=self._staging_accession_cache,
-        )
-        if mismatched_files:
-            self._emit(
-                "storescp",
-                (
-                    f"收到 {len(mismatched_files)} 个检查号与当前任务不匹配的文件，"
-                    f"已保留在暂存目录：{staging}"
-                ),
-                "warning",
-            )
+        # Each 2.9 instance owns one receiver and runs only one C-MOVE at a
+        # time.  Therefore every file created in this move's receive window
+        # belongs to the active request.  Do not reject useful PACS data just
+        # because AccessionNumber is absent, malformed or different.
+        candidate_files = sorted(new_files)
         received_bytes = _total_file_size(candidate_files)
         transfer_seconds = max(0.0, transfer_finished - started)
         average_speed = (
@@ -966,6 +1025,7 @@ class DownloadRunner:
             dcmdump=self.tools.dcmdump,
             dcmtk_environment=_dcmtk_environment(self.tools),
             cancel_event=self._cancel,
+            route_accession=accession,
         )
         rejected_detail = (
             f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
@@ -1148,14 +1208,20 @@ class DownloadRunner:
         with self._process_lock:
             process = self._storescp_process
             self._storescp_process = None
-        if process:
-            # ``storescp --fork`` children can outlive an exited group leader.
-            # Always ask the process-group cleanup helper to drain the group.
-            self._terminate_process_safely(process)
-            self._emit("storescp", "接收器已停止", "info")
-            self._notify_process(
-                "storescp", getattr(process, "pid", 0), str(self.tools.storescp), False
-            )
+        try:
+            if process:
+                # ``storescp --fork`` children can outlive an exited group leader.
+                # Always ask the process-group cleanup helper to drain the group.
+                self._terminate_process_safely(process)
+                self._emit("storescp", "接收器已停止", "info")
+                self._notify_process(
+                    "storescp",
+                    getattr(process, "pid", 0),
+                    str(self.tools.storescp),
+                    False,
+                )
+        finally:
+            self._release_receiver_lease()
 
     def _cleanup_staging(self, staging: Path) -> None:
         remaining = _files_in(staging)
@@ -1200,7 +1266,7 @@ class DownloadRunner:
         self._logger.log(log_level, "[%s] %s", source, message)
 
     def _build_file_logger(self) -> logging.Logger:
-        log_dir = log_directory(self.config)
+        log_dir = self._log_directory or log_directory(self.config)
         log_dir.mkdir(parents=True, exist_ok=True)
         logger = logging.getLogger(f"dcmget.runner.{id(self)}")
         logger.setLevel(logging.DEBUG)
@@ -1266,6 +1332,18 @@ def _port_is_listening(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _receiver_port_lock_path(bind_address: str, port: int) -> Path:
+    identity = f"{bind_address.strip().casefold()}:{int(port)}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    directory = ensure_application_state_dir() / "receiver-port-locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    return directory / f"{digest}.lock"
+
+
 def _files_in(directory: Path) -> set[Path]:
     if not directory.exists():
         return set()
@@ -1282,69 +1360,6 @@ def _total_file_size(files: Iterable[Path]) -> int:
     return total
 
 
-def _select_files_for_accession(
-    all_files: Iterable[Path],
-    new_files: Iterable[Path],
-    accession: str,
-    *,
-    cache: dict[Path, tuple[int, int, int, str | None]] | None = None,
-) -> tuple[list[Path], list[Path]]:
-    """Select received files without assigning another accession by timing alone."""
-
-    from pydicom import dcmread
-
-    new = set(new_files)
-    current = set(all_files)
-    metadata_cache = cache if cache is not None else {}
-    for stale in metadata_cache.keys() - current:
-        metadata_cache.pop(stale, None)
-    selected: list[Path] = []
-    mismatched: list[Path] = []
-    expected = accession.strip()
-    for path in sorted(current):
-        try:
-            stat = path.stat()
-        except OSError:
-            metadata_cache.pop(path, None)
-            continue
-        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
-        cached = metadata_cache.get(path)
-        if cached is not None and cached[:3] == fingerprint:
-            received_accession = cached[3]
-        else:
-            try:
-                dataset = dcmread(
-                    path,
-                    stop_before_pixels=True,
-                    force=True,
-                    specific_tags=["AccessionNumber"],
-                )
-                received_accession = str(
-                    getattr(dataset, "AccessionNumber", "") or ""
-                ).strip()
-            except Exception:
-                received_accession = None
-            metadata_cache[path] = (*fingerprint, received_accession)
-
-        if received_accession is None:
-            # Newly written malformed files still have to reach validation so
-            # the active accession is reported as failed instead of no-data.
-            if path in new:
-                selected.append(path)
-            continue
-
-        if received_accession == expected:
-            selected.append(path)
-        elif not received_accession and path in new:
-            # Some legacy PACS omit AccessionNumber in returned instances.  A
-            # file created during this strictly sequential C-MOVE is the only
-            # safe compatibility fallback.
-            selected.append(path)
-        elif path in new:
-            mismatched.append(path)
-    return selected, mismatched
-
-
 def _archive_dicom_files(
     files: Iterable[Path],
     destination_root: Path,
@@ -1355,12 +1370,14 @@ def _archive_dicom_files(
     dcmdump: Path | None = None,
     dcmtk_environment: dict[str, str] | None = None,
     cancel_event: threading.Event | None = None,
+    route_accession: str | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
 
     moved: list[Path] = []
     rejected: list[Path] = []
+    routing_accession = str(route_accession or "").strip()
     values = list(files)
     if not values:
         return moved, rejected
@@ -1390,7 +1407,11 @@ def _archive_dicom_files(
                     dataset.PatientID = str(
                         getattr(dataset, "StudyInstanceUID", "") or "UNKNOWN_PATIENT"
                     )
-                if not str(getattr(dataset, "AccessionNumber", "") or "").strip():
+                if routing_accession:
+                    dataset.AccessionNumber = routing_accession
+                elif not str(
+                    getattr(dataset, "AccessionNumber", "") or ""
+                ).strip():
                     dataset.AccessionNumber = fallback_accession or "UNKNOWN_ACCESSION"
                 anonymizer.anonymize_dataset(dataset)
             else:
@@ -1404,6 +1425,11 @@ def _archive_dicom_files(
                 value = str(getattr(dataset, field, "") or "").strip()
                 if value:
                     metadata[field] = value
+            if not anonymizer and routing_accession:
+                # Route the accepted object under the request that opened this
+                # receive window.  Keep the original dataset tag untouched so
+                # clinical metadata is never silently rewritten.
+                metadata["AccessionNumber"] = routing_accession
             sop_instance_uid = UID(metadata["SOPInstanceUID"])
             if not sop_instance_uid.is_valid:
                 raise ValueError("invalid SOP Instance UID")
@@ -1618,7 +1644,7 @@ def _validate_dicom_stream(
 def _publish_or_deduplicate(source: Path, target: Path) -> None:
     # Separate DownloadRunner instances can archive into the same destination.
     # Keep existence checking, conflict verification and publication atomic.
-    with _archive_publish_lock:
+    with _locked_archive_target(target):
         if target.exists():
             if _file_sha256(source) != _file_sha256(target):
                 raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
@@ -1648,7 +1674,7 @@ def _publish_or_deduplicate(source: Path, target: Path) -> None:
             shutil.copyfileobj(reader, writer, length=1024 * 1024)
             writer.flush()
             os.fsync(writer.fileno())
-        with _archive_publish_lock:
+        with _locked_archive_target(target):
             if target.exists():
                 if _file_sha256(temporary) != _file_sha256(target):
                     raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
@@ -1657,6 +1683,26 @@ def _publish_or_deduplicate(source: Path, target: Path) -> None:
         source.unlink()
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _locked_archive_target(target: Path):
+    """Serialize one final SOP path across threads and DcmGet processes."""
+
+    try:
+        normalized = os.path.normcase(str(target.resolve(strict=False)))
+    except OSError:
+        normalized = os.path.normcase(os.path.abspath(os.fspath(target)))
+    digest = hashlib.sha256(os.fsencode(normalized)).hexdigest()
+    lock_directory = ensure_application_state_dir() / "archive-publish-locks"
+    lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        lock_directory.chmod(0o700)
+    except OSError:
+        pass
+    lock_path = lock_directory / f"{digest}.lock"
+    with _archive_publish_lock, FileLock(str(lock_path), timeout=300):
+        yield
 
 
 def _is_cross_device_error(exc: OSError) -> bool:

@@ -334,6 +334,7 @@ class SettingsPage(QWidget):
         pacs_form.addRow("PACS AE", self.pacs_ae_edit)
 
         receiver_card, receiver_form = self._card("DICOM 接收器")
+        self.receiver_form = receiver_form
         self.storage_ae_edit = QLineEdit()
         self.storage_port_edit = self._port_edit()
         self.max_concurrent_moves_spin = QSpinBox()
@@ -359,13 +360,13 @@ class SettingsPage(QWidget):
         receiver_form.addRow("接收 AE", self.storage_ae_edit)
         receiver_form.addRow("监听端口", self.storage_port_edit)
         receiver_form.addRow("并发下载数", self.max_concurrent_moves_spin)
-        concurrency_hint = QLabel(
+        self.concurrency_hint = QLabel(
             "相同接收 AE 与端口复用一个并发 SCP；改用不同端口会自动启动多个 SCP。"
             "默认同时下载 2 个检查号，其余任务显示为“等待并发槽”。"
         )
-        concurrency_hint.setObjectName("FieldHint")
-        concurrency_hint.setWordWrap(True)
-        receiver_form.addRow("", concurrency_hint)
+        self.concurrency_hint.setObjectName("FieldHint")
+        self.concurrency_hint.setWordWrap(True)
+        receiver_form.addRow("", self.concurrency_hint)
         receiver_form.addRow("目录模板", self.directory_template_combo)
         directory_hint = QLabel(
             "可编辑组合：{PatientID}、{AccessionNumber}、{StudyInstanceUID}"
@@ -671,6 +672,22 @@ class SettingsPage(QWidget):
             unlocked_tooltip = str(widget.property("unlockedToolTip") or "")
             widget.setToolTip(message if locked else unlocked_tooltip)
 
+    def set_multi_task_mode(self, enabled: bool) -> None:
+        label = self.receiver_form.labelForField(
+            self.max_concurrent_moves_spin
+        )
+        self.max_concurrent_moves_spin.setVisible(enabled)
+        if label is not None:
+            label.setVisible(enabled)
+        self.concurrency_hint.setText(
+            (
+                "相同接收 AE 与端口复用一个并发 SCP；改用不同端口会自动启动多个 SCP。"
+                "默认同时下载 2 个检查号，其余任务显示为“等待并发槽”。"
+                if enabled
+                else "多开实例需使用不同的接收 AE/端口，每个窗口独立保存到自己的目标目录。"
+            )
+        )
+
     def _browse_dcmtk(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择 DCMTK bin 目录", self.dcmtk_edit.text())
         if selected:
@@ -708,6 +725,7 @@ class DownloadWorker(QObject):
         consume_trial_on_ready: bool = False,
         task_store: TaskCheckpointStore | None = None,
         task_id: str = "",
+        log_directory: str | Path | None = None,
     ):
         super().__init__()
         self.config = config
@@ -716,6 +734,9 @@ class DownloadWorker(QObject):
         self.consume_trial_on_ready = consume_trial_on_ready
         self.task_store = task_store
         self.task_id = task_id
+        self.log_directory = (
+            Path(log_directory).expanduser() if log_directory is not None else None
+        )
         self.runner: DownloadRunner | None = None
         self.cancel_requested = False
         self.pause_requested = False
@@ -734,6 +755,10 @@ class DownloadWorker(QObject):
                     self._consume_trial if self.consume_trial_on_ready else None
                 ),
                 process_callback=self._record_process,
+                log_file_name=(
+                    f"task-{self.task_id}.log" if self.task_id else "dcmget.log"
+                ),
+                log_directory=self.log_directory,
             )
             with self._control_lock:
                 self.runner = runner
@@ -883,16 +908,23 @@ class DcmGetWindow(QMainWindow):
         *,
         offer_task_resume: bool = True,
         enable_multi_task: bool | None = None,
+        instance_label: str = "",
+        settings_name: str = "DcmGet2",
+        log_directory: str | Path | None = None,
     ):
         super().__init__()
         self.config_path = Path(config_path)
         self.project_root = Path(project_root)
+        self.instance_label = instance_label.strip()
+        self.settings_name = settings_name.strip() or "DcmGet2"
+        self.log_directory = (
+            Path(log_directory).expanduser() if log_directory is not None else None
+        )
+        self.instance_log_directory = self.log_directory
         self.config = load_config(self.config_path)
         self.resolver = DcmtkResolver(self.project_root)
         self.task_store = TaskCheckpointStore(task_state_path)
-        self.multi_task_enabled = (
-            offer_task_resume if enable_multi_task is None else enable_multi_task
-        )
+        self.multi_task_enabled = bool(enable_multi_task)
         self.task_controller: TaskExecutionController | None = None
         self._task_catalog_path = (
             Path(task_state_path).expanduser().with_name("tasks.sqlite3")
@@ -955,7 +987,7 @@ class DcmGetWindow(QMainWindow):
         self._summary_status_counts: dict[AccessionStatus, int] = {}
         self._workspace_task_summaries: dict[str, TaskSummary] = {}
         self._compact_action_layout: bool | None = None
-        self.settings_store = QSettings("DcmGet", "DcmGet2")
+        self.settings_store = QSettings("DcmGet", self.settings_name)
         self._log_panel_expanded = self.settings_store.value(
             "window/log_expanded", False, type=bool
         )
@@ -966,14 +998,20 @@ class DcmGetWindow(QMainWindow):
             "window/task_form_expanded", True, type=bool
         )
 
-        self.setWindowTitle(f"DcmGet {__version__} - DICOM 下载工作台")
+        instance_title = f" - {self.instance_label}" if self.instance_label else ""
+        self.setWindowTitle(
+            f"DcmGet {__version__}{instance_title} - DICOM 下载工作台"
+        )
         self.setMinimumSize(WINDOW_MINIMUM_WIDTH, WINDOW_MINIMUM_HEIGHT)
         self.resize(1180, 820)
         logo = self.project_root / "logo.png"
         if logo.exists():
             self.setWindowIcon(QIcon(str(logo)))
         self._build_ui()
-        self.task_workspace.set_concurrency_limit(self.config.max_concurrent_moves)
+        if self.task_workspace is not None:
+            self.task_workspace.set_concurrency_limit(
+                self.config.max_concurrent_moves
+            )
         self._restore_ui_state()
         self.settings_page.set_config(self.config)
         self._reset_pdi_status_card()
@@ -995,31 +1033,37 @@ class DcmGetWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.task_detail_page = self._build_task_page()
-        self.task_workspace = TaskWorkspace(self.task_detail_page)
-        self.task_workspace.new_task_requested.connect(
-            self._show_new_task_editor
-        )
-        self.task_workspace.task_selected.connect(
-            self._on_workspace_task_selected
-        )
-        self.task_workspace.delete_task_requested.connect(
-            self._delete_multi_task
-        )
-        self.task_workspace.compact_mode_changed.connect(
-            lambda _compact: self._update_responsive_layouts(force=True)
-        )
-        self.task_workspace.splitter.splitterMoved.connect(
-            lambda _position, _index: self._update_responsive_layouts(force=True)
-        )
-        self.task_page = self.task_workspace
+        self.task_workspace: TaskWorkspace | None = None
+        if self.multi_task_enabled:
+            self.task_workspace = TaskWorkspace(self.task_detail_page)
+            self.task_workspace.new_task_requested.connect(
+                self._show_new_task_editor
+            )
+            self.task_workspace.task_selected.connect(
+                self._on_workspace_task_selected
+            )
+            self.task_workspace.delete_task_requested.connect(
+                self._delete_multi_task
+            )
+            self.task_workspace.compact_mode_changed.connect(
+                lambda _compact: self._update_responsive_layouts(force=True)
+            )
+            self.task_workspace.splitter.splitterMoved.connect(
+                lambda _position, _index: self._update_responsive_layouts(force=True)
+            )
+            self.task_page = self.task_workspace
+        else:
+            self.task_page = self.task_detail_page
         self.pages.addWidget(self.task_page)
         self.settings_page = SettingsPage()
+        self.settings_page.set_multi_task_mode(self.multi_task_enabled)
         self.settings_page.saved.connect(self._save_settings)
         self.settings_page.back_requested.connect(self._cancel_settings)
         self.pages.addWidget(self.settings_page)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
-        self.task_workspace.show_detail()
+        if self.task_workspace is not None:
+            self.task_workspace.show_detail()
         self.setStyleSheet(APP_STYLESHEET)
         for widget in (
             self.app_title,
@@ -1074,9 +1118,10 @@ class DcmGetWindow(QMainWindow):
         status_row.addWidget(self.app_logo, 0, Qt.AlignVCenter)
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        self.app_title = QLabel(f"DcmGet {__version__}")
+        instance_suffix = f" · {self.instance_label}" if self.instance_label else ""
+        self.app_title = QLabel(f"DcmGet {__version__}{instance_suffix}")
         self.app_title.setObjectName("AppTitle")
-        self.app_subtitle = QLabel("DICOM 批量下载工作台")
+        self.app_subtitle = QLabel(f"DICOM 批量下载工作台{instance_suffix}")
         self.app_subtitle.setObjectName("HeaderSubtitle")
         title_box.addWidget(self.app_title)
         title_box.addWidget(self.app_subtitle)
@@ -1512,6 +1557,7 @@ class DcmGetWindow(QMainWindow):
         self.log_scope_combo.currentIndexChanged.connect(
             self._refresh_multi_log_view
         )
+        self.log_scope_combo.setVisible(self.multi_task_enabled)
         header.addWidget(self.log_scope_combo)
         self.log_detail_checkbox = QCheckBox("显示详细日志")
         self.log_detail_checkbox.setChecked(self._show_detailed_logs)
@@ -1564,7 +1610,11 @@ class DcmGetWindow(QMainWindow):
             return self._pdi_task_id
         if self._resume_checkpoint is not None:
             return self._resume_checkpoint.task_id
-        return self.task_workspace.selected_task_id
+        return (
+            self.task_workspace.selected_task_id
+            if self.task_workspace is not None
+            else ""
+        )
 
     def _publish_workspace_summary(
         self,
@@ -1573,6 +1623,8 @@ class DcmGetWindow(QMainWindow):
         select: bool = False,
     ) -> None:
         self._workspace_task_summaries[summary.task_id] = summary
+        if self.task_workspace is None:
+            return
         self.task_workspace.upsert_task(summary)
         if select:
             self.task_workspace.select_task(summary.task_id)
@@ -1695,8 +1747,9 @@ class DcmGetWindow(QMainWindow):
 
     def _show_new_task_editor(self) -> None:
         self.pages.setCurrentWidget(self.task_page)
-        self.task_workspace.show_detail()
-        if self.multi_task_enabled:
+        if self.task_workspace is not None:
+            self.task_workspace.show_detail()
+        if self.multi_task_enabled and self.task_workspace is not None:
             self.task_workspace.clear_task_selection()
             self._selected_task_id = ""
             self._loaded_multi_task_id = ""
@@ -1744,8 +1797,9 @@ class DcmGetWindow(QMainWindow):
 
     def _on_workspace_task_selected(self, task_id: str) -> None:
         self.pages.setCurrentWidget(self.task_page)
-        self.task_workspace.show_detail()
-        if self.multi_task_enabled and task_id:
+        if self.task_workspace is not None:
+            self.task_workspace.show_detail()
+        if self.multi_task_enabled and self.task_workspace is not None and task_id:
             self._selected_task_id = task_id
             self._multi_task_editor_active = False
             self._refresh_multi_log_view()
@@ -1878,7 +1932,10 @@ class DcmGetWindow(QMainWindow):
                 self._resume_checkpoint.config = AppConfig.from_dict(config.to_dict())
         self.config = config
         save_config(self.config_path, self.config)
-        self.task_workspace.set_concurrency_limit(self.config.max_concurrent_moves)
+        if self.task_workspace is not None:
+            self.task_workspace.set_concurrency_limit(
+                self.config.max_concurrent_moves
+            )
         self._sync_quick_pdi_controls_from_config()
         self.pages.setCurrentIndex(0)
         self.pdi_status_card.setVisible(self.config.pdi_export_enabled)
@@ -3115,6 +3172,7 @@ class DcmGetWindow(QMainWindow):
             consume_trial_on_ready=use_trial,
             task_store=self.task_store,
             task_id=checkpoint.task_id,
+            log_directory=self.instance_log_directory,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -4300,7 +4358,8 @@ class DcmGetWindow(QMainWindow):
         finally:
             self.task_store.release_lease()
         self._workspace_task_summaries.pop(task_id, None)
-        self.task_workspace.remove_task(task_id)
+        if self.task_workspace is not None:
+            self.task_workspace.remove_task(task_id)
         self._resume_checkpoint = None
         self._pdi_task_id = ""
         self._pdi_reuse_published = False
@@ -4509,9 +4568,12 @@ class DcmGetWindow(QMainWindow):
             QApplication.clipboard().setText(" | ".join(item.text() if item else "" for item in values))
 
     def _open_log_directory(self) -> None:
-        config = AppConfig.from_dict(self.config.to_dict())
-        config.dicom_destination_folder = self.destination_edit.text().strip()
-        path = log_directory(config)
+        if self.instance_log_directory is not None:
+            path = self.instance_log_directory
+        else:
+            config = AppConfig.from_dict(self.config.to_dict())
+            config.dicom_destination_folder = self.destination_edit.text().strip()
+            path = log_directory(config)
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 

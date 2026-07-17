@@ -22,7 +22,13 @@ from dcmget.licensing import (
     trial_status,
     trial_task_consumed,
 )
-from dcmget.runtime import ensure_default_config, resource_root
+from dcmget.instance_profile import (
+    InstanceProfileError,
+    MIGRATION_MARKER_NAME,
+    PROFILE_DIRECTORY_NAME,
+    _read_migration_marker,
+)
+from dcmget.runtime import application_state_dir, ensure_default_config, resource_root
 from dcmget.pdi import PdiExporter, PdiStatus, cleanup_interrupted_pdi
 from dcmget.task_state import (
     TaskCheckpointStore,
@@ -34,8 +40,21 @@ from dcmget.task_state import (
 PROJECT_ROOT = resource_root()
 
 
+def default_legacy_catalog_was_migrated() -> bool:
+    """Return whether the default 2.8 catalog was migrated into 2.9 profiles."""
+
+    state_root = application_state_dir().expanduser().resolve()
+    marker_path = (
+        state_root / PROFILE_DIRECTORY_NAME / MIGRATION_MARKER_NAME
+    )
+    if not marker_path.is_file():
+        return False
+    _read_migration_marker(marker_path, state_root / "tasks.sqlite3")
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.8.3 DICOM 批量下载工具")
+    parser = argparse.ArgumentParser(description="DcmGet 2.9.0 DICOM 批量下载工具")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -100,6 +119,19 @@ def main(argv: list[str] | None = None) -> int:
         store = TaskCheckpointStore(args.task_state)
     else:
         try:
+            catalog_was_migrated = default_legacy_catalog_was_migrated()
+        except InstanceProfileError as exc:
+            print(f"无法校验旧任务迁移状态：{exc}", file=sys.stderr)
+            return 1
+        if catalog_was_migrated:
+            print(
+                "默认旧任务目录 tasks.sqlite3 已迁移到 DcmGet 2.9 实例恢复点。"
+                "为避免重复下载，命令行不会再次打开该目录；请使用桌面 GUI 恢复，"
+                "或显式指定 --task-state PATH 运行独立单任务。",
+                file=sys.stderr,
+            )
+            return 1
+        try:
             from dcmget.cli_tasks import (
                 CatalogCheckpointStore,
                 MultipleTasksError,
@@ -108,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             from dcmget.task_manager import TaskCatalog
         except ImportError as exc:
-            print(f"多任务组件不可用：{exc}", file=sys.stderr)
+            print(f"任务恢复组件不可用：{exc}", file=sys.stderr)
             return 1
         try:
             catalog = TaskCatalog()

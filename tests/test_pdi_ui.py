@@ -41,6 +41,7 @@ def make_window(qtbot, tmp_path):
         tmp_path,
         tmp_path / "active-task.sqlite3",
         offer_task_resume=False,
+        enable_multi_task=False,
     )
     qtbot.addWidget(window)
     window.show()
