@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -1947,23 +1948,28 @@ def test_posix_cleanup_kills_fork_child_after_group_leader_exits(tmp_path):
     setattr(process, "_dcmget_process_group", process.pid)
     process.wait(timeout=5)
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    child_process = psutil.Process(child_pid)
 
-    try:
-        os.kill(child_pid, 0)
-        child_was_running = True
-    except OSError:
-        child_was_running = False
+    deadline = time.monotonic() + 3
+    while child_process.status() == psutil.STATUS_IDLE:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    child_was_running = child_process.is_running()
 
     try:
         core._terminate_process(process)
-        assert not psutil.pid_exists(child_pid) or (
-            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
-        )
+        _gone, alive = psutil.wait_procs([child_process], timeout=3)
+        if alive:
+            assert child_process.status() == psutil.STATUS_ZOMBIE
     finally:
         if child_was_running:
             try:
-                os.kill(child_pid, 9)
-            except OSError:
+                if (
+                    child_process.is_running()
+                    and child_process.status() != psutil.STATUS_ZOMBIE
+                ):
+                    child_process.kill()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 pass
 
     assert child_was_running

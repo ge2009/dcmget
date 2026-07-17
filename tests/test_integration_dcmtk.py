@@ -34,7 +34,14 @@ def sample_dataset(accession: str, instance_uid: str | None = None) -> FileDatas
     file_meta.MediaStorageSOPClassUID = CTImageStorage
     file_meta.MediaStorageSOPInstanceUID = instance_uid
     file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-    dataset = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+    dataset = FileDataset(
+        None,
+        {},
+        file_meta=file_meta,
+        preamble=b"\0" * 128,
+        is_implicit_VR=False,
+        is_little_endian=True,
+    )
     dataset.SOPClassUID = CTImageStorage
     dataset.SOPInstanceUID = instance_uid
     dataset.StudyInstanceUID = generate_uid()
@@ -335,9 +342,32 @@ def test_real_multitask_shares_one_scp_and_runs_multiple_scps_concurrently(
     assert all(not path.exists() for path in staging_roots.values())
     assert set(route_directories) == {"A001", "A002", "B001"}
     assert len(set(route_directories.values())) == 3
-    assert manager.get_task(first.task_id).summary.phase == "completed"
-    assert manager.get_task(same_key.task_id).summary.phase == "completed"
-    assert manager.get_task(second_receiver.task_id).summary.phase == "completed"
+    task_details = [
+        manager.get_task_detail(task.task_id)
+        for task in (first, same_key, second_receiver)
+    ]
+    task_diagnostics = [
+        {
+            "task_id": detail.task_id,
+            "phase": detail.summary.phase,
+            "error": detail.summary.error_message,
+            "results": [
+                {
+                    "accession": result.accession,
+                    "status": result.status.value,
+                    "message": result.message,
+                    "files": result.file_count,
+                }
+                for result in detail.results
+            ],
+        }
+        for detail in task_details
+    ]
+    assert [detail.summary.phase for detail in task_details] == [
+        "completed",
+        "completed",
+        "completed",
+    ], task_diagnostics
     received = [
         *list((tmp_path / "dicom-a").rglob("*.dcm")),
         *list((tmp_path / "dicom-a-second").rglob("*.dcm")),
