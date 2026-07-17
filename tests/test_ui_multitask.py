@@ -250,6 +250,27 @@ def test_third_task_waits_for_a_concurrency_slot_and_shows_queue_copy(
     window.close()
 
 
+def test_stale_task_snapshot_cannot_remove_a_newer_catalog_task(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    controller = window.task_controller
+    assert controller is not None
+    task = controller.catalog.create_task(AppConfig(), ["A001"])
+    controller.catalog.set_phase(task.task_id, "paused")
+
+    window._on_multi_tasks_updated([controller.catalog.get_summary(task.task_id)])
+    window._on_multi_tasks_updated([])
+
+    index = window.task_workspace.sidebar.model.index_for_task_id(task.task_id)
+    assert index.isValid()
+    assert index.data(
+        window.task_workspace.sidebar.model.StatusTextRole
+    ) == "已暂停"
+    controller.catalog.set_phase(task.task_id, "completed")
+    window.close()
+
+
 def test_task_selection_loads_bounded_detail_and_independent_actions(
     qtbot, tmp_path, monkeypatch
 ):

@@ -1929,6 +1929,14 @@ class DcmGetWindow(QMainWindow):
         if not self.multi_task_enabled:
             return
         values = list(summaries) if isinstance(summaries, (list, tuple)) else []
+        # Worker-thread snapshots can arrive out of order.  Reload the current
+        # catalog view on the UI thread so an older signal cannot temporarily
+        # remove a task that was just created in another concurrent slot.
+        if self.task_controller is not None:
+            try:
+                values = self.task_controller.list_tasks()
+            except (OSError, RuntimeError, TaskStateError):
+                pass
         self._workspace_task_summaries = {
             summary.task_id: summary for summary in values
         }
