@@ -352,15 +352,25 @@ def test_macos_hidden_cocoa_plugin_is_unhidden_before_qapplication(tmp_path):
 def test_ui_self_test_no_longer_constructs_daily_password_dialog(monkeypatch):
     import DICOM_download_ui as entry
 
-    events: list[str] = []
+    events: list[object] = []
+    observed: dict[str, object] = {}
+
+    class Signal:
+        def connect(self, callback):
+            events.append("quit-handler")
+            observed["quit_callback"] = callback
 
     class FakeApplication:
+        aboutToQuit = Signal()
+
         def processEvents(self):
             events.append("events")
 
     class FakeWindow:
-        def __init__(self, *_args, **_kwargs):
+        def __init__(self, *args, **kwargs):
             events.append("window")
+            observed["window_args"] = args
+            observed["window_kwargs"] = kwargs
 
         def show(self):
             events.append("show")
@@ -374,12 +384,56 @@ def test_ui_self_test_no_longer_constructs_daily_password_dialog(monkeypatch):
         def close(self):
             events.append("close")
 
+    class FakeProfile:
+        config_path = Path("profile/config.json")
+        task_state_path = Path("profile/active-task.sqlite3")
+        log_directory = Path("profile/logs")
+        label = "实例 1"
+        settings_name = "DcmGet2-i1"
+
+        def close(self):
+            events.append("profile-close")
+
+    profile = FakeProfile()
+
+    def acquire_profile(*_args, **kwargs):
+        events.append("profile")
+        observed["profile_kwargs"] = kwargs
+        return profile
+
     monkeypatch.setattr(entry, "create_application", FakeApplication)
+    monkeypatch.setattr(entry, "acquire_instance_profile", acquire_profile)
     monkeypatch.setattr(entry, "DcmGetWindow", FakeWindow)
 
     assert entry.run_ui_self_test("unused.json") == 0
     assert not hasattr(entry, "DailyPasswordDialog")
-    assert events == ["window", "show", "events", "close", "events"]
+    profile_kwargs = observed["profile_kwargs"]
+    assert Path(profile_kwargs["state_root"]).name == "state"
+    assert Path(profile_kwargs["config_root"]).name == "config"
+    assert profile_kwargs["template_config_path"] == "unused.json"
+    assert observed["window_args"] == (
+        profile.config_path,
+        entry.PROJECT_ROOT,
+        profile.task_state_path,
+    )
+    assert observed["window_kwargs"] == {
+        "offer_task_resume": False,
+        "enable_multi_task": False,
+        "instance_label": profile.label,
+        "settings_name": profile.settings_name,
+        "log_directory": profile.log_directory,
+    }
+    assert observed["quit_callback"] == profile.close
+    assert events == [
+        "profile",
+        "quit-handler",
+        "window",
+        "show",
+        "events",
+        "close",
+        "events",
+        "profile-close",
+    ]
 
 
 def test_self_test_startup_error_does_not_open_modal_dialog(

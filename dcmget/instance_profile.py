@@ -49,7 +49,7 @@ class InstanceProfileError(RuntimeError):
     pass
 
 
-@dataclass(slots=True)
+@dataclass
 class InstanceProfile:
     number: int
     config_path: Path

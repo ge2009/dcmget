@@ -414,7 +414,7 @@ def download(url: str, destination: Path, attempts: int = 6) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, attempts + 1):
         size = destination.stat().st_size if destination.exists() else 0
-        headers = {"User-Agent": "DcmGet/2.9.0"}
+        headers = {"User-Agent": "DcmGet/2.9.1"}
         if size:
             headers["Range"] = f"bytes={size}-"
         try:

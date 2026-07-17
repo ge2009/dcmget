@@ -760,8 +760,8 @@ class DownloadRunner:
         staging.mkdir(parents=True, exist_ok=False)
         summary = BatchSummary(staging_directory=str(staging))
 
-        self.state_callback("starting_receiver")
         try:
+            self.state_callback("starting_receiver")
             if self._anonymizer:
                 self._emit(
                     "匿名",
@@ -789,10 +789,16 @@ class DownloadRunner:
                     self._append_cancelled(summary, values[index:])
                     break
         finally:
-            self.state_callback("stopping")
-            self._stop_storescp()
-            self._cleanup_staging(staging)
-            self._close_file_logger()
+            try:
+                self.state_callback("stopping")
+            finally:
+                try:
+                    self._stop_storescp()
+                finally:
+                    try:
+                        self._cleanup_staging(staging)
+                    finally:
+                        self._close_file_logger()
 
         if self._cancel.is_set():
             summary.cancelled = True

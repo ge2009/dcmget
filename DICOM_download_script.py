@@ -54,7 +54,7 @@ def default_legacy_catalog_was_migrated() -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.9.0 DICOM 批量下载工具")
+    parser = argparse.ArgumentParser(description="DcmGet 2.9.1 DICOM 批量下载工具")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),

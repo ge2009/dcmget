@@ -123,6 +123,8 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert 'Join-Path $baselineRoot "packaging\\windows\\dcmget.iss"' in workflow
     assert "DcmGet-2.6.1-Setup-x64.exe" in workflow
     assert '$baselineRecords[0].DisplayVersion -ne "2.6.1"' in workflow
+    assert '$upgradeUi = Start-Process "$installDir/DcmGet.exe"' in workflow
+    assert "Installed UI self-test failed" in workflow
     assert "/DAppVersion=2.0.0" not in workflow
 
 

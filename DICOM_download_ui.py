@@ -52,7 +52,7 @@ PROJECT_ROOT = resource_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DcmGet 2.9.0 图形界面")
+    parser = argparse.ArgumentParser(description="DcmGet 2.9.1 图形界面")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -268,22 +268,31 @@ def run_ui_self_test(config_path: str) -> int:
     app = create_application()
     with TemporaryDirectory(prefix="dcmget-ui-self-test-") as temporary:
         temporary_root = Path(temporary)
-        window = DcmGetWindow(
-            config_path,
-            PROJECT_ROOT,
-            temporary_root / "active-task.sqlite3",
-            offer_task_resume=False,
-            enable_multi_task=False,
-            instance_label="界面自检",
-            settings_name=f"DcmGet2-self-test-{os.getpid()}",
-            log_directory=temporary_root / "logs",
+        profile = acquire_instance_profile(
+            state_root=temporary_root / "state",
+            config_root=temporary_root / "config",
+            template_config_path=config_path,
         )
-        window.show()
-        app.processEvents()
-        if not window.isVisible() or window.centralWidget() is None:
-            raise RuntimeError("主窗口未能显示")
-        window.close()
-        app.processEvents()
+        try:
+            app.aboutToQuit.connect(profile.close)
+            window = DcmGetWindow(
+                profile.config_path,
+                PROJECT_ROOT,
+                profile.task_state_path,
+                offer_task_resume=False,
+                enable_multi_task=False,
+                instance_label=profile.label,
+                settings_name=profile.settings_name,
+                log_directory=profile.log_directory,
+            )
+            window.show()
+            app.processEvents()
+            if not window.isVisible() or window.centralWidget() is None:
+                raise RuntimeError("主窗口未能显示")
+            window.close()
+            app.processEvents()
+        finally:
+            profile.close()
     print(f"DcmGet {__version__} UI self-test OK")
     return 0
 

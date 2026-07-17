@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.9.0
+        default: 2.9.1
 
 permissions:
   contents: read
@@ -374,6 +374,9 @@ jobs:
 
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $upgradeUi = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--ui-self-test", "--config", "`"$configPath`"") -Wait -PassThru
+          if ($upgradeUi.ExitCode -ne 0) { throw "Installed UI self-test failed with code $($upgradeUi.ExitCode)" }
           $diagnosticLogs = @(
             Get-ChildItem (Join-Path $env:LOCALAPPDATA "DcmGet\logs") -Filter "dcmget-diagnostics-*.log" -File -ErrorAction SilentlyContinue |
               Where-Object { $_.Length -gt 0 }

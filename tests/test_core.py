@@ -449,6 +449,79 @@ def test_receiver_start_rejects_process_that_exits_after_port_appears(
     assert runner._receiver_lease is None
 
 
+def test_run_still_cleans_every_resource_when_stopping_callback_fails(
+    tmp_path, monkeypatch
+):
+    states: list[str] = []
+
+    def report_state(state: str) -> None:
+        states.append(state)
+        if state == "stopping":
+            raise RuntimeError("stopping callback failed")
+
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        state_callback=report_state,
+        log_directory=tmp_path / "logs",
+    )
+    stop_receiver = Mock(wraps=runner._stop_storescp)
+    cleanup_staging = Mock(wraps=runner._cleanup_staging)
+    close_logger = Mock(wraps=runner._close_file_logger)
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    monkeypatch.setattr(
+        runner,
+        "_download_one",
+        lambda accession, *_args: AccessionResult(
+            accession,
+            AccessionStatus.NO_DATA,
+        ),
+    )
+    monkeypatch.setattr(runner, "_stop_storescp", stop_receiver)
+    monkeypatch.setattr(runner, "_cleanup_staging", cleanup_staging)
+    monkeypatch.setattr(runner, "_close_file_logger", close_logger)
+
+    with pytest.raises(RuntimeError, match="stopping callback failed"):
+        runner.run(["ACC001"])
+
+    assert states == ["starting_receiver", "downloading", "stopping"]
+    stop_receiver.assert_called_once_with()
+    cleanup_staging.assert_called_once()
+    close_logger.assert_called_once_with()
+
+
+def test_run_cleanup_steps_do_not_block_later_cleanup(tmp_path, monkeypatch):
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    cleanup_staging = Mock(side_effect=RuntimeError("staging cleanup failed"))
+    close_logger = Mock(wraps=runner._close_file_logger)
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    monkeypatch.setattr(
+        runner,
+        "_download_one",
+        lambda accession, *_args: AccessionResult(
+            accession,
+            AccessionStatus.NO_DATA,
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_stop_storescp",
+        Mock(side_effect=RuntimeError("receiver cleanup failed")),
+    )
+    monkeypatch.setattr(runner, "_cleanup_staging", cleanup_staging)
+    monkeypatch.setattr(runner, "_close_file_logger", close_logger)
+
+    with pytest.raises(RuntimeError, match="staging cleanup failed"):
+        runner.run(["ACC001"])
+
+    cleanup_staging.assert_called_once()
+    close_logger.assert_called_once_with()
+
+
 def test_receiver_lease_is_held_until_cancel_cleanup_finishes(tmp_path, monkeypatch):
     state_directory = tmp_path / "state"
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
