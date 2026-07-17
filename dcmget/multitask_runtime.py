@@ -316,5 +316,5 @@ class SharedDcmtkRuntime:
             "",
             "接收器",
             f"无法归属的暂存文件已移入隔离目录：{destination}",
-            "warning",
+            "error",
         )

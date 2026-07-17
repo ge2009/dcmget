@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import socket
 import subprocess
@@ -108,6 +109,23 @@ def test_storescp_falls_back_to_single_process(tmp_path):
     assert "--single-process" in build_storescp_command(config, tools, tmp_path)
 
 
+def test_dcmtk_commands_trim_insignificant_ae_title_padding(tmp_path):
+    config = AppConfig(
+        calling_ae_title=" CALLING ",
+        pacs_ae_title=" PACS ",
+        storage_ae_title=" STORAGE ",
+    )
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+
+    store = build_storescp_command(config, tools, tmp_path)
+    move = build_movescu_command(config, tools, "A001")
+
+    assert store[store.index("-aet") + 1] == "STORAGE"
+    assert move[move.index("-aet") + 1] == "CALLING"
+    assert move[move.index("-aec") + 1] == "PACS"
+    assert move[move.index("-aem") + 1] == "STORAGE"
+
+
 def test_windows_dcmtk_fork_capability_is_not_disabled():
     tools = ToolPaths(
         Path("movescu.exe"),
@@ -188,6 +206,25 @@ def test_static_preflight_defers_receiver_port_check(tmp_path, monkeypatch):
     assert result.ok
     assert "storage_port" not in result.errors
     assert ("接收端口", True, "将在任务获得运行机会时检查") in result.checks
+
+
+def test_preflight_rejects_invalid_ae_titles_before_starting_tools(tmp_path):
+    config = AppConfig(
+        dicom_destination_folder=str(tmp_path),
+        calling_ae_title="调用AE",
+        pacs_ae_title="PACS\\BAD",
+        storage_ae_title="STORE\tBAD",
+    )
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    resolver = Mock(spec=DcmtkResolver)
+    resolver.resolve.return_value = tools
+
+    result = preflight(config, resolver, check_port=False)
+
+    assert not result.ok
+    assert "本机调用 AE Title" in result.errors["calling_ae_title"]
+    assert "PACS AE Title" in result.errors["pacs_ae_title"]
+    assert "接收 AE Title" in result.errors["storage_ae_title"]
 
 
 def test_preflight_requires_pdi_dcmtk_tools_only_when_pdi_is_enabled(tmp_path):
@@ -336,6 +373,106 @@ def test_concurrent_publish_never_overwrites_conflicting_sop_instance(tmp_path):
     remaining = [source for source in (first, second) if source.exists()]
     assert len(remaining) == 1
     assert remaining[0].read_bytes() != target.read_bytes()
+
+
+def test_cross_device_publish_copies_durably_before_removing_source(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "state" / "received.dcm"
+    target = tmp_path / "external" / "1.2.3.dcm"
+    source.parent.mkdir()
+    target.parent.mkdir()
+    source.write_bytes(b"complete-dicom-content")
+    real_replace = os.replace
+
+    def replace_with_cross_device_error(candidate, destination):
+        if Path(candidate) == source:
+            raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(candidate, destination)
+
+    monkeypatch.setattr(core.os, "replace", replace_with_cross_device_error)
+
+    core._publish_or_deduplicate(source, target)
+
+    assert not source.exists()
+    assert target.read_bytes() == b"complete-dicom-content"
+    assert list(target.parent.glob(".dcmget-publish-*.part")) == []
+
+
+def test_cross_device_copy_failure_keeps_source_and_removes_partial_target(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "state" / "received.dcm"
+    target = tmp_path / "external" / "1.2.3.dcm"
+    source.parent.mkdir()
+    target.parent.mkdir()
+    source.write_bytes(b"complete-dicom-content")
+    real_replace = os.replace
+
+    def replace_with_cross_device_error(candidate, destination):
+        if Path(candidate) == source:
+            raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(candidate, destination)
+
+    def fail_copy(_reader, writer, *, length):
+        del length
+        writer.write(b"partial")
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(core.os, "replace", replace_with_cross_device_error)
+    monkeypatch.setattr(core.shutil, "copyfileobj", fail_copy)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        core._publish_or_deduplicate(source, target)
+
+    assert source.read_bytes() == b"complete-dicom-content"
+    assert not target.exists()
+    assert list(target.parent.glob(".dcmget-publish-*.part")) == []
+
+
+def test_concurrent_cross_device_publish_preserves_conflicting_source(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "state-a" / "first.dcm"
+    second = tmp_path / "state-b" / "second.dcm"
+    target = tmp_path / "external" / "1.2.3.dcm"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    target.parent.mkdir()
+    first.write_bytes(b"first-content")
+    second.write_bytes(b"second-content")
+    sources = {first, second}
+    real_replace = os.replace
+
+    def replace_with_cross_device_error(candidate, destination):
+        if Path(candidate) in sources:
+            raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(candidate, destination)
+
+    monkeypatch.setattr(core.os, "replace", replace_with_cross_device_error)
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def publish(source: Path) -> None:
+        barrier.wait()
+        try:
+            core._publish_or_deduplicate(source, target)
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=publish, args=(source,)) for source in sources]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(errors) == 1
+    assert "SOP Instance UID 内容冲突" in str(errors[0])
+    remaining = [source for source in sources if source.exists()]
+    assert len(remaining) == 1
+    assert remaining[0].read_bytes() != target.read_bytes()
+    assert list(target.parent.glob(".dcmget-publish-*.part")) == []
 
 
 def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
@@ -1734,6 +1871,31 @@ def test_movescu_process_callback_tracks_start_and_stop(tmp_path, monkeypatch):
     assert events == [
         ("movescu", 123, "movescu", True),
         ("movescu", 123, "movescu", False),
+    ]
+
+
+def test_process_recovery_callback_failure_is_reported_as_error(tmp_path):
+    messages = []
+    config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+
+    def fail_process_update(*_event):
+        raise OSError("recovery database is read-only")
+
+    runner = DownloadRunner(
+        config,
+        tools,
+        log_callback=lambda source, message, level: messages.append(
+            (source, message, level)
+        ),
+        process_callback=fail_process_update,
+    )
+
+    runner._notify_process("movescu", 123, "movescu", True)
+    runner._close_file_logger()
+
+    assert messages == [
+        ("恢复", "无法更新 movescu 进程恢复信息：recovery database is read-only", "error")
     ]
 
 

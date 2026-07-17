@@ -42,6 +42,11 @@ from .task_state import (
 CATALOG_VERSION = 1
 RUNNABLE_PHASES = {"queued", "running", "pause_pending"}
 TERMINAL_PHASES = {"cancelled", "completed", "failed"}
+DELETABLE_TASK_PHASES = {
+    *TERMINAL_PHASES,
+    "download_retryable",
+    "pdi_retryable",
+}
 RECEIVER_TASK_PHASES = {
     *RUNNABLE_PHASES,
     "paused",
@@ -1779,12 +1784,36 @@ class TaskCatalog:
     def delete_task(self, task_id: str) -> None:
         try:
             with self._lock:
-                with closing(self._connect()) as connection, connection:
-                    cursor = connection.execute(
-                        "DELETE FROM tasks WHERE task_id = ?", (task_id,)
-                    )
-                    if cursor.rowcount != 1:
-                        raise TaskStateError("任务不存在")
+                with closing(self._connect()) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        row = connection.execute(
+                            "SELECT phase FROM tasks WHERE task_id = ?",
+                            (task_id,),
+                        ).fetchone()
+                        if row is None:
+                            raise TaskStateError("任务不存在")
+                        phase = str(row[0])
+                        if phase not in DELETABLE_TASK_PHASES:
+                            raise TaskStateError(
+                                "当前任务仍在运行、排队、暂停或生成 PDI，不能删除"
+                            )
+                        if connection.execute(
+                            "SELECT 1 FROM task_processes WHERE task_id = ? LIMIT 1",
+                            (task_id,),
+                        ).fetchone() is not None:
+                            raise TaskStateError(
+                                "任务仍有后台进程记录，请先结束任务并重新启动程序完成清理"
+                            )
+                        cursor = connection.execute(
+                            "DELETE FROM tasks WHERE task_id = ?", (task_id,)
+                        )
+                        if cursor.rowcount != 1:
+                            raise TaskStateError("任务不存在")
+                    except Exception:
+                        connection.rollback()
+                        raise
+                    connection.commit()
         except TaskStateError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -2261,6 +2290,28 @@ class TaskManager:
             self.catalog.retry_failed(task_id)
             self._scheduler.add(task_id)
         return self._with_queue_position(self.catalog.get_summary(task_id))
+
+    def delete_task(self, task_id: str) -> None:
+        """Delete one inactive task record without touching exported files."""
+
+        with self._lock:
+            summary = self.catalog.get_summary(task_id)
+            if (
+                task_id in self._active_task_ids
+                or any(
+                    active_task_id == task_id
+                    for active_task_id, _accession, _config in self._inflight.values()
+                )
+            ):
+                raise TaskStateError("任务仍有后台下载活动，不能删除")
+            if summary.phase not in DELETABLE_TASK_PHASES:
+                raise TaskStateError(
+                    "当前任务仍在运行、排队、暂停或生成 PDI，不能删除"
+                )
+            self.catalog.delete_task(task_id)
+            self._scheduler.remove(task_id)
+            self._cancel_requested.discard(task_id)
+            self._shutdown_requeue_ids.discard(task_id)
 
     def run_next_round(self) -> TaskSummary | None:
         if not self._download_slot.acquire(blocking=False):

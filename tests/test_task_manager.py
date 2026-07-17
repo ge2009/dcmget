@@ -64,6 +64,112 @@ def test_catalog_keeps_multiple_tasks_and_results_isolated(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "phase",
+    ["completed", "failed", "cancelled", "download_retryable", "pdi_retryable"],
+)
+def test_catalog_deletes_only_inactive_terminal_or_retryable_tasks(tmp_path, phase):
+    store = catalog(tmp_path)
+    task = store.create_task(AppConfig(), [f"A-{phase}"])
+    store.set_phase(task.task_id, phase)
+
+    store.delete_task(task.task_id)
+
+    with pytest.raises(TaskStateError, match="不存在"):
+        store.get_summary(task.task_id)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "queued",
+        "running",
+        "pause_pending",
+        "paused",
+        "cancelling",
+        "pdi_pending",
+        "pdi_running",
+    ],
+)
+def test_catalog_refuses_to_delete_task_with_background_or_resumable_state(
+    tmp_path, phase
+):
+    store = catalog(tmp_path)
+    task = store.create_task(AppConfig(), [f"A-{phase}"])
+    store.set_phase(task.task_id, phase)
+
+    with pytest.raises(TaskStateError, match="不能删除"):
+        store.delete_task(task.task_id)
+
+    assert store.get_summary(task.task_id).phase == phase
+
+
+def test_catalog_delete_cascades_database_rows_but_preserves_all_output_files(
+    tmp_path,
+):
+    store = catalog(tmp_path)
+    task = store.create_task(AppConfig(), ["A001"])
+    output_files = [
+        tmp_path / "dicom" / "A001.dcm",
+        tmp_path / "pdi" / "DICOMDIR",
+        tmp_path / "logs" / "task.log",
+        tmp_path / "quarantine" / "unresolved.dcm",
+    ]
+    for path in output_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"kept")
+    store.record_result(
+        task.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[str(output_files[0])],
+        ),
+    )
+    store.save_pdi_result(
+        task.task_id,
+        PdiExportResult(
+            PdiStatus.COMPLETED,
+            output_directory=str(output_files[1].parent),
+        ),
+    )
+    store.set_phase(task.task_id, "completed")
+
+    store.delete_task(task.task_id)
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM accessions WHERE task_id = ?", (task.task_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pdi_results WHERE task_id = ?", (task.task_id,)
+        ).fetchone()[0] == 0
+    assert all(path.read_bytes() == b"kept" for path in output_files)
+
+
+def test_catalog_refuses_delete_while_task_process_record_remains(tmp_path):
+    store = catalog(tmp_path)
+    task = store.create_task(AppConfig(), ["A001"])
+    store.set_phase(task.task_id, "completed")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            """
+            INSERT INTO task_processes(
+                task_id, kind, pid, process_created_at, executable,
+                command_line_json, process_group_id
+            ) VALUES (?, 'movescu', 123, 1.0, '/missing/movescu', '[]', 0)
+            """,
+            (task.task_id,),
+        )
+
+    with pytest.raises(TaskStateError, match="后台进程记录"):
+        store.delete_task(task.task_id)
+
+    assert store.get_summary(task.task_id).phase == "completed"
+
+
 def test_catalog_persists_complete_pdi_result_and_overwrites_latest(tmp_path):
     store = catalog(tmp_path)
     task = store.create_task(AppConfig(), ["A001"])
@@ -785,6 +891,25 @@ def test_failed_and_partial_results_retry_with_retained_files(tmp_path):
     assert completed_summary is not None
     assert completed_summary.phase == "completed"
     assert completed_summary.file_count == 2
+
+
+def test_manager_deletes_cancelled_task_and_rejects_queued_task(tmp_path):
+    store = catalog(tmp_path)
+    manager = TaskManager(
+        store,
+        lambda _task_id, _config, accession: completed(accession),
+    )
+    cancelled = manager.create_task(AppConfig(), ["A001"])
+    queued = manager.create_task(AppConfig(), ["B001"])
+    manager.cancel_task(cancelled.task_id)
+
+    manager.delete_task(cancelled.task_id)
+
+    assert [item.task_id for item in manager.list_tasks()] == [queued.task_id]
+    with pytest.raises(TaskStateError, match="不能删除"):
+        manager.delete_task(queued.task_id)
+    assert store.get_summary(queued.task_id).phase == "queued"
+    assert manager.shutdown()
 
 
 def test_executor_failure_marks_only_that_task_failed_and_stops_idle_receiver(

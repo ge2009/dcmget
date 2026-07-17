@@ -103,7 +103,7 @@ from .task_state import (
     TaskStateError,
     merge_checkpoint_summary,
 )
-from .task_manager import TaskSummary, shared_receiver_config
+from .task_manager import DELETABLE_TASK_PHASES, TaskSummary, shared_receiver_config
 from .task_controller import TaskExecutionController
 from .task_widgets import TaskWorkspace
 
@@ -328,8 +328,6 @@ class SettingsPage(QWidget):
         self.pacs_port_edit = self._port_edit()
         self.calling_ae_edit = QLineEdit()
         self.pacs_ae_edit = QLineEdit()
-        for widget in (self.calling_ae_edit, self.pacs_ae_edit):
-            widget.setMaxLength(16)
         pacs_form.addRow("PACS 地址", self.pacs_host_edit)
         pacs_form.addRow("PACS 端口", self.pacs_port_edit)
         pacs_form.addRow("本机调用 AE", self.calling_ae_edit)
@@ -337,7 +335,6 @@ class SettingsPage(QWidget):
 
         receiver_card, receiver_form = self._card("DICOM 接收器")
         self.storage_ae_edit = QLineEdit()
-        self.storage_ae_edit.setMaxLength(16)
         self.storage_port_edit = self._port_edit()
         self.max_concurrent_moves_spin = QSpinBox()
         self.max_concurrent_moves_spin.setRange(1, 8)
@@ -575,9 +572,9 @@ class SettingsPage(QWidget):
             dcmtk_bin_dir=self.dcmtk_edit.text().strip(),
             pacs_server_ip=self.pacs_host_edit.text().strip(),
             pacs_server_port=self._port_value(self.pacs_port_edit),
-            calling_ae_title=self.calling_ae_edit.text().strip(),
-            pacs_ae_title=self.pacs_ae_edit.text().strip(),
-            storage_ae_title=self.storage_ae_edit.text().strip(),
+            calling_ae_title=self.calling_ae_edit.text().strip(" "),
+            pacs_ae_title=self.pacs_ae_edit.text().strip(" "),
+            storage_ae_title=self.storage_ae_edit.text().strip(" "),
             storage_port=self._port_value(self.storage_port_edit),
             max_concurrent_moves=self.max_concurrent_moves_spin.value(),
             directory_template=self.directory_template_combo.currentText().strip(),
@@ -908,8 +905,9 @@ class DcmGetWindow(QMainWindow):
             else None
         )
         self._selected_task_id = ""
+        self._loaded_multi_task_id = ""
         self._multi_task_editor_active = True
-        self._multi_log_events: list[tuple[str, str, str, str]] = []
+        self._log_events: list[tuple[str, str, str, str]] = []
         self._last_pdi_results: dict[str, object] = {}
         self.tools: ToolPaths | None = None
         self.worker: DownloadWorker | None = None
@@ -966,6 +964,9 @@ class DcmGetWindow(QMainWindow):
         self._log_panel_expanded = self.settings_store.value(
             "window/log_expanded", False, type=bool
         )
+        self._show_detailed_logs = self.settings_store.value(
+            "window/log_detailed", False, type=bool
+        )
         self._task_form_expanded = self.settings_store.value(
             "window/task_form_expanded", True, type=bool
         )
@@ -1005,6 +1006,9 @@ class DcmGetWindow(QMainWindow):
         )
         self.task_workspace.task_selected.connect(
             self._on_workspace_task_selected
+        )
+        self.task_workspace.delete_task_requested.connect(
+            self._delete_multi_task
         )
         self.task_workspace.compact_mode_changed.connect(
             lambda _compact: self._update_responsive_layouts(force=True)
@@ -1295,6 +1299,15 @@ class DcmGetWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.hide()
         self.stop_button.clicked.connect(self._stop_download)
+        self.delete_task_button = QPushButton("删除任务")
+        self.delete_task_button.setObjectName("DangerButton")
+        self.delete_task_button.setToolTip(
+            "仅删除任务记录，不删除 DICOM、PDI、日志或隔离文件"
+        )
+        self.delete_task_button.hide()
+        self.delete_task_button.clicked.connect(
+            lambda _checked=False: self._delete_multi_task(self._selected_task_id)
+        )
         self.start_button = QPushButton("开始下载")
         self.start_button.setObjectName("PrimaryButton")
         self.start_button.setToolTip("开始下载（Ctrl+Enter）")
@@ -1309,6 +1322,7 @@ class DcmGetWindow(QMainWindow):
             self.log_toggle_button,
             self.pause_button,
             self.stop_button,
+            self.delete_task_button,
             self.start_button,
         )
         layout.addLayout(self.task_action_layout)
@@ -1498,11 +1512,22 @@ class DcmGetWindow(QMainWindow):
             self._refresh_multi_log_view
         )
         header.addWidget(self.log_scope_combo)
+        self.log_detail_checkbox = QCheckBox("显示详细日志")
+        self.log_detail_checkbox.setChecked(self._show_detailed_logs)
+        self.log_detail_checkbox.setToolTip(
+            "默认仅显示错误；开启后显示调试、信息、成功和警告。"
+            "磁盘日志始终保留完整内容。"
+        )
+        self.log_detail_checkbox.toggled.connect(
+            self._on_log_detail_toggled
+        )
+        header.addWidget(self.log_detail_checkbox)
         open_result = QPushButton("打开结果")
         open_result.clicked.connect(self._open_selected_result)
         copy_error = QPushButton("复制详情")
         copy_error.clicked.connect(self._copy_selected_detail)
-        clear = QPushButton("清空日志")
+        clear = QPushButton("清空显示")
+        clear.setToolTip("只清空界面缓存，不删除磁盘日志")
         clear.clicked.connect(self._clear_logs)
         open_logs = QPushButton("日志目录")
         open_logs.clicked.connect(self._open_log_directory)
@@ -1673,6 +1698,7 @@ class DcmGetWindow(QMainWindow):
         if self.multi_task_enabled:
             self.task_workspace.clear_task_selection()
             self._selected_task_id = ""
+            self._loaded_multi_task_id = ""
             self._multi_task_editor_active = True
             self._active_task_id = ""
             self._resume_checkpoint = None
@@ -1689,6 +1715,7 @@ class DcmGetWindow(QMainWindow):
             self.stop_button.hide()
             self.pause_button.hide()
             self.retry_button.hide()
+            self.delete_task_button.hide()
             self.start_button.show()
             self.start_button.setEnabled(True)
             concurrent = sum(
@@ -1946,17 +1973,56 @@ class DcmGetWindow(QMainWindow):
 
     def _on_multi_task_updated(self, summary: TaskSummary) -> None:
         previous = self._workspace_task_summaries.get(summary.task_id)
+        if previous is None and self.task_controller is not None:
+            try:
+                summary = self.task_controller.catalog.get_summary(summary.task_id)
+            except TaskStateError:
+                # A queued worker/PDI signal can arrive after the user deletes
+                # the terminal task.  Never recreate a UI-only ghost record.
+                self.task_workspace.remove_task(summary.task_id)
+                return
+        elif previous is not None and summary.updated_at < previous.updated_at:
+            # Signals from the download, live-progress and PDI threads can be
+            # delivered out of order.  Keep the newest persisted task view.
+            return
         self._workspace_task_summaries[summary.task_id] = summary
         self.task_workspace.upsert_task(summary)
         if summary.task_id != self._selected_task_id:
             return
         self._render_multi_summary(summary)
+        if self._loaded_multi_task_id != summary.task_id:
+            self._load_multi_task_detail(summary.task_id)
+            return
+        if summary.total_count > TASK_TABLE_DETAIL_LIMIT:
+            self._apply_large_multi_task_summary(summary)
+            if previous is None or previous.phase != summary.phase:
+                self._render_multi_pdi_result(summary)
+            return
         if (
             previous is None
             or previous.processed_count != summary.processed_count
             or previous.phase != summary.phase
         ):
             self._load_multi_task_detail(summary.task_id)
+
+    def _apply_large_multi_task_summary(self, summary: TaskSummary) -> None:
+        """Refresh a hidden-detail task from its exact catalog summary."""
+
+        self._display_total = summary.total_count
+        self._hidden_accession_count = summary.total_count
+        self._task_table_summary_mode = True
+        self._summary_results = {}
+        self._summary_processed = summary.processed_count
+        self._summary_files = summary.file_count
+        self._summary_status_counts = {
+            AccessionStatus.COMPLETED: summary.completed_only_count,
+            AccessionStatus.NO_DATA: summary.no_data_count,
+            AccessionStatus.PARTIAL: summary.partial_count,
+            AccessionStatus.FAILED: summary.failed_only_count,
+            AccessionStatus.CANCELLED: summary.cancelled_count,
+        }
+        self._update_large_batch_summary_label(summary.total_count)
+        self._sync_task_detail_visibility()
 
     def _load_multi_task_detail(self, task_id: str) -> None:
         controller = self.task_controller
@@ -1972,6 +2038,7 @@ class DcmGetWindow(QMainWindow):
             return
         summary = detail.summary
         self._selected_task_id = task_id
+        self._loaded_multi_task_id = task_id
         self._display_total = summary.total_count
         self._active_task_id = ""
         self.destination_edit.setText(detail.config.dicom_destination_folder)
@@ -2005,25 +2072,14 @@ class DcmGetWindow(QMainWindow):
             self._task_table_summary_mode = True
             self.task_table.setRowCount(0)
             self.row_by_accession.clear()
-            self._summary_results = {}
-            self._summary_processed = summary.processed_count
-            self._summary_files = summary.file_count
-            self._summary_status_counts = {
-                AccessionStatus.COMPLETED: summary.completed_only_count,
-                AccessionStatus.NO_DATA: summary.no_data_count,
-                AccessionStatus.PARTIAL: summary.partial_count,
-                AccessionStatus.FAILED: summary.failed_only_count,
-                AccessionStatus.CANCELLED: summary.cancelled_count,
-            }
-            self._update_large_batch_summary_label(summary.total_count)
-            self._sync_task_detail_visibility()
+            self._apply_large_multi_task_summary(summary)
         self._render_multi_summary(summary)
         self.last_pdi_result = self._last_pdi_results.get(task_id)
         if self.last_pdi_result is None:
             try:
                 self.last_pdi_result = controller.load_pdi_result(task_id)
             except TaskStateError as exc:
-                self._append_log("PDI", f"无法恢复 PDI 结果：{exc}", "warning")
+                self._append_log("PDI", f"无法恢复 PDI 结果：{exc}", "error")
             if self.last_pdi_result is not None:
                 self._last_pdi_results[task_id] = self.last_pdi_result
         self._render_multi_pdi_result(summary)
@@ -2053,6 +2109,9 @@ class DcmGetWindow(QMainWindow):
         self.retry_button.setVisible(retryable)
         self.retry_button.setEnabled(retryable)
         self.retry_button.setText("重试失败项" if phase == "download_retryable" else "恢复任务")
+        deletable = phase in DELETABLE_TASK_PHASES
+        self.delete_task_button.setVisible(deletable)
+        self.delete_task_button.setEnabled(deletable)
         self.accept_partial_button.hide()
         self.discard_resume_button.hide()
         self.open_existing_pdi_button.setVisible(True)
@@ -2301,7 +2360,7 @@ class DcmGetWindow(QMainWindow):
             try:
                 self.task_store.clear(checkpoint.task_id)
             except TaskStateError as exc:
-                self._append_log("恢复", str(exc), "warning")
+                self._append_log("恢复", str(exc), "error")
             self.task_store.release_lease()
             return
 
@@ -2826,7 +2885,8 @@ class DcmGetWindow(QMainWindow):
             f"已创建任务 {summary.task_id[:8]}，共 {summary.total_count:,} 个检查号",
             "success",
         )
-        self._load_multi_task_detail(summary.task_id)
+        if self._loaded_multi_task_id != summary.task_id:
+            self._load_multi_task_detail(summary.task_id)
 
     def _start_download(
         self,
@@ -2916,7 +2976,7 @@ class DcmGetWindow(QMainWindow):
                 try:
                     self.task_store.clear(resume_checkpoint.task_id)
                 except TaskStateError as exc:
-                    self._append_log("恢复", str(exc), "warning")
+                    self._append_log("恢复", str(exc), "error")
                 self._resume_checkpoint = None
                 self.task_store.release_lease()
                 self._set_running(False)
@@ -3933,7 +3993,7 @@ class DcmGetWindow(QMainWindow):
         if process is not self._pdi_viewer_process:
             return
         if self._pdi_viewer_ready:
-            self._append_log("PDI", f"离线阅片服务异常：{process.errorString()}", "warning")
+            self._append_log("PDI", f"离线阅片服务异常：{process.errorString()}", "error")
             return
         self._fail_pdi_viewer_start(
             f"离线阅片服务启动失败：{process.errorString()}"
@@ -4031,6 +4091,56 @@ class DcmGetWindow(QMainWindow):
             "下载中断",
             f"{message}\n\n已完成项已保存；重新启动 DcmGet 后可继续剩余任务。",
         )
+
+    def _delete_multi_task(self, task_id: str) -> None:
+        controller = self.task_controller
+        if not self.multi_task_enabled or controller is None or not task_id:
+            return
+        try:
+            tasks_before = controller.list_tasks()
+            summary = next(item for item in tasks_before if item.task_id == task_id)
+        except (StopIteration, TaskStateError):
+            QMessageBox.warning(self, "无法删除任务", "任务记录不存在或已经被删除。")
+            return
+        if summary.phase not in DELETABLE_TASK_PHASES:
+            QMessageBox.warning(
+                self,
+                "无法删除任务",
+                "运行、排队、暂停、取消中或正在生成 PDI 的任务不能删除。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除任务记录",
+            (
+                "确定从任务列表删除这个任务吗？\n\n"
+                "仅删除任务记录和进度，不会删除已下载的 DICOM、PDI、"
+                "日志或隔离文件。\n\n此操作无法撤销。"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        ordered_ids = [item.task_id for item in tasks_before]
+        deleted_row = ordered_ids.index(task_id)
+        try:
+            controller.delete_task(task_id)
+        except TaskStateError as exc:
+            QMessageBox.warning(self, "无法删除任务", str(exc))
+            return
+        self._workspace_task_summaries.pop(task_id, None)
+        self._last_pdi_results.pop(task_id, None)
+        self.task_workspace.remove_task(task_id)
+        remaining = controller.list_tasks()
+        if remaining:
+            adjacent = remaining[min(deleted_row, len(remaining) - 1)]
+            self._on_multi_tasks_updated(remaining)
+            self.task_workspace.select_task(adjacent.task_id)
+            self._on_workspace_task_selected(adjacent.task_id)
+            return
+        self._on_multi_tasks_updated([])
+        self._show_new_task_editor()
 
     def _on_worker_thread_finished(self) -> None:
         if self.sender() is not self.worker_thread:
@@ -4284,8 +4394,32 @@ class DcmGetWindow(QMainWindow):
         )
 
     def _append_log(self, source: str, message: str, level: str) -> None:
-        if level == "error" and not self._log_panel_expanded:
+        self._record_log_event("", source, message, level)
+
+    def _record_log_event(
+        self,
+        task_id: str,
+        source: str,
+        message: str,
+        level: str,
+    ) -> None:
+        self._log_events.append((task_id, source, message, level))
+        if len(self._log_events) > 5000:
+            del self._log_events[: len(self._log_events) - 5000]
+        visible = self._log_event_is_visible(task_id, level)
+        if level == "error" and visible and not self._log_panel_expanded:
             self._set_log_panel_expanded(True)
+        if not visible:
+            return
+        display_source = f"{source} · {task_id[:8]}" if task_id else source
+        self._render_log_event(display_source, message, level)
+
+    def _render_log_event(
+        self,
+        source: str,
+        message: str,
+        level: str,
+    ) -> None:
         colors = {
             "debug": COLORS["muted"],
             "info": COLORS["text"],
@@ -4303,6 +4437,14 @@ class DcmGetWindow(QMainWindow):
         scrollbar = self.log_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _log_event_is_visible(self, task_id: str, level: str) -> bool:
+        if not self._show_detailed_logs and level != "error":
+            return False
+        if not self.multi_task_enabled:
+            return True
+        show_all = self.log_scope_combo.currentData() == "all"
+        return show_all or not task_id or task_id == self._selected_task_id
+
     def _on_multi_log(
         self,
         task_id: str,
@@ -4310,30 +4452,27 @@ class DcmGetWindow(QMainWindow):
         message: str,
         level: str,
     ) -> None:
-        self._multi_log_events.append((task_id, source, message, level))
-        if len(self._multi_log_events) > 5000:
-            del self._multi_log_events[: len(self._multi_log_events) - 5000]
-        show_all = self.log_scope_combo.currentData() == "all"
-        if show_all or not task_id or task_id == self._selected_task_id:
-            display_source = (
-                f"{source} · {task_id[:8]}" if task_id else source
-            )
-            self._append_log(display_source, message, level)
+        self._record_log_event(task_id, source, message, level)
 
     def _refresh_multi_log_view(self, _index: int = 0) -> None:
-        if not self.multi_task_enabled or not hasattr(self, "log_edit"):
+        if not hasattr(self, "log_edit"):
             return
         self.log_edit.clear()
-        show_all = self.log_scope_combo.currentData() == "all"
-        for task_id, source, message, level in self._multi_log_events:
-            if show_all or not task_id or task_id == self._selected_task_id:
-                display_source = (
-                    f"{source} · {task_id[:8]}" if task_id else source
-                )
-                self._append_log(display_source, message, level)
+        for task_id, source, message, level in self._log_events:
+            if not self._log_event_is_visible(task_id, level):
+                continue
+            display_source = f"{source} · {task_id[:8]}" if task_id else source
+            self._render_log_event(display_source, message, level)
+
+    def _on_log_detail_toggled(self, checked: bool) -> None:
+        self._show_detailed_logs = bool(checked)
+        self.settings_store.setValue(
+            "window/log_detailed", self._show_detailed_logs
+        )
+        self._refresh_multi_log_view()
 
     def _clear_logs(self) -> None:
-        self._multi_log_events.clear()
+        self._log_events.clear()
         self.log_edit.clear()
 
     def _selected_result_directory(self) -> str:
@@ -4509,6 +4648,9 @@ class DcmGetWindow(QMainWindow):
         self.settings_store.setValue("window/geometry", self.saveGeometry())
         self.settings_store.setValue("window/splitter", self.task_splitter.saveState())
         self.settings_store.setValue("window/log_expanded", self._log_panel_expanded)
+        self.settings_store.setValue(
+            "window/log_detailed", self._show_detailed_logs
+        )
         self.settings_store.setValue(
             "window/task_form_expanded", self._task_form_expanded
         )

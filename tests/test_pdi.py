@@ -155,6 +155,30 @@ def _config(tmp_path: Path, **overrides: object) -> AppConfig:
     return AppConfig(**values)
 
 
+def test_pdi_process_recovery_callback_failure_is_reported_as_error(
+    tmp_path: Path, tools: ToolPaths
+) -> None:
+    messages = []
+
+    def fail_process_update(*_event: object) -> None:
+        raise OSError("recovery database is read-only")
+
+    exporter = PdiExporter(
+        _config(tmp_path),
+        tools,
+        log_callback=lambda source, message, level: messages.append(
+            (source, message, level)
+        ),
+        process_callback=fail_process_update,
+    )
+
+    exporter._notify_process(123, "dcmmkdir", True)
+
+    assert messages == [
+        ("PDI", "无法更新 PDI 子进程恢复信息：recovery database is read-only", "error")
+    ]
+
+
 def _viewer(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / "index.html").write_text("<html><script src='/app.js'></script></html>")

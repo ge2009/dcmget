@@ -23,6 +23,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .task_manager import DELETABLE_TASK_PHASES
+
 
 TASK_WIDGET_COLORS = {
     "primary": "#0369A1",
@@ -428,6 +430,7 @@ class TaskSummaryDelegate(QStyledItemDelegate):
 class TaskSidebar(QFrame):
     new_task_requested = pyqtSignal()
     task_selected = pyqtSignal(str)
+    delete_task_requested = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -442,6 +445,15 @@ class TaskSidebar(QFrame):
         title.setObjectName("TaskSidebarTitle")
         header.addWidget(title)
         header.addStretch()
+        self.delete_task_button = QPushButton("删除")
+        self.delete_task_button.setObjectName("TaskDeleteButton")
+        self.delete_task_button.setAccessibleName("删除选中的任务记录")
+        self.delete_task_button.setToolTip(
+            "仅删除已结束任务的记录，不删除 DICOM、PDI 或日志文件"
+        )
+        self.delete_task_button.setEnabled(False)
+        self.delete_task_button.clicked.connect(self._request_delete_current)
+        header.addWidget(self.delete_task_button)
         self.new_task_button = QPushButton("新建任务")
         self.new_task_button.setObjectName("TaskPrimaryButton")
         self.new_task_button.setAccessibleName("新建下载任务")
@@ -487,6 +499,7 @@ class TaskSidebar(QFrame):
         layout.addWidget(self.list_stack, 1)
 
         self.model.tasks_changed.connect(self._refresh_summary)
+        self.model.tasks_changed.connect(self._refresh_delete_button)
         self._refresh_summary()
 
     def set_tasks(self, tasks: Iterable[TaskSummaryLike]) -> None:
@@ -528,10 +541,21 @@ class TaskSidebar(QFrame):
         current: QModelIndex,
         _previous: QModelIndex,
     ) -> None:
+        self._refresh_delete_button()
         if current.isValid():
             self.task_selected.emit(
                 str(current.data(TaskListModel.TaskIdRole) or "")
             )
+
+    def _refresh_delete_button(self) -> None:
+        index = self.list_view.currentIndex()
+        phase = str(index.data(TaskListModel.PhaseRole) or "") if index.isValid() else ""
+        self.delete_task_button.setEnabled(phase in DELETABLE_TASK_PHASES)
+
+    def _request_delete_current(self) -> None:
+        task_id = self.current_task_id()
+        if task_id and self.delete_task_button.isEnabled():
+            self.delete_task_requested.emit(task_id)
 
     def _refresh_summary(self) -> None:
         tasks = self.model.tasks()
@@ -588,6 +612,7 @@ class TaskWorkspace(QWidget):
 
     new_task_requested = pyqtSignal()
     task_selected = pyqtSignal(str)
+    delete_task_requested = pyqtSignal(str)
     compact_mode_changed = pyqtSignal(bool)
 
     def __init__(
@@ -610,6 +635,7 @@ class TaskWorkspace(QWidget):
         self.sidebar = TaskSidebar()
         self.sidebar.new_task_requested.connect(self._request_new_task)
         self.sidebar.task_selected.connect(self._on_task_selected)
+        self.sidebar.delete_task_requested.connect(self.delete_task_requested.emit)
         self.sidebar.list_view.clicked.connect(self._on_task_clicked)
         self.splitter.addWidget(self.sidebar)
 
@@ -834,11 +860,23 @@ QPushButton#TaskPrimaryButton:hover {{
     background: {TASK_WIDGET_COLORS['primary_hover']};
 }}
 QPushButton#TaskPrimaryButton:focus {{ border: 2px solid #FBBF24; }}
+QPushButton#TaskDeleteButton {{
+    color: {TASK_WIDGET_COLORS['danger']};
+    background: {TASK_WIDGET_COLORS['surface']};
+    border: 1px solid {TASK_WIDGET_COLORS['border']};
+    border-radius: 6px;
+    padding: 7px 10px;
+}}
+QPushButton#TaskDeleteButton:hover:enabled {{
+    background: #FEF2F2;
+    border-color: {TASK_WIDGET_COLORS['danger']};
+}}
 """
 
 
 __all__ = [
     "TASK_LIST_ITEM_HEIGHT",
+    "DELETABLE_TASK_PHASES",
     "TASK_WIDGET_COLORS",
     "TASK_WORKSPACE_COMPACT_WIDTH",
     "TaskListModel",

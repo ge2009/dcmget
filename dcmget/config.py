@@ -17,6 +17,12 @@ DIRECTORY_TEMPLATES = (
 )
 DIRECTORY_TEMPLATE_FIELDS = {"PatientID", "AccessionNumber", "StudyInstanceUID"}
 
+AE_TITLE_LABELS = {
+    "calling_ae_title": "本机调用 AE Title",
+    "pacs_ae_title": "PACS AE Title",
+    "storage_ae_title": "接收 AE Title",
+}
+
 DEFAULT_ANONYMIZATION_PROFILE = "research"
 ANONYMIZATION_PROFILE_OPTIONS = (
     (
@@ -38,6 +44,20 @@ ANONYMIZATION_PROFILE_OPTIONS = (
 ANONYMIZATION_PROFILE_IDS = {
     profile_id for profile_id, _label, _description in ANONYMIZATION_PROFILE_OPTIONS
 }
+
+
+def validate_ae_title(value: object, label: str = "AE Title") -> str:
+    """Return a user-facing validation error for a DICOM AE Title."""
+    title = ("" if value is None else str(value)).strip(" ")
+    if not title:
+        return f"请输入{label}"
+    if len(title) > 16:
+        return f"{label}最多 16 个字符"
+    if "\\" in title or any(not 0x20 <= ord(char) <= 0x7E for char in title):
+        return (
+            f"{label}只能使用可打印 ASCII 字符，且不能包含反斜杠（\\）"
+        )
+    return ""
 
 
 @dataclass(slots=True)
@@ -112,6 +132,9 @@ class AppConfig:
         values["max_log_file_size_bytes"] = _as_int(
             values["max_log_file_size_bytes"], 104_857_600
         )
+        for field in AE_TITLE_LABELS:
+            value = values[field]
+            values[field] = ("" if value is None else str(value)).strip(" ")
         values["anonymization_enabled"] = _as_bool(
             values["anonymization_enabled"], False
         )
@@ -134,18 +157,15 @@ class AppConfig:
         required = {
             "dicom_destination_folder": "请选择 DICOM 保存目录",
             "pacs_server_ip": "请输入 PACS 服务器地址",
-            "calling_ae_title": "请输入本机调用 AE Title",
-            "pacs_ae_title": "请输入 PACS AE Title",
-            "storage_ae_title": "请输入接收 AE Title",
         }
         for field, message in required.items():
             if not str(getattr(self, field)).strip():
                 errors[field] = message
 
-        for field in ("calling_ae_title", "pacs_ae_title", "storage_ae_title"):
-            value = str(getattr(self, field)).strip()
-            if len(value) > 16:
-                errors[field] = "AE Title 最多 16 个字符"
+        for field, label in AE_TITLE_LABELS.items():
+            message = validate_ae_title(getattr(self, field), label)
+            if message:
+                errors[field] = message
 
         if not 1 <= self.pacs_server_port <= 65535:
             errors["pacs_server_port"] = "端口必须在 1 到 65535 之间"

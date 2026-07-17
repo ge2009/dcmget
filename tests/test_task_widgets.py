@@ -209,6 +209,13 @@ def test_sidebar_summary_selection_and_new_task_signal(qtbot):
     with qtbot.waitSignal(sidebar.task_selected) as selected:
         assert sidebar.select_task("queued")
     assert selected.args == ["queued"]
+    assert not sidebar.delete_task_button.isEnabled()
+
+    assert sidebar.select_task("failed")
+    assert sidebar.delete_task_button.isEnabled()
+    with qtbot.waitSignal(sidebar.delete_task_requested) as deleted:
+        qtbot.mouseClick(sidebar.delete_task_button, Qt.LeftButton)
+    assert deleted.args == ["failed"]
 
     with qtbot.waitSignal(sidebar.new_task_requested):
         qtbot.mouseClick(sidebar.new_task_button, Qt.LeftButton)

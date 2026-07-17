@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from pydicom import dcmread
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.encaps import encapsulate
@@ -241,7 +242,7 @@ def test_unassigned_object_is_quarantined_and_reported_failed(tmp_path: Path):
     assert len(quarantined) == 1
     assert dcmread(quarantined[0]).SOPInstanceUID == dataset.SOPInstanceUID
     assert any(
-        level == "warning" and "无法归属" in message
+        level == "error" and "无法归属" in message
         for _, message, level in messages
     )
 
@@ -297,3 +298,13 @@ def test_duplicate_accession_and_conflicting_study_bindings_are_rejected(
         assert "另一个" in str(exc)
     else:
         raise AssertionError("conflicting Study Instance UID was accepted")
+
+
+@pytest.mark.parametrize("ae_title", ["中文AE", "BAD\\AE", "BAD\tAE"])
+def test_receiver_rejects_invalid_dicom_ae_title(ae_title, tmp_path):
+    with pytest.raises(ValueError, match="接收 AE Title"):
+        PynetdicomStorageSCP(
+            ae_title,
+            0,
+            quarantine_directory=tmp_path / "quarantine",
+        )

@@ -106,6 +106,29 @@ def test_controller_applies_configured_move_concurrency(tmp_path, monkeypatch):
     assert controller.shutdown()
 
 
+def test_controller_deletes_completed_task_and_publishes_current_list(
+    qtbot, tmp_path, monkeypatch
+):
+    from dcmget import task_controller
+
+    monkeypatch.setattr(task_controller, "SharedDcmtkRuntime", _Runtime)
+    controller = TaskExecutionController(
+        AppConfig(),
+        _tools(tmp_path),
+        catalog_path=tmp_path / "tasks.sqlite3",
+        legacy_path=tmp_path / "active-task.sqlite3",
+    )
+    task = controller.manager.create_task(AppConfig(), ["A001"])
+    controller.catalog.set_phase(task.task_id, "completed")
+
+    with qtbot.waitSignal(controller.tasks_updated) as updated:
+        controller.delete_task(task.task_id)
+
+    assert updated.args == [[]]
+    assert controller.list_tasks() == []
+    assert controller.shutdown()
+
+
 def test_controller_runs_tasks_fairly_and_publishes_live_progress(
     qtbot, tmp_path, monkeypatch
 ):
@@ -381,6 +404,40 @@ def test_pdi_export_runs_in_parallel_with_next_download(qtbot, tmp_path, monkeyp
         "A001",
         "B001",
     ]
+    assert controller.shutdown()
+
+
+def test_late_pdi_pending_signal_does_not_requeue_completed_export(
+    tmp_path, monkeypatch
+):
+    from dcmget import task_controller
+
+    monkeypatch.setattr(task_controller, "SharedDcmtkRuntime", _Runtime)
+    controller = TaskExecutionController(
+        AppConfig(),
+        _tools(tmp_path),
+        catalog_path=tmp_path / "tasks.sqlite3",
+        legacy_path=tmp_path / "active-task.sqlite3",
+    )
+    task = controller.manager.create_task(
+        AppConfig(
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        ["A001"],
+    )
+    controller.catalog.set_phase(task.task_id, "pdi_pending")
+    stale = controller.catalog.get_summary(task.task_id)
+    # The independent PDI worker can finish before the queued Qt signal is
+    # delivered to this controller slot.
+    controller.catalog.set_phase(task.task_id, "completed")
+    published = []
+    controller.task_updated.connect(published.append)
+
+    controller._on_download_task_updated(stale)
+
+    assert controller.catalog.get_summary(task.task_id).phase == "completed"
+    assert published[-1].phase == "completed"
     assert controller.shutdown()
 
 

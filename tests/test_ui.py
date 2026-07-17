@@ -483,6 +483,27 @@ def test_settings_validation_is_inline(qtbot, tmp_path):
     assert page.pacs_host_edit.hasFocus()
 
 
+def test_settings_ae_title_validation_is_inline_and_field_specific(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    page = window.settings_page
+    window.pages.setCurrentWidget(page)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow)
+    page.calling_ae_edit.setText("调用AE")
+    page.pacs_ae_edit.setText("PACS\\BAD")
+    page.storage_ae_edit.setText("S" * 17)
+
+    page._save()
+
+    assert page.calling_ae_edit.property("invalid") is True
+    assert "本机调用 AE Title" in page.calling_ae_edit.toolTip()
+    assert "PACS AE Title" in page.pacs_ae_edit.toolTip()
+    assert "接收 AE Title" in page.storage_ae_edit.toolTip()
+    assert "最多 16 个字符" in page.storage_ae_edit.toolTip()
+    assert page.storage_ae_edit.text() == "S" * 17
+    assert page.calling_ae_edit.hasFocus()
+
+
 def test_settings_ports_are_plain_text_fields_with_range_validation(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     page = window.settings_page
@@ -1196,12 +1217,48 @@ def test_log_panel_defaults_collapsed_and_error_expands_it(qtbot, tmp_path):
 
     assert not window._log_panel_expanded
     assert window.log_panel.isHidden()
+    assert not window.log_detail_checkbox.isChecked()
 
     window._append_log("应用", "测试错误", "error")
 
     assert window._log_panel_expanded
     assert window.log_panel.isVisible()
     assert window.log_toggle_button.text() == "收起日志"
+    assert "测试错误" in window.log_edit.toPlainText()
+
+
+def test_log_view_defaults_to_errors_and_detail_toggle_replays_buffer(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+
+    window._append_log("应用", "普通信息", "info")
+    window._append_log("接收器", "连接警告", "warning")
+    window._append_log("应用", "失败详情", "error")
+
+    visible = window.log_edit.toPlainText()
+    assert "失败详情" in visible
+    assert "普通信息" not in visible
+    assert "连接警告" not in visible
+
+    window.log_detail_checkbox.setChecked(True)
+
+    detailed = window.log_edit.toPlainText()
+    assert "失败详情" in detailed
+    assert "普通信息" in detailed
+    assert "连接警告" in detailed
+
+    window.log_detail_checkbox.setChecked(False)
+    assert "失败详情" in window.log_edit.toPlainText()
+    assert "普通信息" not in window.log_edit.toPlainText()
+
+
+def test_log_detail_preference_is_saved_on_close(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    window.log_detail_checkbox.setChecked(True)
+
+    assert window.close()
+
+    restored = make_window(qtbot, tmp_path)
+    assert restored.log_detail_checkbox.isChecked()
 
 
 def test_header_diagnostic_log_button_opens_private_log_directory(

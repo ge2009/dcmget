@@ -1327,7 +1327,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         try:
             self.process_callback("pdi", pid, executable, active)
         except Exception as exc:
-            self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "warning")
+            self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "error")
 
 
 def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:

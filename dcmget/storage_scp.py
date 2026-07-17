@@ -22,6 +22,7 @@ from pynetdicom import (
 from pynetdicom import _config as pynetdicom_config
 from pynetdicom.sop_class import Verification
 
+from .config import validate_ae_title
 from .runtime import ensure_application_state_dir
 
 
@@ -66,9 +67,10 @@ class PynetdicomStorageSCP:
         maximum_associations: int = 32,
         allow_single_route_fallback: bool = False,
     ) -> None:
-        title = ae_title.strip()
-        if not title or len(title) > 16 or not title.isascii():
-            raise ValueError("接收 AE 必须是 1-16 个 ASCII 字符")
+        title = ae_title.strip(" ")
+        title_error = validate_ae_title(title, "接收 AE Title")
+        if title_error:
+            raise ValueError(title_error)
         if not 0 <= int(port) <= 65535:
             raise ValueError("接收端口必须在 0-65535 之间")
         if maximum_associations < 1:
@@ -281,7 +283,7 @@ class PynetdicomStorageSCP:
                 self._emit(
                     "接收器",
                     f"收到无法归属的 DICOM，已隔离到 {quarantined}：{reason}",
-                    "warning",
+                    "error",
                 )
                 return _STORE_FAILURE
 

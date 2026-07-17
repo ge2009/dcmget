@@ -271,6 +271,150 @@ def test_stale_task_snapshot_cannot_remove_a_newer_catalog_task(
     window.close()
 
 
+def test_stale_task_update_cannot_recreate_a_deleted_task(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    controller = window.task_controller
+    assert controller is not None
+    task = controller.catalog.create_task(AppConfig(), ["A001"])
+    controller.catalog.set_phase(task.task_id, "completed")
+    stale = controller.catalog.get_summary(task.task_id)
+    window._on_multi_tasks_updated([stale])
+
+    controller.manager.delete_task(task.task_id)
+    window._on_multi_tasks_updated([])
+    window._on_multi_task_updated(stale)
+
+    assert task.task_id not in window._workspace_task_summaries
+    assert window.task_workspace.sidebar.model.index_for_task_id(
+        task.task_id
+    ).isValid() is False
+    window.close()
+
+
+def test_out_of_order_task_update_cannot_regress_visible_progress(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    controller = window.task_controller
+    assert controller is not None
+    task = controller.catalog.create_task(AppConfig(), ["A001"])
+    base = controller.catalog.get_summary(task.task_id)
+    newer = replace(
+        base,
+        phase="running",
+        processed_count=1,
+        pending_count=0,
+        completed_count=1,
+        updated_at="2026-07-17T13:30:02+00:00",
+    )
+    stale = replace(
+        base,
+        phase="queued",
+        processed_count=0,
+        pending_count=1,
+        updated_at="2026-07-17T13:30:01+00:00",
+    )
+    window._workspace_task_summaries[task.task_id] = newer
+    window.task_workspace.upsert_task(newer)
+
+    window._on_multi_task_updated(stale)
+
+    assert window._workspace_task_summaries[task.task_id] == newer
+    index = window.task_workspace.sidebar.model.index_for_task_id(task.task_id)
+    assert index.data(window.task_workspace.sidebar.model.PhaseRole) == "running"
+    controller.catalog.set_phase(task.task_id, "completed")
+    window.close()
+
+
+def test_delete_task_confirmation_preserves_files_and_selects_adjacent_or_new(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    controller = window.task_controller
+    assert controller is not None
+    files = [
+        tmp_path / "dicom" / "A001.dcm",
+        tmp_path / "pdi" / "DICOMDIR",
+        tmp_path / "logs" / "task.log",
+        tmp_path / "quarantine" / "unresolved.dcm",
+    ]
+    for path in files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"kept")
+    first = controller.catalog.create_task(AppConfig(), ["A001"])
+    controller.catalog.set_phase(first.task_id, "completed")
+    second = controller.catalog.create_task(AppConfig(), ["B001"])
+    controller.catalog.set_phase(second.task_id, "failed")
+    window._on_multi_tasks_updated(controller.list_tasks())
+    tasks = controller.list_tasks()
+    selected = tasks[0]
+    adjacent = tasks[1]
+    window._on_workspace_task_selected(selected.task_id)
+    prompts: list[str] = []
+
+    def confirm(_parent, _title, message, *_args):
+        prompts.append(message)
+        return QMessageBox.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+
+    window._delete_multi_task(selected.task_id)
+
+    assert window._selected_task_id == adjacent.task_id
+    assert [item.task_id for item in controller.list_tasks()] == [adjacent.task_id]
+    assert all(path.read_bytes() == b"kept" for path in files)
+    assert "不会删除已下载的 DICOM、PDI、日志或隔离文件" in prompts[0]
+
+    window._delete_multi_task(adjacent.task_id)
+
+    assert controller.list_tasks() == []
+    assert window._selected_task_id == ""
+    assert window._multi_task_editor_active
+    assert all(path.read_bytes() == b"kept" for path in files)
+    window.close()
+
+
+def test_log_scope_and_detail_filters_keep_other_task_errors_out_of_current_view(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    window._selected_task_id = "task-current"
+    window.log_scope_combo.setCurrentIndex(
+        window.log_scope_combo.findData("task")
+    )
+    window._set_log_panel_expanded(False)
+
+    window._on_multi_log("task-other", "movescu", "其他任务错误", "error")
+    assert not window._log_panel_expanded
+    window._on_multi_log("task-current", "movescu", "当前任务信息", "info")
+    assert not window._log_panel_expanded
+    window._on_multi_log("", "接收器", "全局错误", "error")
+
+    current_errors = window.log_edit.toPlainText()
+    assert window._log_panel_expanded
+    assert "全局错误" in current_errors
+    assert "其他任务错误" not in current_errors
+    assert "当前任务信息" not in current_errors
+
+    window.log_detail_checkbox.setChecked(True)
+    current_detail = window.log_edit.toPlainText()
+    assert "全局错误" in current_detail
+    assert "当前任务信息" in current_detail
+    assert "其他任务错误" not in current_detail
+
+    window.log_scope_combo.setCurrentIndex(window.log_scope_combo.findData("all"))
+    assert "其他任务错误" in window.log_edit.toPlainText()
+
+    window._clear_logs()
+    window.log_detail_checkbox.setChecked(False)
+    window.log_detail_checkbox.setChecked(True)
+    assert window._log_events == []
+    assert window.log_edit.toPlainText() == ""
+    window.close()
+
+
 def test_task_selection_loads_bounded_detail_and_independent_actions(
     qtbot, tmp_path, monkeypatch
 ):
@@ -365,6 +509,72 @@ def test_large_task_detail_uses_full_sql_counts_and_copies_all_failed_items(
 
     assert queried == [task.task_id]
     assert QApplication.clipboard().text() == "A00002\nA00003\nA00204"
+    controller.catalog.set_phase(task.task_id, "completed")
+    window.close()
+
+
+def test_large_selected_task_updates_summary_without_reloading_detail(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _window(qtbot, tmp_path, monkeypatch)
+    controller = window.task_controller
+    assert controller is not None
+    task = controller.catalog.create_task(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        (f"A{index:05d}" for index in range(205)),
+    )
+    controller.catalog.set_phase(task.task_id, "paused")
+    summary = controller.catalog.get_summary(task.task_id)
+    original = controller.manager.get_task_detail
+    detail_queries: list[str] = []
+
+    def get_task_detail(task_id: str, accession_limit: int = 201):
+        detail_queries.append(task_id)
+        return original(task_id, accession_limit=accession_limit)
+
+    monkeypatch.setattr(controller.manager, "get_task_detail", get_task_detail)
+    window._on_multi_tasks_updated([summary])
+    window._on_workspace_task_selected(task.task_id)
+
+    assert detail_queries == [task.task_id]
+    assert window._task_table_summary_mode
+
+    for processed in range(1, 41):
+        window._on_multi_task_updated(
+            replace(
+                summary,
+                phase="running",
+                processed_count=processed,
+                pending_count=205 - processed,
+                completed_count=processed,
+                file_count=processed * 2,
+                current_accession=f"A{processed - 1:05d}",
+            )
+        )
+
+    exact = replace(
+        summary,
+        phase="running",
+        processed_count=40,
+        pending_count=165,
+        completed_count=23,
+        failed_count=12,
+        file_count=123,
+        current_accession="A00039",
+        no_data_count=3,
+        partial_count=4,
+        cancelled_count=5,
+    )
+    window._on_multi_task_updated(exact)
+
+    assert detail_queries == [task.task_id]
+    assert window.progress_bar.value() == 40
+    assert "40/205" in window.progress_label.text()
+    assert (
+        "已处理 40/205 · 完成 20 · 无数据 3 · 部分成功 4 · "
+        "失败 8 · 已取消 5 · 文件 123"
+        in window.large_batch_summary_label.text()
+    )
     controller.catalog.set_phase(task.task_id, "completed")
     window.close()
 

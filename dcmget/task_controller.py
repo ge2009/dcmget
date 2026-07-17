@@ -22,6 +22,7 @@ from .task_manager import (
     TaskRecord,
     TaskSummary,
 )
+from .task_state import TaskStateError
 
 
 BeforeTaskMove = Callable[[str], None]
@@ -298,6 +299,17 @@ class TaskExecutionController(QObject):
         self._worker.wake()
         return summary
 
+    def delete_task(self, task_id: str) -> None:
+        """Remove an inactive task record while preserving all output files."""
+
+        with self._pdi_lock:
+            if task_id in self._active_exporters or task_id in self._pdi_starting:
+                raise TaskStateError("任务仍有 PDI 后台活动，不能删除")
+        self.manager.delete_task(task_id)
+        with self._pdi_lock:
+            self._pending_pdi_cancellations.discard(task_id)
+        self.tasks_updated.emit(self.manager.list_tasks())
+
     def retry_task(self, task_id: str) -> TaskSummary:
         self.runtime.validate_download_config(self.catalog.get_config(task_id))
         summary = self.manager.retry_task(task_id)
@@ -347,30 +359,17 @@ class TaskExecutionController(QObject):
         return all_stopped
 
     def _on_download_task_updated(self, summary: TaskSummary) -> None:
-        self.task_updated.emit(summary)
-        if summary.phase == "pdi_pending":
-            try:
-                queued = self.pdi_queue.enqueue(summary.task_id)
-            except Exception as exc:
-                self.log.emit(summary.task_id, "PDI", str(exc), "error")
-                return
-            self.task_updated.emit(queued)
-            self.tasks_updated.emit(self.manager.list_tasks())
-            self._pdi_worker.wake()
-            return
-        if summary.phase != "completed" or summary.file_count <= 0:
-            return
         try:
-            config = self.catalog.get_config(summary.task_id)
-            if not config.pdi_export_enabled:
-                return
-            queued = self.pdi_queue.enqueue(summary.task_id)
-        except Exception as exc:
-            self.log.emit(summary.task_id, "PDI", str(exc), "error")
+            current = self.catalog.get_summary(summary.task_id)
+        except TaskStateError:
+            # A queued signal may outlive a task record deleted on the UI thread.
             return
-        self.task_updated.emit(queued)
-        self.tasks_updated.emit(self.manager.list_tasks())
-        self._pdi_worker.wake()
+        self.task_updated.emit(current)
+        if current.phase == "pdi_pending":
+            # PdiQueue discovers persisted pending jobs itself.  Do not enqueue
+            # from this potentially stale Qt signal: the PDI worker may already
+            # have completed and moved the task back to ``completed``.
+            self._pdi_worker.wake()
 
     def _on_download_task_started(self, summary: TaskSummary) -> None:
         """Publish occupied slots before the scheduler waits for completion."""
@@ -485,7 +484,7 @@ class TaskExecutionController(QObject):
                 task_id,
                 "恢复",
                 f"无法保存后台进程恢复信息：{exc}",
-                "warning",
+                "error",
             )
         self.process_changed.emit(task_id, kind, pid, executable, active)
 
@@ -501,7 +500,7 @@ class TaskExecutionController(QObject):
                 task_id,
                 "恢复",
                 f"无法保存实时任务进度：{exc}",
-                "warning",
+                "error",
             )
         self.progress.emit(task_id, result)
         try:

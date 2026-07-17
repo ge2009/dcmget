@@ -7,12 +7,14 @@ import sys
 import pytest
 
 from dcmget.config import (
+    AE_TITLE_LABELS,
     DEFAULT_ANONYMIZATION_PROFILE,
     DEFAULT_DIRECTORY_TEMPLATE,
     AppConfig,
     load_config,
     parse_accessions,
     save_config,
+    validate_ae_title,
 )
 from dcmget import runtime
 
@@ -225,6 +227,51 @@ def test_validation_reports_required_and_invalid_values():
         "max_concurrent_moves",
         "max_log_file_size_bytes",
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "message_part"),
+    [
+        ("   ", "请输入"),
+        ("A" * 17, "最多 16 个字符"),
+        ("中文AE", "可打印 ASCII 字符"),
+        ("BAD\\AE", "不能包含反斜杠"),
+        ("BAD\tAE", "可打印 ASCII 字符"),
+        ("BAD\x7fAE", "可打印 ASCII 字符"),
+    ],
+)
+@pytest.mark.parametrize(("field", "label"), AE_TITLE_LABELS.items())
+def test_ae_title_validation_is_field_specific(field, label, value, message_part):
+    config = AppConfig()
+    setattr(config, field, value)
+
+    message = config.validate()[field]
+
+    assert label in message
+    assert message_part in message
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["A", "DcmGet 01", "AE-1_2.3", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~"[:16]],
+)
+def test_ae_title_validation_accepts_dicom_printable_ascii(value):
+    assert validate_ae_title(value) == ""
+
+
+def test_configuration_load_trims_ae_title_padding_but_not_controls():
+    config = AppConfig.from_dict(
+        {
+            "config_version": 6,
+            "calling_ae_title": " DCMGET ",
+            "pacs_ae_title": "PACS\t",
+            "storage_ae_title": " STORE ",
+        }
+    )
+
+    assert config.calling_ae_title == "DCMGET"
+    assert config.storage_ae_title == "STORE"
+    assert "pacs_ae_title" in config.validate()
 
 
 def test_pdi_institution_validation_is_only_required_when_export_is_enabled():

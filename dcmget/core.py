@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import locale
 import logging
@@ -452,7 +453,7 @@ def build_storescp_command(config: AppConfig, tools: ToolPaths, staging: Path) -
         str(tools.storescp),
         "-v",
         "-aet",
-        config.storage_ae_title,
+        config.storage_ae_title.strip(" "),
         "+xa",
         "+uf",
         "-fe",
@@ -478,11 +479,11 @@ def build_movescu_command(config: AppConfig, tools: ToolPaths, accession: str) -
         "-td",
         "300",
         "-aet",
-        config.calling_ae_title,
+        config.calling_ae_title.strip(" "),
         "-aec",
-        config.pacs_ae_title,
+        config.pacs_ae_title.strip(" "),
         "-aem",
-        config.storage_ae_title,
+        config.storage_ae_title.strip(" "),
         config.pacs_server_ip,
         str(config.pacs_server_port),
         "-S",
@@ -1185,7 +1186,7 @@ class DownloadRunner:
         try:
             self.process_callback(kind, pid, executable, active)
         except Exception as exc:
-            self._emit("恢复", f"无法更新 {kind} 进程恢复信息：{exc}", "warning")
+            self._emit("恢复", f"无法更新 {kind} 进程恢复信息：{exc}", "error")
 
     def _emit(self, source: str, message: str, level: str) -> None:
         self.log_callback(source, message, level)
@@ -1618,12 +1619,48 @@ def _publish_or_deduplicate(source: Path, target: Path) -> None:
     # Separate DownloadRunner instances can archive into the same destination.
     # Keep existence checking, conflict verification and publication atomic.
     with _archive_publish_lock:
-        if not target.exists():
+        if target.exists():
+            if _file_sha256(source) != _file_sha256(target):
+                raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+            source.unlink()
+            return
+        try:
             os.replace(source, target)
             return
-        if _file_sha256(source) != _file_sha256(target):
-            raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+        except OSError as exc:
+            if not _is_cross_device_error(exc):
+                raise
+
+    # Multi-task staging lives in the private application-state directory,
+    # which is commonly on C: while users save DICOM to D: or removable media.
+    # Copy into a temporary file beside the target, make the bytes durable, then
+    # perform the final same-volume rename under the publication lock.  The
+    # source is deliberately retained until a complete target is published or
+    # an identical target has been verified.
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".dcmget-publish-",
+        suffix=".part",
+        dir=target.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        with _archive_publish_lock:
+            if target.exists():
+                if _file_sha256(temporary) != _file_sha256(target):
+                    raise ValueError(f"SOP Instance UID 内容冲突：{target.stem}")
+            else:
+                os.replace(temporary, target)
         source.unlink()
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _is_cross_device_error(exc: OSError) -> bool:
+    return exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == 17
 
 
 def _file_sha256(path: Path) -> str:
