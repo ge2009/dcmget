@@ -1065,6 +1065,7 @@ class DcmGetWindow(QMainWindow):
         self.task_scroll.setWidgetResizable(True)
         self.task_scroll.setFrameShape(QFrame.NoFrame)
         content = QWidget()
+        content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 20, 24, 24)
         layout.setSpacing(14)
