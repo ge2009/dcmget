@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import struct
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,26 @@ def test_source_deploy_contains_transitive_requirement_files():
     bundled = {path.relative_to(root).as_posix() for path in source_files(root)}
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
+
+
+def test_brand_assets_are_real_hidpi_images_and_windows_icon_has_256px():
+    root = Path(__file__).resolve().parents[1]
+    logo = (root / "logo.png").read_bytes()
+    assert logo[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", logo[16:24])
+    assert (width, height) == (1024, 1024)
+    assert logo[25] in {4, 6}  # Grayscale-alpha or RGBA.
+
+    assert (root / "logo.icns").read_bytes()[:4] == b"icns"
+    build_source = (root / "scripts" / "build_windows.py").read_text(encoding="utf-8")
+    assert "(256, 256)" in build_source
+
+    bundled = {path.relative_to(root).as_posix() for path in source_files(root)}
+    assert {
+        "logo.icns",
+        "logo.png",
+        "assets/branding/dcmget-icon-image2-source.png",
+    } <= bundled
 
 
 def test_release_version_sources_and_ui_self_test_flag_stay_in_sync():

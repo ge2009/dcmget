@@ -24,6 +24,8 @@ dcmtk/
 # Runtime data.
 logs/
 .dcmget-staging/
+/config.json
+/access.txt
 config.local.json
 trial.json
 *.lic

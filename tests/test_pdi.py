@@ -14,6 +14,7 @@ from pydicom.sequence import Sequence
 from pydicom.uid import (
     CTImageStorage,
     ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
     MediaStorageDirectoryStorage,
     generate_uid,
 )
@@ -36,12 +37,13 @@ def _dicom(
     modality: str = "CT",
     private_value: str | None = None,
     frames: int = 1,
+    transfer_syntax_uid: str = ExplicitVRLittleEndian,
 ) -> Path:
     sop_uid = sop_uid or generate_uid()
     file_meta = FileMetaDataset()
     file_meta.MediaStorageSOPClassUID = CTImageStorage
     file_meta.MediaStorageSOPInstanceUID = sop_uid
-    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.TransferSyntaxUID = transfer_syntax_uid
     dataset = FileDataset(path, {}, file_meta=file_meta, preamble=b"\0" * 128)
     dataset.SOPClassUID = CTImageStorage
     dataset.SOPInstanceUID = sop_uid
@@ -76,6 +78,29 @@ def _dicom(
     path.parent.mkdir(parents=True, exist_ok=True)
     dataset.save_as(path, enforce_file_format=True)
     return path
+
+
+def _replace_specific_character_set(path: Path, replacement: bytes | None) -> None:
+    """Patch test data without re-encoding its text elements."""
+
+    content = path.read_bytes()
+    tag = b"\x08\x00\x05\x00"
+    offset = content.index(tag)
+    explicit_vr = content[offset + 4 : offset + 6] == b"CS"
+    length_offset = offset + (6 if explicit_vr else 4)
+    length_size = 2 if explicit_vr else 4
+    length = int.from_bytes(
+        content[length_offset : length_offset + length_size], "little"
+    )
+    end = length_offset + length_size + length
+    encoded_element = b""
+    if replacement is not None:
+        padded = replacement + (b" " if len(replacement) % 2 else b"")
+        vr = b"CS" if explicit_vr else b""
+        encoded_element = (
+            tag + vr + len(padded).to_bytes(length_size, "little") + padded
+        )
+    path.write_bytes(content[:offset] + encoded_element + content[end:])
 
 
 def _write_dicomdir(root: Path) -> None:
@@ -246,6 +271,140 @@ def test_ohif_index_references_original_local_dicom_and_naturalized_metadata(
     assert all((output / str(entry["url"])[10:]).is_file() for entry in instances)
     assert instances[0]["metadata"]["PixelSpacing"] == [0.5, 0.5]
     assert "PixelData" not in instances[0]["metadata"]
+
+
+@pytest.mark.parametrize(
+    ("declared_charset", "transfer_syntax_uid"),
+    [
+        (None, ExplicitVRLittleEndian),
+        (b"ISO_IR 192", ExplicitVRLittleEndian),
+        (None, ImplicitVRLittleEndian),
+    ],
+)
+def test_ohif_index_repairs_missing_or_wrong_gb18030_declaration(
+    tmp_path: Path,
+    tools: ToolPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    declared_charset: bytes | None,
+    transfer_syntax_uid: str,
+) -> None:
+    source = _dicom(
+        tmp_path / "chinese.dcm", transfer_syntax_uid=transfer_syntax_uid
+    )
+    dataset = dcmread(source)
+    dataset.SpecificCharacterSet = "GB18030"
+    dataset.PatientName = "孙碎兰"
+    dataset.StudyDescription = "胸部检查"
+    dataset.SeriesDescription = "胸部平扫"
+    dataset.ProtocolName = "常规胸部"
+    dataset.save_as(source, enforce_file_format=True)
+    _replace_specific_character_set(source, declared_charset)
+    source_hash = pdi._sha256(source)
+
+    exporter = PdiExporter(_config(tmp_path), tools)
+    _fake_dcmtk(exporter, monkeypatch)
+    result = exporter.export([source])
+
+    output = Path(result.output_directory)
+    payload_text = (output / pdi.STUDY_INDEX).read_text(encoding="utf-8")
+    payload = json.loads(payload_text)
+    study = payload["studies"][0]
+    series = study["series"][0]
+    metadata = series["instances"][0]["metadata"]
+    assert result.status == PdiStatus.COMPLETED
+    assert study["PatientName"] == "孙碎兰"
+    assert study["StudyDescription"] == "胸部检查"
+    assert series["SeriesDescription"] == "胸部平扫"
+    assert series["ProtocolName"] == "常规胸部"
+    assert metadata["PatientName"] == "孙碎兰"
+    assert metadata["SpecificCharacterSet"] == "GB18030"
+    assert metadata["TransferSyntaxUID"] == str(transfer_syntax_uid)
+    assert "\ufffd" not in payload_text
+    assert any("GB18030" in warning for warning in result.warnings)
+    assert pdi._sha256(source) == source_hash
+
+
+def test_ohif_index_repairs_gb18030_declaration_for_utf8_text(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "utf8-declared-gb18030.dcm")
+    dataset = dcmread(source)
+    dataset.SpecificCharacterSet = "ISO_IR 192"
+    dataset.PatientName = "测试中文"
+    dataset.StudyDescription = "测试中文"
+    dataset.SeriesDescription = "测试中文"
+    dataset.save_as(source, enforce_file_format=True)
+    _replace_specific_character_set(source, b"GB18030")
+    source_hash = pdi._sha256(source)
+
+    exporter = PdiExporter(_config(tmp_path), tools)
+    _fake_dcmtk(exporter, monkeypatch)
+    result = exporter.export([source])
+
+    output = Path(result.output_directory)
+    payload_text = (output / pdi.STUDY_INDEX).read_text(encoding="utf-8")
+    payload = json.loads(payload_text)
+    study = payload["studies"][0]
+    series = study["series"][0]
+    metadata = series["instances"][0]["metadata"]
+    assert result.status == PdiStatus.COMPLETED
+    assert study["PatientName"] == "测试中文"
+    assert study["StudyDescription"] == "测试中文"
+    assert series["SeriesDescription"] == "测试中文"
+    assert metadata["SpecificCharacterSet"] == "ISO_IR 192"
+    assert "娴嬭瘯" not in payload_text
+    assert any("ISO_IR 192" in warning for warning in result.warnings)
+    assert pdi._sha256(source) == source_hash
+
+
+def test_ohif_index_preserves_valid_gb18030_when_utf8_decode_also_succeeds(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "valid-gb18030.dcm")
+    dataset = dcmread(source)
+    dataset.SpecificCharacterSet = "GB18030"
+    # These GB18030 bytes also form valid UTF-8 ("һҵΪô"), so successful
+    # UTF-8 decoding alone must not override the explicit declaration.
+    dataset.PatientName = "一业为么"
+    dataset.StudyDescription = "一业为么"
+    dataset.save_as(source, enforce_file_format=True)
+    source_hash = pdi._sha256(source)
+
+    exporter = PdiExporter(_config(tmp_path), tools)
+    _fake_dcmtk(exporter, monkeypatch)
+    result = exporter.export([source])
+
+    output = Path(result.output_directory)
+    metadata = _instances(output / pdi.STUDY_INDEX)[0]["metadata"]
+    assert result.status == PdiStatus.COMPLETED
+    assert metadata["PatientName"] == "一业为么"
+    assert metadata["StudyDescription"] == "一业为么"
+    assert metadata["SpecificCharacterSet"] == "GB18030"
+    assert not any("字符集缺失或声明异常" in warning for warning in result.warnings)
+    assert pdi._sha256(source) == source_hash
+
+
+def test_ohif_index_preserves_valid_latin_character_set(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "latin.dcm")
+    dataset = dcmread(source)
+    dataset.SpecificCharacterSet = "ISO_IR 100"
+    dataset.PatientName = "Jos\xe9^Patient"
+    dataset.StudyDescription = "Radiologie g\xe9n\xe9rale"
+    dataset.save_as(source, enforce_file_format=True)
+    exporter = PdiExporter(_config(tmp_path), tools)
+    _fake_dcmtk(exporter, monkeypatch)
+
+    result = exporter.export([source])
+
+    metadata = _instances(Path(result.output_directory) / pdi.STUDY_INDEX)[0][
+        "metadata"
+    ]
+    assert metadata["PatientName"] == "Jos\xe9^Patient"
+    assert metadata["StudyDescription"] == "Radiologie g\xe9n\xe9rale"
+    assert metadata["SpecificCharacterSet"] == "ISO_IR 100"
+    assert not any("字符集缺失或声明异常" in warning for warning in result.warnings)
 
 
 def test_ohif_index_omits_non_rendering_identity_but_keeps_image_metadata(

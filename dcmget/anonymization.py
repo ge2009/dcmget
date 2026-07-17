@@ -124,6 +124,30 @@ _RESEARCH_CLEAR = {
     "RetrieveAETitle",
 }
 
+# LT/ST/UT/UC are free-form text VRs.  They are not required to
+# decode Pixel Data and may contain identifying text in newly added Standard
+# Attributes that are not yet present in a fixed keyword list.  LO/SH are also
+# used for technical acquisition metadata, so only the high-risk Standard
+# patient/workflow fields below are cleared by keyword.
+_HIGH_RISK_FREE_TEXT_VRS = {"LT", "ST", "UC", "UT"}
+
+_HIGH_RISK_TEXT_KEYWORDS = {
+    "Allergies",
+    "DischargeDiagnosisDescription",
+    "MedicalAlerts",
+    "PatientInstitutionResidence",
+    "PatientState",
+    "PatientTransportArrangements",
+    "PreMedication",
+    "ReasonForTheImagingServiceRequest",
+    "RequestedProcedureLocation",
+    "RouteOfAdmissions",
+    "ScheduledPatientInstitutionResidence",
+    "ScheduledProcedureStepLocation",
+    "ServiceEpisodeDescription",
+    "SpecialNeeds",
+}
+
 _STRICT_CLEAR = {
     "DeviceSerialNumber",
     "DeviceUID",
@@ -184,6 +208,7 @@ class DicomAnonymizer:
 
         if self.profile in {"research", "strict"}:
             self._clear_keywords(dataset, _RESEARCH_CLEAR)
+            self._clear_high_risk_text(dataset)
             self._remap_uids(dataset)
 
         if self.profile == "research":
@@ -301,6 +326,18 @@ class DicomAnonymizer:
             for element in current:
                 if element.keyword in keywords:
                     element.value = [] if element.VR == "SQ" else ""
+
+    @staticmethod
+    def _clear_high_risk_text(dataset: Dataset) -> None:
+        """Clear free-form and known patient/workflow text at every depth."""
+
+        for current in _datasets(dataset):
+            for element in current:
+                if (
+                    element.VR in _HIGH_RISK_FREE_TEXT_VRS
+                    or element.keyword in _HIGH_RISK_TEXT_KEYWORDS
+                ):
+                    element.value = ""
 
     def _pseudonymize_identifiers(self, dataset: Dataset, identity: str) -> None:
         for current in _datasets(dataset):

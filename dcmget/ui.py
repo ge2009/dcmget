@@ -26,6 +26,7 @@ from PyQt5.QtGui import (
     QIcon,
     QIntValidator,
     QKeySequence,
+    QPixmap,
 )
 from PyQt5.QtNetwork import (
     QNetworkAccessManager,
@@ -106,6 +107,7 @@ from .task_state import (
 COLORS = {
     "primary": "#0369A1",
     "primary_hover": "#075985",
+    "focus_on_primary": "#FBBF24",
     "success": "#047857",
     "warning": "#B45309",
     "danger": "#B91C1C",
@@ -203,7 +205,22 @@ class ReleaseNotesDialog(QDialog):
     def __init__(self, notes: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"DcmGet {__version__} 版本说明")
-        self.setMinimumSize(680, 520)
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(480, 360)
+            self.resize(680, 520)
+        else:
+            available = screen.availableGeometry()
+            usable_width = max(1, available.width() - 48)
+            usable_height = max(1, available.height() - 48)
+            self.setMinimumSize(
+                min(480, usable_width),
+                min(360, usable_height),
+            )
+            self.resize(
+                min(680, usable_width),
+                min(520, usable_height),
+            )
         layout = QVBoxLayout(self)
         title = QLabel(f"DcmGet {__version__} 版本说明")
         title.setObjectName("PageTitle")
@@ -848,6 +865,7 @@ class DcmGetWindow(QMainWindow):
         self._pdi_viewer_probe_url = ""
         self._pdi_viewer_ready = False
         self._pdi_viewer_open_when_ready = False
+        self._pdi_viewer_button_states = (False, False)
         self._pdi_viewer_network = QNetworkAccessManager(self)
         self._pdi_viewer_network.setProxy(QNetworkProxy(QNetworkProxy.NoProxy))
         self._pdi_viewer_probe_reply: QNetworkReply | None = None
@@ -885,6 +903,7 @@ class DcmGetWindow(QMainWindow):
         self._summary_processed = 0
         self._summary_files = 0
         self._summary_status_counts: dict[AccessionStatus, int] = {}
+        self._compact_action_layout: bool | None = None
         self.settings_store = QSettings("DcmGet", "DcmGet2")
         self._log_panel_expanded = self.settings_store.value(
             "window/log_expanded", False, type=bool
@@ -905,6 +924,7 @@ class DcmGetWindow(QMainWindow):
         self._reset_pdi_status_card()
         last_destination = self.settings_store.value("task/destination", "", type=str)
         self.destination_edit.setText(last_destination or self.config.dicom_destination_folder)
+        self._sync_quick_pdi_controls_from_config()
         self._load_configured_accessions()
         QTimer.singleShot(0, self._refresh_tool_status)
         if offer_task_resume:
@@ -961,6 +981,24 @@ class DcmGetWindow(QMainWindow):
 
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
+        self.app_logo = QLabel()
+        self.app_logo.setAccessibleName("DcmGet 标志")
+        self.app_logo.setFixedSize(32, 32)
+        self.app_logo.setAlignment(Qt.AlignCenter)
+        logo_path = self.project_root / "logo.png"
+        logo_pixmap = QPixmap(str(logo_path)) if logo_path.is_file() else QPixmap()
+        if logo_pixmap.isNull():
+            self.app_logo.hide()
+        else:
+            self.app_logo.setPixmap(
+                logo_pixmap.scaled(
+                    32,
+                    32,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+        status_row.addWidget(self.app_logo, 0, Qt.AlignVCenter)
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
         self.app_title = QLabel(f"DcmGet {__version__}")
@@ -1077,6 +1115,9 @@ class DcmGetWindow(QMainWindow):
         self.destination_edit = QLineEdit()
         self.destination_edit.setAccessibleName("DICOM 保存目录")
         self.destination_edit.textChanged.connect(self._update_task_form_summary)
+        self.destination_edit.textChanged.connect(
+            lambda _text: self._set_destination_error("")
+        )
         grid.addWidget(self.destination_edit, 2, 1)
         self.destination_button = QPushButton("选择目录")
         self.destination_button.clicked.connect(self._choose_destination)
@@ -1084,14 +1125,38 @@ class DcmGetWindow(QMainWindow):
         self.open_destination_button = QPushButton("打开目标目录")
         self.open_destination_button.clicked.connect(self._open_destination_directory)
         grid.addWidget(self.open_destination_button, 2, 3)
+        self.destination_error_label = QLabel()
+        self.destination_error_label.setObjectName("InlineErrorText")
+        self.destination_error_label.setWordWrap(True)
+        self.destination_error_label.hide()
+        grid.addWidget(self.destination_error_label, 3, 1, 1, 3)
+
+        self.quick_pdi_checkbox = QCheckBox("下载完成后生成 PDI 便携目录")
+        self.quick_pdi_checkbox.setAccessibleName("下载完成后生成 PDI 便携目录")
+        self.quick_pdi_checkbox.toggled.connect(self._on_quick_pdi_toggled)
+        grid.addWidget(self.quick_pdi_checkbox, 4, 1, 1, 3)
+        self.quick_pdi_output_label = QLabel()
+        self.quick_pdi_output_label.setObjectName("FieldHint")
+        self.quick_pdi_output_label.setWordWrap(True)
+        self.quick_pdi_output_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
+        self.quick_pdi_output_label.setAccessibleName("PDI 保存目录")
+        grid.addWidget(self.quick_pdi_output_label, 5, 1, 1, 2)
+        self.quick_pdi_output_button = QPushButton("选择 PDI 保存目录")
+        self.quick_pdi_output_button.clicked.connect(
+            self._choose_quick_pdi_output
+        )
+        grid.addWidget(self.quick_pdi_output_button, 5, 3)
+        self.destination_edit.textChanged.connect(self._update_quick_pdi_summary)
         grid.setColumnStretch(1, 1)
         input_layout.addWidget(self.task_form_body)
         self._set_task_form_expanded(self._task_form_expanded)
         layout.addWidget(input_card)
 
-        preflight_card = QFrame()
-        preflight_card.setObjectName("Card")
-        preflight_layout = QVBoxLayout(preflight_card)
+        self.preflight_card = QFrame()
+        self.preflight_card.setObjectName("Card")
+        preflight_layout = QVBoxLayout(self.preflight_card)
         preflight_layout.setSpacing(8)
         preflight_title = QLabel("启动预检")
         preflight_title.setObjectName("SectionTitle")
@@ -1106,17 +1171,19 @@ class DcmGetWindow(QMainWindow):
             label = QLabel(text)
             label.setObjectName("CheckPill")
             label.setProperty("status", "pending")
-            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             self.preflight_labels.append(label)
             self.preflight_grid.addWidget(label, index // 3, index % 3)
         preflight_layout.addLayout(self.preflight_grid)
-        layout.addWidget(preflight_card)
+        layout.addWidget(self.preflight_card)
 
-        action_row = QHBoxLayout()
+        self.task_action_layout = QGridLayout()
+        self.task_action_layout.setHorizontalSpacing(8)
+        self.task_action_layout.setVerticalSpacing(8)
         self.progress_label = QLabel("尚未开始")
         self.progress_label.setObjectName("ProgressText")
-        action_row.addWidget(self.progress_label)
-        action_row.addStretch()
+        self.progress_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.discard_resume_button = QPushButton("放弃续传并新建")
         self.discard_resume_button.setObjectName("DangerButton")
         self.discard_resume_button.setToolTip("保留已下载文件，仅删除未完成任务的恢复记录")
@@ -1159,15 +1226,17 @@ class DcmGetWindow(QMainWindow):
         self.start_button.clicked.connect(
             lambda _checked=False: self._start_download()
         )
-        action_row.addWidget(self.discard_resume_button)
-        action_row.addWidget(self.retry_button)
-        action_row.addWidget(self.accept_partial_button)
-        action_row.addWidget(self.open_existing_pdi_button)
-        action_row.addWidget(self.log_toggle_button)
-        action_row.addWidget(self.pause_button)
-        action_row.addWidget(self.stop_button)
-        action_row.addWidget(self.start_button)
-        layout.addLayout(action_row)
+        self._task_action_buttons = (
+            self.discard_resume_button,
+            self.retry_button,
+            self.accept_partial_button,
+            self.open_existing_pdi_button,
+            self.log_toggle_button,
+            self.pause_button,
+            self.stop_button,
+            self.start_button,
+        )
+        layout.addLayout(self.task_action_layout)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1175,19 +1244,49 @@ class DcmGetWindow(QMainWindow):
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
 
+        self.large_batch_summary_card = QFrame()
+        self.large_batch_summary_card.setObjectName("LargeBatchSummaryCard")
+        large_batch_layout = QVBoxLayout(self.large_batch_summary_card)
+        large_batch_layout.setContentsMargins(14, 12, 14, 12)
+        large_batch_layout.setSpacing(6)
+        large_batch_header = QHBoxLayout()
+        large_batch_title = QLabel("大批量任务摘要")
+        large_batch_title.setObjectName("SectionTitle")
+        large_batch_header.addWidget(large_batch_title)
+        large_batch_header.addStretch()
+        self.copy_failed_button = QPushButton("复制失败检查号")
+        self.copy_failed_button.setAccessibleName("复制失败检查号")
+        self.copy_failed_button.clicked.connect(self._copy_failed_accessions)
+        self.copy_failed_button.hide()
+        large_batch_header.addWidget(self.copy_failed_button)
+        large_batch_layout.addLayout(large_batch_header)
+        self.large_batch_summary_label = QLabel()
+        self.large_batch_summary_label.setObjectName("LargeBatchSummaryText")
+        self.large_batch_summary_label.setWordWrap(True)
+        self.large_batch_summary_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
+        self.large_batch_summary_label.setAccessibleName("大批量任务总进度")
+        large_batch_layout.addWidget(self.large_batch_summary_label)
+        self.large_batch_summary_card.hide()
+        layout.addWidget(self.large_batch_summary_card)
+
         self.pdi_status_card = QFrame()
         self.pdi_status_card.setObjectName("PdiStatusCard")
         pdi_status_layout = QVBoxLayout(self.pdi_status_card)
         pdi_status_layout.setContentsMargins(14, 10, 14, 10)
         pdi_status_layout.setSpacing(8)
-        pdi_status_header = QHBoxLayout()
-        pdi_title = QLabel("PDI 便携阅片目录")
-        pdi_title.setObjectName("SectionTitle")
-        pdi_status_header.addWidget(pdi_title)
+        self.pdi_status_header = QGridLayout()
+        self.pdi_status_header.setHorizontalSpacing(8)
+        self.pdi_status_header.setVerticalSpacing(8)
+        self.pdi_status_title = QLabel("PDI 便携阅片目录")
+        self.pdi_status_title.setObjectName("SectionTitle")
         self.pdi_status_label = QLabel("下载完成后自动生成")
         self.pdi_status_label.setObjectName("PdiStatusText")
         self.pdi_status_label.setWordWrap(True)
-        pdi_status_header.addWidget(self.pdi_status_label, 1)
+        self.pdi_status_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
         self.pdi_view_button = QPushButton("打开影像")
         self.pdi_view_button.setObjectName("PrimaryButton")
         self.pdi_view_button.setEnabled(False)
@@ -1200,32 +1299,19 @@ class DcmGetWindow(QMainWindow):
         self.pdi_retry_button = QPushButton("重试 PDI")
         self.pdi_retry_button.setEnabled(False)
         self.pdi_retry_button.clicked.connect(self._retry_pdi)
-        pdi_status_header.addWidget(self.pdi_view_button)
-        pdi_status_header.addWidget(self.pdi_open_button)
-        pdi_status_header.addWidget(self.pdi_retry_button)
-        pdi_status_layout.addLayout(pdi_status_header)
+        self._pdi_action_buttons = (
+            self.pdi_view_button,
+            self.pdi_open_button,
+            self.pdi_retry_button,
+        )
+        pdi_status_layout.addLayout(self.pdi_status_header)
         self.pdi_progress_bar = QProgressBar()
         self.pdi_progress_bar.setRange(0, 100)
         self.pdi_progress_bar.setValue(0)
         self.pdi_progress_bar.setTextVisible(False)
         pdi_status_layout.addWidget(self.pdi_progress_bar)
         layout.addWidget(self.pdi_status_card)
-
-        self.large_batch_summary_card = QFrame()
-        self.large_batch_summary_card.setObjectName("LargeBatchSummaryCard")
-        large_batch_layout = QVBoxLayout(self.large_batch_summary_card)
-        large_batch_layout.setContentsMargins(14, 12, 14, 12)
-        large_batch_layout.setSpacing(6)
-        large_batch_title = QLabel("大批量任务摘要")
-        large_batch_title.setObjectName("SectionTitle")
-        large_batch_layout.addWidget(large_batch_title)
-        self.large_batch_summary_label = QLabel()
-        self.large_batch_summary_label.setObjectName("LargeBatchSummaryText")
-        self.large_batch_summary_label.setWordWrap(True)
-        self.large_batch_summary_label.setAccessibleName("大批量任务总进度")
-        large_batch_layout.addWidget(self.large_batch_summary_label)
-        self.large_batch_summary_card.hide()
-        layout.addWidget(self.large_batch_summary_card)
+        self._update_responsive_layouts(force=True)
 
         self.task_splitter = QSplitter(Qt.Vertical)
         self.task_table = QTableWidget(0, 6)
@@ -1253,6 +1339,67 @@ class DcmGetWindow(QMainWindow):
         self.task_scroll.setWidget(content)
         page_layout.addWidget(self.task_scroll)
         return page
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if hasattr(self, "task_action_layout"):
+            self._update_responsive_layouts()
+
+    def _update_responsive_layouts(self, *, force: bool = False) -> None:
+        compact = self.width() < 900
+        if not force and compact == self._compact_action_layout:
+            return
+        self._compact_action_layout = compact
+
+        task_widgets = (self.progress_label, *self._task_action_buttons)
+        for widget in task_widgets:
+            self.task_action_layout.removeWidget(widget)
+        for column in range(len(self._task_action_buttons) + 2):
+            self.task_action_layout.setColumnStretch(column, 0)
+        self.task_action_layout.setColumnStretch(0, 1)
+        self.progress_label.setWordWrap(compact)
+        if compact:
+            self.task_action_layout.addWidget(
+                self.progress_label,
+                0,
+                0,
+                1,
+                len(self._task_action_buttons) + 1,
+            )
+            for column, button in enumerate(self._task_action_buttons, start=1):
+                self.task_action_layout.addWidget(button, 1, column)
+        else:
+            self.task_action_layout.addWidget(self.progress_label, 0, 0)
+            for column, button in enumerate(self._task_action_buttons, start=1):
+                self.task_action_layout.addWidget(button, 0, column)
+
+        pdi_widgets = (
+            self.pdi_status_title,
+            self.pdi_status_label,
+            *self._pdi_action_buttons,
+        )
+        for widget in pdi_widgets:
+            self.pdi_status_header.removeWidget(widget)
+        for column in range(len(self._pdi_action_buttons) + 2):
+            self.pdi_status_header.setColumnStretch(column, 0)
+        if compact:
+            self.pdi_status_header.addWidget(self.pdi_status_title, 0, 0)
+            self.pdi_status_header.addWidget(
+                self.pdi_status_label,
+                0,
+                1,
+                1,
+                len(self._pdi_action_buttons) + 1,
+            )
+            self.pdi_status_header.setColumnStretch(1, 1)
+            for column, button in enumerate(self._pdi_action_buttons, start=2):
+                self.pdi_status_header.addWidget(button, 1, column)
+        else:
+            self.pdi_status_header.addWidget(self.pdi_status_title, 0, 0)
+            self.pdi_status_header.addWidget(self.pdi_status_label, 0, 1)
+            self.pdi_status_header.setColumnStretch(1, 1)
+            for column, button in enumerate(self._pdi_action_buttons, start=2):
+                self.pdi_status_header.addWidget(button, 0, column)
 
     def _build_log_panel(self) -> QWidget:
         panel = QFrame()
@@ -1383,6 +1530,7 @@ class DcmGetWindow(QMainWindow):
                 self._resume_checkpoint.config = AppConfig.from_dict(config.to_dict())
         self.config = config
         save_config(self.config_path, self.config)
+        self._sync_quick_pdi_controls_from_config()
         self.pages.setCurrentIndex(0)
         self.pdi_status_card.setVisible(self.config.pdi_export_enabled)
         previous_status = str(
@@ -1582,6 +1730,7 @@ class DcmGetWindow(QMainWindow):
         self.config = AppConfig.from_dict(checkpoint.config.to_dict())
         self.settings_page.set_config(self.config)
         self.destination_edit.setText(self.config.dicom_destination_folder)
+        self._sync_quick_pdi_controls_from_config()
         self._display_total = len(checkpoint.accessions)
         if len(checkpoint.accessions) <= TASK_TABLE_DETAIL_LIMIT:
             self._hidden_accession_count = 0
@@ -1725,6 +1874,66 @@ class DcmGetWindow(QMainWindow):
         if selected:
             self.destination_edit.setText(selected)
 
+    def _sync_quick_pdi_controls_from_config(self) -> None:
+        previous = self.quick_pdi_checkbox.blockSignals(True)
+        self.quick_pdi_checkbox.setChecked(self.config.pdi_export_enabled)
+        self.quick_pdi_checkbox.blockSignals(previous)
+        self._update_quick_pdi_summary()
+
+    def _update_quick_pdi_summary(self, _value=None) -> None:
+        configured = self.config.pdi_output_folder.strip()
+        destination = self.destination_edit.text().strip()
+        if configured:
+            path_text = configured
+            summary = f"PDI 保存位置：{configured}"
+        elif destination:
+            path_text = str(Path(destination).expanduser() / "PDI")
+            summary = f"PDI 保存位置：{path_text}（默认）"
+        else:
+            path_text = "DICOM 保存目录下的 PDI（默认）"
+            summary = f"PDI 保存位置：{path_text}"
+        self.quick_pdi_output_label.setText(summary)
+        self.quick_pdi_output_label.setToolTip(path_text)
+        self.quick_pdi_output_label.setAccessibleDescription(path_text)
+        recovery_pending = bool(self._resume_checkpoint or self._pdi_task_id)
+        self.quick_pdi_output_button.setEnabled(
+            self.quick_pdi_checkbox.isChecked()
+            and not self._is_busy()
+            and not recovery_pending
+        )
+
+    def _on_quick_pdi_toggled(self, enabled: bool) -> None:
+        if self._is_busy() or self._resume_checkpoint or self._pdi_task_id:
+            self._sync_quick_pdi_controls_from_config()
+            return
+        self.config.pdi_export_enabled = enabled
+        save_config(self.config_path, self.config)
+        self.settings_page.set_config(self.config)
+        self.pdi_status_card.setVisible(enabled)
+        self._update_quick_pdi_summary()
+        self._append_log(
+            "应用",
+            "已启用下载完成后生成 PDI" if enabled else "已关闭下载完成后生成 PDI",
+            "info",
+        )
+
+    def _choose_quick_pdi_output(self) -> None:
+        initial = (
+            self.config.pdi_output_folder.strip()
+            or self.destination_edit.text().strip()
+            or str(Path.home())
+        )
+        selected = QFileDialog.getExistingDirectory(
+            self, "选择 PDI 保存目录", initial
+        )
+        if not selected:
+            return
+        self.config.pdi_output_folder = selected
+        save_config(self.config_path, self.config)
+        self.settings_page.set_config(self.config)
+        self._update_quick_pdi_summary()
+        self._append_log("应用", f"PDI 保存目录：{selected}", "info")
+
     def _open_destination_directory(self) -> None:
         directory = self.destination_edit.text().strip()
         if not directory:
@@ -1735,6 +1944,19 @@ class DcmGetWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
             return
         QMessageBox.warning(self, "无法打开目录", "请先选择已存在的目标目录。")
+
+    def _set_destination_error(self, message: str, *, focus: bool = False) -> None:
+        self.destination_edit.setProperty("invalid", bool(message))
+        self.destination_edit.setToolTip(message)
+        self.destination_edit.setAccessibleDescription(message)
+        self.destination_error_label.setText(message)
+        self.destination_error_label.setVisible(bool(message))
+        self.destination_edit.style().unpolish(self.destination_edit)
+        self.destination_edit.style().polish(self.destination_edit)
+        if message and focus:
+            self._set_task_form_expanded(True)
+            self.task_scroll.ensureWidgetVisible(self.destination_edit, 0, 24)
+            self.destination_edit.setFocus(Qt.OtherFocusReason)
 
     def _update_accession_preview(self) -> None:
         parsed = parse_accessions(self.accession_edit.toPlainText())
@@ -1853,6 +2075,32 @@ class DcmGetWindow(QMainWindow):
                 f"{current.file_count:,} 个文件"
             )
         self.large_batch_summary_label.setText("\n".join(lines))
+        failed_accessions = self._failed_accessions_for_copy()
+        self.copy_failed_button.setVisible(bool(failed_accessions))
+        self.copy_failed_button.setEnabled(bool(failed_accessions))
+        self.copy_failed_button.setToolTip(
+            f"复制 {len(failed_accessions):,} 个失败或部分成功的检查号"
+            if failed_accessions
+            else ""
+        )
+
+    def _failed_accessions_for_copy(self) -> list[str]:
+        return [
+            result.accession
+            for result in self._summary_results.values()
+            if result.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
+        ]
+
+    def _copy_failed_accessions(self) -> None:
+        accessions = self._failed_accessions_for_copy()
+        if not accessions:
+            return
+        QApplication.clipboard().setText("\n".join(accessions))
+        self._append_log(
+            "应用",
+            f"已复制 {len(accessions):,} 个失败或部分成功的检查号",
+            "info",
+        )
 
     def _sync_task_detail_visibility(self) -> None:
         self.task_table.setVisible(not self._task_table_summary_mode)
@@ -1924,6 +2172,7 @@ class DcmGetWindow(QMainWindow):
             if continuing_existing and requested_destination:
                 self.config.dicom_destination_folder = requested_destination
             self.destination_edit.setText(self.config.dicom_destination_folder)
+            self._sync_quick_pdi_controls_from_config()
             try:
                 self.task_store.update_config(
                     resume_checkpoint.task_id,
@@ -1959,11 +2208,18 @@ class DcmGetWindow(QMainWindow):
         check = preflight(self.config, self.resolver)
         self._show_preflight(check)
         self.settings_page.apply_errors(check.errors)
+        destination_error = check.errors.get("dicom_destination_folder", "")
+        self._set_destination_error(destination_error)
         if not check.ok or check.tools is None:
             self._append_log("预检", "启动预检未通过，请修正标红设置", "error")
             QMessageBox.warning(self, "预检未通过", "请查看启动预检和设置页中的错误提示。")
-            if any(key != "dicom_destination_folder" for key in check.errors):
+            has_settings_error = any(
+                key != "dicom_destination_folder" for key in check.errors
+            )
+            if has_settings_error:
                 self.pages.setCurrentIndex(1)
+            elif destination_error:
+                self._set_destination_error(destination_error, focus=True)
             if resume_checkpoint is not None:
                 self.task_store.release_lease()
                 self._set_running(False)
@@ -2082,7 +2338,8 @@ class DcmGetWindow(QMainWindow):
         while len(self.preflight_labels) < len(check.checks):
             label = QLabel()
             label.setObjectName("CheckPill")
-            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             index = len(self.preflight_labels)
             self.preflight_labels.append(label)
             self.preflight_grid.addWidget(label, index // 3, index % 3)
@@ -2112,6 +2369,10 @@ class DcmGetWindow(QMainWindow):
         )
         pdi_pending = not running and bool(self._pdi_task_id)
         recovery_pending = resume_pending or pdi_pending
+        self.preflight_card.setVisible(not running and not recovery_pending)
+        self.pdi_status_card.setVisible(
+            self.config.pdi_export_enabled and (not running or not can_pause)
+        )
         self.start_button.setEnabled(not running and not pdi_pending)
         self.start_button.setText(
             "重试失败项"
@@ -2158,6 +2419,12 @@ class DcmGetWindow(QMainWindow):
         self.destination_edit.setReadOnly(running or pdi_pending)
         self.accession_button.setEnabled(not running and not recovery_pending)
         self.destination_button.setEnabled(not running and not pdi_pending)
+        self.quick_pdi_checkbox.setEnabled(not running and not recovery_pending)
+        self.quick_pdi_output_button.setEnabled(
+            not running
+            and not recovery_pending
+            and self.quick_pdi_checkbox.isChecked()
+        )
         self.settings_button.setEnabled(not running)
         self.registration_button.setEnabled(not running)
 
@@ -2711,6 +2978,7 @@ class DcmGetWindow(QMainWindow):
         self._pdi_viewer_probe_url = ""
         self._pdi_viewer_ready = False
         self._pdi_viewer_open_when_ready = controls_browser
+        self._set_pdi_viewer_starting_feedback()
         if viewer_url:
             self._set_pdi_viewer_url(viewer_url)
         try:
@@ -2725,6 +2993,34 @@ class DcmGetWindow(QMainWindow):
         self._pdi_viewer_timeout_timer.start(PDI_VIEWER_START_TIMEOUT_MS)
         self._probe_pdi_viewer_ready()
         self._capture_pdi_viewer_url()
+
+    def _set_pdi_viewer_starting_feedback(self) -> None:
+        self._pdi_viewer_button_states = (
+            self.pdi_view_button.isEnabled(),
+            self.open_existing_pdi_button.isEnabled(),
+        )
+        self.pdi_view_button.setText("正在启动…")
+        self.pdi_view_button.setEnabled(False)
+        self.open_existing_pdi_button.setText("阅片器启动中…")
+        self.open_existing_pdi_button.setEnabled(False)
+        if not self._is_busy():
+            self.progress_label.setText("正在启动本地离线阅片服务…")
+            if self.pdi_status_card.isVisible():
+                self._set_pdi_status("正在启动本地离线阅片服务…", "generating")
+
+    def _restore_pdi_viewer_feedback(self, message: str, status: str) -> None:
+        pdi_enabled, existing_enabled = self._pdi_viewer_button_states
+        actions_available = not self._is_busy()
+        self.pdi_view_button.setText("打开影像")
+        self.pdi_view_button.setEnabled(pdi_enabled and actions_available)
+        self.open_existing_pdi_button.setText("打开已有 PDI 目录")
+        self.open_existing_pdi_button.setEnabled(
+            existing_enabled and actions_available
+        )
+        if actions_available:
+            self.progress_label.setText(message)
+            if self.pdi_status_card.isVisible():
+                self._set_pdi_status(message, status)
 
     def _set_pdi_viewer_url(self, url: str) -> None:
         candidate = QUrl(url)
@@ -2797,6 +3093,10 @@ class DcmGetWindow(QMainWindow):
         self._pdi_viewer_probe_timer.stop()
         self._pdi_viewer_timeout_timer.stop()
         self._append_log("PDI", "离线阅片服务已就绪", "success")
+        self._restore_pdi_viewer_feedback(
+            "离线阅片服务已就绪，正在打开影像",
+            "ok",
+        )
         if self._pdi_viewer_open_when_ready and self._pdi_viewer_url:
             self._pdi_viewer_open_when_ready = False
             QDesktopServices.openUrl(QUrl(self._pdi_viewer_url))
@@ -2817,6 +3117,10 @@ class DcmGetWindow(QMainWindow):
             return
         self._append_log("PDI", "离线阅片服务已退出", "info")
         self._stop_pdi_viewer_process()
+        self._restore_pdi_viewer_feedback(
+            "离线阅片服务已退出，可重新打开",
+            "warning",
+        )
 
     def _on_pdi_viewer_error(self, process: QProcess, _error: object) -> None:
         if process is not self._pdi_viewer_process:
@@ -2839,6 +3143,10 @@ class DcmGetWindow(QMainWindow):
         if self._pdi_viewer_process is None:
             return
         self._stop_pdi_viewer_process()
+        self._restore_pdi_viewer_feedback(
+            "离线阅片服务启动失败，可重试",
+            "error",
+        )
         QMessageBox.critical(
             self,
             "阅片器启动失败",
@@ -3302,6 +3610,7 @@ QLabel#PdiStatusText[status="ok"] {{ color: {COLORS['success']}; font-weight: 60
 QLabel#PdiStatusText[status="warning"] {{ color: {COLORS['warning']}; font-weight: 600; }}
 QLabel#PdiStatusText[status="error"] {{ color: {COLORS['danger']}; font-weight: 600; }}
 QLabel#ErrorText {{ color: {COLORS['danger']}; background: #FEF2F2; border: 1px solid #FECACA; padding: 9px; border-radius: 6px; }}
+QLabel#InlineErrorText {{ color: {COLORS['danger']}; }}
 QLabel#WarningText {{ color: {COLORS['warning']}; background: #FFF7ED; border: 1px solid #FED7AA; padding: 9px; border-radius: 6px; }}
 QLabel#StatusPill, QLabel#CheckPill {{ padding: 6px 10px; border-radius: 12px; background: #F1F5F9; color: {COLORS['muted']}; }}
 QLabel#StatusPill[status="ok"], QLabel#CheckPill[status="ok"], QLabel#FieldHint[status="ok"] {{ background: #ECFDF5; color: {COLORS['success']}; }}
@@ -3316,7 +3625,7 @@ QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox, QTableWidget {{
 }}
 QLineEdit, QSpinBox, QComboBox {{ padding: 7px 9px; min-height: 20px; }}
 QPlainTextEdit, QTextEdit {{ padding: 8px; }}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus, QTableWidget:focus {{ border: 2px solid #38BDF8; }}
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus, QTableWidget:focus {{ border: 2px solid {COLORS['primary']}; }}
 QLineEdit[invalid="true"], QSpinBox[invalid="true"], QComboBox[invalid="true"] {{ border: 2px solid {COLORS['danger']}; background: #FEF2F2; }}
 QPushButton, QToolButton {{
     background: {COLORS['surface']};
@@ -3325,13 +3634,15 @@ QPushButton, QToolButton {{
     padding: 7px 12px;
 }}
 QPushButton:hover, QToolButton:hover {{ background: #F1F5F9; border-color: #94A3B8; }}
-QPushButton:focus, QToolButton:focus {{ border: 2px solid #38BDF8; }}
+QPushButton:focus, QToolButton:focus {{ border: 2px solid {COLORS['primary']}; }}
 QPushButton:disabled, QToolButton:disabled {{ color: #94A3B8; background: #F8FAFC; }}
 QPushButton#PrimaryButton {{ background: {COLORS['primary']}; color: white; border-color: {COLORS['primary']}; font-weight: 650; }}
 QPushButton#PrimaryButton:hover {{ background: {COLORS['primary_hover']}; }}
+QPushButton#PrimaryButton:focus {{ border: 2px solid {COLORS['focus_on_primary']}; }}
 QPushButton#PrimaryButton:disabled {{ color: #94A3B8; border-color: {COLORS['border']}; background: #F8FAFC; }}
 QPushButton#DangerButton {{ color: {COLORS['danger']}; border-color: #FCA5A5; }}
 QPushButton#DangerButton:hover {{ background: #FEF2F2; }}
+QPushButton#DangerButton:focus {{ border: 2px solid {COLORS['primary']}; }}
 QPushButton#DangerButton:disabled {{ color: #94A3B8; border-color: {COLORS['border']}; background: #F8FAFC; }}
 QProgressBar {{ border: 0; background: #E2E8F0; border-radius: 4px; min-height: 8px; max-height: 8px; }}
 QProgressBar::chunk {{ background: {COLORS['primary']}; border-radius: 4px; }}

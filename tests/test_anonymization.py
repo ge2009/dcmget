@@ -19,6 +19,7 @@ from dcmget.anonymization import (
 
 
 SECRET = b"dcmget-test-anonymization-key-32b"
+PHI_SENTINEL = "DANGEROUS-PHI-JANE-DOE-19700101"
 
 
 def test_anonymization_secret_first_creation_is_serialized(tmp_path):
@@ -125,6 +126,22 @@ def test_basic_profile_removes_common_identity_and_private_tags():
     assert dataset.PatientIdentityRemoved == "NO"
 
 
+def test_basic_profile_keeps_high_risk_clinical_text_for_in_hospital_use():
+    dataset = _add_high_risk_text(
+        _dataset(None, "1.2.3.1", "1.2.3.10"), PHI_SENTINEL
+    )
+
+    DicomAnonymizer("basic", secret=SECRET).anonymize_dataset(dataset)
+
+    assert dataset.MedicalAlerts == PHI_SENTINEL
+    assert dataset.Allergies == PHI_SENTINEL
+    assert dataset.PatientState == PHI_SENTINEL
+    assert dataset.VisitComments == PHI_SENTINEL
+    assert dataset.RequestAttributesSequence[0].MedicalAlerts == PHI_SENTINEL
+    assert dataset.RequestAttributesSequence[0].PatientState == PHI_SENTINEL
+    assert dataset.PatientIdentityRemoved == "NO"
+
+
 def test_research_aliases_are_stable_across_anonymizer_instances():
     first = _dataset(None, "1.2.3.1", "1.2.3.10")
     second = _dataset(None, "1.2.3.1", "1.2.3.10")
@@ -210,6 +227,46 @@ def test_strict_profile_clears_temporal_demographic_and_device_values():
     assert dataset.StudyDescription == ""
     assert dataset.LongitudinalTemporalInformationModified == "REMOVED"
     assert dataset.PixelData == b"\x01\x02"
+
+
+@pytest.mark.parametrize("profile", ["research", "strict"])
+def test_anonymous_profiles_clear_high_risk_text_recursively_after_serialization(
+    profile, tmp_path
+):
+    dataset = _add_high_risk_text(
+        _dataset(None, "1.2.3.1", "1.2.3.10"), PHI_SENTINEL
+    )
+
+    DicomAnonymizer(profile, secret=SECRET).anonymize_dataset(dataset)
+    output = tmp_path / f"{profile}.dcm"
+    dataset.save_as(output, enforce_file_format=True)
+
+    assert PHI_SENTINEL.encode("ascii") not in output.read_bytes()
+    reloaded = dcmread(output)
+    nested = reloaded.RequestAttributesSequence[0]
+    for keyword in (
+        "MedicalAlerts",
+        "Allergies",
+        "PatientState",
+        "SpecialNeeds",
+        "VisitComments",
+        "AcquisitionContextDescription",
+    ):
+        assert getattr(reloaded, keyword) == ""
+        assert getattr(nested, keyword) == ""
+    assert all(
+        PHI_SENTINEL not in str(element.value) for element in reloaded.iterall()
+    )
+    assert reloaded.PatientIdentityRemoved == "YES"
+    assert reloaded.Rows == 1
+    assert reloaded.Columns == 2
+    assert reloaded.SamplesPerPixel == 1
+    assert reloaded.PhotometricInterpretation == "MONOCHROME2"
+    assert reloaded.BitsAllocated == 8
+    assert reloaded.BitsStored == 8
+    assert reloaded.HighBit == 7
+    assert reloaded.PixelRepresentation == 0
+    assert reloaded.PixelData == b"\x01\x02"
 
 
 @pytest.mark.parametrize("profile", ["research", "strict"])
@@ -387,4 +444,21 @@ def _dataset(
     dataset.ReferencedImageSequence = Sequence([reference])
     if path is not None:
         dataset.save_as(path, enforce_file_format=True)
+    return dataset
+
+
+def _add_high_risk_text(dataset: FileDataset, value: str) -> FileDataset:
+    dataset.MedicalAlerts = value
+    dataset.Allergies = value
+    dataset.PatientState = value
+    dataset.SpecialNeeds = value
+    dataset.VisitComments = value
+    dataset.AcquisitionContextDescription = value
+    nested = dataset.RequestAttributesSequence[0]
+    nested.MedicalAlerts = value
+    nested.Allergies = value
+    nested.PatientState = value
+    nested.SpecialNeeds = value
+    nested.VisitComments = value
+    nested.AcquisitionContextDescription = value
     return dataset

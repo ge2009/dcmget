@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 
 import pytest
-from PyQt5.QtCore import QSettings, Qt
+from PyQt5.QtCore import QPoint, QSettings, Qt
 from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox
 
-from dcmget.config import AppConfig
+from dcmget.config import AppConfig, load_config
 from dcmget.core import (
     AccessionResult,
     AccessionStatus,
@@ -131,6 +131,96 @@ def test_pdi_settings_round_trip_ohif_option(qtbot, tmp_path):
     assert not result.pdi_include_ohif_viewer
     assert page.pdi_ohif_checkbox.isEnabled()
     assert "无需选择 JSON、DICOMDIR 或逐个影像文件" in page.pdi_ohif_hint.text()
+
+
+def test_task_page_pdi_quick_controls_persist_and_sync_settings(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    output = tmp_path / "便携阅片"
+    output.mkdir()
+    original_ae = window.config.calling_ae_title
+
+    assert not window.quick_pdi_checkbox.isChecked()
+    assert not window.quick_pdi_output_button.isEnabled()
+
+    window.quick_pdi_checkbox.click()
+
+    persisted = load_config(tmp_path / "config.json")
+    assert persisted.pdi_export_enabled
+    assert persisted.calling_ae_title == original_ae
+    assert window.settings_page.pdi_enabled_checkbox.isChecked()
+    assert "pdi_institution_name" in persisted.validate()
+    assert window.pdi_status_card.isVisible()
+
+    monkeypatch.setattr(
+        ui_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args: str(output),
+    )
+    window.quick_pdi_output_button.click()
+
+    persisted = load_config(tmp_path / "config.json")
+    assert persisted.pdi_output_folder == str(output)
+    assert window.settings_page.pdi_output_edit.text() == str(output)
+    assert window.quick_pdi_output_label.toolTip() == str(output)
+
+    window.quick_pdi_checkbox.click()
+    assert not load_config(tmp_path / "config.json").pdi_export_enabled
+    assert not window.settings_page.pdi_enabled_checkbox.isChecked()
+    assert not window.pdi_status_card.isVisible()
+
+
+def test_pdi_settings_save_syncs_task_page_quick_controls(qtbot, tmp_path):
+    window = make_window(qtbot, tmp_path)
+    page = window.settings_page
+    output = tmp_path / "pdi-output"
+
+    window._show_settings()
+    page.pdi_enabled_checkbox.setChecked(True)
+    page.pdi_institution_edit.setText("测试医院")
+    page.pdi_output_edit.setText(str(output))
+    page._save()
+
+    assert window.pages.currentWidget() is window.task_page
+    assert window.quick_pdi_checkbox.isChecked()
+    assert window.quick_pdi_output_button.isEnabled()
+    assert window.quick_pdi_output_label.toolTip() == str(output)
+    assert load_config(tmp_path / "config.json").pdi_output_folder == str(output)
+
+
+def test_task_page_pdi_quick_controls_fit_high_dpi_and_lock_while_running(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    window._set_task_form_expanded(True)
+    window.quick_pdi_checkbox.click()
+    QApplication.processEvents()
+
+    viewport = window.task_scroll.viewport()
+    assert window.task_scroll.horizontalScrollBar().maximum() == 0
+    for widget in (window.quick_pdi_checkbox, window.quick_pdi_output_button):
+        left = widget.mapTo(viewport, QPoint(0, 0)).x()
+        right = widget.mapTo(
+            viewport, QPoint(widget.width() - 1, widget.height() - 1)
+        ).x()
+        assert 0 <= left <= right < viewport.width()
+
+    window.quick_pdi_checkbox.setFocus(Qt.OtherFocusReason)
+    qtbot.keyClick(window.quick_pdi_checkbox, Qt.Key_Tab)
+    assert QApplication.focusWidget() is window.quick_pdi_output_button
+
+    window.worker = object()
+    window._set_running(True)
+    assert not window.quick_pdi_checkbox.isEnabled()
+    assert not window.quick_pdi_output_button.isEnabled()
+
+    window.worker = None
+    window._set_running(False)
+    assert window.quick_pdi_checkbox.isEnabled()
+    assert window.quick_pdi_output_button.isEnabled()
 
 
 def test_download_completion_starts_pdi_with_exact_batch_files(
@@ -480,6 +570,8 @@ def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
         output_directory: str
 
     window.last_pdi_result = Result(str(output))
+    window.pdi_view_button.setEnabled(True)
+    window.open_existing_pdi_button.setEnabled(True)
     launched = []
 
     class FakeSignal:
@@ -554,6 +646,11 @@ def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
     window._open_pdi_viewer()
     window._pdi_viewer_probe_timer.stop()
 
+    assert window.pdi_view_button.text() == "正在启动…"
+    assert not window.pdi_view_button.isEnabled()
+    assert window.open_existing_pdi_button.text() == "阅片器启动中…"
+    assert not window.open_existing_pdi_button.isEnabled()
+    assert "正在启动本地离线阅片服务" in window.progress_label.text()
     assert len(launched) == 1
     program, arguments, cwd = launched[0]
     assert Path(program).resolve() == Path(ui_module.sys.executable).resolve()
@@ -595,6 +692,11 @@ def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
     window._on_pdi_viewer_probe_finished(reply)
 
     assert opened == [viewer_url(port, session_token)]
+    assert window.pdi_view_button.text() == "打开影像"
+    assert window.pdi_view_button.isEnabled()
+    assert window.open_existing_pdi_button.text() == "打开已有 PDI 目录"
+    assert window.open_existing_pdi_button.isEnabled()
+    assert "已就绪" in window.progress_label.text()
     window._open_pdi_viewer()
     assert opened == [
         viewer_url(port, session_token),
@@ -602,6 +704,12 @@ def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
     ]
 
     process = FakeProcess.instances[0]
+    window._on_pdi_viewer_finished(process, 0, None)
+    assert window.pdi_view_button.text() == "打开影像"
+    assert window.pdi_view_button.isEnabled()
+    assert window.open_existing_pdi_button.text() == "打开已有 PDI 目录"
+    assert window.open_existing_pdi_button.isEnabled()
+    assert "已退出" in window.progress_label.text()
     event = QCloseEvent()
     window.closeEvent(event)
 
@@ -796,6 +904,9 @@ def test_pdi_viewer_reports_early_exit_and_readiness_timeout(
             self.deleted = True
 
     exited = FakeProcess(ui_module.QProcess.NotRunning)
+    window.pdi_view_button.setEnabled(True)
+    window.open_existing_pdi_button.setEnabled(True)
+    window._set_pdi_viewer_starting_feedback()
     window._pdi_viewer_process = exited
     window._pdi_viewer_root = tmp_path
     window._on_pdi_viewer_finished(exited, 1, None)
@@ -804,8 +915,14 @@ def test_pdi_viewer_reports_early_exit_and_readiness_timeout(
     assert exited.deleted
     assert "就绪前退出" in messages[-1][1]
     assert "诊断日志" in messages[-1][1]
+    assert window.pdi_view_button.text() == "打开影像"
+    assert window.pdi_view_button.isEnabled()
+    assert window.open_existing_pdi_button.text() == "打开已有 PDI 目录"
+    assert window.open_existing_pdi_button.isEnabled()
+    assert "启动失败" in window.progress_label.text()
 
     timed_out = FakeProcess(ui_module.QProcess.Running)
+    window._set_pdi_viewer_starting_feedback()
     window._pdi_viewer_process = timed_out
     window._pdi_viewer_root = tmp_path
     window._on_pdi_viewer_start_timeout()
@@ -814,6 +931,11 @@ def test_pdi_viewer_reports_early_exit_and_readiness_timeout(
     assert timed_out.terminated
     assert timed_out.deleted
     assert "30 秒内未就绪" in messages[-1][1]
+    assert window.pdi_view_button.text() == "打开影像"
+    assert window.pdi_view_button.isEnabled()
+    assert window.open_existing_pdi_button.text() == "打开已有 PDI 目录"
+    assert window.open_existing_pdi_button.isEnabled()
+    assert "启动失败" in window.progress_label.text()
 
 
 def test_accept_partial_results_continues_pdi_without_redownload(

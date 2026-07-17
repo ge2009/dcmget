@@ -805,7 +805,8 @@ def test_pending_move_with_aborted_store_is_failed_and_retryable(tmp_path, monke
     staging.mkdir()
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
-    runner = DownloadRunner(config, tools)
+    logs: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(config, tools, log_callback=lambda *entry: logs.append(entry))
 
     class Process:
         stdout = iter(["I: Received Move Response 1 (Pending)\n"])
@@ -826,7 +827,8 @@ def test_pending_move_with_aborted_store_is_failed_and_retryable(tmp_path, monke
 
     assert result.status == AccessionStatus.FAILED
     assert "待处理响应" in result.message
-    assert "接收连接中止" in result.message
+    assert "接收连接中止" not in result.message
+    assert any("仅作为接收器警告" in message for _source, message, _level in logs)
     assert BatchSummary([result]).failed_accessions == ["FAILED001"]
 
 
@@ -974,6 +976,129 @@ def test_success_status_with_zero_failed_suboperations_remains_completed(
 
     assert result.status == AccessionStatus.COMPLETED
     assert result.file_count == 1
+
+
+def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+
+    class Process:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Remaining Suboperations : 0\n",
+                "I: Number of Completed Suboperations : 2\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("MISSING001", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.FAILED
+    assert result.file_count == 0
+    assert "PACS 报告完成 2 个子操作" in result.message
+    assert "成功归档 0 个文件" in result.message
+
+
+def test_success_with_fewer_archived_files_than_completed_suboperations_is_partial(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+
+    class Process:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Remaining Suboperations : 0\n",
+                "I: Number of Completed Suboperations : 2\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            _write_minimal_dicom(
+                staging / "one.dcm", "1.2.3.73", accession="PARTIAL002"
+            )
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("PARTIAL002", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.PARTIAL
+    assert result.file_count == 1
+    assert "PACS 报告完成 2 个子操作" in result.message
+    assert "成功归档 1 个文件" in result.message
+
+
+def test_success_with_remaining_suboperations_is_partial(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+
+    class Process:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Remaining Suboperations : 1\n",
+                "I: Number of Completed Suboperations : 1\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            _write_minimal_dicom(
+                staging / "one.dcm", "1.2.3.74", accession="REMAINING001"
+            )
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("REMAINING001", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.PARTIAL
+    assert result.file_count == 1
+    assert "最终响应仍有 1 个子操作未完成" in result.message
 
 
 def test_pending_without_final_response_with_files_is_partial(tmp_path, monkeypatch):
@@ -1164,15 +1289,24 @@ def test_receiver_death_aborts_current_move_and_marks_failure(tmp_path, monkeypa
     assert "storescp 意外退出" in result.message
 
 
-def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
+def test_unrelated_store_abort_does_not_downgrade_successful_move(tmp_path, monkeypatch):
     staging = tmp_path / "staging"
     staging.mkdir()
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
-    runner = DownloadRunner(config, tools)
+    logs: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(config, tools, log_callback=lambda *entry: logs.append(entry))
 
     class Process:
-        stdout = iter(["I: Received Move Response 1 (Pending)\n"])
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Remaining Suboperations : 0\n",
+                "I: Number of Completed Suboperations : 1\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
 
         @staticmethod
         def poll():
@@ -1180,7 +1314,9 @@ def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
 
         @staticmethod
         def wait():
-            _write_minimal_dicom(staging / "CT.1", "1.2.3.10")
+            _write_minimal_dicom(
+                staging / "CT.1", "1.2.3.10", accession="PARTIAL001"
+            )
             with runner._diagnostic_lock:
                 runner._storescp_abort_count += 1
             return 0
@@ -1189,9 +1325,10 @@ def test_received_files_with_aborted_store_are_partial(tmp_path, monkeypatch):
     result = runner._download_one("PARTIAL001", staging, 1, 1)
     runner._close_file_logger()
 
-    assert result.status == AccessionStatus.PARTIAL
+    assert result.status == AccessionStatus.COMPLETED
     assert result.file_count == 1
-    assert "接收连接中止" in result.message
+    assert "接收连接中止" not in result.message
+    assert any("仅作为接收器警告" in message for _source, message, _level in logs)
     assert result.archived_files == [
         str(next((tmp_path / "dicom").rglob("*.dcm")))
     ]
@@ -1312,7 +1449,9 @@ def test_live_speed_updates_when_one_received_file_keeps_growing(tmp_path, monke
     assert result.status == AccessionStatus.COMPLETED
 
 
-def test_live_speed_scans_staging_only_every_half_second(tmp_path, monkeypatch):
+def test_live_speed_uses_incremental_tracker_and_only_full_scans_at_boundaries(
+    tmp_path, monkeypatch
+):
     staging = tmp_path / "staging"
     staging.mkdir()
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
@@ -1354,9 +1493,43 @@ def test_live_speed_scans_staging_only_every_half_second(tmp_path, monkeypatch):
     result = runner._download_one("SAMPLED001", staging, 1, 1)
     runner._close_file_logger()
 
-    assert files_in.call_count == 3  # initial snapshot, one live sample, final snapshot
+    assert files_in.call_count == 2  # initial baseline and authoritative final snapshot
     assert len(progress) == 1
     assert result.status == AccessionStatus.NO_DATA
+
+
+def test_live_tracker_stops_statting_all_stable_files_and_adapts_interval(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    for index in range(1_000):
+        (staging / f"{index:04d}.dcm").write_bytes(b"x")
+
+    real_stat = Path.stat
+    stat_calls = 0
+
+    def counted_stat(path, *args, **kwargs):
+        nonlocal stat_calls
+        if path.parent == staging:
+            stat_calls += 1
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    tracker = core._LiveStagingTracker(staging, set())
+
+    assert tracker.sample() == (1_000, 1_000)
+    first_sample_calls = stat_calls
+    assert first_sample_calls == 1_000
+    assert tracker.sample_interval_seconds == 1.0
+
+    tracker.sample()
+    second_sample_calls = stat_calls - first_sample_calls
+    assert second_sample_calls == 1_000
+
+    before_third = stat_calls
+    tracker.sample()
+    assert stat_calls - before_third <= tracker._RECENT_FILE_LIMIT
 
 
 def test_progress_callback_failure_terminates_movescu_and_joins_reader(

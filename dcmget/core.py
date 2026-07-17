@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -148,11 +149,19 @@ def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
         if re.match(r"pending\b", response_status, re.IGNORECASE):
             diagnostics.pending_responses += 1
         else:
+            _reset_move_suboperation_counts(diagnostics)
             diagnostics.final_response_status = response_status
 
     dimse_status = _MOVE_DIMSE_STATUS_RE.search(text)
     if dimse_status:
-        diagnostics.dimse_status_code = int(dimse_status.group("code"), 16)
+        status_code = int(dimse_status.group("code"), 16)
+        if (
+            status_code not in _PENDING_DIMSE_STATUSES
+            and diagnostics.dimse_status_code in _PENDING_DIMSE_STATUSES
+            and diagnostics.final_response_status is None
+        ):
+            _reset_move_suboperation_counts(diagnostics)
+        diagnostics.dimse_status_code = status_code
         diagnostics.dimse_status_text = (dimse_status.group("text") or "").strip()
 
     suboperation = _MOVE_SUBOPERATION_RE.search(text)
@@ -163,6 +172,15 @@ def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
             f"{kind}_suboperations",
             int(suboperation.group("count")),
         )
+
+
+def _reset_move_suboperation_counts(diagnostics: _MoveDiagnostics) -> None:
+    """Discard counts from the last pending response before parsing the final one."""
+
+    diagnostics.remaining_suboperations = None
+    diagnostics.completed_suboperations = None
+    diagnostics.failed_suboperations = None
+    diagnostics.warning_suboperations = None
 
 
 def _move_has_final_response(diagnostics: _MoveDiagnostics) -> bool:
@@ -198,6 +216,25 @@ def _move_has_problem(diagnostics: _MoveDiagnostics) -> bool:
     )
 
 
+def _move_archive_mismatch(
+    diagnostics: _MoveDiagnostics, archived_file_count: int
+) -> str:
+    """Describe a final C-MOVE count that cannot match the usable local archive."""
+
+    if not _move_has_final_response(diagnostics):
+        return ""
+    details: list[str] = []
+    remaining = diagnostics.remaining_suboperations
+    if remaining is not None and remaining > 0:
+        details.append(f"最终响应仍有 {remaining} 个子操作未完成")
+    completed = diagnostics.completed_suboperations
+    if completed is not None and completed != archived_file_count:
+        details.append(
+            f"PACS 报告完成 {completed} 个子操作，本机成功归档 {archived_file_count} 个文件"
+        )
+    return "；".join(details)
+
+
 def _move_diagnostic_summary(diagnostics: _MoveDiagnostics) -> str:
     details: list[str] = []
     dimse_status = diagnostics.dimse_status_code
@@ -229,6 +266,86 @@ def _move_diagnostic_summary(diagnostics: _MoveDiagnostics) -> str:
     if counts:
         details.append("子操作：" + "、".join(counts))
     return "；".join(details)
+
+
+class _LiveStagingTracker:
+    """Approximate live transfer metrics without repeatedly stat'ing every file.
+
+    ``storescp -od`` writes directly into the staging directory used here.  Live
+    metrics therefore use a cheap top-level ``scandir`` plus a bounded recent-file
+    cache.  The authoritative recursive snapshot still runs after C-MOVE exits.
+    """
+
+    _RECENT_FILE_LIMIT = 128
+
+    def __init__(self, directory: Path, baseline: Iterable[Path]):
+        self.directory = directory
+        self._baseline = set(baseline)
+        self._known: set[Path] = set()
+        self._active: set[Path] = set()
+        self._sizes: dict[Path, int] = {}
+        self._recent: deque[Path] = deque(maxlen=self._RECENT_FILE_LIMIT)
+        self._total_bytes = 0
+
+    @property
+    def sample_interval_seconds(self) -> float:
+        count = len(self._known)
+        if count >= 20_000:
+            return 5.0
+        if count >= 5_000:
+            return 2.0
+        if count >= 500:
+            return 1.0
+        return 0.5
+
+    def sample(self) -> tuple[int, int]:
+        self._discover_new_files()
+        candidates = set(self._active)
+        candidates.update(self._recent)
+        for path in candidates:
+            previous = self._sizes.get(path)
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                self._forget(path)
+                continue
+            except OSError:
+                continue
+            if previous is None:
+                self._total_bytes += size
+            else:
+                self._total_bytes += size - previous
+                if size == previous:
+                    self._active.discard(path)
+                else:
+                    self._active.add(path)
+            self._sizes[path] = size
+        return len(self._known), max(0, self._total_bytes)
+
+    def _discover_new_files(self) -> None:
+        try:
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    path = Path(entry.path)
+                    if path in self._baseline or path in self._known:
+                        continue
+                    self._known.add(path)
+                    self._active.add(path)
+                    self._recent.append(path)
+        except OSError:
+            return
+
+    def _forget(self, path: Path) -> None:
+        self._known.discard(path)
+        self._active.discard(path)
+        previous = self._sizes.pop(path, None)
+        if previous is not None:
+            self._total_bytes -= previous
 
 
 class DcmtkResolver:
@@ -664,6 +781,7 @@ class DownloadRunner:
         self, accession: str, staging: Path, index: int, total: int
     ) -> AccessionResult:
         before = _files_in(staging)
+        live_files = _LiveStagingTracker(staging, before)
         with self._diagnostic_lock:
             aborts_before = self._storescp_abort_count
         command = build_movescu_command(self.config, self.tools, accession)
@@ -701,10 +819,8 @@ class DownloadRunner:
                         self._terminate_process_safely(process)
                         break
                 now = time.monotonic()
-                if now - last_sample_at >= 0.5:
-                    new_files = _files_in(staging) - before
-                    received = len(new_files)
-                    received_bytes = _total_file_size(new_files)
+                if now - last_sample_at >= live_files.sample_interval_seconds:
+                    received, received_bytes = live_files.sample()
                     sample_seconds = now - last_sample_at
                     sample_speed = (
                         max(0, received_bytes - last_received_bytes) / sample_seconds
@@ -799,6 +915,21 @@ class DownloadRunner:
             receiver_aborts = self._storescp_abort_count - aborts_before
         move_problem = _move_has_problem(diagnostics)
         move_detail = _move_diagnostic_summary(diagnostics)
+        archive_mismatch = _move_archive_mismatch(diagnostics, len(moved))
+        if archive_mismatch:
+            move_problem = True
+            move_detail = "；".join(
+                detail for detail in (move_detail, archive_mismatch) if detail
+            )
+        if receiver_aborts:
+            self._emit(
+                "storescp",
+                (
+                    f"当前 C-MOVE 期间记录到 {receiver_aborts} 个未关联的接收连接中止；"
+                    "该信息仅作为接收器警告，检查号结果以 C-MOVE 最终状态和文件完整性为准"
+                ),
+                "warning",
+            )
 
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
@@ -810,28 +941,22 @@ class DownloadRunner:
                 message += f"，已保留 {len(moved)} 个完整文件"
             if rejected:
                 message += f"，{rejected_detail}"
-        elif return_code == 0 and moved and (
-            move_problem or receiver_aborts or rejected
-        ):
+        elif return_code == 0 and moved and (move_problem or rejected):
             status = AccessionStatus.PARTIAL
             details = []
             if move_problem:
                 details.append(move_detail or "C-MOVE 未正常完成")
-            if receiver_aborts:
-                details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
                 details.append(rejected_detail)
             message = f"收到 {len(moved)} 个文件，但" + "；".join(details)
         elif return_code == 0 and moved:
             status = AccessionStatus.COMPLETED
             message = f"收到 {len(moved)} 个文件"
-        elif return_code == 0 and (move_problem or receiver_aborts or rejected):
+        elif return_code == 0 and (move_problem or rejected):
             status = AccessionStatus.FAILED
             details = []
             if move_problem:
                 details.append(move_detail or "C-MOVE 未正常完成")
-            if receiver_aborts:
-                details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
                 details.append(rejected_detail)
             message = "；".join(details) + "；未收到文件"

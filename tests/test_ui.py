@@ -5,8 +5,8 @@ import threading
 import traceback
 
 import pytest
-from PyQt5.QtCore import QSettings, Qt, QThread
-from PyQt5.QtGui import QCloseEvent
+from PyQt5.QtCore import QPoint, QRect, QSettings, Qt, QThread
+from PyQt5.QtGui import QCloseEvent, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QFormLayout,
@@ -17,7 +17,13 @@ from PyQt5.QtWidgets import (
 )
 
 from dcmget.config import AppConfig
-from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
+from dcmget.core import (
+    AccessionResult,
+    AccessionStatus,
+    BatchSummary,
+    PreflightResult,
+    ToolPaths,
+)
 from dcmget.task_state import TaskCheckpoint, TaskCheckpointStore
 import dcmget.ui as ui_module
 from dcmget.ui import DcmGetWindow, DownloadWorker, PdiWorker
@@ -68,6 +74,41 @@ def test_more_than_200_accessions_use_summary_mode_without_table_rows(qtbot, tmp
     assert window.large_batch_summary_card.isVisible()
     assert "40,000" in window.large_batch_summary_label.text()
     assert "超过 200 条" in window.large_batch_summary_label.text()
+
+
+def test_large_batch_summary_stays_in_first_viewport_and_failed_items_copy_from_results(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    accessions = [f"A{index:05d}" for index in range(40_000)]
+    window._display_total = len(accessions)
+    window._populate_waiting_rows(accessions)
+    window.worker = object()
+    window._set_running(True)
+    QApplication.processEvents()
+
+    viewport = window.task_scroll.viewport()
+    summary_top = window.large_batch_summary_card.mapTo(viewport, QPoint(0, 0)).y()
+    assert window.task_scroll.horizontalScrollBar().maximum() == 0
+    assert 0 <= summary_top < viewport.height()
+    assert not window.preflight_card.isVisible()
+    assert not window.pdi_status_card.isVisible()
+
+    window.worker = None
+    window._set_running(False)
+    results = [
+        AccessionResult("OK", AccessionStatus.COMPLETED),
+        AccessionResult("FAILED-1", AccessionStatus.FAILED),
+        AccessionResult("PARTIAL-2", AccessionStatus.PARTIAL),
+    ]
+    window._reset_large_batch_summary(len(accessions), results)
+
+    assert window.task_table.rowCount() == 0
+    assert window.copy_failed_button.isVisible()
+    qtbot.mouseClick(window.copy_failed_button, Qt.LeftButton)
+    assert QApplication.clipboard().text() == "FAILED-1\nPARTIAL-2"
 
 
 def test_200_accessions_keep_details_and_201_hide_them(qtbot, tmp_path):
@@ -281,6 +322,7 @@ def test_header_uses_two_rows_without_clipping_at_high_dpi_logical_width(
     window.resize(683, 480)
     QApplication.processEvents()
 
+    assert not window.app_logo.isVisible()
     status_widgets = (
         window.app_title,
         window.app_subtitle,
@@ -301,6 +343,89 @@ def test_header_uses_two_rows_without_clipping_at_high_dpi_logical_width(
     assert window.tool_status.toolTip() == window.tool_status.text()
     assert window.tool_status.accessibleDescription() == window.tool_status.text()
     assert window.entitlement_status.toolTip() == "已注册 · Windows设备"
+
+
+def test_header_shows_scaled_project_logo_without_narrow_width_overflow(
+    qtbot, tmp_path
+):
+    source = QPixmap(128, 64)
+    source.fill(Qt.blue)
+    assert source.save(str(tmp_path / "logo.png"))
+    window = make_window(qtbot, tmp_path)
+
+    assert window.app_logo.isVisible()
+    assert window.app_logo.size().width() == 32
+    assert window.app_logo.size().height() == 32
+    assert window.app_logo.pixmap() is not None
+    assert window.app_logo.pixmap().width() == 32
+    assert window.app_logo.pixmap().height() == 16
+
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    QApplication.processEvents()
+
+    assert window.app_logo.geometry().right() < window.header.width()
+    assert window.task_scroll.horizontalScrollBar().maximum() == 0
+
+
+def test_task_and_pdi_action_rows_do_not_overflow_at_150_percent_scaling(
+    qtbot, tmp_path
+):
+    window = make_window(qtbot, tmp_path)
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    window.worker = object()
+    window._set_running(True)
+    QApplication.processEvents()
+
+    viewport = window.task_scroll.viewport()
+    assert window.task_scroll.horizontalScrollBar().maximum() == 0
+    for button in window._task_action_buttons:
+        if not button.isVisible():
+            continue
+        left = button.mapTo(viewport, QPoint(0, 0)).x()
+        right = button.mapTo(
+            viewport, QPoint(button.width() - 1, button.height() - 1)
+        ).x()
+        assert 0 <= left <= right < viewport.width()
+
+    window.worker = None
+    window.config.pdi_export_enabled = True
+    window._set_running(False)
+    window.pdi_status_card.show()
+    for button in window._pdi_action_buttons:
+        button.setEnabled(True)
+    QApplication.processEvents()
+
+    assert window.task_scroll.horizontalScrollBar().maximum() == 0
+    for button in window._pdi_action_buttons:
+        left = button.mapTo(viewport, QPoint(0, 0)).x()
+        right = button.mapTo(
+            viewport, QPoint(button.width() - 1, button.height() - 1)
+        ).x()
+        assert 0 <= left <= right < viewport.width()
+
+
+def test_release_notes_dialog_fits_1024x720_at_150_percent_scaling(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+
+    class LogicalScreen:
+        @staticmethod
+        def availableGeometry():
+            return QRect(0, 0, 683, 480)
+
+    monkeypatch.setattr(window, "screen", lambda: LogicalScreen())
+    dialog = ui_module.ReleaseNotesDialog("# 版本说明", window)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    QApplication.processEvents()
+
+    assert dialog.width() <= 683
+    assert dialog.height() <= 480
+    assert dialog.minimumWidth() <= 683
+    assert dialog.minimumHeight() <= 480
 
 
 def test_task_shortcuts_only_run_on_task_page_without_reloading_settings(
@@ -438,6 +563,53 @@ def test_settings_validation_scrolls_to_first_invalid_field(qtbot, tmp_path):
     assert page.directory_template_combo.hasFocus()
     assert page.settings_scroll.verticalScrollBar().value() > 0
     assert "目录模板" in page.directory_template_combo.accessibleDescription()
+
+
+def test_destination_preflight_error_is_inline_accessible_and_focused(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow)
+    window.accession_edit.setPlainText("A001")
+    tools = ToolPaths(
+        movescu=tmp_path / "movescu",
+        storescp=tmp_path / "storescp",
+        bin_dir=tmp_path,
+        version="3.7.0",
+    )
+    message = "保存目录不可写：拒绝访问"
+    monkeypatch.setattr(
+        ui_module,
+        "preflight",
+        lambda *_args: PreflightResult(
+            tools,
+            {"dicom_destination_folder": message},
+            [("保存目录", False, message)],
+        ),
+    )
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: QMessageBox.Ok)
+
+    window._start_download()
+
+    assert window.pages.currentWidget() is window.task_page
+    assert window.destination_edit.property("invalid") is True
+    assert window.destination_edit.toolTip() == message
+    assert window.destination_edit.accessibleDescription() == message
+    assert window.destination_error_label.text() == message
+    assert window.destination_error_label.isVisible()
+    assert window.destination_edit.hasFocus()
+
+    window.destination_edit.setText(str(tmp_path / "fixed"))
+    assert window.destination_edit.property("invalid") is False
+    assert window.destination_edit.toolTip() == ""
+    assert window.destination_edit.accessibleDescription() == ""
+    assert not window.destination_error_label.isVisible()
+
+
+def test_keyboard_focus_border_uses_high_contrast_primary_color():
+    assert ui_module.APP_STYLESHEET.count("border: 2px solid #0369A1") >= 2
+    assert "#38BDF8" not in ui_module.APP_STYLESHEET
 
 
 def test_cancel_settings_discards_unsaved_directory_template(qtbot, tmp_path):
@@ -929,6 +1101,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.7.0",
         "2.6.5",
         "2.6.4",
         "2.6.3",

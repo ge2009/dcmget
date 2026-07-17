@@ -18,6 +18,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 from pydicom import dcmread
+from pydicom.charset import convert_encodings
+from pydicom.datadict import dictionary_VR
+from pydicom.dataelem import RawDataElement
 from pydicom.dataset import Dataset
 
 from .config import AppConfig
@@ -37,6 +40,8 @@ RECOVERY_MARKER = ".DCMGET-EXPORT.JSON"
 RECOVERY_MARKER_PATH = "VIEWER/.dcmget/recovery"
 MAX_OHIF_INDEX_FRAMES = 100_000
 MAX_OHIF_INDEX_ESTIMATED_BYTES = 64 * 1024 * 1024
+_CHARSET_TEXT_VRS = {"LO", "LT", "PN", "SH", "ST", "UC", "UT"}
+_CHARSET_SAMPLE_LIMIT = 32 * 1024
 OHIF_INDEX_EXCLUDED_KEYWORDS = {
     "AdditionalPatientHistory",
     "AdmissionID",
@@ -394,6 +399,15 @@ class PdiExporter:
             except Exception as exc:
                 raise ValueError(f"无法读取 DICOM 文件 {source}：{exc}") from exc
 
+            repaired_character_set = _repair_dataset_character_set(dataset)
+            if repaired_character_set:
+                warning = (
+                    "检测到字符集缺失或声明异常，已按 "
+                    f"{repaired_character_set} 整理 PDI 阅片文字（原始 DICOM 未修改）"
+                )
+                if warning not in warnings:
+                    warnings.append(warning)
+
             sop_uid = str(
                 dataset.get("SOPInstanceUID", "")
                 or getattr(dataset.file_meta, "MediaStorageSOPInstanceUID", "")
@@ -442,6 +456,7 @@ class PdiExporter:
             metadata = _naturalize_dataset(dataset)
             metadata.setdefault("SOPInstanceUID", sop_uid)
             metadata.setdefault("StudyInstanceUID", study_uid)
+            metadata.setdefault("TransferSyntaxUID", transfer_syntax)
             item = _DicomItem(
                 source=source,
                 file_id=file_id,
@@ -1325,7 +1340,6 @@ def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:
         if (
             not keyword
             or element.VR in binary_vrs
-            or element.VR == "PN"
             or keyword in OHIF_INDEX_EXCLUDED_KEYWORDS
         ):
             continue
@@ -1342,8 +1356,9 @@ def _naturalize_value(value: object, vr: str = "") -> object:
     if vr == "SQ":
         return [_naturalize_dataset(item) for item in value]  # type: ignore[union-attr]
     if vr == "PN":
-        values = value if _is_sequence_value(value) else [value]
-        return [{"Alphabetic": str(item)} for item in values]
+        if _is_sequence_value(value):
+            return [str(item) for item in value]  # type: ignore[union-attr]
+        return str(value)
     if isinstance(value, bytes):
         raise TypeError("binary value")
     if _is_sequence_value(value):
@@ -1368,6 +1383,145 @@ def _naturalize_value(value: object, vr: str = "") -> object:
         except (TypeError, ValueError):
             return str(value)
     return str(value)
+
+
+def _repair_dataset_character_set(dataset: Dataset) -> str | None:
+    """Repair common vendor charset omissions for the generated OHIF index.
+
+    DICOM defaults to ISO_IR 6 when (0008,0005) is absent, but some PACS export
+    GBK/GB18030 or UTF-8 bytes without a matching declaration.  Pydicom keeps
+    text elements raw until first access, so this conservative check runs
+    immediately after ``dcmread`` and only changes the in-memory dataset used to
+    build the viewer index.  The copied source object remains byte-for-byte
+    unchanged.
+    """
+
+    samples = _raw_character_set_samples(dataset)
+    if not samples:
+        return None
+
+    declared_value = dataset.get("SpecificCharacterSet", "")
+    declared = (
+        str(declared_value[0] if _is_sequence_value(declared_value) else declared_value)
+        .strip()
+        .upper()
+    )
+    try:
+        declared_encoding = convert_encodings(declared_value or "")[0]
+    except (LookupError, TypeError, ValueError):
+        declared_encoding = "iso8859"
+
+    declared_text = _decode_character_set_samples(samples, declared_encoding)
+    utf8_text = _decode_character_set_samples(samples, "utf-8")
+    gb18030_text = _decode_character_set_samples(samples, "gb18030")
+
+    replacement: str | None = None
+    if declared in {"ISO_IR 192", "UTF-8", "UTF8"}:
+        if declared_text is None and _cjk_count(gb18030_text) >= 2:
+            replacement = "GB18030"
+    elif declared in {"GB18030", "GBK", "ISO 2022 GBK"}:
+        if declared_text is None and utf8_text is not None:
+            replacement = "ISO_IR 192"
+        elif (
+            utf8_text is not None
+            and _cjk_count(utf8_text) >= 2
+            and _text_damage_score(declared_text)
+            >= _text_damage_score(utf8_text) + 8
+        ):
+            replacement = "ISO_IR 192"
+    elif declared in {"", "ISO_IR 6", "ISO 2022 IR 6"}:
+        if utf8_text is not None and _non_ascii_count(utf8_text) > 0:
+            replacement = "ISO_IR 192"
+        elif _cjk_count(gb18030_text) >= 2 and _has_consecutive_high_bytes(samples):
+            replacement = "GB18030"
+
+    if replacement is None or replacement == declared:
+        return None
+    dataset.SpecificCharacterSet = replacement
+    is_implicit_vr, is_little_endian = dataset.original_encoding
+    dataset.set_original_encoding(
+        is_implicit_vr,
+        is_little_endian,
+        convert_encodings(replacement),
+    )
+    return replacement
+
+
+def _raw_character_set_samples(dataset: Dataset) -> list[bytes]:
+    samples: list[bytes] = []
+    total = 0
+    for raw in dataset._dict.values():
+        if not isinstance(raw, RawDataElement):
+            continue
+        try:
+            value_representation = str(raw.VR or dictionary_VR(raw.tag))
+        except KeyError:
+            continue
+        if value_representation not in _CHARSET_TEXT_VRS:
+            continue
+        if not isinstance(raw.value, bytes) or not any(
+            byte >= 0x80 for byte in raw.value
+        ):
+            continue
+        remaining = _CHARSET_SAMPLE_LIMIT - total
+        if remaining <= 0:
+            break
+        sample = raw.value[:remaining]
+        samples.append(sample)
+        total += len(sample)
+    return samples
+
+
+def _decode_character_set_samples(
+    samples: list[bytes], encoding: str
+) -> str | None:
+    try:
+        return "\n".join(
+            sample.rstrip(b"\x00 ").decode(encoding, errors="strict")
+            for sample in samples
+        )
+    except (LookupError, UnicodeDecodeError):
+        return None
+
+
+def _cjk_count(value: str | None) -> int:
+    if not value:
+        return 0
+    return sum(
+        "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+        for char in value
+    )
+
+
+def _non_ascii_count(value: str | None) -> int:
+    return sum(ord(char) > 0x7F for char in value or "")
+
+
+def _text_damage_score(value: str | None) -> int:
+    """Score strong corruption signals without guessing from valid text alone."""
+
+    score = 0
+    for char in value or "":
+        codepoint = ord(char)
+        is_private_use = (
+            0xE000 <= codepoint <= 0xF8FF
+            or 0xF0000 <= codepoint <= 0xFFFFD
+            or 0x100000 <= codepoint <= 0x10FFFD
+        )
+        if char == "\ufffd":
+            score += 16
+        elif is_private_use or (char not in "\n\r\t" and not char.isprintable()):
+            score += 8
+    return score
+
+
+def _has_consecutive_high_bytes(samples: list[bytes]) -> bool:
+    return any(
+        any(first >= 0x80 and second >= 0x80 for first, second in zip(sample, sample[1:]))
+        for sample in samples
+    )
 
 
 def _is_sequence_value(value: object) -> bool:
