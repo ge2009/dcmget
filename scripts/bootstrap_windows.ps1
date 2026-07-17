@@ -32,14 +32,14 @@ if (-not (Test-Path $Runtime)) {
 }
 
 $Config = Get-Content config.json -Raw | ConvertFrom-Json
-$RuleName = "DcmGet storescp TCP $($Config.storage_port)"
+$RuleName = "DcmGet storescp TCP"
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 if ($IsAdmin) {
     $Storescp = Get-ChildItem ".runtime\dcmtk\windows-x86_64" -Filter "storescp.exe" -File -Recurse | Select-Object -First 1
     if (-not $Storescp) { throw "未找到 storescp.exe，无法创建精确的防火墙规则。" }
-    Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    Get-NetFirewallRule -DisplayName "DcmGet storescp TCP*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
         -Program $Storescp.FullName -Protocol TCP -LocalPort $Config.storage_port `
         -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null

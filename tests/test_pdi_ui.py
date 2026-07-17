@@ -30,6 +30,9 @@ def isolated_settings(monkeypatch, tmp_path):
         "QSettings",
         lambda *_args: QSettings(str(path), QSettings.IniFormat),
     )
+    installed_resources = tmp_path / "installed-resources"
+    make_installed_viewer_root(installed_resources)
+    monkeypatch.setattr(ui_module, "resource_root", lambda: installed_resources)
 
 
 def make_window(qtbot, tmp_path):
@@ -46,14 +49,29 @@ def make_window(qtbot, tmp_path):
 
 def make_pdi_viewer_root(output: Path) -> Path:
     viewer = output / "VIEWER" / "OHIF"
-    viewer.mkdir(parents=True)
+    viewer.mkdir(parents=True, exist_ok=True)
     (viewer / "index.html").write_text("OHIF", encoding="utf-8")
     private = output / "VIEWER" / ".dcmget"
     private.mkdir()
     (private / "index").write_text('{"studies": []}', encoding="utf-8")
+    (output / "DICOM").mkdir()
     server_script = output / "VIEWER" / "pdi_server.py"
     server_script.write_text("# viewer", encoding="utf-8")
     return server_script
+
+
+def make_installed_viewer_root(resource_root: Path) -> Path:
+    viewer = (
+        resource_root
+        / ".runtime"
+        / "ohif"
+        / f"ohif-{ui_module.PDI_OHIF_VERSION}"
+    )
+    viewer.mkdir(parents=True, exist_ok=True)
+    (viewer / "index.html").write_text("TRUSTED INSTALLED OHIF", encoding="utf-8")
+    (viewer / "DCMGET_PAYLOAD.SHA256").write_text("checksums", encoding="utf-8")
+    (viewer / "DCMGET_OHIF_PAYLOAD.json").write_text("{}", encoding="utf-8")
+    return viewer
 
 
 def test_pdi_settings_are_collapsed_and_disabled_by_default(qtbot, tmp_path):
@@ -443,12 +461,18 @@ def test_pdi_progress_and_success_enable_viewer_and_open_directory(
     assert str(output) in messages[0][1]
 
 
-def test_pdi_immediate_viewer_starts_with_pdi_root_only(
+def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
     qtbot, tmp_path, monkeypatch
 ):
     window = make_window(qtbot, tmp_path)
     output = tmp_path / "PDI 目录"
     make_pdi_viewer_root(output)
+    (output / "VIEWER" / "OHIF" / "index.html").write_text(
+        "TAMPERED MEDIA VIEWER", encoding="utf-8"
+    )
+    installed_resources = tmp_path / "installed-resources"
+    trusted_viewer = make_installed_viewer_root(installed_resources)
+    monkeypatch.setattr(ui_module, "resource_root", lambda: installed_resources)
     trusted_server_script = Path(ui_module.__file__).with_name("pdi_server.py")
 
     @dataclass
@@ -533,18 +557,21 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
     assert len(launched) == 1
     program, arguments, cwd = launched[0]
     assert Path(program).resolve() == Path(ui_module.sys.executable).resolve()
-    assert arguments[:4] == [
+    assert arguments[:6] == [
         str(trusted_server_script),
         "--root",
         str(output.resolve()),
+        "--viewer-root",
+        str(trusted_viewer.resolve()),
         "--quiet",
     ]
-    assert arguments[4] == "--session-token"
-    session_token = arguments[5]
+    assert str(output / "VIEWER" / "OHIF") not in arguments
+    assert arguments[6] == "--session-token"
+    session_token = arguments[7]
     assert len(session_token) >= 43
-    assert arguments[6] == "--port"
-    port = int(arguments[7])
-    assert arguments[8] == "--no-browser"
+    assert arguments[8] == "--port"
+    port = int(arguments[9])
+    assert arguments[10] == "--no-browser"
     assert cwd == str(output.resolve())
     from dcmget.pdi_server import viewer_url
 
@@ -583,18 +610,141 @@ def test_pdi_immediate_viewer_starts_with_pdi_root_only(
     assert window._pdi_viewer_process is None
 
 
+def test_open_existing_pdi_directory_remembers_chinese_path(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    output = tmp_path / "既往 PDI 目录 with spaces"
+    make_pdi_viewer_root(output)
+    (output / "OPEN_VIEWER.exe").write_bytes(b"untrusted media executable")
+    dialog_calls = []
+
+    def choose_directory(_parent, title, initial):
+        dialog_calls.append((title, initial))
+        return str(output)
+
+    monkeypatch.setattr(
+        ui_module.QFileDialog,
+        "getExistingDirectory",
+        choose_directory,
+    )
+    launched = []
+    monkeypatch.setattr(
+        window,
+        "_launch_pdi_viewer",
+        lambda root: launched.append(root),
+    )
+
+    window._choose_existing_pdi_directory()
+
+    assert window.open_existing_pdi_button.text() == "打开已有 PDI 目录"
+    assert dialog_calls[0][0] == "打开已有 PDI 目录"
+    assert launched == [output.resolve()]
+    assert window.settings_store.value(
+        ui_module.PDI_LAST_OPEN_DIRECTORY_KEY,
+        "",
+        type=str,
+    ) == str(output.resolve())
+
+    remembered = []
+
+    def cancel_directory(_parent, title, initial):
+        remembered.append((title, initial))
+        return ""
+
+    monkeypatch.setattr(
+        ui_module.QFileDialog,
+        "getExistingDirectory",
+        cancel_directory,
+    )
+    window._choose_existing_pdi_directory()
+
+    assert remembered == [("打开已有 PDI 目录", str(output.resolve()))]
+    assert launched == [output.resolve()]
+
+
+def test_open_existing_pdi_directory_rejects_incomplete_root_without_json_wording(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    incomplete = tmp_path / "不完整 PDI 目录"
+    incomplete.mkdir()
+    monkeypatch.setattr(
+        ui_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(incomplete),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    launched = []
+    monkeypatch.setattr(
+        window,
+        "_launch_pdi_viewer",
+        lambda root: launched.append(root),
+    )
+
+    window._choose_existing_pdi_directory()
+
+    assert launched == []
+    assert warnings
+    assert warnings[0][0] == "无法打开 PDI 目录"
+    assert "PDI 根目录" in warnings[0][1]
+    assert "JSON" not in " ".join(warnings[0])
+    assert window.settings_store.value(
+        ui_module.PDI_LAST_OPEN_DIRECTORY_KEY,
+        "",
+        type=str,
+    ) == ""
+
+
 def test_frozen_ui_never_executes_a_viewer_from_the_pdi_directory(
     tmp_path, monkeypatch
 ):
     output = tmp_path / "external PDI"
     make_pdi_viewer_root(output)
     (output / "OPEN_VIEWER.exe").write_bytes(b"untrusted")
-    empty_resources = tmp_path / "installed-resources"
+    empty_resources = tmp_path / "empty-installed-resources"
     empty_resources.mkdir()
     monkeypatch.setattr(ui_module, "is_frozen", lambda: True)
     monkeypatch.setattr(ui_module, "resource_root", lambda: empty_resources)
 
     assert pdi_viewer_command(output) is None
+
+
+def test_app_command_opens_legacy_index_with_installed_viewer(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "legacy PDI"
+    make_pdi_viewer_root(output)
+    (output / "VIEWER" / ".dcmget" / "index").unlink()
+    (output / "DCMGET_STUDIES.json").write_text(
+        '{"studies": []}', encoding="utf-8"
+    )
+    (output / "VIEWER" / "OHIF" / "media-only.js").write_text(
+        "malicious media javascript", encoding="utf-8"
+    )
+    installed_resources = tmp_path / "installed-resources"
+    trusted_viewer = make_installed_viewer_root(installed_resources)
+    monkeypatch.setattr(ui_module, "resource_root", lambda: installed_resources)
+
+    command = pdi_viewer_command(output)
+
+    assert command is not None
+    program, arguments = command
+    assert Path(program).resolve() == Path(ui_module.sys.executable).resolve()
+    assert arguments[:6] == [
+        str(Path(ui_module.__file__).with_name("pdi_server.py")),
+        "--root",
+        str(output.resolve()),
+        "--viewer-root",
+        str(trusted_viewer.resolve()),
+        "--quiet",
+    ]
+    assert str(output / "VIEWER" / "OHIF") not in arguments
 
 
 def test_retry_pdi_does_not_restart_download(qtbot, tmp_path, monkeypatch):
@@ -1082,11 +1232,11 @@ def test_pdi_worker_uses_exporter_callbacks_and_honors_early_cancel(
             self.config = config
             self.tools = tools
             self.kwargs = kwargs
-            self.cancelled = False
+            self.cancel_calls = 0
             instances.append(self)
 
         def request_cancel(self):
-            self.cancelled = True
+            self.cancel_calls += 1
 
         def export(self, files):
             assert files == [str(tmp_path / "image.dcm")]
@@ -1105,12 +1255,13 @@ def test_pdi_worker_uses_exporter_callbacks_and_honors_early_cancel(
     finished = []
     worker.finished.connect(finished.append)
     worker.request_cancel()
+    worker.request_cancel()
 
     worker.run()
 
     assert instances[0].config == worker.config
     assert instances[0].tools is tools
-    assert instances[0].cancelled
+    assert instances[0].cancel_calls == 1
     assert callable(instances[0].kwargs["log_callback"])
     assert callable(instances[0].kwargs["progress_callback"])
     assert finished == [result]

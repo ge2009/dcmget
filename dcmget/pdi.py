@@ -184,13 +184,50 @@ class PdiExporter:
         self._cancel = threading.Event()
         self._process_lock = threading.Lock()
         self._current_process: subprocess.Popen[str] | None = None
+        self._termination_condition = threading.Condition()
+        self._terminating_processes: dict[int, subprocess.Popen[str]] = {}
+        self._terminated_processes: dict[int, subprocess.Popen[str]] = {}
+        self._cancel_cleanup_lock = threading.Lock()
+        self._cancel_cleanup_thread: threading.Thread | None = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
+        with self._cancel_cleanup_lock:
+            if self._cancel_cleanup_thread is not None:
+                return
+            cleanup = threading.Thread(
+                target=self._cancel_running_process,
+                name="pdi-cancel-cleanup",
+                daemon=True,
+            )
+            self._cancel_cleanup_thread = cleanup
+            cleanup.start()
+
+    def _cancel_running_process(self) -> None:
         with self._process_lock:
             process = self._current_process
         if process is not None:
+            self._terminate_process_safely(process)
+
+    def _terminate_process_safely(self, process: subprocess.Popen[str]) -> None:
+        """Terminate a PDI child once when cancellation races worker cleanup."""
+
+        identity = id(process)
+        with self._termination_condition:
+            if self._terminated_processes.get(identity) is process:
+                return
+            if self._terminating_processes.get(identity) is process:
+                while self._terminating_processes.get(identity) is process:
+                    self._termination_condition.wait(timeout=0.1)
+                return
+            self._terminating_processes[identity] = process
+        try:
             self._terminate_process(process)
+        finally:
+            with self._termination_condition:
+                self._terminating_processes.pop(identity, None)
+                self._terminated_processes[identity] = process
+                self._termination_condition.notify_all()
 
     def export(self, files: Iterable[str | Path]) -> PdiExportResult:
         source_paths = [Path(path).expanduser().resolve() for path in files]
@@ -998,7 +1035,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         try:
             while True:
                 if self._cancel.is_set():
-                    self._terminate_process(process)
+                    self._terminate_process_safely(process)
                     raise _Cancelled()
                 try:
                     output = process.communicate(timeout=0.1)[0] or ""
@@ -1017,13 +1054,27 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
         if process.poll() is not None:
             return
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=3,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)

@@ -113,6 +113,122 @@ ProcessCallback = Callable[[str, int, str, bool], None]
 @dataclass(slots=True)
 class _MoveDiagnostics:
     pending_responses: int = 0
+    final_response_status: str | None = None
+    dimse_status_code: int | None = None
+    dimse_status_text: str = ""
+    remaining_suboperations: int | None = None
+    completed_suboperations: int | None = None
+    failed_suboperations: int | None = None
+    warning_suboperations: int | None = None
+
+
+_MOVE_RESPONSE_RE = re.compile(
+    r"\bReceived\s+(?:Final\s+)?Move\s+Response(?:\s+\d+)?\s*"
+    r"\((?P<status>[^)]*)\)",
+    re.IGNORECASE,
+)
+_MOVE_DIMSE_STATUS_RE = re.compile(
+    r"\bDIMSE\s+Status\b\s*(?::|=)?\s*(?:0x)?(?P<code>[0-9a-f]{4})\b"
+    r"(?:\s*:\s*(?P<text>.*))?",
+    re.IGNORECASE,
+)
+_MOVE_SUBOPERATION_RE = re.compile(
+    r"\b(?:Number\s+of\s+)?"
+    r"(?P<kind>Remaining|Completed|Failed|Warning)\s+"
+    r"Sub[\s-]*Operations?\s*(?::|=)?\s*(?P<count>\d+)\b",
+    re.IGNORECASE,
+)
+_PENDING_DIMSE_STATUSES = {0xFF00, 0xFF01}
+
+
+def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
+    response = _MOVE_RESPONSE_RE.search(text)
+    if response:
+        response_status = response.group("status").strip()
+        if re.match(r"pending\b", response_status, re.IGNORECASE):
+            diagnostics.pending_responses += 1
+        else:
+            diagnostics.final_response_status = response_status
+
+    dimse_status = _MOVE_DIMSE_STATUS_RE.search(text)
+    if dimse_status:
+        diagnostics.dimse_status_code = int(dimse_status.group("code"), 16)
+        diagnostics.dimse_status_text = (dimse_status.group("text") or "").strip()
+
+    suboperation = _MOVE_SUBOPERATION_RE.search(text)
+    if suboperation:
+        kind = suboperation.group("kind").casefold()
+        setattr(
+            diagnostics,
+            f"{kind}_suboperations",
+            int(suboperation.group("count")),
+        )
+
+
+def _move_has_final_response(diagnostics: _MoveDiagnostics) -> bool:
+    if diagnostics.final_response_status is not None:
+        return True
+    return (
+        diagnostics.dimse_status_code is not None
+        and diagnostics.dimse_status_code not in _PENDING_DIMSE_STATUSES
+    )
+
+
+def _move_has_problem(diagnostics: _MoveDiagnostics) -> bool:
+    final_response = diagnostics.final_response_status
+    if final_response is not None and not re.match(
+        r"success\b", final_response, re.IGNORECASE
+    ):
+        return True
+
+    dimse_status = diagnostics.dimse_status_code
+    if (
+        dimse_status is not None
+        and dimse_status not in _PENDING_DIMSE_STATUSES
+        and dimse_status != 0x0000
+    ):
+        return True
+
+    if (diagnostics.failed_suboperations or 0) > 0:
+        return True
+    if (diagnostics.warning_suboperations or 0) > 0:
+        return True
+    return diagnostics.pending_responses > 0 and not _move_has_final_response(
+        diagnostics
+    )
+
+
+def _move_diagnostic_summary(diagnostics: _MoveDiagnostics) -> str:
+    details: list[str] = []
+    dimse_status = diagnostics.dimse_status_code
+    if dimse_status is not None and dimse_status not in _PENDING_DIMSE_STATUSES:
+        status = f"C-MOVE 最终状态 0x{dimse_status:04X}"
+        status_text = (
+            diagnostics.dimse_status_text or diagnostics.final_response_status or ""
+        )
+        if status_text:
+            status += f"（{status_text}）"
+        details.append(status)
+    elif diagnostics.final_response_status is not None:
+        details.append(f"C-MOVE 最终响应 {diagnostics.final_response_status}")
+
+    if diagnostics.pending_responses and not _move_has_final_response(diagnostics):
+        details.append(
+            f"PACS 返回 {diagnostics.pending_responses} 次待处理响应后未返回最终响应"
+        )
+
+    counts = []
+    for label, value in (
+        ("剩余", diagnostics.remaining_suboperations),
+        ("完成", diagnostics.completed_suboperations),
+        ("失败", diagnostics.failed_suboperations),
+        ("警告", diagnostics.warning_suboperations),
+    ):
+        if value is not None:
+            counts.append(f"{label} {value}")
+    if counts:
+        details.append("子操作：" + "、".join(counts))
+    return "；".join(details)
 
 
 class DcmtkResolver:
@@ -681,7 +797,8 @@ class DownloadRunner:
         duration = time.monotonic() - started
         with self._diagnostic_lock:
             receiver_aborts = self._storescp_abort_count - aborts_before
-        pending_responses = diagnostics.pending_responses
+        move_problem = _move_has_problem(diagnostics)
+        move_detail = _move_diagnostic_summary(diagnostics)
 
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
@@ -693,38 +810,46 @@ class DownloadRunner:
                 message += f"，已保留 {len(moved)} 个完整文件"
             if rejected:
                 message += f"，{rejected_detail}"
-        elif return_code == 0 and moved and (receiver_aborts or rejected):
+        elif return_code == 0 and moved and (
+            move_problem or receiver_aborts or rejected
+        ):
             status = AccessionStatus.PARTIAL
             details = []
+            if move_problem:
+                details.append(move_detail or "C-MOVE 未正常完成")
             if receiver_aborts:
                 details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
                 details.append(rejected_detail)
-            message = f"收到 {len(moved)} 个文件，但" + "，".join(details)
+            message = f"收到 {len(moved)} 个文件，但" + "；".join(details)
         elif return_code == 0 and moved:
             status = AccessionStatus.COMPLETED
             message = f"收到 {len(moved)} 个文件"
-        elif return_code == 0 and (pending_responses or receiver_aborts or rejected):
+        elif return_code == 0 and (move_problem or receiver_aborts or rejected):
             status = AccessionStatus.FAILED
             details = []
-            if pending_responses:
-                details.append(f"PACS 返回 {pending_responses} 次待处理响应")
+            if move_problem:
+                details.append(move_detail or "C-MOVE 未正常完成")
             if receiver_aborts:
                 details.append(f"{receiver_aborts} 个接收连接中止")
             if rejected:
                 details.append(rejected_detail)
-            message = "，".join(details) + "，未收到文件"
+            message = "；".join(details) + "；未收到文件"
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
             message = "C-MOVE 完成，但未收到文件"
         elif moved:
             status = AccessionStatus.PARTIAL
             message = f"movescu 退出码 {return_code}，已保留 {len(moved)} 个文件"
+            if move_detail:
+                message += f"；{move_detail}"
             if rejected:
                 message += f"，{rejected_detail}"
         else:
             status = AccessionStatus.FAILED
             message = f"movescu 退出码 {return_code}，未收到文件"
+            if move_detail:
+                message += f"；{move_detail}"
             if rejected:
                 message += f"，{rejected_detail}"
 
@@ -800,13 +925,8 @@ class DownloadRunner:
                     with self._diagnostic_lock:
                         if source == "storescp" and "Association Aborted" in text:
                             self._storescp_abort_count += 1
-                        elif (
-                            source == "movescu"
-                            and diagnostics is not None
-                            and "Received Move Response" in text
-                            and "(Pending)" in text
-                        ):
-                            diagnostics.pending_responses += 1
+                        elif source == "movescu" and diagnostics is not None:
+                            _record_move_diagnostic(diagnostics, text)
                     level = (
                         "error"
                         if text.startswith(("E:", "F:"))

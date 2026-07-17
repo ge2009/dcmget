@@ -269,6 +269,40 @@ def test_task_page_scrolls_and_restored_geometry_stays_on_screen(qtbot, tmp_path
     assert geometry.bottom() <= available.bottom()
 
 
+def test_header_uses_two_rows_without_clipping_at_high_dpi_logical_width(
+    qtbot, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ui_module, "entitlement_text", lambda: "已注册 · Windows设备")
+    window = make_window(qtbot, tmp_path)
+    window._set_tool_status("DCMTK 3.7.0 已就绪", "ok")
+
+    # 1024x720 at 150% scaling provides roughly 683x480 logical pixels.
+    window.setMinimumSize(1, 1)
+    window.resize(683, 480)
+    QApplication.processEvents()
+
+    status_widgets = (
+        window.app_title,
+        window.app_subtitle,
+        window.tool_status,
+        window.entitlement_status,
+    )
+    action_widgets = (
+        window.registration_button,
+        window.release_notes_button,
+        window.diagnostic_log_button,
+        window.settings_button,
+    )
+    assert all(widget.width() >= widget.sizeHint().width() for widget in status_widgets)
+    assert all(widget.width() >= widget.sizeHint().width() for widget in action_widgets)
+    assert min(widget.y() for widget in action_widgets) > max(
+        widget.geometry().bottom() for widget in status_widgets
+    )
+    assert window.tool_status.toolTip() == window.tool_status.text()
+    assert window.tool_status.accessibleDescription() == window.tool_status.text()
+    assert window.entitlement_status.toolTip() == "已注册 · Windows设备"
+
+
 def test_task_shortcuts_only_run_on_task_page_without_reloading_settings(
     qtbot, tmp_path, monkeypatch
 ):
@@ -479,6 +513,7 @@ def test_running_state_locks_inputs_and_progress_updates(qtbot, tmp_path):
     assert window.stop_button.isHidden()
     assert window.retry_button.isHidden()
     assert "QPushButton#DangerButton:disabled" in ui_module.APP_STYLESHEET
+    assert "QPushButton#PrimaryButton:disabled" in ui_module.APP_STYLESHEET
 
     window._set_running(True)
     assert window.last_summary is None
@@ -894,6 +929,7 @@ def test_version_notes_dialog_lists_upgrade_history(qtbot, tmp_path):
     assert window.release_notes_dialog.isVisible()
     text = window.release_notes_dialog.findChild(QTextBrowser).toPlainText()
     for version in (
+        "2.6.5",
         "2.6.4",
         "2.6.3",
         "2.6.2",

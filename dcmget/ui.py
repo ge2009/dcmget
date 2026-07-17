@@ -119,6 +119,8 @@ COLORS = {
 TASK_TABLE_DETAIL_LIMIT = 200
 PDI_VIEWER_PROBE_INTERVAL_MS = 250
 PDI_VIEWER_START_TIMEOUT_MS = 30_000
+PDI_LAST_OPEN_DIRECTORY_KEY = "pdi/last_open_directory"
+PDI_OHIF_VERSION = "3.12.6"
 WINDOW_MINIMUM_WIDTH = 800
 WINDOW_MINIMUM_HEIGHT = 520
 
@@ -126,22 +128,50 @@ WINDOW_MINIMUM_HEIGHT = 520
 def pdi_viewer_command(directory: str | Path) -> tuple[str, list[str]] | None:
     """Return the trusted local server command for one complete PDI root."""
 
-    root = Path(directory).expanduser().resolve()
-    if not root.is_dir():
+    root_candidate = Path(directory).expanduser()
+    if root_candidate.is_symlink():
         return None
-    viewer_index = root / "VIEWER" / "OHIF" / "index.html"
+    root = root_candidate.resolve()
+    dicom_root = root / "DICOM"
+    if (
+        not root.is_dir()
+        or not dicom_root.is_dir()
+        or dicom_root.is_symlink()
+    ):
+        return None
     study_indexes = (
         root / "VIEWER" / ".dcmget" / "index",
         root / "DCMGET_STUDIES.json",
     )
-    if (
-        not viewer_index.is_file()
-        or viewer_index.is_symlink()
-        or not any(path.is_file() and not path.is_symlink() for path in study_indexes)
+    if not any(path.is_file() and not path.is_symlink() for path in study_indexes):
+        return None
+
+    viewer_candidate = (
+        resource_root()
+        / ".runtime"
+        / "ohif"
+        / f"ohif-{PDI_OHIF_VERSION}"
+    )
+    if viewer_candidate.is_symlink():
+        return None
+    viewer_root = viewer_candidate.resolve()
+    required_viewer_files = (
+        viewer_root / "index.html",
+        viewer_root / "DCMGET_PAYLOAD.SHA256",
+        viewer_root / "DCMGET_OHIF_PAYLOAD.json",
+    )
+    if not all(
+        path.is_file() and not path.is_symlink() for path in required_viewer_files
     ):
         return None
 
-    base_arguments = ["--root", str(root), "--quiet"]
+    base_arguments = [
+        "--root",
+        str(root),
+        "--viewer-root",
+        str(viewer_root),
+        "--quiet",
+    ]
     if is_frozen():
         trusted_executable = resource_root() / "DcmGetPdiServer.exe"
         if trusted_executable.is_file() and not trusted_executable.is_symlink():
@@ -769,6 +799,8 @@ class PdiWorker(QObject):
 
     def request_cancel(self) -> None:
         with self._control_lock:
+            if self.cancel_requested:
+                return
             self.cancel_requested = True
             if self.exporter is not None:
                 self.exporter.request_cancel()
@@ -883,7 +915,8 @@ class DcmGetWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
-        root_layout.addWidget(self._build_header())
+        self.header = self._build_header()
+        root_layout.addWidget(self.header)
 
         self.pages = QStackedWidget()
         self.task_page = self._build_task_page()
@@ -895,6 +928,7 @@ class DcmGetWindow(QMainWindow):
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.setStyleSheet(APP_STYLESHEET)
+        self._refresh_entitlement_status()
 
         self.open_accession_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
         self.open_accession_shortcut.activated.connect(
@@ -910,35 +944,51 @@ class DcmGetWindow(QMainWindow):
     def _build_header(self) -> QWidget:
         header = QFrame()
         header.setObjectName("Header")
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(24, 14, 24, 14)
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(24, 12, 24, 12)
+        layout.setSpacing(8)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         title_box = QVBoxLayout()
-        title = QLabel(f"DcmGet {__version__}")
-        title.setObjectName("AppTitle")
-        subtitle = QLabel("DICOM 批量下载工作台")
-        subtitle.setObjectName("HeaderSubtitle")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        layout.addLayout(title_box)
-        layout.addStretch()
+        title_box.setSpacing(2)
+        self.app_title = QLabel(f"DcmGet {__version__}")
+        self.app_title.setObjectName("AppTitle")
+        self.app_subtitle = QLabel("DICOM 批量下载工作台")
+        self.app_subtitle.setObjectName("HeaderSubtitle")
+        title_box.addWidget(self.app_title)
+        title_box.addWidget(self.app_subtitle)
+        status_row.addLayout(title_box)
+        status_row.addStretch()
         self.tool_status = QLabel("正在检测 DCMTK…")
         self.tool_status.setObjectName("StatusPill")
         self.tool_status.setProperty("status", "pending")
-        layout.addWidget(self.tool_status)
+        self.tool_status.setAccessibleName("DCMTK 工具状态")
+        self.tool_status.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        status_row.addWidget(self.tool_status)
         self.entitlement_status = QLabel()
         self.entitlement_status.setObjectName("StatusPill")
+        self.entitlement_status.setAccessibleName("软件授权状态")
+        self.entitlement_status.setSizePolicy(
+            QSizePolicy.Minimum, QSizePolicy.Preferred
+        )
         self._refresh_entitlement_status()
-        layout.addWidget(self.entitlement_status)
+        status_row.addWidget(self.entitlement_status)
+        layout.addLayout(status_row)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch()
         self.registration_button = QToolButton()
         self.registration_button.setText("软件注册")
         self.registration_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.registration_button.clicked.connect(self._show_activation)
-        layout.addWidget(self.registration_button)
+        action_row.addWidget(self.registration_button)
         self.release_notes_button = QToolButton()
         self.release_notes_button.setText("版本说明")
         self.release_notes_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.release_notes_button.clicked.connect(self._show_release_notes)
-        layout.addWidget(self.release_notes_button)
+        action_row.addWidget(self.release_notes_button)
         self.diagnostic_log_button = QToolButton()
         self.diagnostic_log_button.setText("诊断日志")
         self.diagnostic_log_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -946,14 +996,15 @@ class DcmGetWindow(QMainWindow):
         self.diagnostic_log_button.clicked.connect(
             self._open_diagnostic_log_directory
         )
-        layout.addWidget(self.diagnostic_log_button)
+        action_row.addWidget(self.diagnostic_log_button)
         self.settings_button = QToolButton()
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         self.settings_button.setToolTip("连接、接收、匿名与 PDI 设置（Ctrl+,）")
         self.settings_button.clicked.connect(self._show_settings)
-        layout.addWidget(self.settings_button)
+        action_row.addWidget(self.settings_button)
+        layout.addLayout(action_row)
         return header
 
     def _build_task_page(self) -> QWidget:
@@ -1074,6 +1125,13 @@ class DcmGetWindow(QMainWindow):
             "收起日志" if self._log_panel_expanded else "展开日志"
         )
         self.log_toggle_button.clicked.connect(self._toggle_log_panel)
+        self.open_existing_pdi_button = QPushButton("打开已有 PDI 目录")
+        self.open_existing_pdi_button.setToolTip(
+            "选择一个完整的 PDI 根目录并使用内置离线阅片服务打开"
+        )
+        self.open_existing_pdi_button.clicked.connect(
+            self._choose_existing_pdi_directory
+        )
         self.pause_button = QPushButton("暂停")
         self.pause_button.setEnabled(False)
         self.pause_button.hide()
@@ -1093,6 +1151,7 @@ class DcmGetWindow(QMainWindow):
         action_row.addWidget(self.discard_resume_button)
         action_row.addWidget(self.retry_button)
         action_row.addWidget(self.accept_partial_button)
+        action_row.addWidget(self.open_existing_pdi_button)
         action_row.addWidget(self.log_toggle_button)
         action_row.addWidget(self.pause_button)
         action_row.addWidget(self.stop_button)
@@ -1272,11 +1331,17 @@ class DcmGetWindow(QMainWindow):
     def _refresh_entitlement_status(self) -> None:
         text = entitlement_text()
         self.entitlement_status.setText(text)
+        self.entitlement_status.setToolTip(text)
+        self.entitlement_status.setAccessibleDescription(text)
         self.entitlement_status.setProperty(
             "status", "ok" if text.startswith("已注册") else "warning"
         )
         self.entitlement_status.style().unpolish(self.entitlement_status)
         self.entitlement_status.style().polish(self.entitlement_status)
+        self.entitlement_status.setMinimumWidth(
+            self.entitlement_status.sizeHint().width()
+        )
+        self.entitlement_status.updateGeometry()
 
     def _save_settings(self, config: AppConfig) -> None:
         config.access_numbers_file_path = self.config.access_numbers_file_path
@@ -1344,9 +1409,13 @@ class DcmGetWindow(QMainWindow):
 
     def _set_tool_status(self, text: str, status: str) -> None:
         self.tool_status.setText(text)
+        self.tool_status.setToolTip(text)
+        self.tool_status.setAccessibleDescription(text)
         self.tool_status.setProperty("status", status)
         self.tool_status.style().unpolish(self.tool_status)
         self.tool_status.style().polish(self.tool_status)
+        self.tool_status.setMinimumWidth(self.tool_status.sizeHint().width())
+        self.tool_status.updateGeometry()
 
     def _load_configured_accessions(self) -> None:
         path = Path(self.config.access_numbers_file_path).expanduser()
@@ -2071,6 +2140,9 @@ class DcmGetWindow(QMainWindow):
         self.retry_button.setEnabled(retry_available)
         self.accept_partial_button.setVisible(download_retryable)
         self.accept_partial_button.setEnabled(download_retryable)
+        can_open_existing_pdi = not running and not recovery_pending
+        self.open_existing_pdi_button.setVisible(can_open_existing_pdi)
+        self.open_existing_pdi_button.setEnabled(can_open_existing_pdi)
         self.accession_edit.setReadOnly(running or recovery_pending)
         self.destination_edit.setReadOnly(running or pdi_pending)
         self.accession_button.setEnabled(not running and not recovery_pending)
@@ -2514,13 +2586,55 @@ class DcmGetWindow(QMainWindow):
 
     def _open_pdi_viewer(self) -> None:
         root = self._pdi_output_directory()
-        command = pdi_viewer_command(root) if root is not None else None
-        if root is None or command is None:
+        if root is None:
             QMessageBox.warning(
                 self,
                 "无法启动阅片器",
                 "当前 PDI 目录没有可用的离线阅片启动器，请重试 PDI 导出。\n\n"
                 f"诊断日志：{diagnostic_log_directory()}",
+            )
+            return
+        self._launch_pdi_viewer(root)
+
+    def _choose_existing_pdi_directory(self) -> None:
+        initial_directory = self.settings_store.value(
+            PDI_LAST_OPEN_DIRECTORY_KEY,
+            "",
+            type=str,
+        ).strip()
+        if not initial_directory:
+            initial_directory = (
+                self.config.pdi_output_folder.strip()
+                or self.destination_edit.text().strip()
+            )
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "打开已有 PDI 目录",
+            initial_directory,
+        )
+        if not selected:
+            return
+        root = Path(selected).expanduser().resolve()
+        if pdi_viewer_command(root) is None:
+            QMessageBox.warning(
+                self,
+                "无法打开 PDI 目录",
+                "所选目录不是可用的 PDI 根目录，或程序内置阅片资源不完整。"
+                "请选择包含 DICOM 数据和有效阅片索引的完整 PDI 根目录。",
+            )
+            return
+        self.settings_store.setValue(PDI_LAST_OPEN_DIRECTORY_KEY, str(root))
+        self.settings_store.sync()
+        self._launch_pdi_viewer(root)
+
+    def _launch_pdi_viewer(self, root: Path) -> None:
+        root = root.expanduser().resolve()
+        command = pdi_viewer_command(root)
+        if command is None:
+            QMessageBox.warning(
+                self,
+                "无法打开 PDI 目录",
+                "程序内置离线阅片资源不可用，或 PDI 目录不完整，请检查后重试。",
             )
             return
         if self._pdi_viewer_process is not None:
@@ -3204,6 +3318,7 @@ QPushButton:focus, QToolButton:focus {{ border: 2px solid #38BDF8; }}
 QPushButton:disabled, QToolButton:disabled {{ color: #94A3B8; background: #F8FAFC; }}
 QPushButton#PrimaryButton {{ background: {COLORS['primary']}; color: white; border-color: {COLORS['primary']}; font-weight: 650; }}
 QPushButton#PrimaryButton:hover {{ background: {COLORS['primary_hover']}; }}
+QPushButton#PrimaryButton:disabled {{ color: #94A3B8; border-color: {COLORS['border']}; background: #F8FAFC; }}
 QPushButton#DangerButton {{ color: {COLORS['danger']}; border-color: #FCA5A5; }}
 QPushButton#DangerButton:hover {{ background: #FEF2F2; }}
 QPushButton#DangerButton:disabled {{ color: #94A3B8; border-color: {COLORS['border']}; background: #F8FAFC; }}

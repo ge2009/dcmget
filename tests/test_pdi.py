@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -589,6 +591,83 @@ def test_cancel_removes_partial_and_keeps_source(
     assert result.status == PdiStatus.CANCELLED
     assert pdi._sha256(source) == original_hash
     assert not list((tmp_path / "portable").glob(".*.partial-*"))
+
+
+def test_request_cancel_returns_before_process_cleanup_and_terminates_once(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exporter = PdiExporter(_config(tmp_path), tools)
+    process = Mock()
+    exporter._current_process = process
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[object] = []
+
+    def terminate(target: object) -> None:
+        calls.append(target)
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(exporter, "_terminate_process", terminate)
+    fail_safe = threading.Timer(1, release.set)
+    fail_safe.start()
+    started = time.monotonic()
+    try:
+        exporter.request_cancel()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.5
+        assert entered.wait(1)
+
+        competing_cleanup = threading.Thread(
+            target=exporter._terminate_process_safely,
+            args=(process,),
+        )
+        competing_cleanup.start()
+        exporter.request_cancel()
+        release.set()
+        competing_cleanup.join(timeout=2)
+        cleanup = exporter._cancel_cleanup_thread
+        assert cleanup is not None
+        cleanup.join(timeout=2)
+        assert not competing_cleanup.is_alive()
+        assert not cleanup.is_alive()
+    finally:
+        release.set()
+        fail_safe.cancel()
+
+    assert calls == [process]
+
+
+@pytest.mark.parametrize(
+    "taskkill_error",
+    [
+        pdi.subprocess.TimeoutExpired(["taskkill"], 3),
+        OSError("taskkill unavailable"),
+    ],
+    ids=["timeout", "os-error"],
+)
+def test_windows_taskkill_failure_has_timeout_and_falls_back_to_direct_kill(
+    tmp_path: Path,
+    tools: ToolPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    taskkill_error: BaseException,
+) -> None:
+    exporter = PdiExporter(_config(tmp_path), tools)
+    process = Mock()
+    process.pid = 4321
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    taskkill = Mock(side_effect=taskkill_error)
+    monkeypatch.setattr(pdi.os, "name", "nt")
+    monkeypatch.setattr(pdi.subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    monkeypatch.setattr(pdi.subprocess, "run", taskkill)
+
+    exporter._terminate_process(process)
+
+    taskkill.assert_called_once()
+    assert taskkill.call_args.kwargs["timeout"] == 3
+    process.kill.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=3)
 
 
 def test_crash_recovery_reuses_published_directory(

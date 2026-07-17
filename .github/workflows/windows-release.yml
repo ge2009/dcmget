@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.6.4
+        default: 2.6.5
 
 permissions:
   contents: read
@@ -39,8 +39,10 @@ jobs:
       - name: Restore DCMTK cache
         uses: actions/cache@v4
         with:
-          path: .runtime/dcmtk/windows-x86_64
-          key: dcmtk-3.7.0-windows-x86_64
+          path: |
+            .runtime/dcmtk/windows-x86_64
+            .runtime/downloads
+          key: dcmtk-3.7.0-integrity-v2-windows-x86_64
 
       - name: Prepare DCMTK
         shell: pwsh
@@ -261,7 +263,7 @@ jobs:
           if ($baselineRecords[0].DisplayVersion -ne "2.6.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.6.1" }
           if ($baselineRecords[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Baseline installation directory is incorrect" }
           New-Item -ItemType Directory -Force $configDir | Out-Null
-          [IO.File]::WriteAllText($configPath, '{"config_version":2,"pacs_server_ip":"upgrade-preserve.invalid"}', [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText($configPath, '{"config_version":2,"pacs_server_ip":"upgrade-preserve.invalid","storage_port":16666}', [Text.UTF8Encoding]::new($false))
           Set-Content $licensePath "upgrade-license-sentinel"
           python -c "from dcmget.licensing import consume_trial; consume_trial()"
           if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
@@ -300,11 +302,15 @@ jobs:
           if ($records[0].DisplayVersion -ne "${{ inputs.version }}") { throw "Installed version is $($records[0].DisplayVersion)" }
           if ($records[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Upgrade changed the installation directory" }
 
-          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction Stop)
+          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction Stop)
           if ($firewallRules.Count -ne 1) { throw "Expected exactly one storescp firewall rule, found $($firewallRules.Count)" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Upgrade left the legacy TCP 6666 firewall rule behind" }
           $firewall = $firewallRules[0]
+          if ($firewall.Direction.ToString() -ne "Inbound" -or $firewall.Action.ToString() -ne "Allow" -or $firewall.Enabled.ToString() -ne "True" -or $firewall.EdgeTraversalPolicy.ToString() -ne "Block") {
+            throw "Firewall rule must be enabled inbound allow with edge traversal blocked"
+          }
           $portFilters = @($firewall | Get-NetFirewallPortFilter)
-          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "6666") { throw "Firewall rule does not allow exactly TCP 6666" }
+          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") { throw "Firewall rule does not allow the configured storescp TCP port" }
           $applicationFilters = @($firewall | Get-NetFirewallApplicationFilter)
           if ($applicationFilters.Count -ne 1) { throw "Expected one firewall application filter, found $($applicationFilters.Count)" }
           $expectedStorescp = (Resolve-Path -LiteralPath (Join-Path $resourceRoot ".runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe") -ErrorAction Stop).ProviderPath
@@ -326,7 +332,8 @@ jobs:
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
           if (-not (Test-Path $diagnosticLog)) { throw "Uninstall removed the diagnostic log" }
-          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the firewall rule behind" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the firewall rule behind" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }
           Remove-Item $configDir -Recurse -Force
 
       - name: Finalize checksums

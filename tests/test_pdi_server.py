@@ -26,6 +26,24 @@ def _write_viewer_checksums(root: Path) -> None:
     checksum_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_pinned_viewer(root: Path, index_text: str = "TRUSTED OHIF") -> Path:
+    root.mkdir(parents=True)
+    (root / "index.html").write_text(index_text, encoding="utf-8")
+    (root / "app-config.js").write_text("window.config = {};", encoding="utf-8")
+    (root / pdi_server.OHIF_PROVENANCE_FILE).write_text(
+        json.dumps(
+            {
+                "package_name": "@ohif/app",
+                "version": pdi_server.PINNED_OHIF_VERSION,
+                "source_sha256": pdi_server.PINNED_OHIF_SOURCE_SHA256,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_viewer_checksums(root)
+    return root
+
+
 def _study_index_payload(
     url: str = "dicomweb:/DICOM/I000001",
 ) -> dict[str, object]:
@@ -596,6 +614,81 @@ def test_legacy_index_is_private_but_still_supported(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["hidden-index", "legacy-index"])
+def test_app_viewer_uses_directory_route_and_never_serves_media_javascript(
+    tmp_path: Path,
+    legacy: bool,
+) -> None:
+    pdi_root = tmp_path / "external-pdi"
+    media_viewer = pdi_root / "VIEWER" / "OHIF"
+    media_viewer.mkdir(parents=True)
+    (media_viewer / "index.html").write_text(
+        "MALICIOUS MEDIA VIEWER", encoding="utf-8"
+    )
+    (media_viewer / "media-only.js").write_text(
+        "window.location='https://invalid.example'", encoding="utf-8"
+    )
+    (pdi_root / "DICOM").mkdir()
+    _write_study_index(pdi_root, {"studies": []}, legacy=legacy)
+    trusted_viewer = _write_pinned_viewer(tmp_path / "installed-ohif")
+
+    server = PdiHttpServer(
+        pdi_root,
+        "127.0.0.1",
+        0,
+        quiet=True,
+        viewer_root=trusted_viewer,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, headers, body = _request(server, f"/open/{server.session_token}")
+        assert status == 303 and body == b""
+        assert headers["Location"] == (
+            "/viewer/directory/?url=%2Fapi%2Fstudies&lng=zh"
+        )
+        authenticated = {"Cookie": headers["Set-Cookie"].partition(";")[0]}
+        status, _headers, body = _request(
+            server,
+            "/viewer/directory/?url=%2Fapi%2Fstudies&lng=zh",
+            authenticated,
+        )
+        assert status == 200 and body == b"TRUSTED OHIF"
+        status, _headers, _body = _request(
+            server,
+            "/media-only.js",
+            authenticated,
+        )
+        assert status == 404
+        status, _headers, _body = _request(
+            server,
+            "/DCMGET_STUDIES.json",
+            authenticated,
+        )
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_app_viewer_rejects_tampered_pinned_payload(tmp_path: Path) -> None:
+    pdi_root = tmp_path / "pdi"
+    (pdi_root / "DICOM").mkdir(parents=True)
+    _write_study_index(pdi_root, {"studies": []}, legacy=True)
+    trusted_viewer = _write_pinned_viewer(tmp_path / "installed-ohif")
+    (trusted_viewer / "index.html").write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="校验失败"):
+        PdiHttpServer(
+            pdi_root,
+            "127.0.0.1",
+            0,
+            quiet=True,
+            viewer_root=trusted_viewer,
+        )
 
 
 def test_repeated_frames_validate_one_dicom_path_once(

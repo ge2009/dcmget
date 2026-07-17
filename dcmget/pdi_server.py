@@ -26,8 +26,14 @@ STUDY_INDEX = "VIEWER/.dcmget/index"
 LEGACY_STUDY_INDEX = "DCMGET_STUDIES.json"
 STUDY_INDEX_ENDPOINT = "/api/studies"
 OHIF_PAYLOAD_CHECKSUMS = "DCMGET_PAYLOAD.SHA256"
+OHIF_PROVENANCE_FILE = "DCMGET_OHIF_PAYLOAD.json"
+PINNED_OHIF_VERSION = "3.12.6"
+PINNED_OHIF_SOURCE_SHA256 = (
+    "930f3334c3a347d2b8e45fbef34c0f030da976af4fd18b8c62a1967afdc3674f"
+)
 VIEWER_LOG_NAME = "dcmget-pdi-viewer.log"
 MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024
+MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_VIEWER_FILES = 4096
 MAX_VIEWER_FILE_BYTES = 512 * 1024 * 1024
 MAX_VIEWER_TOTAL_BYTES = 512 * 1024 * 1024
@@ -64,7 +70,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 class PdiRequestHandler(BaseHTTPRequestHandler):
     """Serve one PDI directory without exposing the surrounding filesystem."""
 
-    server_version = "DcmGetPDI/2.6.4"
+    server_version = "DcmGetPDI/2.6.5"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -256,8 +262,7 @@ class PdiRequestHandler(BaseHTTPRequestHandler):
         return _safe_dicom_path(Path(getattr(self.server, "pdi_root")), request_path)
 
     def _resolve_viewer_path(self, request_path: str) -> Path | None:
-        root = Path(getattr(self.server, "pdi_root")).resolve()
-        viewer_root = (root / "VIEWER" / "OHIF").resolve()
+        viewer_root = Path(getattr(self.server, "viewer_root")).resolve()
         relative = request_path.lstrip("/")
         candidate = viewer_root.joinpath(*relative.split("/"))
         if not candidate.is_file():
@@ -375,6 +380,7 @@ class PdiHttpServer(ThreadingHTTPServer):
         logger: logging.Logger | None = None,
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
         session_token: str | None = None,
+        viewer_root: str | Path | None = None,
     ):
         if host != "127.0.0.1":
             raise ValueError("PDI 服务只允许绑定 127.0.0.1")
@@ -389,11 +395,17 @@ class PdiHttpServer(ThreadingHTTPServer):
         )
         self.cookie_name = f"dcmget_pdi_{secrets.token_hex(12)}"
         study_index_path = _study_index_path(self.pdi_root)
-        self.viewer_path = (
-            LEGACY_VIEWER_PATH
-            if study_index_path == self.pdi_root / LEGACY_STUDY_INDEX
-            else VIEWER_PATH
+        self.viewer_root = (
+            validate_pinned_viewer_root(viewer_root)
+            if viewer_root is not None
+            else (self.pdi_root / "VIEWER" / "OHIF").resolve()
         )
+        if viewer_root is not None:
+            self.viewer_path = VIEWER_PATH
+        elif study_index_path == self.pdi_root / LEGACY_STUDY_INDEX:
+            self.viewer_path = LEGACY_VIEWER_PATH
+        else:
+            self.viewer_path = VIEWER_PATH
         self.study_index_bytes, self.dicom_allowlist = _load_study_index(
             self.pdi_root, study_index_path
         )
@@ -476,14 +488,17 @@ class PdiHttpServer(ThreadingHTTPServer):
                 pass
 
 
-def validate_pdi_root(value: str | Path) -> Path:
+def validate_pdi_root(
+    value: str | Path,
+    *,
+    require_embedded_viewer: bool = True,
+) -> Path:
     root = Path(value).expanduser().resolve()
-    required_directories = (
-        root / "DICOM",
-        root / "VIEWER",
-        root / "VIEWER" / "OHIF",
-    )
-    required_files = (root / "VIEWER" / "OHIF" / "index.html",)
+    required_directories = [root / "DICOM"]
+    required_files: list[Path] = []
+    if require_embedded_viewer:
+        required_directories.extend((root / "VIEWER", root / "VIEWER" / "OHIF"))
+        required_files.append(root / "VIEWER" / "OHIF" / "index.html")
     missing = [
         str(path.relative_to(root))
         for path in required_directories
@@ -504,14 +519,43 @@ def validate_pdi_root(value: str | Path) -> Path:
             path.resolve(strict=True).relative_to(root)
         except (OSError, ValueError) as exc:
             raise FileNotFoundError(f"PDI 路径超出导出目录：{path.name}") from exc
-    viewer_root = root / "VIEWER" / "OHIF"
-    checksum_path = viewer_root / OHIF_PAYLOAD_CHECKSUMS
-    if checksum_path.is_file():
-        verify_viewer_payload(viewer_root)
-    elif study_index == root / STUDY_INDEX:
-        raise FileNotFoundError(
-            f"PDI 离线阅片器缺少资源校验清单：{OHIF_PAYLOAD_CHECKSUMS}"
-        )
+    if require_embedded_viewer:
+        viewer_root = root / "VIEWER" / "OHIF"
+        checksum_path = viewer_root / OHIF_PAYLOAD_CHECKSUMS
+        if checksum_path.is_file():
+            verify_viewer_payload(viewer_root)
+        elif study_index == root / STUDY_INDEX:
+            raise FileNotFoundError(
+                f"PDI 离线阅片器缺少资源校验清单：{OHIF_PAYLOAD_CHECKSUMS}"
+            )
+    return root
+
+
+def validate_pinned_viewer_root(value: str | Path) -> Path:
+    """Validate the application-owned, pinned OHIF payload."""
+
+    candidate = Path(value).expanduser()
+    if candidate.is_symlink():
+        raise RuntimeError("内置 OHIF 资源目录不能是符号链接")
+    root = candidate.resolve()
+    verify_viewer_payload(root)
+    provenance_path = root / OHIF_PROVENANCE_FILE
+    try:
+        if provenance_path.is_symlink():
+            raise RuntimeError("内置 OHIF 来源清单不能是符号链接")
+        if provenance_path.stat().st_size > MAX_PROVENANCE_BYTES:
+            raise RuntimeError("内置 OHIF 来源清单过大")
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except RuntimeError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("内置 OHIF 来源清单缺失或损坏") from exc
+    if not isinstance(provenance, dict) or (
+        provenance.get("package_name") != "@ohif/app"
+        or provenance.get("version") != PINNED_OHIF_VERSION
+        or provenance.get("source_sha256") != PINNED_OHIF_SOURCE_SHA256
+    ):
+        raise RuntimeError("内置 OHIF 来源与固定版本不匹配")
     return root
 
 
@@ -770,6 +814,7 @@ def _validate_dicom_url(value: str) -> str:
 def run_server(
     root: str | Path,
     *,
+    viewer_root: str | Path | None = None,
     port: int = 0,
     open_browser: bool = True,
     quiet: bool = False,
@@ -777,7 +822,10 @@ def run_server(
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
     session_token: str | None = None,
 ) -> int:
-    pdi_root = validate_pdi_root(root)
+    pdi_root = validate_pdi_root(
+        root,
+        require_embedded_viewer=viewer_root is None,
+    )
     with PdiHttpServer(
         pdi_root,
         "127.0.0.1",
@@ -786,6 +834,7 @@ def run_server(
         logger=logger,
         idle_timeout_seconds=idle_timeout_seconds,
         session_token=session_token,
+        viewer_root=viewer_root,
     ) as server:
         url = viewer_url(server.server_address[1], server.session_token)
         if logger is not None:
@@ -814,6 +863,11 @@ def main(argv: list[str] | None = None) -> int:
         else Path.cwd()
     )
     parser.add_argument("--root", default=str(default_root), help="PDI 根目录")
+    parser.add_argument(
+        "--viewer-root",
+        default="",
+        help="由 DcmGet 提供的受信任 OHIF 资源目录",
+    )
     parser.add_argument("--port", type=int, default=0, help="本地端口，0 表示自动选择")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--quiet", action="store_true", help="不输出 HTTP 访问日志")
@@ -840,6 +894,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run_server(
             args.root,
+            viewer_root=args.viewer_root or None,
             port=args.port,
             open_browser=not args.no_browser,
             quiet=args.quiet,

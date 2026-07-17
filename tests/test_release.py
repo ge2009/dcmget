@@ -101,9 +101,17 @@ def test_windows_firewall_is_limited_to_storescp_and_private_networks():
 
     assert 'program=""{app}\\_internal\\.runtime\\dcmtk' in installer
     assert "profile=domain,private" in installer
+    assert 'localport=6666' not in installer
+    assert '#define FirewallRule "DcmGet storescp TCP"' in installer
+    assert '#define LegacyFirewallRule "DcmGet storescp TCP 6666"' in installer
     assert "-Program $Storescp.FullName" in bootstrap
     assert "-Profile Domain,Private" in bootstrap
+    assert '$RuleName = "DcmGet storescp TCP"' in bootstrap
+    assert 'Get-NetFirewallRule -DisplayName "DcmGet storescp TCP*"' in bootstrap
     assert "$firewallRules.Count -ne 1" in workflow
+    assert 'LocalPort.ToString() -ne "Any"' in workflow
+    assert '"storage_port":16666' in workflow
+    assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
     assert "$applicationFilters.Count -ne 1" in workflow
     assert (
         ".runtime\\dcmtk\\windows-x86_64\\dcmtk-3.7.0-win64-dynamic"
@@ -113,6 +121,10 @@ def test_windows_firewall_is_limited_to_storescp_and_private_networks():
     assert "$profileNames.Count -ne 2" in workflow
     assert '$profileNames -notcontains "Domain"' in workflow
     assert '$profileNames -notcontains "Private"' in workflow
+    assert '$firewall.Direction.ToString() -ne "Inbound"' in workflow
+    assert '$firewall.Action.ToString() -ne "Allow"' in workflow
+    assert '$firewall.Enabled.ToString() -ne "True"' in workflow
+    assert '$firewall.EdgeTraversalPolicy.ToString() -ne "Block"' in workflow
     assert "DCMGET_PAYLOAD.SHA256" in workflow
 
 

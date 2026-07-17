@@ -11,8 +11,10 @@ import zipfile
 from pathlib import Path
 
 try:
+    from scripts.download_dcmtk import IntegrityError, validate_installation
     from scripts.prepare_ohif import load_manifest, payload_is_current
 except ModuleNotFoundError:  # direct execution from the scripts directory
+    from download_dcmtk import IntegrityError, validate_installation
     from prepare_ohif import load_manifest, payload_is_current
 
 
@@ -55,18 +57,14 @@ def version_tuple(version: str) -> tuple[int, int, int, int]:
     return major, minor, patch, 0
 
 
-def find_dcmtk_bin() -> Path:
-    for movescu in PLATFORM_RUNTIME.rglob("movescu.exe"):
-        required = (
-            "storescp.exe",
-            "dcmmkdir.exe",
-        )
-        if all((movescu.parent / name).is_file() for name in required):
-            return movescu.parent
-    raise FileNotFoundError(
-        "未找到完整的 Windows DCMTK/PDI 工具。请先运行 "
-        "scripts/download_dcmtk.py --platform windows-x86_64"
-    )
+def find_dcmtk_bin(runtime: Path = PLATFORM_RUNTIME) -> Path:
+    try:
+        return validate_installation(runtime, "windows-x86_64")
+    except IntegrityError as exc:
+        raise FileNotFoundError(
+            f"Windows DCMTK 完整性校验失败：{exc}。请先运行 "
+            "scripts/download_dcmtk.py --platform windows-x86_64"
+        ) from exc
 
 
 def find_ohif_payload() -> Path:
