@@ -74,7 +74,6 @@ jobs:
           --ignore=tests/test_task_controller.py
           --ignore=tests/test_task_widgets.py
           --ignore=tests/test_ui.py
-          --ignore=tests/test_ui_multitask.py
 
       - name: Run UI tests
         env:
@@ -87,7 +86,6 @@ jobs:
           tests/test_task_controller.py
           tests/test_task_widgets.py
           tests/test_ui.py
-          tests/test_ui_multitask.py
 
   minimum-python:
     name: Python 3.10 minimum
@@ -117,6 +115,6 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pytest -q -m "not integration" --ignore=tests/test_auth_ui.py --ignore=tests/test_diagnostics.py --ignore=tests/test_pdi_ui.py --ignore=tests/test_task_controller.py --ignore=tests/test_task_widgets.py --ignore=tests/test_ui.py --ignore=tests/test_ui_multitask.py
-          python -m pytest -q tests/test_auth_ui.py tests/test_diagnostics.py tests/test_pdi_ui.py tests/test_task_controller.py tests/test_task_widgets.py tests/test_ui.py tests/test_ui_multitask.py
+          python -m pytest -q -m "not integration" --ignore=tests/test_auth_ui.py --ignore=tests/test_diagnostics.py --ignore=tests/test_pdi_ui.py --ignore=tests/test_task_controller.py --ignore=tests/test_task_widgets.py --ignore=tests/test_ui.py
+          python -m pytest -q tests/test_auth_ui.py tests/test_diagnostics.py tests/test_pdi_ui.py tests/test_task_controller.py tests/test_task_widgets.py tests/test_ui.py
           python DICOM_download_ui.py --ui-self-test --config "${{ runner.temp }}/dcmget-ui-self-test.json"

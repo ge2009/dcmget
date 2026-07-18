@@ -383,12 +383,11 @@ def test_preflight_rejects_destination_below_configured_free_space_guard(
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
     resolver = Mock()
     resolver.resolve.return_value = tools
-    usage = os.statvfs(tmp_path)
     monkeypatch.setattr(
         core.shutil,
         "disk_usage",
         lambda _path: SimpleNamespace(
-            total=usage.f_blocks * usage.f_frsize,
+            total=8 * 1024**3,
             used=0,
             free=1024**3,
         ),

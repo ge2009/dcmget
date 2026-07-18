@@ -97,14 +97,14 @@ def test_txt_gb18030_is_detected(tmp_path):
 
 def test_csv_recognizes_chinese_column_and_keeps_formula_as_plain_text(tmp_path):
     source = tmp_path / "中文检查号.csv"
-    source.write_text(
-        '患者姓名,检查号,备注\r\n'
-        '张三,A001,首诊\r\n'
-        '李四,"=CONCAT(\"\"CT\"\",2026)",仅作为文本\r\n'
-        '王五,A001,重复\r\n'
-        '赵六,,空值\r\n',
-        encoding="utf-8-sig",
-    )
+    with source.open("w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(
+            '患者姓名,检查号,备注\r\n'
+            '张三,A001,首诊\r\n'
+            '李四,"=CONCAT(\"\"CT\"\",2026)",仅作为文本\r\n'
+            '王五,A001,重复\r\n'
+            '赵六,,空值\r\n'
+        )
 
     result = import_accession_file(source)
 
