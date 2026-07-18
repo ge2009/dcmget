@@ -400,8 +400,7 @@ def _diagnostic_files(directory: Path) -> list[Path]:
                 continue
     return sorted(
         found.values(),
-        key=lambda path: (_safe_mtime(path), path.name),
-        reverse=True,
+        key=lambda path: (-_safe_mtime(path), path.name.casefold()),
     )
 
 

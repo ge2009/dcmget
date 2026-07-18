@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 
 from dcmget.config import AppConfig
@@ -115,6 +116,8 @@ def test_support_bundle_has_allowlisted_redacted_files_and_no_dicom(tmp_path):
         "E: (0010,0020) LO [6906368]\n",
         encoding="utf-8",
     )
+    for name in ("dcmget-crash-123.log", "dcmget-diagnostics-123.log"):
+        os.utime(logs / name, (1_700_000_000, 1_700_000_000))
     (logs / "image.dcm").write_bytes(b"DICM PATIENT SECRET")
     (logs / "unrelated.txt").write_text("202601261643", encoding="utf-8")
     output = tmp_path / "support.zip"
