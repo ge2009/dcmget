@@ -9,7 +9,7 @@ from PyQt5.QtCore import QPoint, QSettings, Qt
 from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
-from dcmget.config import AppConfig, load_config
+from dcmget.config import AppConfig, load_config, save_config
 from dcmget.core import (
     AccessionResult,
     AccessionStatus,
@@ -19,6 +19,7 @@ from dcmget.core import (
 )
 import dcmget.pdi as pdi_module
 import dcmget.ui as ui_module
+from dcmget.task_state import TaskCheckpointStore
 from dcmget.ui import DcmGetWindow, PdiWorker, pdi_viewer_command
 
 
@@ -134,7 +135,7 @@ def test_pdi_settings_round_trip_ohif_option(qtbot, tmp_path):
     assert "无需选择 JSON、DICOMDIR 或逐个影像文件" in page.pdi_ohif_hint.text()
 
 
-def test_task_page_pdi_quick_controls_persist_and_sync_settings(
+def test_task_page_pdi_quick_controls_only_change_current_task_draft(
     qtbot, tmp_path, monkeypatch
 ):
     window = make_window(qtbot, tmp_path)
@@ -148,11 +149,11 @@ def test_task_page_pdi_quick_controls_persist_and_sync_settings(
     window.quick_pdi_checkbox.click()
 
     persisted = load_config(tmp_path / "config.json")
-    assert persisted.pdi_export_enabled
+    assert not persisted.pdi_export_enabled
     assert persisted.calling_ae_title == original_ae
-    assert window.settings_page.pdi_enabled_checkbox.isChecked()
-    assert "pdi_institution_name" in persisted.validate()
-    assert window.pdi_status_card.isVisible()
+    assert not window.settings_page.pdi_enabled_checkbox.isChecked()
+    assert window.quick_pdi_checkbox.isChecked()
+    assert not window.pdi_status_card.isVisible()
 
     monkeypatch.setattr(
         ui_module.QFileDialog,
@@ -162,8 +163,8 @@ def test_task_page_pdi_quick_controls_persist_and_sync_settings(
     window.quick_pdi_output_button.click()
 
     persisted = load_config(tmp_path / "config.json")
-    assert persisted.pdi_output_folder == str(output)
-    assert window.settings_page.pdi_output_edit.text() == str(output)
+    assert persisted.pdi_output_folder == ""
+    assert window.settings_page.pdi_output_edit.text() == ""
     assert window.quick_pdi_output_label.toolTip() == str(output)
 
     window.quick_pdi_checkbox.click()
@@ -373,11 +374,6 @@ def test_startup_can_resume_pdi_without_redownloading(qtbot, tmp_path, monkeypat
     window.task_store.set_phase(checkpoint.task_id, "pdi_retryable")
     started = []
     monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *_args, **_kwargs: QMessageBox.Yes,
-    )
-    monkeypatch.setattr(
         window,
         "_start_pdi_export",
         lambda files=None: started.append(files),
@@ -385,7 +381,10 @@ def test_startup_can_resume_pdi_without_redownloading(qtbot, tmp_path, monkeypat
 
     window._offer_task_resume()
 
-    assert started == [[str(archived)]]
+    assert started == []
+    assert window.recovery_card.isVisible()
+    window.recovery_continue_button.click()
+    assert started == [None]
     assert window._pdi_task_id == checkpoint.task_id
     # Large recovery points keep file paths on disk and load them only when
     # PDI actually starts.
@@ -504,7 +503,7 @@ def test_preflight_area_expands_for_pdi_checks(qtbot, tmp_path):
 
 
 def test_pdi_progress_and_success_enable_viewer_and_open_directory(
-    qtbot, tmp_path, monkeypatch
+    qtbot, tmp_path
 ):
     window = make_window(qtbot, tmp_path)
     output = tmp_path / "PDI" / "DCMGET_PDI_20260716_120000"
@@ -512,12 +511,6 @@ def test_pdi_progress_and_success_enable_viewer_and_open_directory(
     window.config.pdi_export_enabled = True
     window._pdi_source_files = [str(tmp_path / "image.dcm")]
     window.last_summary = BatchSummary()
-    messages = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "information",
-        lambda _parent, title, message: messages.append((title, message)),
-    )
 
     class Stage:
         value = "生成 DICOMDIR"
@@ -549,7 +542,7 @@ def test_pdi_progress_and_success_enable_viewer_and_open_directory(
     assert "PDI 导出目录" in window.pdi_open_button.toolTip()
     assert "已生成" in window.pdi_status_label.text()
     assert output.name in window.pdi_status_label.text()
-    assert str(output) in messages[0][1]
+    assert str(output) in window.progress_label.toolTip()
 
 
 def test_pdi_immediate_viewer_uses_pdi_data_and_installed_viewer(
@@ -1009,6 +1002,7 @@ def test_accept_partial_results_without_pdi_ends_recovery(
     window._resume_checkpoint = window.task_store.load_required(
         include_archived_files=False
     )
+    window._apply_checkpoint_config(window._resume_checkpoint)
     window.last_summary = BatchSummary(list(window._resume_checkpoint.results))
     window._set_running(False)
     assert window.start_button.text() == "重试失败项"
@@ -1028,11 +1022,12 @@ def test_accept_partial_results_without_pdi_ends_recovery(
     )
 
     window._accept_partial_results()
-    window._show_download_completion()
 
     assert window.task_store.load() is None
     assert window._resume_checkpoint is None
-    assert window.start_button.isEnabled()
+    assert window.current_accessions == []
+    assert window.accession_edit.toPlainText() == ""
+    assert not window.start_button.isEnabled()
     assert not window.retry_button.isEnabled()
     assert all("重试" not in message for _title, message in messages)
 
@@ -1044,7 +1039,12 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
     archived = str(tmp_path / "image.dcm")
     window._pdi_source_files = [archived]
     checkpoint = window.task_store.start(
-        AppConfig(pdi_export_enabled=True, pdi_institution_name="旧机构"),
+        AppConfig(
+            pdi_export_enabled=True,
+            pdi_institution_name="旧机构",
+            pacs_server_ip="10.0.0.8",
+            dicom_destination_folder=str(tmp_path / "task-dicom"),
+        ),
         ["A001"],
         trial_required=False,
     )
@@ -1081,28 +1081,82 @@ def test_saving_corrected_settings_preserves_failed_pdi_retry(
     restored = window.task_store.load_required()
     assert restored.config.pdi_institution_name == "海市中心医院"
     assert not restored.config.pdi_include_ohif_viewer
+    assert restored.config.pacs_server_ip == "10.0.0.8"
+    assert restored.config.dicom_destination_folder == str(tmp_path / "task-dicom")
 
     restarted = make_window(qtbot, tmp_path)
     started_with = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *_args, **_kwargs: QMessageBox.Yes,
-    )
     monkeypatch.setattr(
         restarted,
         "_start_pdi_export",
         lambda _files=None: started_with.append(
             (
-                restarted.config.pdi_institution_name,
-                restarted.config.pdi_include_ohif_viewer,
+                restarted._effective_task_config().pdi_institution_name,
+                restarted._effective_task_config().pdi_include_ohif_viewer,
             )
         ),
     )
     restarted._offer_task_resume()
+    assert started_with == []
+    restarted.recovery_continue_button.click()
 
     assert started_with == [("海市中心医院", False)]
     restarted.task_store.release_lease()
+
+
+def test_pdi_retry_settings_open_with_task_values_not_profile_defaults(
+    qtbot,
+    tmp_path,
+):
+    config_path = tmp_path / "config.json"
+    profile_output = tmp_path / "profile-pdi"
+    task_output = tmp_path / "task-pdi"
+    save_config(
+        config_path,
+        AppConfig(
+            pdi_export_enabled=False,
+            pdi_institution_name="Profile 医院",
+            pdi_output_folder=str(profile_output),
+        ),
+    )
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(
+        AppConfig(
+            pdi_export_enabled=True,
+            pdi_institution_name="任务医院",
+            pdi_output_folder=str(task_output),
+        ),
+        ["A001"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.COMPLETED, file_count=1),
+    )
+    store.set_phase(checkpoint.task_id, "pdi_retryable")
+    window = DcmGetWindow(
+        config_path,
+        tmp_path,
+        tmp_path / "active-task.sqlite3",
+        offer_task_resume=True,
+        enable_multi_task=False,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    QApplication.processEvents()
+
+    window._show_settings()
+
+    assert window.settings_page.pdi_enabled_checkbox.isChecked()
+    assert window.settings_page.pdi_institution_edit.text() == "任务医院"
+    assert window.settings_page.pdi_output_edit.text() == str(task_output)
+
+    window._save_settings(window.settings_page.config())
+
+    restored = window.task_store.load_required(include_archived_files=False)
+    assert restored.config.pdi_export_enabled
+    assert restored.config.pdi_institution_name == "任务医院"
+    assert restored.config.pdi_output_folder == str(task_output)
 
 
 def test_saving_settings_preserves_completed_pdi_actions(qtbot, tmp_path):
@@ -1186,7 +1240,7 @@ def test_failed_pdi_checkpoint_blocks_new_download_until_discarded(
 
     assert window.task_store.load() is None
     assert window._pdi_task_id == ""
-    assert window.start_button.isEnabled()
+    assert not window.start_button.isEnabled()
 
 
 def test_pdi_checkpoint_guard_rejects_direct_start_and_failed_retry(
@@ -1340,7 +1394,7 @@ def test_pdi_thread_completion_releases_busy_state(qtbot, tmp_path, monkeypatch)
 
     assert window.pdi_worker is None
     assert not window._is_busy()
-    assert window.start_button.isEnabled()
+    assert not window.start_button.isEnabled()
     assert window.settings_button.isEnabled()
 
 

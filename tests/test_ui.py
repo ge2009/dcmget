@@ -75,7 +75,7 @@ def test_more_than_200_accessions_use_summary_mode_without_table_rows(qtbot, tmp
     assert window.task_table.rowCount() == 0
     assert window.row_by_accession == {}
     assert window.task_table.isHidden()
-    assert window.large_batch_summary_card.isVisible()
+    assert window.large_batch_summary_card.isHidden()
     assert "40,000" in window.large_batch_summary_label.text()
     assert "超过 200 条" in window.large_batch_summary_label.text()
     assert window.accession_edit.toPlainText() == ""
@@ -204,6 +204,8 @@ def test_large_batch_summary_stays_in_first_viewport_and_failed_items_copy_from_
         AccessionResult("PARTIAL-2", AccessionStatus.PARTIAL),
     ]
     window._reset_large_batch_summary(len(accessions), results)
+    window.last_summary = BatchSummary(results)
+    window._render_task_phase()
 
     assert window.task_table.rowCount() == 0
     assert window.copy_failed_button.isVisible()
@@ -291,7 +293,7 @@ def test_large_batch_progress_is_aggregated_once_and_small_retry_restores_table(
 
     window._populate_waiting_rows(["A001", "A002"])
     assert not window._task_table_summary_mode
-    assert window.task_table.isVisible()
+    assert window.task_table.isHidden()
     assert window.task_table.rowCount() == 2
     assert window.row_by_accession == {"A001": 0, "A002": 1}
 
@@ -411,7 +413,7 @@ def test_task_page_scrolls_and_restored_geometry_stays_on_screen(qtbot, tmp_path
     assert geometry.bottom() <= available.bottom()
 
 
-def test_header_uses_two_rows_without_clipping_at_high_dpi_logical_width(
+def test_header_uses_one_row_without_clipping_at_high_dpi_logical_width(
     qtbot, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(ui_module, "entitlement_text", lambda: "已注册 · Windows设备")
@@ -423,24 +425,25 @@ def test_header_uses_two_rows_without_clipping_at_high_dpi_logical_width(
     window.resize(683, 480)
     QApplication.processEvents()
 
-    assert not window.app_logo.isVisible()
-    status_widgets = (
+    visible_widgets = (
         window.app_title,
         window.app_subtitle,
-        window.tool_status,
-        window.entitlement_status,
+        window.system_status,
+        window.header_settings_button,
+        window.more_button,
     )
-    action_widgets = (
-        window.registration_button,
-        window.release_notes_button,
-        window.diagnostic_log_button,
-        window.settings_button,
+    assert all(widget.isVisible() for widget in visible_widgets)
+    assert all(widget.geometry().left() >= 0 for widget in visible_widgets)
+    assert all(
+        widget.geometry().right() < window.header.width()
+        for widget in visible_widgets
     )
-    assert all(widget.width() >= widget.sizeHint().width() for widget in status_widgets)
-    assert all(widget.width() >= widget.sizeHint().width() for widget in action_widgets)
-    assert min(widget.y() for widget in action_widgets) > max(
-        widget.geometry().bottom() for widget in status_widgets
+    assert max(widget.y() for widget in visible_widgets) < min(
+        widget.geometry().bottom() for widget in visible_widgets
     )
+    assert window.tool_status.isHidden()
+    assert window.entitlement_status.isHidden()
+    assert window.registration_button.isHidden()
     assert window.tool_status.toolTip() == window.tool_status.text()
     assert window.tool_status.accessibleDescription() == window.tool_status.text()
     assert window.entitlement_status.toolTip() == "已注册 · Windows设备"
@@ -601,7 +604,7 @@ def test_profile_shortcut_uses_saved_receiver_config_and_fixed_profile(
         lambda _parent, title, message: notices.append((title, message)),
     )
 
-    qtbot.mouseClick(window.instance_shortcut_button, Qt.LeftButton)
+    window.instance_shortcut_action.trigger()
 
     assert captured["default"] == "dcmget-7788-RECEIVER6"
     assert "--profile 6" in captured["label"]
@@ -621,8 +624,8 @@ def test_profile_shortcut_can_be_created_while_download_is_running(
 
     window._set_running(True)
 
-    assert window.instance_shortcut_button.isVisible()
-    assert window.instance_shortcut_button.isEnabled()
+    assert window.instance_shortcut_action.isVisible()
+    assert window.instance_shortcut_action.isEnabled()
     window.worker = None
     window._set_running(False)
 
@@ -1209,11 +1212,6 @@ def test_startup_offer_restores_snapshot_and_only_resumes_pending_items(
     window = make_window(qtbot, tmp_path)
     started = []
     monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *_args, **_kwargs: QMessageBox.Yes,
-    )
-    monkeypatch.setattr(
         window,
         "_start_download",
         lambda override=None, **kwargs: started.append((override, kwargs)),
@@ -1223,6 +1221,9 @@ def test_startup_offer_restores_snapshot_and_only_resumes_pending_items(
 
     assert window.current_accessions == ["A001", "A002", "A003"]
     assert window.destination_edit.text() == str(destination)
+    assert started == []
+    assert window.recovery_card.isVisible()
+    window.recovery_continue_button.click()
     resumed = started[0][1]["resume_checkpoint"]
     assert resumed.pending_accessions == ["A002", "A003"]
     assert resumed.config.dicom_destination_folder == str(destination)
@@ -1303,7 +1304,7 @@ def test_failed_batch_remains_retryable_and_reuses_original_task(
 
 
 def test_safety_pause_shows_reason_and_keeps_pending_resume(
-    qtbot, tmp_path, monkeypatch
+    qtbot, tmp_path
 ):
     window = make_window(qtbot, tmp_path)
     checkpoint = window.task_store.start(
@@ -1314,12 +1315,6 @@ def test_safety_pause_shows_reason_and_keeps_pending_resume(
     window._active_task_id = checkpoint.task_id
     window._display_total = 2
     reason = "磁盘可用空间低于最低保留值；批次已安全暂停"
-    shown = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "information",
-        lambda _parent, title, message: shown.append((title, message)),
-    )
 
     window._on_worker_finished(
         BatchSummary([completed], interrupted_reason=reason)
@@ -1333,10 +1328,10 @@ def test_safety_pause_shows_reason_and_keeps_pending_resume(
     assert window.start_button.text() == "继续安全暂停任务"
     assert not window.accept_partial_button.isVisible()
 
-    assert shown[0][0] == "任务已安全暂停"
-    assert reason in shown[0][1]
-    assert "尚有 1 个检查号待处理" in shown[0][1]
-    assert "失败 0" not in shown[0][1]
+    assert window.progress_label.text() == "任务已安全暂停"
+    assert reason in window.recovery_detail_label.text()
+    assert "剩余 1" in window.recovery_summary_label.text()
+    assert "失败或部分成功 0" in window.recovery_summary_label.text()
 
 
 def test_startup_safety_pause_can_continue_without_failed_results(
@@ -1358,14 +1353,6 @@ def test_startup_safety_pause_can_continue_without_failed_results(
         "download_retryable",
         interrupted_reason=reason,
     )
-    prompts = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda _parent, title, message, *_args: (
-            prompts.append((title, message)) or QMessageBox.Yes
-        ),
-    )
     started = []
     monkeypatch.setattr(
         window,
@@ -1375,8 +1362,10 @@ def test_startup_safety_pause_can_continue_without_failed_results(
 
     window._offer_task_resume()
 
-    assert prompts[0][0] == "继续安全暂停任务"
-    assert reason in prompts[0][1]
+    assert started == []
+    assert reason in window.recovery_detail_label.text()
+    assert window.recovery_continue_button.text() == "问题已修复，继续"
+    window.recovery_continue_button.click()
     resumed = started[0][1]["resume_checkpoint"]
     assert resumed.pending_accessions == ["PENDING"]
 
@@ -1722,11 +1711,13 @@ def test_conflict_directory_button_only_enables_for_existing_directory(
     assert Path(opened[0]).resolve() == conflict.resolve()
 
 
-def test_new_task_form_and_log_panel_are_collapsed_by_default(qtbot, tmp_path):
+def test_new_task_form_is_expanded_and_log_panel_is_collapsed_by_default(
+    qtbot, tmp_path
+):
     window = make_window(qtbot, tmp_path)
 
-    assert not window._task_form_expanded
-    assert window.task_form_body.isHidden()
+    assert window._task_form_expanded
+    assert window.task_form_body.isVisible()
     assert not window._log_panel_expanded
     assert window.log_panel.isHidden()
     assert not window.log_detail_checkbox.isChecked()
@@ -1989,7 +1980,7 @@ def test_download_result_keeps_thread_busy_until_thread_finished(
 
     assert window.worker is None
     assert not window._is_busy()
-    assert window.start_button.isEnabled()
+    assert not window.start_button.isEnabled()
     assert completions == [True]
 
 
@@ -2025,7 +2016,7 @@ def test_download_failure_keeps_thread_busy_until_thread_finished(
 
     assert window.worker is None
     assert not window._is_busy()
-    assert window.start_button.isEnabled()
+    assert not window.start_button.isEnabled()
     assert critical_messages[0][0] == "下载中断"
     assert "download failed" in critical_messages[0][1]
 
@@ -2119,6 +2110,67 @@ def test_cancelled_pdi_verification_does_not_generate_acceptance_report(
     worker.run()
 
     assert completed == [{"cancelled": True, "items": []}]
+
+
+def test_pdi_verify_dialog_cancels_worker_while_worker_thread_is_busy(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+):
+    import dcmget.pdi_verify as verify_module
+
+    started = threading.Event()
+
+    class SlowVerifier:
+        def __init__(self, *_args, cancel_event, **_kwargs):
+            self.cancel_event = cancel_event
+
+        def verify(self):
+            started.set()
+            assert self.cancel_event.wait(2), "取消信号未及时送达工作线程"
+            return SimpleNamespace(status=SimpleNamespace(value="cancelled"))
+
+        def cancel(self):
+            self.cancel_event.set()
+
+    window = make_window(qtbot, tmp_path)
+    monkeypatch.setattr(
+        ui_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        PdiVerifyWorker,
+        "_verification_roots",
+        lambda _worker: [tmp_path],
+    )
+    monkeypatch.setattr(verify_module, "PdiVerifier", SlowVerifier)
+    monkeypatch.setattr(
+        verify_module,
+        "write_pdi_delivery_reports",
+        lambda *_args: pytest.fail("取消验证不得生成验收报告"),
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    window._verify_existing_pdi()
+    qtbot.waitUntil(started.is_set)
+    worker = window.pdi_verify_worker
+    assert worker is not None
+    thread = window.pdi_verify_thread
+    assert thread is not None
+    try:
+        window.pdi_verify_dialog.canceled.emit()
+
+        qtbot.waitUntil(worker._cancel.is_set, timeout=3000)
+        qtbot.waitUntil(lambda: window.pdi_verify_thread is None, timeout=3000)
+    finally:
+        active_worker = window.pdi_verify_worker
+        active_thread = window.pdi_verify_thread
+        if active_worker is not None:
+            active_worker.request_cancel()
+        if active_thread is not None and active_thread.isRunning():
+            active_thread.quit()
+            active_thread.wait(3000)
 
 
 def test_pdi_verify_worker_writes_volume_reports_outside_the_volume_set(
@@ -2323,7 +2375,6 @@ def test_instance_label_settings_namespace_and_log_scope_are_independent(
 
     assert settings_calls == ["DcmGet-Instance-A", "DcmGet-Instance-B"]
     assert "任务窗口 A" in first.windowTitle()
-    assert "任务窗口 A" in first.app_title.text()
     assert "任务窗口 A" in first.app_subtitle.text()
     assert first._show_detailed_logs
     assert not second._show_detailed_logs
