@@ -25,6 +25,7 @@ from dcmget.core import (
     BatchSummary,
     DcmtkResolver,
     DownloadRunner,
+    ResultVerificationStatus,
     ToolPaths,
     build_movescu_command,
     build_storescp_command,
@@ -370,6 +371,33 @@ def test_static_preflight_defers_receiver_port_check(tmp_path, monkeypatch):
 
     assert result.ok
     assert "storage_port" not in result.errors
+
+
+def test_preflight_rejects_destination_below_configured_free_space_guard(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(
+        dicom_destination_folder=str(tmp_path / "dicom"),
+        minimum_free_space_bytes=4 * 1024**3,
+    )
+    tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
+    resolver = Mock()
+    resolver.resolve.return_value = tools
+    usage = os.statvfs(tmp_path)
+    monkeypatch.setattr(
+        core.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=usage.f_blocks * usage.f_frsize,
+            used=0,
+            free=1024**3,
+        ),
+    )
+
+    result = preflight(config, resolver, check_port=False)
+
+    assert "dicom_destination_folder" in result.errors
+    assert "可用空间" in result.errors["dicom_destination_folder"]
     assert ("接收端口", True, "将在任务获得运行机会时检查") in result.checks
 
 
@@ -1575,6 +1603,51 @@ def test_pending_move_with_aborted_store_is_failed_and_retryable(tmp_path, monke
     assert BatchSummary([result]).failed_accessions == ["FAILED001"]
 
 
+def test_transient_move_failure_is_retried_and_combined(tmp_path, monkeypatch):
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=2,
+            auto_retry_backoff_seconds=0,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    outcomes = iter(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.FAILED,
+                duration_seconds=1,
+                message="连接被重置",
+                received_bytes=100,
+                transient_failure=True,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                file_count=1,
+                duration_seconds=2,
+                message="成功归档 1 个文件",
+                received_bytes=200,
+                archived_files=[str(tmp_path / "dicom" / "one.dcm")],
+                verification_status=ResultVerificationStatus.MATCHED,
+                actual_accessions=["A001"],
+                local_verified_files=1,
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_download_one", lambda *_args: next(outcomes))
+
+    result = runner._download_accession_with_retry("A001", tmp_path, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.attempt_count == 2
+    assert result.duration_seconds == 3
+    assert result.received_bytes == 300
+    assert "第 2 次尝试" in result.message
+
+
 @pytest.mark.parametrize(
     ("response_status", "has_problem"),
     [
@@ -1909,9 +1982,16 @@ def test_invalid_received_file_is_failed_and_left_in_staging(tmp_path, monkeypat
     assert (staging / "broken.dcm").exists()
 
 
-@pytest.mark.parametrize("returned_accession", ["A001", ""])
+@pytest.mark.parametrize(
+    ("returned_accession", "expected_verification"),
+    [
+        ("B001", ResultVerificationStatus.MATCHED),
+        ("A001", ResultVerificationStatus.MISMATCH),
+        ("", ResultVerificationStatus.UNVERIFIABLE),
+    ],
+)
 def test_received_file_is_accepted_despite_missing_or_different_accession(
-    tmp_path, monkeypatch, returned_accession
+    tmp_path, monkeypatch, returned_accession, expected_verification
 ):
     staging = tmp_path / "staging"
     staging.mkdir()
@@ -1941,6 +2021,10 @@ def test_received_file_is_accepted_despite_missing_or_different_accession(
 
     assert result.status == AccessionStatus.COMPLETED
     assert result.file_count == 1
+    assert result.verification_status == expected_verification
+    assert result.actual_accessions == ([returned_accession] if returned_accession else [])
+    assert result.local_verified_files == 1
+    assert result.attempt_count == 1
     assert not list(staging.glob("*.dcm"))
     archived = list((tmp_path / "dicom").rglob("*.dcm"))
     assert len(archived) == 1
@@ -1950,6 +2034,34 @@ def test_received_file_is_accepted_despite_missing_or_different_accession(
         str(getattr(archived_dataset, "AccessionNumber", ""))
         == returned_accession
     )
+
+
+def test_reconciliation_is_non_blocking_when_one_returned_accession_mismatches(
+    tmp_path,
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    matching = staging / "matching.dcm"
+    mismatching = staging / "mismatching.dcm"
+    _write_minimal_dicom(matching, "1.2.3.80", accession="REQ001")
+    _write_minimal_dicom(mismatching, "1.2.3.81", accession="OTHER001")
+    stats = core.ArchiveStats()
+
+    moved, rejected = core._archive_dicom_files(
+        [matching, mismatching],
+        tmp_path / "dicom",
+        "{AccessionNumber}",
+        "REQ001",
+        route_accession="REQ001",
+        stats=stats,
+    )
+    status, message = core.reconcile_archive_stats("REQ001", stats)
+
+    assert len(moved) == 2
+    assert rejected == []
+    assert status == ResultVerificationStatus.MISMATCH
+    assert stats.source_accessions == {"REQ001", "OTHER001"}
+    assert "OTHER001" in message
 
 
 def test_preexisting_staging_file_is_not_assigned_to_a_later_move(tmp_path, monkeypatch):

@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.10.0
+        default: 2.11.0
 
 permissions:
   contents: read
@@ -35,6 +35,25 @@ jobs:
       - name: Verify AMD64 Python build host
         shell: pwsh
         run: python -c "from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime(); print('AMD64 Python runtime verified')"
+
+      - name: Configure optional Authenticode certificate
+        shell: pwsh
+        env:
+          DCMGET_SIGN_CERTIFICATE_BASE64: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
+          DCMGET_SIGN_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DCMGET_SIGN_CERTIFICATE_BASE64)) {
+            Write-Host "No signing certificate configured; release manifest will state UNSIGNED."
+            exit 0
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "dcmget-authenticode.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:DCMGET_SIGN_CERTIFICATE_BASE64)
+          )
+          "DCMGET_SIGN_CERTIFICATE_PATH=$certificatePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_CERTIFICATE_PASSWORD=$env:DCMGET_SIGN_CERTIFICATE_PASSWORD_SECRET" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_TIMESTAMP_URL=http://timestamp.digicert.com" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install build dependencies
         run: |
@@ -371,6 +390,12 @@ jobs:
           & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
+      - name: Sign installer before testing exact release artifact
+        shell: pwsh
+        run: |
+          $env:DCMGET_SETUP_PATH = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
+          python -c "import os; from pathlib import Path; from scripts.build_windows import sign_windows_payloads; sign_windows_payloads([Path(os.environ['DCMGET_SETUP_PATH'])])"
+
       - name: Silent install, in-place upgrade and uninstall test
         shell: pwsh
         run: |
@@ -484,8 +509,17 @@ jobs:
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }
           Remove-Item $configDir -Recurse -Force
 
-      - name: Finalize checksums
-        run: python scripts/build_windows.py --checksums-only
+      - name: Enforce Windows x64 gate, verify signatures, and finalize manifest
+        shell: pwsh
+        run: |
+          python scripts/windows_release_gate.py `
+            --release-dir release/windows `
+            --version "${{ inputs.version }}" `
+            --amd64-pe build/windows/dist/DcmGet/DcmGet.exe `
+            --amd64-pe build/windows/dist/DcmGetPdiServer.exe `
+            --amd64-pe "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" `
+            --dcmtk-bin "build/windows/dcmtk-runtime/dcmtk-3.7.0-win64-dynamic/bin" `
+            --verify-existing-signatures
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
@@ -494,6 +528,7 @@ jobs:
           path: |
             release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe
             release/windows/SHA256SUMS.txt
+            release/windows/RELEASE-MANIFEST.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -505,6 +540,7 @@ jobs:
           path: |
             release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe
             release/windows/SHA256SUMS.txt
+            release/windows/RELEASE-MANIFEST.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -516,6 +552,7 @@ jobs:
           path: |
             release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip
             release/windows/SHA256SUMS.txt
+            release/windows/RELEASE-MANIFEST.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

@@ -1005,7 +1005,7 @@ def test_crash_recovery_reuses_published_directory(
 
 
 def test_concurrent_pdi_publication_uses_unique_directories(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output_root = tmp_path / "portable"
     output_root.mkdir()
@@ -1024,11 +1024,12 @@ def test_concurrent_pdi_publication_uses_unique_directories(
     barrier = threading.Barrier(2)
     published: list[Path] = []
     failures: list[BaseException] = []
+    exporter = PdiExporter(_config(tmp_path), tools)
 
     def publish(temporary: Path) -> None:
         try:
             barrier.wait(timeout=2)
-            published.append(PdiExporter._publish_directory(temporary, output_root))
+            published.append(exporter._publish_directory(temporary, output_root))
         except BaseException as exc:  # pragma: no cover - surfaced below
             failures.append(exc)
 
@@ -1049,6 +1050,39 @@ def test_concurrent_pdi_publication_uses_unique_directories(
         "1",
         "2",
     }
+
+
+def test_publish_lock_cancel_after_acquire_does_not_rename(
+    tmp_path: Path,
+    tools: ToolPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "portable"
+    output_root.mkdir()
+    temporary = output_root / ".DCMGET_PDI_TEST.partial-deadbeef"
+    temporary.mkdir()
+    exporter = PdiExporter(_config(tmp_path), tools)
+    released = []
+
+    class CancellingLock:
+        def __init__(self, _path: str):
+            pass
+
+        def acquire(self, *, timeout: float):
+            exporter._cancel.set()
+            return self
+
+        def release(self) -> None:
+            released.append(True)
+
+    monkeypatch.setattr(pdi, "FileLock", CancellingLock)
+
+    with pytest.raises(pdi._Cancelled):
+        exporter._publish_directory(temporary, output_root)
+
+    assert released == [True]
+    assert temporary.is_dir()
+    assert not list(output_root.glob("DCMGET_PDI_*"))
 
 
 def test_restart_removes_only_matching_interrupted_partial(
@@ -1092,6 +1126,26 @@ def test_partial_cleanup_failure_is_reported_and_kept(
     with pytest.raises(OSError, match="无法删除 PDI 暂存目录"):
         pdi.cleanup_interrupted_pdi(_config(tmp_path), "d" * 32)
     assert partial.exists()
+
+
+def test_failed_export_reports_sensitive_partial_cleanup_failure(
+    tmp_path: Path, tools: ToolPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dicom(tmp_path / "source.dcm")
+    exporter = PdiExporter(_config(tmp_path), tools)
+
+    def fail_after_partial_created(_paths):
+        raise RuntimeError("simulated export failure")
+
+    monkeypatch.setattr(exporter, "_prepare_items", fail_after_partial_created)
+    monkeypatch.setattr(pdi.shutil, "rmtree", Mock(side_effect=OSError("in use")))
+
+    result = exporter.export([source])
+
+    assert result.status == PdiStatus.FAILED
+    assert "可能仍包含患者影像" in result.message
+    assert any("人工删除" in warning for warning in result.warnings)
+    assert list((tmp_path / "portable").glob(".*.partial-*"))
 
 
 def test_manifest_covers_index_viewer_launchers_and_dicom(

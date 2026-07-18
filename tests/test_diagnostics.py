@@ -613,6 +613,7 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
             activation_path=tmp_path / "state" / f"i{number}" / "gui-instance.json",
             label=f"实例 {number}",
             settings_name=f"DcmGet2-i{number}",
+            slot_lock=object(),
             close=lambda number=number: events.append(("close", number)),
         )
         profiles.append((requested, Path(template_config_path), profile))
@@ -659,6 +660,7 @@ def test_repeated_gui_launches_acquire_independent_profiles(monkeypatch, tmp_pat
             "instance_label": profile.label,
             "settings_name": profile.settings_name,
             "log_directory": profile.log_directory,
+            "profile_lock": profile.slot_lock,
         }
     assert ("authorize", "resume-i1") in events
     assert ("authorize", "resume-i2") in events

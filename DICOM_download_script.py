@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
+from pathlib import Path
 
 from dcmget import __version__
+from dcmget.accession_import import (
+    AccessionImportResult,
+    ColumnSelectionError,
+    import_accession_file,
+)
 from dcmget.architecture import ArchitectureError, ensure_supported_runtime
-from dcmget.config import load_accessions, load_config
+from dcmget.config import load_config
 from dcmget.core import (
     AccessionStatus,
     BatchSummary,
@@ -31,12 +38,18 @@ from dcmget.instance_profile import (
     _read_migration_marker,
 )
 from dcmget.runtime import application_state_dir, ensure_default_config, resource_root
-from dcmget.pdi import PdiExporter, PdiStatus, cleanup_interrupted_pdi
+from dcmget.pdi import (
+    PdiExporter,
+    PdiStatus,
+    PdiVolumeExporter,
+    cleanup_interrupted_pdi,
+)
 from dcmget.task_state import (
     TaskCheckpointStore,
     TaskStateError,
     merge_checkpoint_summary,
 )
+from dcmget.task_ledger import TaskLedger, TaskLedgerError
 
 
 PROJECT_ROOT = resource_root()
@@ -64,7 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(ensure_default_config()),
         help="配置文件路径（默认：项目目录/config.json）",
     )
-    parser.add_argument("--accessions", help="覆盖配置中的检查号 TXT 文件路径")
+    parser.add_argument(
+        "--accessions",
+        help="覆盖配置中的检查号 TXT、CSV 或 XLSX 文件路径",
+    )
+    parser.add_argument(
+        "--accession-column",
+        metavar="NAME_OR_INDEX",
+        help="CSV/XLSX 检查号列名或从 0 开始的列序号；多列表格必须指定",
+    )
     parser.add_argument(
         "--task-id",
         help="恢复 tasks.sqlite3 中指定的未完成或可重试任务",
@@ -82,7 +103,167 @@ def build_parser() -> argparse.ArgumentParser:
         help="接受恢复任务中的下载失败，保留现有文件并继续 PDI 或结束任务",
     )
     parser.add_argument("--task-state", help=argparse.SUPPRESS)
+    maintenance = parser.add_mutually_exclusive_group()
+    maintenance.add_argument(
+        "--health-check",
+        action="store_true",
+        help="运行本机环境、DCMTK、目录、端口和进程健康检查",
+    )
+    maintenance.add_argument(
+        "--support-bundle",
+        metavar="ZIP",
+        help="生成默认脱敏的诊断支持包",
+    )
+    maintenance.add_argument(
+        "--backup-profiles",
+        metavar="ZIP",
+        help="备份本机全部 Profile 配置与显示名（不含授权和试用信息）",
+    )
+    maintenance.add_argument(
+        "--restore-profiles",
+        metavar="ZIP",
+        help="校验并恢复 Profile 配置，恢复前自动创建快照",
+    )
+    maintenance.add_argument(
+        "--verify-pdi",
+        metavar="DIRECTORY",
+        help="校验已复制到 U 盘或其他介质的 PDI 完整性",
+    )
     return parser
+
+
+def load_cli_accessions(
+    path: str | Path,
+    column_argument: str | None,
+) -> AccessionImportResult:
+    """Load CLI accessions without guessing among multiple table columns."""
+
+    column: str | int | None = column_argument
+    if column_argument is not None:
+        candidate = column_argument.strip()
+        if not candidate:
+            raise ColumnSelectionError("--accession-column 不能为空")
+        column = int(candidate) if candidate.isdecimal() else candidate
+    try:
+        result = import_accession_file(path, column=column)
+    except ColumnSelectionError as exc:
+        if column_argument is None and exc.columns:
+            choices = "、".join(
+                f"{item.index}:{item.name}" for item in exc.columns
+            )
+            raise ColumnSelectionError(
+                f"{exc}；可选列为 {choices}。请使用 --accession-column 明确指定",
+                exc.columns,
+            ) from exc
+        raise
+    if column_argument is None and len(result.available_columns) > 1:
+        choices = "、".join(
+            f"{item.index}:{item.name}" for item in result.available_columns
+        )
+        raise ColumnSelectionError(
+            "表格包含多列，命令行不会自动选择检查号列；"
+            f"可选列为 {choices}。请使用 --accession-column 明确指定",
+            result.available_columns,
+        )
+    return result
+
+
+def run_maintenance_command(args: argparse.Namespace) -> int | None:
+    if not any(
+        (
+            args.health_check,
+            args.support_bundle,
+            args.backup_profiles,
+            args.restore_profiles,
+            args.verify_pdi,
+        )
+    ):
+        return None
+    try:
+        if args.backup_profiles:
+            from dcmget.profile_backup import create_profile_backup
+
+            result = create_profile_backup(args.backup_profiles)
+            print(f"Profile 配置与显示名备份已生成：{result.path}")
+            print("包含 Profile：" + "、".join(map(str, result.profile_numbers)))
+            return 0
+        if args.restore_profiles:
+            from dcmget.profile_backup import restore_profile_backup
+
+            result = restore_profile_backup(args.restore_profiles)
+            print(
+                "Profile 配置与显示名已恢复："
+                + "、".join(map(str, result.profile_numbers))
+            )
+            if result.previous_backup:
+                print(f"恢复前快照：{result.previous_backup}")
+            return 0
+        if args.verify_pdi:
+            from dcmget.pdi_verify import (
+                PdiVerificationStatus,
+                discover_pdi_verification_roots,
+                pdi_delivery_report_output_directory,
+                verify_pdi_directory,
+                write_pdi_delivery_reports,
+            )
+
+            roots = discover_pdi_verification_roots(args.verify_pdi)
+            results = []
+            for index, root in enumerate(roots, start=1):
+                result = verify_pdi_directory(root)
+                report_directory = pdi_delivery_report_output_directory(
+                    args.verify_pdi,
+                    root,
+                    len(roots),
+                )
+                reports = write_pdi_delivery_reports(
+                    result,
+                    report_directory,
+                )
+                results.append(result)
+                prefix = f"第 {index}/{len(roots)} 卷：" if len(roots) > 1 else ""
+                print(prefix + result.message)
+                print(f"PDI 验收报告：{reports.html_path}")
+            if any(
+                result.status == PdiVerificationStatus.CANCELLED
+                for result in results
+            ):
+                return 130
+            return (
+                0
+                if all(
+                    result.status == PdiVerificationStatus.PASSED
+                    for result in results
+                )
+                else 2
+            )
+
+        config = load_config(args.config)
+        if args.health_check:
+            from dcmget.health import run_health_check
+
+            report = run_health_check(
+                config,
+                project_root=PROJECT_ROOT,
+                minimum_free_bytes=config.minimum_free_space_bytes,
+                check_pacs=True,
+            )
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if report.status != "error" else 1
+        if args.support_bundle:
+            from dcmget.support_bundle import create_support_bundle
+
+            result = create_support_bundle(
+                args.support_bundle,
+                config,
+                project_root=PROJECT_ROOT,
+            )
+            print(f"脱敏支持包已生成：{result.path}")
+            return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"维护操作失败：{exc}", file=sys.stderr)
+        return 1
+    return None
 
 
 def authorize_cli(
@@ -118,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"运行环境不受支持：{exc}", file=sys.stderr)
         return 1
     args = build_parser().parse_args(argv)
+    maintenance_exit = run_maintenance_command(args)
+    if maintenance_exit is not None:
+        return maintenance_exit
     if args.task_state:
         if args.task_id:
             print(
@@ -244,10 +428,20 @@ def main(argv: list[str] | None = None) -> int:
             if checkpoint.phase == "download_retryable":
                 accepting_download_failures = bool(args.accept_download_failures)
                 if accepting_download_failures:
+                    if checkpoint.interrupted_reason or checkpoint.pending_accessions:
+                        raise ValueError(
+                            "安全暂停任务仍有未处理检查号，不能直接接受当前结果；"
+                            "请先继续任务"
+                        )
                     print("[恢复] 已接受当前下载结果，不再重试失败项")
                 else:
+                    interrupted_reason = checkpoint.interrupted_reason
                     checkpoint = store.prepare_download_retry(checkpoint.task_id)
-                    print("[恢复] 正在重试上次失败和部分成功的检查号")
+                    if interrupted_reason:
+                        print(f"[恢复] 安全暂停原因：{interrupted_reason}")
+                        print("[恢复] 正在继续未处理项并重试已有失败项")
+                    else:
+                        print("[恢复] 正在重试上次失败和部分成功的检查号")
             config = checkpoint.config
             accessions = checkpoint.pending_accessions
             print(
@@ -258,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = load_config(args.config)
             accession_path = args.accessions or config.access_numbers_file_path
-            parsed = load_accessions(accession_path)
+            parsed = load_cli_accessions(accession_path, args.accession_column)
             if parsed.invalid_values:
                 examples = "、".join(parsed.invalid_values[:3])
                 raise ValueError(
@@ -266,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                     + examples
                 )
             accessions = parsed.values
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TaskStateError) as exc:
         store.release_lease()
         print(f"配置或检查号文件错误：{exc}", file=sys.stderr)
         return 1
@@ -325,6 +519,54 @@ def main(argv: list[str] | None = None) -> int:
 
     task_id = checkpoint.task_id
     offset = len(checkpoint.results)
+    try:
+        ledger = TaskLedger(Path(store.path).expanduser().with_name("task-ledger.sqlite3"))
+        try:
+            ledger.load_batch(task_id)
+        except TaskLedgerError as exc:
+            if "不存在当前批次" not in str(exc):
+                raise
+            ledger.create_batch(
+                checkpoint.accessions,
+                batch_id=task_id,
+                profile_name=Path(args.config).stem,
+                anonymization_requested=config.anonymization_enabled,
+                pdi_requested=config.pdi_export_enabled,
+            )
+    except TaskLedgerError as exc:
+        store.release_lease()
+        print(f"无法建立任务台账：{exc}", file=sys.stderr)
+        return 1
+
+    def export_acceptance_report(*, complete_status: str | None = None) -> None:
+        try:
+            if complete_status:
+                ledger.complete_batch(task_id, complete_status)
+            report_root = (
+                Path(config.dicom_destination_folder).expanduser()
+                / "_DcmGetReports"
+                / f"task-{task_id[:8]}"
+            )
+            report = ledger.export_reports(task_id, report_root)
+            print(f"[验收] 脱敏验收报告：{report.html_path}")
+        except (OSError, TaskLedgerError) as exc:
+            print(f"[验收] 报告生成失败：{exc}", file=sys.stderr)
+
+    def record_audit(result, observations) -> None:
+        if not config.anonymization_enabled:
+            anonymization_status = "not_requested"
+        elif result.archived_files:
+            anonymization_status = "completed"
+        elif result.status == AccessionStatus.NO_DATA:
+            anonymization_status = "no_data"
+        else:
+            anonymization_status = "failed"
+        ledger.record_runner_result(
+            task_id,
+            result,
+            observed_instances=observations,
+            anonymization_status=anonymization_status,
+        )
 
     def report_progress(index, total, result) -> None:
         persisted = store.record_result(task_id, result)
@@ -342,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[授权] 本次使用免费试用，剩余 {trial.remaining} 次")
 
     runner: DownloadRunner | None = None
-    exporter: PdiExporter | None = None
+    exporter: PdiExporter | PdiVolumeExporter | None = None
     cancel_requested = threading.Event()
 
     def cancel(_signum: int, _frame: object) -> None:
@@ -377,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
                     executable,
                     active=active,
                 ),
+                audit_callback=record_audit,
             )
             current_summary = runner.run(accessions)
             persisted = store.load_required()
@@ -397,25 +640,54 @@ def main(argv: list[str] | None = None) -> int:
         else:
             summary = BatchSummary(list(checkpoint.results))
         if summary.cancelled or cancel_requested.is_set():
+            export_acceptance_report()
             return 130
         download_exit_code = summary.exit_code
         if download_exit_code == 2 and not accepting_download_failures:
-            store.set_phase(task_id, "download_retryable")
-            print("[恢复] 失败项已保留，下次启动将只重试失败和部分成功项。")
+            store.set_phase(
+                task_id,
+                "download_retryable",
+                interrupted_reason=summary.interrupted_reason,
+            )
+            if summary.interrupted_reason:
+                pending_count = len(store.load_required().pending_accessions)
+                print(f"[安全暂停] {summary.interrupted_reason}")
+                print(
+                    f"[恢复] 尚有 {pending_count} 个检查号待处理；"
+                    "修复问题后再次启动即可继续。"
+                )
+            else:
+                print("[恢复] 失败项已保留，下次启动将只重试失败和部分成功项。")
+            export_acceptance_report()
             return 2
         if not config.pdi_export_enabled:
             store.clear(task_id)
+            export_acceptance_report(
+                complete_status=(
+                    "accepted_partial" if download_exit_code == 2 else "completed"
+                )
+            )
             return download_exit_code
         if not summary.archived_files:
             print("[PDI] 当前批次没有已归档 DICOM 文件，跳过便携目录导出。")
             store.clear(task_id)
+            export_acceptance_report(
+                complete_status=(
+                    "accepted_partial" if download_exit_code == 2 else "completed"
+                )
+            )
             return download_exit_code
 
         pdi_attempt_id, reuse_published_pdi = store.begin_pdi_attempt(
             task_id,
             reuse_existing=checkpoint.phase == "pdi_running",
         )
-        exporter = PdiExporter(
+        exporter_type = (
+            PdiVolumeExporter
+            if config.pdi_volume_size_bytes > 0
+            else PdiExporter
+        )
+        exporter = exporter_type(
             config,
             tools,
             project_root=PROJECT_ROOT,
@@ -443,16 +715,39 @@ def main(argv: list[str] | None = None) -> int:
             save_pdi_result(task_id, pdi_result)
         if pdi_result.output_directory:
             print(f"[PDI] 输出目录：{pdi_result.output_directory}")
+        try:
+            ledger.record_pdi_result(
+                task_id,
+                pdi_result.status,
+                output_directory=pdi_result.output_directory,
+                message=pdi_result.message,
+            )
+        except TaskLedgerError as exc:
+            print(f"[验收] PDI 台账更新失败：{exc}", file=sys.stderr)
         if pdi_result.status == PdiStatus.CANCELLED:
             store.set_phase(task_id, "pdi_retryable")
+            export_acceptance_report(complete_status="cancelled")
             return 130
         if pdi_result.core_tool_failure:
             store.set_phase(task_id, "pdi_retryable")
+            export_acceptance_report(complete_status="failed")
             return 1
         if pdi_result.status in {PdiStatus.PARTIAL, PdiStatus.FAILED}:
             store.set_phase(task_id, "pdi_retryable")
+            export_acceptance_report(
+                complete_status=(
+                    "partial"
+                    if pdi_result.status == PdiStatus.PARTIAL
+                    else "failed"
+                )
+            )
             return 2
         store.clear(task_id)
+        export_acceptance_report(
+            complete_status=(
+                "accepted_partial" if download_exit_code == 2 else "completed"
+            )
+        )
         return download_exit_code
     except (OSError, LicenseError, RuntimeError, TaskStateError, TimeoutError) as exc:
         print(f"下载启动失败：{exc}", file=sys.stderr)

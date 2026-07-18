@@ -398,6 +398,33 @@ def verify_packaged_dcmtk_tree(
         )
 
 
+def sign_windows_payloads(paths: list[Path]) -> str:
+    """Sign embedded Windows payloads before they are copied or zipped."""
+
+    try:
+        from scripts.windows_release_gate import (
+            AuthenticodeConfig,
+            SignatureStatus,
+            sign_windows_files,
+        )
+    except ModuleNotFoundError:
+        from windows_release_gate import (  # type: ignore[no-redef]
+            AuthenticodeConfig,
+            SignatureStatus,
+            sign_windows_files,
+        )
+
+    config = AuthenticodeConfig.from_environment()
+    statuses = sign_windows_files(paths, config)
+    status = (
+        SignatureStatus.SIGNED if config.configured else SignatureStatus.UNSIGNED
+    )
+    if set(statuses.values()) != {status}:
+        raise RuntimeError("Windows 内嵌程序签名状态不一致")
+    print(f"WINDOWS_PAYLOAD_SIGNING_STATUS={status.value}")
+    return status.value
+
+
 def build_payloads(version: str) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
@@ -426,6 +453,7 @@ def build_payloads(version: str) -> None:
     pdi_server = DIST_ROOT / "DcmGetPdiServer.exe"
     if not pdi_server.is_file():
         raise FileNotFoundError("PDI 本地阅片服务 DcmGetPdiServer.exe 构建失败")
+    sign_windows_payloads([pdi_server])
 
     run_pyinstaller(
         pyinstaller_args(
@@ -451,8 +479,12 @@ def build_payloads(version: str) -> None:
         )
     )
 
+    application = DIST_ROOT / "DcmGet" / "DcmGet.exe"
+    portable_payload = DIST_ROOT / "DcmGet-Portable.exe"
+    sign_windows_payloads([application, portable_payload])
+
     portable = RELEASE_ROOT / f"DcmGet-{version}-windows-x64-portable.exe"
-    shutil.copy2(DIST_ROOT / "DcmGet-Portable.exe", portable)
+    shutil.copy2(portable_payload, portable)
     archive = RELEASE_ROOT / f"DcmGet-{version}-windows-x64.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as package:
         for path in sorted((DIST_ROOT / "DcmGet").rglob("*")):

@@ -23,7 +23,7 @@ from dcmget.core import (
     build_storescp_command,
     is_port_available,
 )
-from dcmget.pdi import PdiExporter, PdiStatus
+from dcmget.pdi import PdiExporter, PdiStatus, PdiVolumeExporter
 from dcmget.multitask_runtime import SharedDcmtkRuntime
 from dcmget.task_manager import ReceiverService, TaskCatalog, TaskManager
 
@@ -531,3 +531,57 @@ def test_real_dcmtk_builds_valid_pdi_dicomdir_and_ohif_index(tmp_path):
         if "ReferencedFileID" in record
     ]
     assert len(references) == 1
+
+
+@pytest.mark.integration
+def test_real_dcmtk_builds_independent_complete_study_pdi_volumes(tmp_path):
+    try:
+        tools = DcmtkResolver(Path(__file__).resolve().parents[1]).resolve()
+    except FileNotFoundError:
+        pytest.skip("本机未安装 DCMTK")
+    if tools.dcmmkdir is None:
+        pytest.skip("当前 DCMTK 缺少 dcmmkdir")
+
+    source_root = tmp_path / "download"
+    source_root.mkdir()
+    sources = []
+    for number in (1, 2):
+        source = source_root / f"study-{number}.dcm"
+        dataset = sample_dataset(f"PDI-VOLUME-{number}")
+        dataset.save_as(source, enforce_file_format=True)
+        sources.append(source)
+    # The configured limit applies to the complete portable volume, not only
+    # to its source DICOM payload.  Match the exporter's safety reserves so
+    # one Study fits while a second Study still starts a new volume.
+    capacity = (
+        16 * 1024 * 1024
+        + 64 * 1024
+        + max(path.stat().st_size for path in sources)
+    )
+    config = AppConfig(
+        dicom_destination_folder=str(source_root),
+        pdi_export_enabled=True,
+        pdi_institution_name="DcmGet Integration Hospital",
+        pdi_output_folder=str(tmp_path / "portable"),
+        pdi_include_ohif_viewer=False,
+        pdi_volume_size_bytes=capacity,
+    )
+
+    result = PdiVolumeExporter(config, tools).export(sources)
+
+    assert result.status == PdiStatus.COMPLETED
+    assert result.volume_count == 2
+    output = Path(result.output_directory)
+    assert (output / "VOLUME_SET.json").is_file()
+    for number in (1, 2):
+        volume = output / f"VOLUME_{number:03d}"
+        assert (volume / "DICOMDIR").is_file()
+        assert (volume / "MANIFEST.SHA256").is_file()
+        references = [
+            record.ReferencedFileID
+            for record in dcmread(volume / "DICOMDIR").DirectoryRecordSequence
+            if "ReferencedFileID" in record
+        ]
+        assert len(references) == 1
+    metadata = (output / "VOLUME_SET.json").read_text(encoding="utf-8")
+    assert str(tmp_path) not in metadata

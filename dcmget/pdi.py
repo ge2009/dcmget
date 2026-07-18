@@ -10,14 +10,16 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 from pydicom import dcmread
 from pydicom.charset import convert_encodings
 from pydicom.datadict import dictionary_VR, keyword_for_tag
@@ -104,6 +106,8 @@ class PdiExportResult:
     indexed_count: int = 0
     strict_profile: bool | None = None
     core_tool_failure: bool = False
+    output_directories: list[str] = field(default_factory=list)
+    volume_count: int = 1
 
 
 ProgressCallback = Callable[[PdiStage, int, int, str], None]
@@ -319,7 +323,16 @@ class PdiExporter:
                 except _Cancelled:
                     raise
                 except Exception as exc:
-                    shutil.rmtree(temporary / "VIEWER" / "OHIF", ignore_errors=True)
+                    incomplete_viewer = temporary / "VIEWER" / "OHIF"
+                    try:
+                        shutil.rmtree(incomplete_viewer)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as cleanup_exc:
+                        raise RuntimeError(
+                            "离线阅片器准备失败，且无法清理不完整资源："
+                            f"{cleanup_exc}"
+                        ) from cleanup_exc
                     (temporary / "VIEWER" / "pdi_server.py").unlink(missing_ok=True)
                     (temporary / "VIEWER" / "architecture.py").unlink(missing_ok=True)
                     self._remove_launchers(temporary)
@@ -360,6 +373,7 @@ class PdiExporter:
             temporary = None
 
             result.output_directory = str(final)
+            result.output_directories = [str(final)]
             self._emit(result.message, "warning" if is_partial else "success")
             return result
         except _Cancelled:
@@ -380,7 +394,20 @@ class PdiExporter:
             return result
         finally:
             if temporary is not None:
-                shutil.rmtree(temporary, ignore_errors=True)
+                try:
+                    shutil.rmtree(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    warning = (
+                        "PDI 暂存目录未能自动删除，可能仍包含患者影像；"
+                        f"请关闭占用程序后人工删除：{temporary}（{exc}）"
+                    )
+                    result.warnings.append(warning)
+                    result.message = (
+                        f"{result.message}；{warning}" if result.message else warning
+                    )
+                    self._emit(warning, "error")
 
     def _prepare_items(
         self, source_paths: list[Path]
@@ -1203,6 +1230,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
                 return PdiExportResult(
                     status=status,
                     output_directory=str(candidate),
+                    output_directories=[str(candidate)],
                     message=str(marker.get("message", "") or status.value),
                     warnings=[str(warning) for warning in warnings],
                     source_count=int(marker.get("source_count", 0)),
@@ -1298,8 +1326,7 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             suffix += 1
         return candidate
 
-    @staticmethod
-    def _publish_directory(temporary: Path, output_root: Path) -> Path:
+    def _publish_directory(self, temporary: Path, output_root: Path) -> Path:
         """Atomically choose and publish a unique PDI directory across processes."""
 
         try:
@@ -1313,8 +1340,13 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             lock_directory.chmod(0o700)
         except OSError:
             pass
-        with FileLock(str(lock_directory / f"{digest}.lock"), timeout=300):
+        with _cancellable_file_lock(
+            lock_directory / f"{digest}.lock",
+            self._check_cancelled,
+        ):
+            self._check_cancelled()
             final = PdiExporter._next_output_directory(output_root)
+            self._check_cancelled()
             temporary.rename(final)
             return final
 
@@ -1356,6 +1388,382 @@ MANIFEST.SHA256 校验目录中除清单自身外的所有文件。
             self.process_callback("pdi", pid, executable, active)
         except Exception as exc:
             self._emit(f"无法更新 PDI 子进程恢复信息：{exc}", "error")
+
+
+class PdiVolumeExporter:
+    """Export one or more independently usable PDI volumes.
+
+    A positive configured capacity groups complete Studies into volumes.  Each
+    volume is built by the normal :class:`PdiExporter`, so every published
+    volume contains its own DICOMDIR, manifest and optional offline viewer.
+    """
+
+    def __init__(
+        self,
+        config: AppConfig,
+        tools: ToolPaths,
+        project_root: str | Path | None = None,
+        viewer_source: str | Path | None = None,
+        ohif_payload_dir: str | Path | None = None,
+        log_callback: LogCallback | None = None,
+        progress_callback: ProgressCallback | None = None,
+        process_callback: ProcessCallback | None = None,
+        recovery_id: str = "",
+        reuse_published: bool = False,
+    ):
+        self.config = config
+        self.tools = tools
+        self.project_root = project_root
+        self.viewer_source = viewer_source
+        self.ohif_payload_dir = ohif_payload_dir
+        self.log_callback = log_callback or (lambda _source, _message, _level: None)
+        self.progress_callback = progress_callback or (
+            lambda _stage, _current, _total, _message: None
+        )
+        self.process_callback = process_callback or (
+            lambda _kind, _pid, _executable, _active: None
+        )
+        normalized_recovery_id = recovery_id.strip().lower()
+        if normalized_recovery_id and not re.fullmatch(
+            r"[0-9a-f]{32}", normalized_recovery_id
+        ):
+            raise ValueError("PDI 恢复标识格式不正确")
+        self.recovery_id = normalized_recovery_id
+        self.reuse_published = reuse_published
+        self._cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._current_exporter: PdiExporter | None = None
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        with self._lock:
+            exporter = self._current_exporter
+        if exporter is not None:
+            exporter.request_cancel()
+
+    def export(self, files: Iterable[str | Path]) -> PdiExportResult:
+        source_files = [Path(path).expanduser().resolve() for path in files]
+        capacity = max(0, int(self.config.pdi_volume_size_bytes))
+        if capacity == 0:
+            exporter = self._make_exporter(self.config)
+            with self._lock:
+                self._current_exporter = exporter
+            if self._cancel.is_set():
+                exporter.request_cancel()
+            try:
+                return exporter.export(source_files)
+            finally:
+                with self._lock:
+                    self._current_exporter = None
+
+        from .pdi_volume import plan_pdi_volumes
+
+        fixed_overhead = self._estimated_fixed_volume_overhead()
+        per_file_overhead = 64 * 1024
+        try:
+            self._check_cancelled()
+            plan = plan_pdi_volumes(
+                source_files,
+                capacity,
+                fixed_volume_overhead_bytes=fixed_overhead,
+                per_file_overhead_bytes=per_file_overhead,
+                cancel_check=self._check_cancelled,
+            )
+            self._check_cancelled()
+        except _Cancelled:
+            return PdiExportResult(
+                status=PdiStatus.CANCELLED,
+                message="PDI 分卷导出已取消",
+                source_count=len(source_files),
+            )
+        except Exception as exc:
+            return PdiExportResult(
+                status=PdiStatus.FAILED,
+                message=f"PDI 分卷规划失败：{exc}",
+                source_count=len(source_files),
+            )
+        if not plan.volumes:
+            return PdiExportResult(
+                status=PdiStatus.FAILED,
+                message="当前批次没有可导出的 DICOM 文件",
+                source_count=0,
+                volume_count=0,
+            )
+        if len(plan.volumes) <= 1:
+            exporter = self._make_exporter(
+                replace(self.config, pdi_volume_size_bytes=0)
+            )
+            with self._lock:
+                self._current_exporter = exporter
+            if self._cancel.is_set():
+                exporter.request_cancel()
+            try:
+                result = exporter.export(source_files)
+                result.warnings[:0] = [warning.message for warning in plan.warnings]
+                self._apply_single_volume_capacity_result(
+                    result,
+                    plan.volumes[0],
+                    capacity,
+                )
+                return result
+            finally:
+                with self._lock:
+                    self._current_exporter = None
+
+        output_root = _pdi_output_root(self.config)
+        partial: Path | None = None
+        combined = PdiExportResult(
+            status=PdiStatus.GENERATING,
+            source_count=plan.total_files,
+            volume_count=len(plan.volumes),
+            warnings=[warning.message for warning in plan.warnings],
+        )
+        try:
+            output_root.mkdir(parents=True, exist_ok=True)
+            base = f"DCMGET_PDI_SET_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            partial = output_root / f".{base}.partial-{uuid.uuid4().hex[:8]}"
+            partial.mkdir(parents=False, exist_ok=False)
+            if self.recovery_id:
+                _write_volume_set_recovery_marker(
+                    partial,
+                    self.recovery_id,
+                    state="building",
+                )
+            volume_results: list[PdiExportResult] = []
+            for volume in plan.volumes:
+                self._check_cancelled()
+                number = volume.number
+                self.log_callback(
+                    "PDI",
+                    f"开始生成第 {number}/{len(plan.volumes)} 卷，"
+                    f"{volume.file_count} 个文件、{volume.study_count} 个 Study",
+                    "info",
+                )
+                volume_config = replace(
+                    self.config,
+                    pdi_output_folder=str(partial),
+                    pdi_volume_size_bytes=0,
+                )
+                exporter = self._make_exporter(
+                    volume_config,
+                    volume_number=number,
+                    volume_total=len(plan.volumes),
+                )
+                with self._lock:
+                    self._current_exporter = exporter
+                if self._cancel.is_set():
+                    exporter.request_cancel()
+                result = exporter.export(volume.files)
+                with self._lock:
+                    self._current_exporter = None
+                self._check_cancelled()
+                if result.status == PdiStatus.CANCELLED:
+                    raise _Cancelled()
+                if result.status == PdiStatus.FAILED or not result.output_directory:
+                    combined.core_tool_failure = (
+                        combined.core_tool_failure or result.core_tool_failure
+                    )
+                    raise RuntimeError(
+                        f"第 {number} 卷生成失败：{result.message or '未知错误'}"
+                    )
+                generated = Path(result.output_directory)
+                actual_bytes = _directory_file_bytes(generated)
+                if actual_bytes > capacity:
+                    warning = (
+                        f"第 {number} 卷实际大小 {actual_bytes} 字节超过单卷容量 "
+                        f"{capacity} 字节"
+                    )
+                    if volume.study_count > 1:
+                        raise RuntimeError(warning + "；已停止发布，请降低单卷容量后重试")
+                    result.status = PdiStatus.PARTIAL
+                    result.warnings.append(warning + "；单个 Study 不会被拆分")
+                target = partial / f"VOLUME_{number:03d}"
+                generated.rename(target)
+                result.output_directory = str(target)
+                result.output_directories = [str(target)]
+                volume_results.append(result)
+
+            combined.exported_count = sum(item.exported_count for item in volume_results)
+            combined.duplicate_count = sum(item.duplicate_count for item in volume_results)
+            combined.indexed_count = sum(item.indexed_count for item in volume_results)
+            combined.strict_profile = all(
+                item.strict_profile is True for item in volume_results
+            )
+            for number, item in enumerate(volume_results, start=1):
+                combined.warnings.extend(
+                    f"第 {number} 卷：{warning}" for warning in item.warnings
+                )
+            combined.status = (
+                PdiStatus.PARTIAL
+                if any(item.status == PdiStatus.PARTIAL for item in volume_results)
+                else PdiStatus.COMPLETED
+            )
+            self._check_cancelled()
+            _write_volume_set_metadata(partial, plan, volume_results)
+            if self.recovery_id:
+                _write_volume_set_recovery_marker(
+                    partial,
+                    self.recovery_id,
+                    state="published",
+                )
+            self._check_cancelled()
+            final = _publish_volume_set(
+                partial,
+                output_root,
+                base,
+                cancel_check=self._check_cancelled,
+            )
+            partial = None
+            combined.output_directory = str(final)
+            combined.output_directories = [
+                str(final / f"VOLUME_{volume.number:03d}")
+                for volume in plan.volumes
+            ]
+            combined.message = (
+                f"PDI 已按完整 Study 生成 {len(plan.volumes)} 卷，"
+                f"共 {combined.exported_count} 个 DICOM 文件"
+            )
+            self.log_callback(
+                "PDI",
+                combined.message,
+                "warning" if combined.status == PdiStatus.PARTIAL else "success",
+            )
+            return combined
+        except _Cancelled:
+            combined.status = PdiStatus.CANCELLED
+            combined.message = "PDI 分卷导出已取消"
+            return combined
+        except Exception as exc:
+            combined.status = PdiStatus.FAILED
+            combined.message = str(exc).strip() or exc.__class__.__name__
+            self.log_callback("PDI", combined.message, "error")
+            return combined
+        finally:
+            with self._lock:
+                self._current_exporter = None
+            if partial is not None:
+                try:
+                    shutil.rmtree(partial)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    warning = (
+                        "PDI 分卷暂存目录未能自动删除，可能仍包含患者影像；"
+                        f"请关闭占用程序后人工删除：{partial}（{exc}）"
+                    )
+                    combined.warnings.append(warning)
+                    combined.message = (
+                        f"{combined.message}；{warning}" if combined.message else warning
+                    )
+                    self.log_callback("PDI", warning, "error")
+
+    def _check_cancelled(self) -> None:
+        if self._cancel.is_set():
+            raise _Cancelled()
+
+    def _estimated_fixed_volume_overhead(self) -> int:
+        reserve = 16 * 1024 * 1024
+        if not self.config.pdi_include_ohif_viewer:
+            return reserve
+        selected = self.ohif_payload_dir or self.viewer_source
+        candidates = (
+            (Path(selected).expanduser(),)
+            if selected is not None
+            else (
+                resource_root() / ".runtime" / "ohif" / f"ohif-{OHIF_VERSION}",
+                Path(self.project_root or resource_root())
+                / ".runtime"
+                / "ohif"
+                / f"ohif-{OHIF_VERSION}",
+                Path(self.project_root or resource_root())
+                / "resources"
+                / "ohif"
+                / f"ohif-{OHIF_VERSION}",
+            )
+        )
+        payload = next((path for path in candidates if path.is_dir()), None)
+        if payload is None:
+            return reserve
+        try:
+            return reserve + _directory_file_bytes(payload)
+        except OSError:
+            return reserve
+
+    def _apply_single_volume_capacity_result(
+        self,
+        result: PdiExportResult,
+        volume: object,
+        capacity: int,
+    ) -> None:
+        if not result.output_directory or result.status in {
+            PdiStatus.FAILED,
+            PdiStatus.CANCELLED,
+        }:
+            return
+        output = Path(result.output_directory)
+        actual_bytes = _directory_file_bytes(output)
+        if actual_bytes <= capacity:
+            return
+        warning = (
+            f"PDI 实际大小 {actual_bytes} 字节超过单卷容量 {capacity} 字节"
+        )
+        study_count = int(getattr(volume, "study_count", 0))
+        if study_count <= 1:
+            result.status = PdiStatus.PARTIAL
+            result.warnings.append(warning + "；单个 Study 不会被拆分")
+            result.message = warning + "；已保留为单 Study 超限卷"
+            return
+        try:
+            shutil.rmtree(output)
+        except OSError as exc:
+            cleanup_warning = (
+                warning
+                + "；超限目录未能自动删除，仍包含患者影像；"
+                + f"请关闭占用程序后人工移动到更大介质或删除：{output}（{exc}）"
+            )
+            result.status = PdiStatus.PARTIAL
+            result.warnings.append(cleanup_warning)
+            result.message = warning + "；目录保持完整但未满足分卷容量，需人工处理"
+            self.log_callback("PDI", cleanup_warning, "error")
+            return
+        result.output_directory = ""
+        result.output_directories = []
+        result.status = PdiStatus.FAILED
+        result.message = warning + "；已停止发布，请降低单卷容量后重试"
+
+    def _make_exporter(
+        self,
+        config: AppConfig,
+        *,
+        volume_number: int = 0,
+        volume_total: int = 0,
+    ) -> PdiExporter:
+        recovery_id = self.recovery_id
+        if recovery_id and volume_number:
+            recovery_id = hashlib.sha256(
+                f"{recovery_id}:{volume_number}".encode("ascii")
+            ).hexdigest()[:32]
+
+        def progress(stage: PdiStage, current: int, total: int, message: str) -> None:
+            prefix = (
+                f"第 {volume_number}/{volume_total} 卷 · "
+                if volume_number and volume_total
+                else ""
+            )
+            self.progress_callback(stage, current, total, prefix + message)
+
+        return PdiExporter(
+            config,
+            self.tools,
+            project_root=self.project_root,
+            viewer_source=self.viewer_source,
+            ohif_payload_dir=self.ohif_payload_dir,
+            log_callback=self.log_callback,
+            progress_callback=progress,
+            process_callback=self.process_callback,
+            recovery_id=recovery_id,
+            reuse_published=(self.reuse_published and not volume_number),
+        )
 
 
 def _naturalize_dataset(dataset: Dataset) -> dict[str, object]:
@@ -1658,6 +2066,147 @@ def _pdi_output_root(config: AppConfig) -> Path:
         return Path(configured).expanduser().resolve()
     destination = Path(config.dicom_destination_folder).expanduser().resolve()
     return destination / "PDI"
+
+
+def _write_volume_set_metadata(
+    root: Path,
+    plan: object,
+    results: list[PdiExportResult],
+) -> None:
+    raw_plan = plan.to_dict()
+    public_plan = {
+        key: value
+        for key, value in raw_plan.items()
+        if key not in {"volumes", "warnings"}
+    }
+    public_plan["volumes"] = [
+        {
+            key: value
+            for key, value in volume.items()
+            if key != "files"
+        }
+        for volume in raw_plan.get("volumes", [])
+    ]
+    public_plan["warnings"] = raw_plan.get("warnings", [])
+    payload = {
+        "schema": "dcmget-pdi-volume-set",
+        "version": 1,
+        "created_at": datetime.now().astimezone().isoformat(),
+        # Never expose local source paths in portable-media metadata.  The
+        # aggregate counts are sufficient to verify and copy each volume.
+        "plan": public_plan,
+        "volumes": [
+            {
+                "number": number,
+                "directory": f"VOLUME_{number:03d}",
+                "status": result.status.value,
+                "dicom_files": result.exported_count,
+                "indexed_instances": result.indexed_count,
+                "warnings": list(result.warnings),
+            }
+            for number, result in enumerate(results, start=1)
+        ],
+    }
+    (root / "VOLUME_SET.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (root / "README.TXT").write_text(
+        "DcmGet PDI 分卷目录\n\n"
+        "每个 VOLUME_### 子目录都是一份可独立复制和打开的 PDI 介质目录。\n"
+        "请将单个 VOLUME_### 目录完整复制到对应 U 盘；不要只复制其中的 DICOM 文件。\n"
+        "同一个 Study 不会跨卷拆分。VOLUME_SET.json 保存分卷清单。\n",
+        encoding="utf-8-sig",
+    )
+
+
+def _write_volume_set_recovery_marker(
+    root: Path,
+    attempt_id: str,
+    *,
+    state: str,
+) -> None:
+    marker_path = root / RECOVERY_MARKER_PATH
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "attempt_id": attempt_id,
+                "state": state,
+                "version": 2,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _publish_volume_set(
+    temporary: Path,
+    output_root: Path,
+    base: str,
+    *,
+    cancel_check: Callable[[], None],
+) -> Path:
+    try:
+        normalized = os.path.normcase(str(output_root.resolve(strict=False)))
+    except OSError:
+        normalized = os.path.normcase(os.path.abspath(os.fspath(output_root)))
+    digest = hashlib.sha256(os.fsencode(normalized)).hexdigest()
+    lock_directory = ensure_application_state_dir() / "pdi-publish-locks"
+    lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _cancellable_file_lock(
+        lock_directory / f"{digest}.lock",
+        cancel_check,
+    ):
+        cancel_check()
+        final = output_root / base
+        suffix = 1
+        while final.exists():
+            final = output_root / f"{base}-{suffix}"
+            suffix += 1
+        cancel_check()
+        temporary.rename(final)
+        return final
+
+
+@contextmanager
+def _cancellable_file_lock(
+    lock_path: Path,
+    cancel_check: Callable[[], None],
+    *,
+    timeout: float = 300,
+) -> Iterator[None]:
+    lock = FileLock(str(lock_path))
+    deadline = time.monotonic() + timeout
+    while True:
+        cancel_check()
+        remaining = deadline - time.monotonic()
+        try:
+            lock.acquire(timeout=max(0.0, min(0.1, remaining)))
+            break
+        except FileLockTimeout:
+            if time.monotonic() >= deadline:
+                raise
+    try:
+        cancel_check()
+        yield
+    finally:
+        lock.release()
+
+
+def _directory_file_bytes(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise OSError(f"PDI 目录包含不允许的符号链接：{path}")
+        if path.is_file():
+            total += path.stat().st_size
+    return total
 
 
 def cleanup_interrupted_pdi(config: AppConfig, attempt_id: str) -> list[Path]:

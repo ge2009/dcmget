@@ -28,6 +28,7 @@ logs/
 /config.json.lock
 /instances/
 /access.txt
+/Dicom/
 config.local.json
 trial.json
 *.lic

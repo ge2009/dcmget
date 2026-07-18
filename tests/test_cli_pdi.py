@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -46,6 +47,46 @@ def test_cli_resume_remains_authorized_after_last_trial(monkeypatch):
     assert cli.authorize_cli("任意旧口令", None, task_id) == "trial"
 
 
+def test_cli_verify_pdi_checks_every_declared_volume(tmp_path, monkeypatch, capsys):
+    import dcmget.pdi_verify as verify_module
+
+    roots = (tmp_path / "VOLUME_001", tmp_path / "VOLUME_002")
+    discover = Mock(return_value=roots)
+    verify = Mock(
+        side_effect=[
+            SimpleNamespace(
+                status=verify_module.PdiVerificationStatus.PASSED,
+                message="第一卷通过",
+            ),
+            SimpleNamespace(
+                status=verify_module.PdiVerificationStatus.PASSED,
+                message="第二卷通过",
+            ),
+        ]
+    )
+    reports = Mock(
+        side_effect=[
+            SimpleNamespace(html_path=tmp_path / "report-1.html"),
+            SimpleNamespace(html_path=tmp_path / "report-2.html"),
+        ]
+    )
+    monkeypatch.setattr(verify_module, "discover_pdi_verification_roots", discover)
+    monkeypatch.setattr(verify_module, "verify_pdi_directory", verify)
+    monkeypatch.setattr(verify_module, "write_pdi_delivery_reports", reports)
+    args = cli.build_parser().parse_args(["--verify-pdi", str(tmp_path)])
+
+    assert cli.run_maintenance_command(args) == 0
+    assert [item.args[0] for item in verify.call_args_list] == list(roots)
+    report_root = tmp_path.parent / f"{tmp_path.name}-验收报告"
+    assert [item.args[1] for item in reports.call_args_list] == [
+        report_root / "VOLUME_001",
+        report_root / "VOLUME_002",
+    ]
+    output = capsys.readouterr().out
+    assert "第 1/2 卷：第一卷通过" in output
+    assert "第 2/2 卷：第二卷通过" in output
+
+
 def _run_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -54,6 +95,8 @@ def _run_cli(
     pdi_status: PdiStatus = PdiStatus.COMPLETED,
     core_tool_failure: bool = False,
     download_status: AccessionStatus = AccessionStatus.COMPLETED,
+    interrupted_reason: str = "",
+    include_download_result: bool = True,
 ) -> tuple[int, Mock]:
     accessions = tmp_path / "access.txt"
     accessions.write_text("ACC001\n", encoding="utf-8")
@@ -79,7 +122,7 @@ def _run_cli(
         dcmmkdir=Path("dcmmkdir"),
     )
     summary = BatchSummary(
-        [
+        ([
             AccessionResult(
                 "ACC001",
                 download_status,
@@ -90,7 +133,8 @@ def _run_cli(
                     else []
                 ),
             )
-        ]
+        ] if include_download_result else []),
+        interrupted_reason=interrupted_reason,
     )
     runner = Mock()
     runner.run.return_value = summary
@@ -173,6 +217,39 @@ def test_cli_download_failure_keeps_retry_checkpoint_and_skips_pdi(
     ).load_required()
     assert checkpoint.phase == "download_retryable"
     assert [result.accession for result in checkpoint.results] == ["ACC001"]
+
+
+def test_cli_safety_pause_keeps_pending_item_and_resumes_it(tmp_path, monkeypatch, capsys):
+    reason = "磁盘可用空间低于最低保留值；批次已安全暂停"
+
+    first_exit, _ = _run_cli(
+        tmp_path,
+        monkeypatch,
+        pdi_enabled=False,
+        interrupted_reason=reason,
+        include_download_result=False,
+    )
+
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    paused = store.load_required()
+    assert first_exit == 2
+    assert paused.phase == "download_retryable"
+    assert paused.interrupted_reason == reason
+    assert paused.pending_accessions == ["ACC001"]
+    first_output = capsys.readouterr().out
+    assert "安全暂停" in first_output
+    assert "尚有 1 个检查号待处理" in first_output
+
+    second_exit, _ = _run_cli(
+        tmp_path,
+        monkeypatch,
+        pdi_enabled=False,
+    )
+
+    assert second_exit == 0
+    assert store.load() is None
+    second_output = capsys.readouterr().out
+    assert "正在继续未处理项" in second_output
 
 
 def test_cli_returns_one_when_pdi_core_tool_cannot_start(tmp_path, monkeypatch):

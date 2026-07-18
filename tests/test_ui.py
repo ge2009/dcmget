@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 import traceback
+from types import SimpleNamespace
 
 import pytest
-from PyQt5.QtCore import QPoint, QRect, QSettings, Qt, QThread
+from PyQt5.QtCore import QMimeData, QPoint, QRect, QSettings, Qt, QThread
 from PyQt5.QtGui import QCloseEvent, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -16,7 +17,7 @@ from PyQt5.QtWidgets import (
     QTextBrowser,
 )
 
-from dcmget.config import AppConfig
+from dcmget.config import AppConfig, save_config
 from dcmget.instance_shortcut import ShortcutExistsError
 from dcmget.core import (
     AccessionResult,
@@ -27,7 +28,7 @@ from dcmget.core import (
 )
 from dcmget.task_state import TaskCheckpoint, TaskCheckpointStore
 import dcmget.ui as ui_module
-from dcmget.ui import DcmGetWindow, DownloadWorker, PdiWorker
+from dcmget.ui import DcmGetWindow, DownloadWorker, PdiVerifyWorker, PdiWorker
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +78,102 @@ def test_more_than_200_accessions_use_summary_mode_without_table_rows(qtbot, tmp
     assert window.large_batch_summary_card.isVisible()
     assert "40,000" in window.large_batch_summary_label.text()
     assert "超过 200 条" in window.large_batch_summary_label.text()
+    assert window.accession_edit.toPlainText() == ""
+
+
+def test_large_paste_appends_to_existing_accessions_without_losing_them(
+    qtbot,
+    tmp_path,
+):
+    window = make_window(qtbot, tmp_path)
+    window.accession_edit.setPlainText("OLD001\nOLD002")
+    cursor = window.accession_edit.textCursor()
+    cursor.movePosition(cursor.End)
+    window.accession_edit.setTextCursor(cursor)
+    mime = QMimeData()
+    mime.setText("\n" + "\n".join(f"NEW{index:03d}" for index in range(201)))
+
+    window.accession_edit.insertFromMimeData(mime)
+
+    assert window.current_accessions[:2] == ["OLD001", "OLD002"]
+    assert len(window.current_accessions) == 203
+    assert window.accession_edit.toPlainText() == ""
+    assert window.task_table.rowCount() == 0
+
+
+def test_multiple_small_pastes_switch_to_summary_when_total_exceeds_200(
+    qtbot,
+    tmp_path,
+):
+    window = make_window(qtbot, tmp_path)
+    window.accession_edit.setPlainText(
+        "\n".join(f"A{index:03d}" for index in range(150))
+    )
+    cursor = window.accession_edit.textCursor()
+    cursor.movePosition(cursor.End)
+    window.accession_edit.setTextCursor(cursor)
+    mime = QMimeData()
+    mime.setText("\n" + "\n".join(f"B{index:03d}" for index in range(60)))
+
+    window.accession_edit.insertFromMimeData(mime)
+
+    assert len(window.current_accessions) == 210
+    assert window.current_accessions[0] == "A000"
+    assert window.current_accessions[-1] == "B059"
+    assert window.accession_edit.toPlainText() == ""
+    assert window.task_table.rowCount() == 0
+
+
+def test_configured_gb18030_txt_uses_safe_importer_on_startup(qtbot, tmp_path):
+    source = tmp_path / "检查号.txt"
+    source.write_bytes("检查甲\n检查乙".encode("gb18030"))
+    save_config(
+        tmp_path / "config.json",
+        AppConfig(access_numbers_file_path=str(source)),
+    )
+
+    window = make_window(qtbot, tmp_path)
+
+    assert window.current_accessions == ["检查甲", "检查乙"]
+    assert window.accession_edit.toPlainText() == "检查甲\n检查乙"
+
+
+def test_configured_multicolumn_table_is_not_guessed_without_saved_selection(
+    qtbot,
+    tmp_path,
+):
+    source = tmp_path / "检查号.csv"
+    source.write_text("患者,检查号\n张三,CT001\n", encoding="utf-8-sig")
+    save_config(
+        tmp_path / "config.json",
+        AppConfig(access_numbers_file_path=str(source)),
+    )
+
+    window = make_window(qtbot, tmp_path)
+
+    assert window.current_accessions == []
+    assert "需要确认" in window.accession_summary.text()
+    assert any(
+        "明确选择" in message
+        for _task_id, _source, message, _level in window._log_events
+    )
+
+
+def test_explicit_table_column_is_remembered_for_next_start(
+    qtbot,
+    tmp_path,
+):
+    source = tmp_path / "检查号.csv"
+    source.write_text("患者,检查号\n张三,CT001\n李四,CT002\n", encoding="utf-8-sig")
+    first = make_window(qtbot, tmp_path)
+    result = ui_module.import_accession_file(source, column="检查号")
+    first._apply_accession_import(str(source), result)
+    save_config(first.config_path, first.config)
+
+    restarted = make_window(qtbot, tmp_path)
+
+    assert restarted.current_accessions == ["CT001", "CT002"]
+    assert restarted.accession_edit.toPlainText() == "CT001\nCT002"
 
 
 def test_large_batch_summary_stays_in_first_viewport_and_failed_items_copy_from_results(
@@ -1205,6 +1302,85 @@ def test_failed_batch_remains_retryable_and_reuses_original_task(
     assert started == [(None, {"resume_checkpoint": window._resume_checkpoint})]
 
 
+def test_safety_pause_shows_reason_and_keeps_pending_resume(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(), ["DONE", "PENDING"], trial_required=False
+    )
+    completed = AccessionResult("DONE", AccessionStatus.COMPLETED)
+    window.task_store.record_result(checkpoint.task_id, completed)
+    window._active_task_id = checkpoint.task_id
+    window._display_total = 2
+    reason = "磁盘可用空间低于最低保留值；批次已安全暂停"
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message: shown.append((title, message)),
+    )
+
+    window._on_worker_finished(
+        BatchSummary([completed], interrupted_reason=reason)
+    )
+
+    restored = window.task_store.load_required()
+    assert restored.phase == "download_retryable"
+    assert restored.interrupted_reason == reason
+    assert restored.pending_accessions == ["PENDING"]
+    assert window._resume_checkpoint is not None
+    assert window.start_button.text() == "继续安全暂停任务"
+    assert not window.accept_partial_button.isVisible()
+
+    assert shown[0][0] == "任务已安全暂停"
+    assert reason in shown[0][1]
+    assert "尚有 1 个检查号待处理" in shown[0][1]
+    assert "失败 0" not in shown[0][1]
+
+
+def test_startup_safety_pause_can_continue_without_failed_results(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    checkpoint = window.task_store.start(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ["DONE", "PENDING"],
+        trial_required=False,
+    )
+    window.task_store.record_result(
+        checkpoint.task_id,
+        AccessionResult("DONE", AccessionStatus.COMPLETED),
+    )
+    reason = "PACS 连续关联失败，批次已安全暂停"
+    window.task_store.set_phase(
+        checkpoint.task_id,
+        "download_retryable",
+        interrupted_reason=reason,
+    )
+    prompts = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda _parent, title, message, *_args: (
+            prompts.append((title, message)) or QMessageBox.Yes
+        ),
+    )
+    started = []
+    monkeypatch.setattr(
+        window,
+        "_start_download",
+        lambda override=None, **kwargs: started.append((override, kwargs)),
+    )
+
+    window._offer_task_resume()
+
+    assert prompts[0][0] == "继续安全暂停任务"
+    assert reason in prompts[0][1]
+    resumed = started[0][1]["resume_checkpoint"]
+    assert resumed.pending_accessions == ["PENDING"]
+
+
 def test_declining_download_resume_keeps_checkpoint_for_later(
     qtbot, tmp_path, monkeypatch
 ):
@@ -1892,6 +2068,110 @@ def test_pdi_failure_keeps_thread_busy_and_retry_disabled_until_finished(
     assert completions == [("PDI 导出失败：PDI failed", {"pdi_problem": True})]
 
 
+def test_cancelled_pdi_verification_is_not_reported_as_complete_or_opened(
+    qtbot, tmp_path, monkeypatch
+):
+    window = make_window(qtbot, tmp_path)
+    messages = []
+    opened = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+    monkeypatch.setattr(
+        ui_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url) or True,
+    )
+    cancelled = SimpleNamespace(status=SimpleNamespace(value="cancelled"))
+    reports = SimpleNamespace(html_path=tmp_path / "cancelled-report.html")
+
+    window._on_pdi_verify_finished([(cancelled, reports)])
+
+    assert messages == [("PDI 验证已取消", "验证已取消，没有修改 PDI 文件。")]
+    assert opened == []
+
+
+def test_cancelled_pdi_verification_does_not_generate_acceptance_report(
+    qtbot, tmp_path, monkeypatch
+):
+    import dcmget.pdi_verify as verify_module
+
+    class CancelledVerifier:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def verify(self):
+            return SimpleNamespace(status=SimpleNamespace(value="cancelled"))
+
+    worker = PdiVerifyWorker(tmp_path)
+    completed = []
+    worker.finished.connect(completed.append)
+    monkeypatch.setattr(worker, "_verification_roots", lambda: [tmp_path])
+    monkeypatch.setattr(verify_module, "PdiVerifier", CancelledVerifier)
+    monkeypatch.setattr(
+        verify_module,
+        "write_pdi_delivery_reports",
+        lambda _result: pytest.fail("取消验证不得生成验收报告"),
+    )
+
+    worker.run()
+
+    assert completed == [{"cancelled": True, "items": []}]
+
+
+def test_pdi_verify_worker_writes_volume_reports_outside_the_volume_set(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+):
+    import dcmget.pdi_verify as verify_module
+
+    class PassedVerifier:
+        def __init__(self, root, **_kwargs):
+            self.root = root
+
+        def verify(self):
+            return SimpleNamespace(
+                root_directory=str(self.root),
+                status=SimpleNamespace(value="passed"),
+            )
+
+        def cancel(self):
+            pass
+
+    volume_set = tmp_path / "PDI_SET"
+    roots = [volume_set / "VOLUME_001", volume_set / "VOLUME_002"]
+    outputs = []
+    worker = PdiVerifyWorker(volume_set)
+    completed = []
+    worker.finished.connect(completed.append)
+    monkeypatch.setattr(worker, "_verification_roots", lambda: roots)
+    monkeypatch.setattr(verify_module, "PdiVerifier", PassedVerifier)
+
+    def write_report(_result, output_directory):
+        outputs.append(output_directory)
+        return SimpleNamespace(html_path=output_directory / "report.html")
+
+    monkeypatch.setattr(
+        verify_module,
+        "write_pdi_delivery_reports",
+        write_report,
+    )
+
+    worker.run()
+
+    report_root = tmp_path / "PDI_SET-验收报告"
+    assert outputs == [
+        report_root / "VOLUME_001",
+        report_root / "VOLUME_002",
+    ]
+    assert len(completed) == 1
+    assert not completed[0]["cancelled"]
+    assert len(completed[0]["items"]) == 2
+
+
 def test_new_task_form_collapse_state_is_restored(qtbot, tmp_path):
     window = make_window(qtbot, tmp_path)
     window._set_task_form_expanded(False)
@@ -1974,7 +2254,7 @@ def test_single_task_page_has_no_task_workspace_at_wide_or_narrow_width(
     assert window.pages.currentWidget() is window.task_page
     assert window.task_page is window.task_detail_page
     assert window.task_workspace is None
-    assert window.findChildren(ui_module.TaskWorkspace) == []
+    assert "TaskWorkspace" not in vars(ui_module)
     assert window.task_detail_page.isVisible()
 
     window.setMinimumSize(1, 1)
@@ -1984,6 +2264,24 @@ def test_single_task_page_has_no_task_workspace_at_wide_or_narrow_width(
     assert window.task_workspace is None
     assert window.task_detail_page.isVisible()
     assert window.task_scroll.isVisible()
+
+
+def test_legacy_enable_multi_task_flag_is_ignored(qtbot, tmp_path):
+    window = DcmGetWindow(
+        tmp_path / "config.json",
+        tmp_path,
+        tmp_path / "active-task.sqlite3",
+        offer_task_resume=False,
+        enable_multi_task=True,
+    )
+    qtbot.addWidget(window)
+    window.show()
+
+    assert not window.multi_task_enabled
+    assert window.task_controller is None
+    assert window.task_workspace is None
+    assert window.task_page is window.task_detail_page
+    assert window.log_scope_combo.isHidden()
 
 
 def test_instance_label_settings_namespace_and_log_scope_are_independent(

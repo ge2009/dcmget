@@ -81,6 +81,12 @@ class InstanceProfile:
         return self._slot_lock.is_locked
 
     @property
+    def slot_lock(self) -> FileLock:
+        """Return the live lease used to prove ownership during online restore."""
+
+        return self._slot_lock
+
+    @property
     def activation_path(self) -> Path:
         return self.state_directory / "gui-instance.json"
 
@@ -449,6 +455,15 @@ def _initialize_claimed_profile(
         log_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         config_path = _config_path(roots, number)
         _ensure_profile_config(roots, number, config_path)
+        label = f"实例 {number}"
+        try:
+            from .profile_manager import read_profile_display_name
+
+            label = read_profile_display_name(config_path, number)
+        except Exception:
+            # A cosmetic metadata problem must never prevent the downloader
+            # from opening; Profile 管理 will surface and repair it separately.
+            pass
         return InstanceProfile(
             number=number,
             config_path=config_path,
@@ -456,7 +471,7 @@ def _initialize_claimed_profile(
             task_state_path=state_directory / "active-task.sqlite3",
             log_directory=log_directory,
             settings_name=f"DcmGet2-i{number}",
-            label=f"实例 {number}",
+            label=label,
             _slot_lock=slot_lock,
         )
     except Exception:

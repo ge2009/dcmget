@@ -223,6 +223,19 @@ def test_windows_release_validates_real_profile_shortcut_properties():
     assert "Portable EXE is missing profile shortcut support" in workflow
 
 
+def test_windows_release_tests_the_signed_installer_and_only_reverifies_it():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    signing_step = workflow.index("Sign installer before testing exact release artifact")
+    install_test = workflow.index("Silent install, in-place upgrade and uninstall test")
+    assert signing_step < install_test
+    assert "sign_windows_payloads([Path(os.environ['DCMGET_SETUP_PATH'])])" in workflow
+    assert "--verify-existing-signatures" in workflow
+
+
 def test_windows_pdi_smoke_uses_authenticated_directory_entry():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/windows-release.yml").read_text(

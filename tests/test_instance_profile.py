@@ -106,6 +106,33 @@ def _checkpoint(
     )
 
 
+def test_profile_uses_persisted_display_name_without_affecting_claim(tmp_path):
+    kwargs = _profile_kwargs(tmp_path)
+    metadata = (
+        kwargs["config_root"]
+        / "instances"
+        / "i1"
+        / "profile-meta.json"
+    )
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema": "dcmget-profile-meta",
+                "version": 1,
+                "display_name": "CT 夜班下载",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = acquire_instance_profile(1, **kwargs)
+    try:
+        assert profile.label == "CT 夜班下载"
+    finally:
+        profile.close()
+
+
 def test_import_checkpoint_preserves_identity_progress_and_pdi_state(tmp_path):
     store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     source = _checkpoint(

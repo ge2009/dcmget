@@ -5,10 +5,11 @@ import re
 import socket
 import sys
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from filelock import FileLock
 from PyQt5.QtCore import (
     QObject,
     QProcess,
@@ -29,6 +30,7 @@ from PyQt5.QtGui import (
     QIntValidator,
     QKeySequence,
     QPixmap,
+    QTextCursor,
 )
 from PyQt5.QtNetwork import (
     QNetworkAccessManager,
@@ -42,6 +44,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -49,9 +52,11 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QShortcut,
@@ -75,6 +80,12 @@ from PyQt5.QtWidgets import (
 
 from . import __version__
 from .auth_ui import activate_gui, entitlement_text, prepare_download_entitlement
+from .accession_import import (
+    AccessionImportError,
+    AccessionImportResult,
+    ColumnSelectionError,
+    import_accession_file,
+)
 from .config import (
     ANONYMIZATION_PROFILE_OPTIONS,
     DEFAULT_ANONYMIZATION_PROFILE,
@@ -111,9 +122,7 @@ from .task_state import (
     TaskStateError,
     merge_checkpoint_summary,
 )
-from .task_manager import DELETABLE_TASK_PHASES, TaskSummary, shared_receiver_config
-from .task_controller import TaskExecutionController
-from .task_widgets import TaskWorkspace
+from .task_ledger import TaskLedger, TaskLedgerError
 
 
 COLORS = {
@@ -134,9 +143,48 @@ TASK_TABLE_DETAIL_LIMIT = 200
 PDI_VIEWER_PROBE_INTERVAL_MS = 250
 PDI_VIEWER_START_TIMEOUT_MS = 30_000
 PDI_LAST_OPEN_DIRECTORY_KEY = "pdi/last_open_directory"
+ACCESSION_IMPORT_PATH_KEY = "accession_import/path"
+ACCESSION_IMPORT_COLUMN_NAME_KEY = "accession_import/column_name"
+ACCESSION_IMPORT_COLUMN_INDEX_KEY = "accession_import/column_index"
 PDI_OHIF_VERSION = "3.12.6"
 WINDOW_MINIMUM_WIDTH = 800
 WINDOW_MINIMUM_HEIGHT = 520
+DELETABLE_TASK_PHASES = frozenset(
+    {"cancelled", "completed", "failed", "download_retryable", "pdi_retryable"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskSummary:
+    """Lightweight compatibility view used by the single-task UI state."""
+
+    task_id: str
+    name: str
+    phase: str
+    total_count: int
+    processed_count: int
+    pending_count: int
+    completed_count: int
+    failed_count: int
+    file_count: int
+    received_bytes: int
+    speed_bytes_per_second: float
+    queue_position: int | None
+    current_accession: str
+    error_message: str
+    created_at: str
+    updated_at: str
+    no_data_count: int = 0
+    partial_count: int = 0
+    cancelled_count: int = 0
+
+    @property
+    def completed_only_count(self) -> int:
+        return max(0, self.completed_count - self.no_data_count)
+
+    @property
+    def failed_only_count(self) -> int:
+        return max(0, self.failed_count - self.partial_count)
 
 
 def pdi_viewer_command(directory: str | Path) -> tuple[str, list[str]] | None:
@@ -249,18 +297,25 @@ class ReleaseNotesDialog(QDialog):
 
 class AccessionTextEdit(QPlainTextEdit):
     file_dropped = pyqtSignal(str)
+    large_text_pasted = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self.hidden_accessions: list[str] = []
         self.setAcceptDrops(True)
         self.setTabChangesFocus(True)
-        self.setPlaceholderText("每行一个检查号；也可以拖入 TXT 文件")
+        self.setPlaceholderText("每行一个检查号；也可以拖入 TXT、CSV 或 XLSX 文件")
         self.setMinimumHeight(92)
         self.setAccessibleName("检查号输入")
 
     def dragEnterEvent(self, event):  # type: ignore[override]
         urls = event.mimeData().urls()
-        if urls and urls[0].isLocalFile() and urls[0].toLocalFile().lower().endswith(".txt"):
+        if (
+            urls
+            and urls[0].isLocalFile()
+            and Path(urls[0].toLocalFile()).suffix.lower()
+            in {".txt", ".csv", ".xlsx"}
+        ):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
@@ -272,6 +327,38 @@ class AccessionTextEdit(QPlainTextEdit):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+    def insertFromMimeData(self, source):  # type: ignore[override]
+        if source.hasText():
+            pasted_text = source.text()
+            if self.hidden_accessions and not self.toPlainText():
+                prospective_text = "\n".join(
+                    [*self.hidden_accessions, pasted_text]
+                )
+            else:
+                cursor = self.textCursor()
+                prefix_cursor = QTextCursor(self.document())
+                prefix_cursor.setPosition(0)
+                prefix_cursor.setPosition(
+                    cursor.selectionStart(),
+                    QTextCursor.KeepAnchor,
+                )
+                suffix_cursor = QTextCursor(self.document())
+                suffix_cursor.setPosition(cursor.selectionEnd())
+                suffix_cursor.setPosition(
+                    self.document().characterCount() - 1,
+                    QTextCursor.KeepAnchor,
+                )
+                prefix = prefix_cursor.selectedText().replace("\u2029", "\n")
+                suffix = suffix_cursor.selectedText().replace("\u2029", "\n")
+                prospective_text = prefix + pasted_text + suffix
+            if (
+                len(parse_accessions(prospective_text).values)
+                > TASK_TABLE_DETAIL_LIMIT
+            ):
+                self.large_text_pasted.emit(prospective_text)
+                return
+        super().insertFromMimeData(source)
 
 
 class SettingsPage(QWidget):
@@ -384,6 +471,37 @@ class SettingsPage(QWidget):
         receiver_form.addRow("", directory_hint)
         receiver_form.addRow("单个日志上限", self.log_size_spin)
 
+        reliability_card, reliability_form = self._card("可靠性与安全保护")
+        self.minimum_free_space_spin = QDoubleSpinBox()
+        self.minimum_free_space_spin.setRange(0, 4096)
+        self.minimum_free_space_spin.setDecimals(1)
+        self.minimum_free_space_spin.setSingleStep(1)
+        self.minimum_free_space_spin.setSuffix(" GB")
+        self.minimum_free_space_spin.setSpecialValueText("关闭保护")
+        self.minimum_free_space_spin.setToolTip(
+            "低于该剩余空间时不再启动新的检查号，并安全结束当前接收进程"
+        )
+        self.auto_retry_attempts_spin = QSpinBox()
+        self.auto_retry_attempts_spin.setRange(0, 10)
+        self.auto_retry_attempts_spin.setSuffix(" 次")
+        self.auto_retry_backoff_spin = QSpinBox()
+        self.auto_retry_backoff_spin.setRange(0, 300)
+        self.auto_retry_backoff_spin.setSuffix(" 秒")
+        self.circuit_breaker_spin = QSpinBox()
+        self.circuit_breaker_spin.setRange(2, 100)
+        self.circuit_breaker_spin.setSuffix(" 个")
+        reliability_form.addRow("磁盘保留空间", self.minimum_free_space_spin)
+        reliability_form.addRow("瞬时故障重试", self.auto_retry_attempts_spin)
+        reliability_form.addRow("重试基础等待", self.auto_retry_backoff_spin)
+        reliability_form.addRow("连续失败暂停", self.circuit_breaker_spin)
+        reliability_hint = QLabel(
+            "自动重试只用于网络、关联等瞬时故障；连续失败达到阈值后安全暂停，"
+            "避免 PACS 或网络异常时批量空跑。"
+        )
+        reliability_hint.setObjectName("FieldHint")
+        reliability_hint.setWordWrap(True)
+        reliability_form.addRow("", reliability_hint)
+
         anonymization_card, anonymization_form = self._card("下载后匿名处理")
         self.anonymization_enabled_checkbox = QCheckBox(
             "归档前自动处理 DICOM 元数据"
@@ -461,6 +579,16 @@ class SettingsPage(QWidget):
 
         self.pdi_ohif_checkbox = QCheckBox("在目录内附带离线阅片器（推荐）")
         pdi_form.addRow("DICOM 查看器", self.pdi_ohif_checkbox)
+        self.pdi_volume_size_spin = QDoubleSpinBox()
+        self.pdi_volume_size_spin.setRange(0, 4096)
+        self.pdi_volume_size_spin.setDecimals(1)
+        self.pdi_volume_size_spin.setSingleStep(1)
+        self.pdi_volume_size_spin.setSuffix(" GB")
+        self.pdi_volume_size_spin.setSpecialValueText("不分卷")
+        self.pdi_volume_size_spin.setToolTip(
+            "按完整 Study 自动分卷；同一检查绝不会拆到两个介质目录"
+        )
+        pdi_form.addRow("单卷容量", self.pdi_volume_size_spin)
         self.pdi_ohif_hint = QLabel(
             "直接读取目录中的原始 DICOM，不生成 JPG；"
             "无需选择 JSON、DICOMDIR 或逐个影像文件。"
@@ -482,6 +610,7 @@ class SettingsPage(QWidget):
         content_layout.addWidget(dcmtk_card)
         content_layout.addWidget(pacs_card)
         content_layout.addWidget(receiver_card)
+        content_layout.addWidget(reliability_card)
         content_layout.addWidget(anonymization_card)
         content_layout.addWidget(pdi_card)
         content_layout.addStretch()
@@ -508,10 +637,15 @@ class SettingsPage(QWidget):
             "storage_ae_title": self.storage_ae_edit,
             "storage_port": self.storage_port_edit,
             "max_concurrent_moves": self.max_concurrent_moves_spin,
+            "minimum_free_space_bytes": self.minimum_free_space_spin,
+            "auto_retry_attempts": self.auto_retry_attempts_spin,
+            "auto_retry_backoff_seconds": self.auto_retry_backoff_spin,
+            "circuit_breaker_failures": self.circuit_breaker_spin,
             "directory_template": self.directory_template_combo,
             "anonymization_profile": self.anonymization_profile_combo,
             "pdi_institution_name": self.pdi_institution_edit,
             "pdi_output_folder": self.pdi_output_edit,
+            "pdi_volume_size_bytes": self.pdi_volume_size_spin,
             "max_log_file_size_bytes": self.log_size_spin,
         }
 
@@ -556,6 +690,12 @@ class SettingsPage(QWidget):
         self.storage_ae_edit.setText(config.storage_ae_title)
         self.storage_port_edit.setText(str(config.storage_port))
         self.max_concurrent_moves_spin.setValue(config.max_concurrent_moves)
+        self.minimum_free_space_spin.setValue(
+            config.minimum_free_space_bytes / 1024**3
+        )
+        self.auto_retry_attempts_spin.setValue(config.auto_retry_attempts)
+        self.auto_retry_backoff_spin.setValue(config.auto_retry_backoff_seconds)
+        self.circuit_breaker_spin.setValue(config.circuit_breaker_failures)
         self.directory_template_combo.setCurrentText(config.directory_template)
         self.anonymization_enabled_checkbox.setChecked(config.anonymization_enabled)
         profile_index = self.anonymization_profile_combo.findData(
@@ -571,6 +711,7 @@ class SettingsPage(QWidget):
         self.pdi_institution_edit.setText(config.pdi_institution_name)
         self.pdi_output_edit.setText(config.pdi_output_folder)
         self.pdi_ohif_checkbox.setChecked(config.pdi_include_ohif_viewer)
+        self.pdi_volume_size_spin.setValue(config.pdi_volume_size_bytes / 1024**3)
         self._set_pdi_card_expanded(config.pdi_export_enabled)
         self._update_pdi_state()
         self.log_size_spin.setValue(max(1, config.max_log_file_size_bytes // (1024 * 1024)))
@@ -587,6 +728,12 @@ class SettingsPage(QWidget):
             storage_ae_title=self.storage_ae_edit.text().strip(" "),
             storage_port=self._port_value(self.storage_port_edit),
             max_concurrent_moves=self.max_concurrent_moves_spin.value(),
+            minimum_free_space_bytes=round(
+                self.minimum_free_space_spin.value() * 1024**3
+            ),
+            auto_retry_attempts=self.auto_retry_attempts_spin.value(),
+            auto_retry_backoff_seconds=self.auto_retry_backoff_spin.value(),
+            circuit_breaker_failures=self.circuit_breaker_spin.value(),
             directory_template=self.directory_template_combo.currentText().strip(),
             anonymization_enabled=self.anonymization_enabled_checkbox.isChecked(),
             anonymization_profile=str(
@@ -597,6 +744,9 @@ class SettingsPage(QWidget):
             pdi_institution_name=self.pdi_institution_edit.text().strip(),
             pdi_output_folder=self.pdi_output_edit.text().strip(),
             pdi_include_ohif_viewer=self.pdi_ohif_checkbox.isChecked(),
+            pdi_volume_size_bytes=round(
+                self.pdi_volume_size_spin.value() * 1024**3
+            ),
             max_log_file_size_bytes=self.log_size_spin.value() * 1024 * 1024,
         )
         return AppConfig.from_dict(values)
@@ -625,6 +775,7 @@ class SettingsPage(QWidget):
             self.pdi_output_edit,
             self.pdi_output_button,
             self.pdi_ohif_checkbox,
+            self.pdi_volume_size_spin,
         ):
             widget.setEnabled(enabled)
         self.pdi_ohif_hint.setEnabled(enabled)
@@ -736,6 +887,7 @@ class DownloadWorker(QObject):
         task_id: str = "",
         log_directory: str | Path | None = None,
         fallback_log_directory: str | Path | None = None,
+        task_ledger: TaskLedger | None = None,
     ):
         super().__init__()
         self.config = config
@@ -752,6 +904,7 @@ class DownloadWorker(QObject):
             if fallback_log_directory is not None
             else None
         )
+        self.task_ledger = task_ledger
         self.runner: DownloadRunner | None = None
         self.cancel_requested = False
         self.pause_requested = False
@@ -770,6 +923,9 @@ class DownloadWorker(QObject):
                     self._consume_trial if self.consume_trial_on_ready else None
                 ),
                 process_callback=self._record_process,
+                audit_callback=(
+                    self._record_audit if self.task_ledger is not None else None
+                ),
                 log_file_name=(
                     f"task-{self.task_id}.log" if self.task_id else "dcmget.log"
                 ),
@@ -794,6 +950,28 @@ class DownloadWorker(QObject):
         except Exception as exc:  # keep worker failures visible in the UI
             record_exception("DownloadWorker.run", exc)
             self.failed.emit(str(exc))
+
+    def _record_audit(
+        self,
+        result: AccessionResult,
+        observations: tuple[object, ...],
+    ) -> None:
+        if self.task_ledger is None or not self.task_id:
+            return
+        if not self.config.anonymization_enabled:
+            anonymization_status = "not_requested"
+        elif result.archived_files:
+            anonymization_status = "completed"
+        elif result.status == AccessionStatus.NO_DATA:
+            anonymization_status = "no_data"
+        else:
+            anonymization_status = "failed"
+        self.task_ledger.record_runner_result(
+            self.task_id,
+            result,
+            observed_instances=observations,
+            anonymization_status=anonymization_status,
+        )
 
     def request_cancel(self) -> None:
         with self._control_lock:
@@ -877,9 +1055,14 @@ class PdiWorker(QObject):
     def run(self) -> None:
         try:
             # Keep the optional export subsystem out of the normal UI import path.
-            from .pdi import PdiExporter
+            from .pdi import PdiExporter, PdiVolumeExporter
 
-            exporter = PdiExporter(
+            exporter_type = (
+                PdiVolumeExporter
+                if self.config.pdi_volume_size_bytes > 0
+                else PdiExporter
+            )
+            exporter = exporter_type(
                 self.config,
                 self.tools,
                 project_root=self.project_root,
@@ -923,6 +1106,86 @@ class PdiWorker(QObject):
             )
 
 
+class PdiVerifyWorker(QObject):
+    progress = pyqtSignal(str, int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, root: str | Path):
+        super().__init__()
+        self.root = Path(root).expanduser()
+        self._cancel = threading.Event()
+        self._verifier = None
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            from .pdi_verify import (
+                PdiVerifier,
+                pdi_delivery_report_output_directory,
+                write_pdi_delivery_reports,
+            )
+
+            roots = self._verification_roots()
+            completed: list[tuple[object, object]] = []
+            cancelled = False
+            for index, root in enumerate(roots, start=1):
+                if self._cancel.is_set():
+                    cancelled = True
+                    break
+
+                def on_progress(item, *, _index=index, _root=root) -> None:
+                    prefix = f"第 {_index}/{len(roots)} 卷 · " if len(roots) > 1 else ""
+                    self.progress.emit(
+                        str(_root),
+                        int(getattr(item, "current", 0)),
+                        int(getattr(item, "total", 0)),
+                        prefix + str(getattr(item, "message", "")),
+                    )
+
+                verifier = PdiVerifier(
+                    root,
+                    progress_callback=on_progress,
+                    cancel_event=self._cancel,
+                )
+                self._verifier = verifier
+                result = verifier.verify()
+                if self._cancel.is_set() or str(
+                    getattr(getattr(result, "status", ""), "value", "")
+                ) == "cancelled":
+                    cancelled = True
+                    break
+                report_directory = pdi_delivery_report_output_directory(
+                    self.root,
+                    root,
+                    len(roots),
+                )
+                reports = write_pdi_delivery_reports(
+                    result,
+                    report_directory,
+                )
+                completed.append((result, reports))
+            self.finished.emit(
+                {"cancelled": cancelled or self._cancel.is_set(), "items": completed}
+            )
+        except Exception as exc:
+            record_exception("PdiVerifyWorker.run", exc)
+            self.failed.emit(str(exc))
+        finally:
+            self._verifier = None
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        verifier = self._verifier
+        if verifier is not None:
+            verifier.cancel()
+
+    def _verification_roots(self) -> list[Path]:
+        from .pdi_verify import discover_pdi_verification_roots
+
+        return list(discover_pdi_verification_roots(self.root))
+
+
 class DcmGetWindow(QMainWindow):
     external_activation_requested = pyqtSignal(object)
 
@@ -938,11 +1201,13 @@ class DcmGetWindow(QMainWindow):
         instance_label: str = "",
         settings_name: str = "DcmGet2",
         log_directory: str | Path | None = None,
+        profile_lock: FileLock | None = None,
     ):
         super().__init__()
         self.config_path = Path(config_path)
         self.project_root = Path(project_root)
         self.profile_number = int(profile_number) if profile_number is not None else None
+        self.profile_lock = profile_lock
         self.instance_label = instance_label.strip()
         self.settings_name = settings_name.strip() or "DcmGet2"
         self.log_directory = (
@@ -954,8 +1219,15 @@ class DcmGetWindow(QMainWindow):
         self.config = load_config(self.config_path)
         self.resolver = DcmtkResolver(self.project_root)
         self.task_store = TaskCheckpointStore(task_state_path)
-        self.multi_task_enabled = bool(enable_multi_task)
-        self.task_controller: TaskExecutionController | None = None
+        self.task_ledger_path = self.task_store.path.with_name("task-ledger.sqlite3")
+        self.task_ledger: TaskLedger | None = None
+        self._task_ledger_error = ""
+        self._last_acceptance_report: Path | None = None
+        # Window-internal multi-task scheduling was retired. Each profile owns
+        # one receiver/task process and users open another profile for another
+        # independent task. Keep the argument only for source compatibility.
+        self.multi_task_enabled = False
+        self.task_controller = None
         self._task_catalog_path = (
             Path(task_state_path).expanduser().with_name("tasks.sqlite3")
             if task_state_path is not None
@@ -971,6 +1243,9 @@ class DcmGetWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.pdi_worker: PdiWorker | None = None
         self.pdi_thread: QThread | None = None
+        self.pdi_verify_worker: PdiVerifyWorker | None = None
+        self.pdi_verify_thread: QThread | None = None
+        self.pdi_verify_dialog: QProgressDialog | None = None
         self._pdi_viewer_process: QProcess | None = None
         self._pdi_viewer_root: Path | None = None
         self._pdi_viewer_url = ""
@@ -1075,27 +1350,8 @@ class DcmGetWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.task_detail_page = self._build_task_page()
-        self.task_workspace: TaskWorkspace | None = None
-        if self.multi_task_enabled:
-            self.task_workspace = TaskWorkspace(self.task_detail_page)
-            self.task_workspace.new_task_requested.connect(
-                self._show_new_task_editor
-            )
-            self.task_workspace.task_selected.connect(
-                self._on_workspace_task_selected
-            )
-            self.task_workspace.delete_task_requested.connect(
-                self._delete_multi_task
-            )
-            self.task_workspace.compact_mode_changed.connect(
-                lambda _compact: self._update_responsive_layouts(force=True)
-            )
-            self.task_workspace.splitter.splitterMoved.connect(
-                lambda _position, _index: self._update_responsive_layouts(force=True)
-            )
-            self.task_page = self.task_workspace
-        else:
-            self.task_page = self.task_detail_page
+        self.task_workspace = None
+        self.task_page = self.task_detail_page
         self.pages.addWidget(self.task_page)
         self.settings_page = SettingsPage()
         self.settings_page.set_multi_task_mode(self.multi_task_enabled)
@@ -1115,6 +1371,7 @@ class DcmGetWindow(QMainWindow):
             self.registration_button,
             self.release_notes_button,
             self.diagnostic_log_button,
+            self.maintenance_button,
             self.instance_shortcut_button,
             self.settings_button,
         ):
@@ -1207,6 +1464,25 @@ class DcmGetWindow(QMainWindow):
             self._open_diagnostic_log_directory
         )
         action_row.addWidget(self.diagnostic_log_button)
+        self.maintenance_button = QToolButton()
+        self.maintenance_button.setText("运维工具")
+        self.maintenance_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.maintenance_button.setPopupMode(QToolButton.InstantPopup)
+        maintenance_menu = QMenu(self.maintenance_button)
+        maintenance_menu.addAction("运行健康检查", self._run_health_check)
+        maintenance_menu.addAction("生成脱敏支持包", self._create_support_bundle)
+        maintenance_menu.addSeparator()
+        maintenance_menu.addAction("验证 PDI/U盘", self._verify_existing_pdi)
+        maintenance_menu.addSeparator()
+        maintenance_menu.addAction("管理 Profile", self._manage_profiles)
+        maintenance_menu.addAction(
+            "备份全部 Profile 配置与显示名", self._backup_profiles
+        )
+        maintenance_menu.addAction(
+            "恢复 Profile 配置与显示名", self._restore_profiles
+        )
+        self.maintenance_button.setMenu(maintenance_menu)
+        action_row.addWidget(self.maintenance_button)
         self.instance_shortcut_button = QToolButton()
         self.instance_shortcut_button.setText("实例快捷方式")
         self.instance_shortcut_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -1273,8 +1549,9 @@ class DcmGetWindow(QMainWindow):
         self.accession_edit = AccessionTextEdit()
         self.accession_edit.textChanged.connect(self._update_accession_preview)
         self.accession_edit.file_dropped.connect(self._load_accession_file)
+        self.accession_edit.large_text_pasted.connect(self._apply_large_accession_text)
         grid.addWidget(self.accession_edit, 0, 1, 1, 2)
-        self.accession_button = QPushButton("选择 TXT")
+        self.accession_button = QPushButton("导入 TXT/CSV/Excel")
         self.accession_button.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self.accession_button.clicked.connect(self._choose_accession_file)
         self.accession_summary = QLabel("有效 0 · 空行 0 · 重复 0")
@@ -1442,11 +1719,17 @@ class DcmGetWindow(QMainWindow):
         )
         self.open_task_log_button = QPushButton("打开任务日志")
         self.open_task_log_button.clicked.connect(self._open_task_log_directory)
+        self.open_acceptance_report_button = QPushButton("打开验收报告")
+        self.open_acceptance_report_button.setEnabled(False)
+        self.open_acceptance_report_button.clicked.connect(
+            self._open_acceptance_report
+        )
         self.open_conflict_button = QPushButton("打开冲突目录")
         self.open_conflict_button.clicked.connect(self._open_conflict_directory)
         for button in (
             self.open_destination_button,
             self.open_task_log_button,
+            self.open_acceptance_report_button,
             self.open_conflict_button,
         ):
             result_shortcuts.addWidget(button)
@@ -1682,6 +1965,8 @@ class DcmGetWindow(QMainWindow):
                 self.worker_thread,
                 self.pdi_worker,
                 self.pdi_thread,
+                self.pdi_verify_worker,
+                self.pdi_verify_thread,
             )
         )
 
@@ -1755,7 +2040,10 @@ class DcmGetWindow(QMainWindow):
             ),
             queue_position=None,
             current_accession=(current.current_accession if current is not None else ""),
-            error_message=(current.error_message if current is not None else ""),
+            error_message=(
+                checkpoint.interrupted_reason
+                or (current.error_message if current is not None else "")
+            ),
             created_at=checkpoint.created_at,
             updated_at=now,
         )
@@ -1803,7 +2091,10 @@ class DcmGetWindow(QMainWindow):
             speed_bytes_per_second=0.0,
             queue_position=None,
             current_accession="",
-            error_message=(current.error_message if current is not None else ""),
+            error_message=(
+                batch.interrupted_reason
+                or (current.error_message if current is not None else "")
+            ),
             created_at=(current.created_at if current is not None else now),
             updated_at=now,
         )
@@ -2038,33 +2329,6 @@ class DcmGetWindow(QMainWindow):
     def _save_settings(self, config: AppConfig) -> None:
         config.access_numbers_file_path = self.config.access_numbers_file_path
         config.dicom_destination_folder = self.destination_edit.text().strip()
-        if self.multi_task_enabled and self.task_controller is not None:
-            runtime_changed = (
-                shared_receiver_config(config) != shared_receiver_config(self.config)
-                or config.max_concurrent_moves
-                != self.config.max_concurrent_moves
-            )
-            if runtime_changed:
-                unfinished = [
-                    item
-                    for item in self.task_controller.list_tasks()
-                    if item.phase not in {"completed", "failed", "cancelled"}
-                ]
-                if unfinished:
-                    QMessageBox.warning(
-                        self,
-                        "运行参数已锁定",
-                        "仍有未结束任务，暂时不能修改并发数或 DCMTK 路径。PACS、AE 和接收端口可按新任务单独保存。",
-                    )
-                    return
-                if not self.task_controller.shutdown():
-                    QMessageBox.warning(
-                        self,
-                        "设置未保存",
-                        "后台调度器尚未完全停止，请稍后重试。",
-                    )
-                    return
-                self.task_controller = None
         recovery_task_id = (
             self._resume_checkpoint.task_id
             if self._resume_checkpoint is not None
@@ -2134,43 +2398,7 @@ class DcmGetWindow(QMainWindow):
             self.settings_page.set_dcmtk_status(str(exc), False)
 
     def _ensure_task_controller(self) -> bool:
-        if not self.multi_task_enabled:
-            return False
-        if self.task_controller is not None:
-            return True
-        if self.tools is None:
-            return False
-        try:
-            controller = TaskExecutionController(
-                self.config,
-                self.tools,
-                catalog_path=self._task_catalog_path,
-                legacy_path=self.task_store.path,
-                before_task_move=lambda task_id: consume_trial(task_id=task_id),
-                project_root=self.project_root,
-                parent=self,
-            )
-        except Exception as exc:
-            self._append_log("多任务", str(exc), "error")
-            return False
-        controller.task_updated.connect(self._on_multi_task_updated)
-        controller.tasks_updated.connect(self._on_multi_tasks_updated)
-        controller.progress.connect(self._on_multi_progress)
-        controller.log.connect(self._on_multi_log)
-        controller.scheduler_error.connect(self._on_multi_scheduler_error)
-        controller.pdi_progress.connect(self._on_multi_pdi_progress)
-        controller.pdi_finished.connect(self._on_multi_pdi_finished)
-        self.task_controller = controller
-        for message in controller.startup_messages:
-            self._append_log("恢复", message, "warning")
-        initial_tasks = controller.list_tasks()
-        self._on_multi_tasks_updated(initial_tasks)
-        if initial_tasks and not self._selected_task_id:
-            self._selected_task_id = initial_tasks[0].task_id
-            self._multi_task_editor_active = False
-            self.task_workspace.select_task(self._selected_task_id)
-        controller.start()
-        return True
+        return False
 
     def _on_multi_tasks_updated(self, summaries: object) -> None:
         if not self.multi_task_enabled:
@@ -2465,11 +2693,104 @@ class DcmGetWindow(QMainWindow):
         path = Path(self.config.access_numbers_file_path).expanduser()
         if not path.is_absolute():
             path = self.project_root / path
-        if path.exists():
-            try:
-                self.accession_edit.setPlainText(path.read_text(encoding="utf-8-sig"))
-            except OSError:
-                pass
+        if not path.exists():
+            return
+        has_saved_column, saved_column = self._saved_accession_column(path)
+        try:
+            result = import_accession_file(
+                path,
+                column=saved_column if has_saved_column else None,
+            )
+        except ColumnSelectionError as exc:
+            self._show_configured_accession_import_issue(
+                path,
+                f"{exc}。请点击“导入 TXT/CSV/Excel”并明确选择检查号列。",
+            )
+            return
+        except AccessionImportError as exc:
+            self._show_configured_accession_import_issue(path, str(exc))
+            return
+        if not has_saved_column and len(result.available_columns) > 1:
+            self._show_configured_accession_import_issue(
+                path,
+                "表格包含多列，不能安全判断检查号列。"
+                "请点击“导入 TXT/CSV/Excel”并明确选择。",
+            )
+            return
+        self._apply_accession_import(str(path), result)
+
+    @staticmethod
+    def _canonical_accession_path(path: str | Path) -> str:
+        return str(Path(path).expanduser().resolve(strict=False))
+
+    def _saved_accession_column(
+        self,
+        path: str | Path,
+    ) -> tuple[bool, str | int | None]:
+        stored_path = self.settings_store.value(
+            ACCESSION_IMPORT_PATH_KEY,
+            "",
+            type=str,
+        )
+        if (
+            not stored_path
+            or self._canonical_accession_path(stored_path)
+            != self._canonical_accession_path(path)
+        ):
+            return False, None
+        column_name = self.settings_store.value(
+            ACCESSION_IMPORT_COLUMN_NAME_KEY,
+            "",
+            type=str,
+        ).strip()
+        if column_name:
+            return True, column_name
+        raw_index = self.settings_store.value(
+            ACCESSION_IMPORT_COLUMN_INDEX_KEY,
+            "",
+        )
+        try:
+            return True, int(raw_index)
+        except (TypeError, ValueError):
+            return False, None
+
+    def _remember_accession_column(
+        self,
+        path: str | Path,
+        result: AccessionImportResult,
+    ) -> None:
+        self.settings_store.setValue(
+            ACCESSION_IMPORT_PATH_KEY,
+            self._canonical_accession_path(path),
+        )
+        if result.selected_column is None:
+            self.settings_store.remove(ACCESSION_IMPORT_COLUMN_NAME_KEY)
+            self.settings_store.remove(ACCESSION_IMPORT_COLUMN_INDEX_KEY)
+        else:
+            self.settings_store.setValue(
+                ACCESSION_IMPORT_COLUMN_NAME_KEY,
+                result.selected_column.name,
+            )
+            self.settings_store.setValue(
+                ACCESSION_IMPORT_COLUMN_INDEX_KEY,
+                result.selected_column.index,
+            )
+        self.settings_store.sync()
+
+    def _show_configured_accession_import_issue(
+        self,
+        path: Path,
+        message: str,
+    ) -> None:
+        self.accession_edit.setPlaceholderText(
+            "未自动载入检查号文件；请重新导入并确认文件格式或检查号列"
+        )
+        self.accession_summary.setText("检查号文件需要确认，尚未载入")
+        self._append_log(
+            "应用",
+            f"未自动载入检查号文件 {path}：{message}",
+            "warning",
+        )
 
     def _offer_task_resume(self) -> None:
         if self._is_busy():
@@ -2501,6 +2822,17 @@ class DcmGetWindow(QMainWindow):
             return
         if checkpoint is None:
             self.task_store.release_lease()
+            return
+        try:
+            self._ensure_task_ledger_batch(checkpoint)
+        except TaskLedgerError as exc:
+            self.task_store.release_lease()
+            self._append_log("验收", str(exc), "error")
+            QMessageBox.warning(
+                self,
+                "无法恢复任务台账",
+                f"{exc}\n\n恢复记录已保留，修复台账目录权限后可再次启动。",
+            )
             return
         self._publish_workspace_summary(
             self._workspace_summary_from_checkpoint(
@@ -2559,28 +2891,46 @@ class DcmGetWindow(QMainWindow):
                 if result.status
                 in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
             ]
-            if not retryable:
-                self._append_log("恢复", "失败重试恢复点中没有失败项", "error")
+            if not retryable and not pending:
+                self._append_log("恢复", "恢复点中没有未处理或失败项", "error")
                 self._hold_download_resume(
                     checkpoint, "恢复点需要人工处理；可明确放弃后新建任务"
                 )
                 return
-            answer = QMessageBox.question(
-                self,
-                "重试上次失败项",
-                (
+            safety_reason = checkpoint.interrupted_reason
+            if safety_reason:
+                prompt_title = "继续安全暂停任务"
+                prompt_message = (
+                    f"上次任务因安全保护暂停：\n{safety_reason}\n\n"
+                    f"尚有 {len(pending):,} 个检查号未处理，"
+                    f"另有 {len(retryable):,} 个失败或部分成功项可重试。\n\n"
+                    "确认磁盘空间、PACS 或网络问题已经修复后继续；"
+                    "已完成项目不会重复请求，已收到文件会保留并去重。\n\n"
+                    "选择“否”会保留恢复记录，之后仍可继续。"
+                )
+            else:
+                prompt_title = "重试上次失败项"
+                prompt_message = (
                     f"检测到上次任务有 {len(retryable):,} 个失败或部分成功的检查号。\n\n"
                     "继续后只重试这些检查号，已经完成和无数据的项目不会重复请求；"
                     "已收到的 DICOM 文件会保留并去重。\n\n"
                     "选择“否”会保留恢复记录，之后仍可继续。"
-                ),
+                )
+            answer = QMessageBox.question(
+                self,
+                prompt_title,
+                prompt_message,
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
             )
             if answer != QMessageBox.Yes:
                 self._hold_download_resume(
                     checkpoint,
-                    f"已保留 {len(retryable):,} 个失败项，点击“重试失败项”继续",
+                    (
+                        f"任务因安全保护暂停，尚有 {len(pending):,} 项待处理"
+                        if safety_reason
+                        else f"已保留 {len(retryable):,} 个失败项，点击“重试失败项”继续"
+                    ),
                 )
                 return
             self._apply_checkpoint_config(checkpoint)
@@ -2679,7 +3029,10 @@ class DcmGetWindow(QMainWindow):
             ),
             select=True,
         )
-        self.last_summary = BatchSummary(list(checkpoint.results))
+        self.last_summary = BatchSummary(
+            list(checkpoint.results),
+            interrupted_reason=checkpoint.interrupted_reason,
+        )
         self.progress_label.setText(message)
         self.task_store.release_lease()
         self._set_running(False)
@@ -2770,20 +3123,119 @@ class DcmGetWindow(QMainWindow):
             self,
             "选择检查号文件",
             self.config.access_numbers_file_path,
-            "文本文件 (*.txt);;所有文件 (*)",
+            "检查号文件 (*.txt *.csv *.xlsx);;文本文件 (*.txt);;"
+            "CSV 文件 (*.csv);;Excel 文件 (*.xlsx)",
         )
         if selected:
             self._load_accession_file(selected)
 
     def _load_accession_file(self, path: str) -> None:
         try:
-            text = Path(path).read_text(encoding="utf-8-sig")
-        except OSError as exc:
-            QMessageBox.critical(self, "无法读取文件", str(exc))
+            result = import_accession_file(path)
+        except ColumnSelectionError as exc:
+            selected = self._choose_accession_column(exc.columns)
+            if selected is None:
+                return
+            try:
+                result = import_accession_file(path, column=selected)
+            except AccessionImportError as retry_exc:
+                QMessageBox.critical(self, "无法导入检查号", str(retry_exc))
+                return
+        except AccessionImportError as exc:
+            QMessageBox.critical(self, "无法导入检查号", str(exc))
             return
+
+        if len(result.available_columns) > 1 and result.selected_column is not None:
+            selected = self._choose_accession_column(
+                result.available_columns,
+                current=result.selected_column.index,
+            )
+            if selected is None:
+                return
+            if selected != result.selected_column.index:
+                try:
+                    result = import_accession_file(path, column=selected)
+                except AccessionImportError as exc:
+                    QMessageBox.critical(self, "无法导入检查号", str(exc))
+                    return
+        self._apply_accession_import(path, result)
+
+    def _choose_accession_column(
+        self,
+        columns: tuple[object, ...],
+        *,
+        current: int = 0,
+    ) -> int | None:
+        if not columns:
+            QMessageBox.warning(
+                self,
+                "未找到检查号列",
+                "表格没有可选择的列，请确认第一行是列名。",
+            )
+            return None
+        labels = [
+            f"{getattr(column, 'name', '') or '未命名列'}（第 {getattr(column, 'index', 0) + 1} 列）"
+            for column in columns
+        ]
+        current_row = next(
+            (
+                index
+                for index, column in enumerate(columns)
+                if getattr(column, "index", -1) == current
+            ),
+            0,
+        )
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "选择检查号列",
+            "请选择包含检查号（Accession Number）的列：",
+            labels,
+            current_row,
+            False,
+        )
+        if not accepted:
+            return None
+        return int(getattr(columns[labels.index(choice)], "index", 0))
+
+    def _apply_accession_import(
+        self,
+        path: str,
+        result: AccessionImportResult,
+    ) -> None:
+        values = list(result.values)
+        if len(values) <= TASK_TABLE_DETAIL_LIMIT:
+            self.accession_edit.hidden_accessions = []
+            self.accession_edit.setPlainText("\n".join(values))
+        else:
+            previous = self.accession_edit.blockSignals(True)
+            self.accession_edit.clear()
+            self.accession_edit.setPlaceholderText(
+                f"已导入 {len(values):,} 个检查号；为保持界面流畅，明细已隐藏"
+            )
+            self.accession_edit.blockSignals(previous)
+            self.accession_edit.hidden_accessions = list(values)
+            self.current_accessions = values
+            self._hidden_accession_count = len(values)
+            self.invalid_accessions = result.invalid_values
+            self._populate_waiting_rows(values)
+            self._update_task_form_summary()
+        self.invalid_accessions = result.invalid_values
+        self.accession_summary.setText(
+            f"有效 {result.valid_count:,} · 空行 {result.blank_count:,} · "
+            f"重复 {result.duplicate_count:,} · 无效 {result.invalid_count:,}"
+        )
         self.config.access_numbers_file_path = path
-        self.accession_edit.setPlainText(text)
-        self._append_log("应用", f"已载入检查号文件：{path}", "info")
+        self._remember_accession_column(path, result)
+        column = (
+            f"，列：{result.selected_column.name}"
+            if result.selected_column is not None
+            else ""
+        )
+        self._append_log(
+            "应用",
+            f"已导入检查号文件：{path}{column}，有效 {result.valid_count:,} 条",
+            "info",
+        )
 
     def _choose_destination(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2884,6 +3336,86 @@ class DcmGetWindow(QMainWindow):
             return self.instance_log_directory
         return log_directory(config)
 
+    def _get_task_ledger(self) -> TaskLedger:
+        if self.task_ledger is not None:
+            return self.task_ledger
+        try:
+            self.task_ledger = TaskLedger(self.task_ledger_path)
+        except TaskLedgerError as exc:
+            self._task_ledger_error = str(exc)
+            raise
+        self._task_ledger_error = ""
+        return self.task_ledger
+
+    def _ensure_task_ledger_batch(self, checkpoint: TaskCheckpoint) -> None:
+        ledger = self._get_task_ledger()
+        try:
+            ledger.load_batch(checkpoint.task_id)
+            return
+        except TaskLedgerError as exc:
+            if "不存在当前批次" not in str(exc):
+                raise
+        profile_name = self.instance_label or (
+            f"Profile {self.profile_number}" if self.profile_number is not None else ""
+        )
+        ledger.create_batch(
+            checkpoint.accessions,
+            batch_id=checkpoint.task_id,
+            profile_name=profile_name,
+            anonymization_requested=checkpoint.config.anonymization_enabled,
+            pdi_requested=checkpoint.config.pdi_export_enabled,
+        )
+
+    def _acceptance_report_directory(self, task_id: str) -> Path:
+        destination = self._destination_directory()
+        if destination is None:
+            destination = self.task_ledger_path.parent
+        return destination / "_DcmGetReports" / f"task-{task_id[:8]}"
+
+    def _export_acceptance_report(self, task_id: str) -> None:
+        if not task_id:
+            return
+        try:
+            paths = self._get_task_ledger().export_reports(
+                task_id,
+                self._acceptance_report_directory(task_id),
+            )
+        except (OSError, TaskLedgerError) as exc:
+            self._append_log("验收", f"验收报告生成失败：{exc}", "error")
+            return
+        self._last_acceptance_report = paths.html_path
+        self._append_log(
+            "验收",
+            f"已生成脱敏验收报告：{paths.html_path}",
+            "success",
+        )
+        self._update_result_shortcut_state()
+
+    def _complete_task_ledger(
+        self,
+        task_id: str,
+        status: object,
+        *,
+        pdi_result: object | None = None,
+    ) -> None:
+        if not task_id:
+            return
+        try:
+            ledger = self._get_task_ledger()
+            if pdi_result is not None:
+                ledger.record_pdi_result(
+                    task_id,
+                    getattr(pdi_result, "status", "unknown"),
+                    output_directory=str(
+                        getattr(pdi_result, "output_directory", "") or ""
+                    ),
+                    message=str(getattr(pdi_result, "message", "") or ""),
+                )
+            ledger.complete_batch(task_id, status)
+        except TaskLedgerError as exc:
+            self._append_log("验收", f"任务台账更新失败：{exc}", "error")
+        self._export_acceptance_report(task_id)
+
     def _expected_task_log_directory(self) -> Path | None:
         if self.config.anonymization_enabled:
             return self._task_log_directory_for_config(self.config)
@@ -2929,6 +3461,15 @@ class DcmGetWindow(QMainWindow):
         else:
             self.open_task_log_button.setText("打开任务日志")
             self.open_task_log_button.setToolTip("开始任务后可打开下载与接收日志")
+
+        report = self._last_acceptance_report
+        report_exists = bool(report and report.is_file())
+        self.open_acceptance_report_button.setEnabled(report_exists)
+        self.open_acceptance_report_button.setToolTip(
+            f"打开本批脱敏验收报告：{report}"
+            if report_exists
+            else "任务结束后自动生成验收报告"
+        )
 
         conflict = self._conflict_directory()
         conflict_exists = bool(conflict and conflict.is_dir())
@@ -2986,6 +3527,13 @@ class DcmGetWindow(QMainWindow):
             self._update_result_shortcut_state()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
+    def _open_acceptance_report(self) -> None:
+        path = self._last_acceptance_report
+        if path is None or not path.is_file():
+            QMessageBox.warning(self, "无法打开验收报告", "当前任务尚未生成验收报告。")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
     def _open_conflict_directory(self) -> None:
         path = self._conflict_directory()
         if path is None or not path.is_dir():
@@ -3013,6 +3561,10 @@ class DcmGetWindow(QMainWindow):
 
     def _update_accession_preview(self) -> None:
         parsed = parse_accessions(self.accession_edit.toPlainText())
+        if len(parsed.values) > TASK_TABLE_DETAIL_LIMIT:
+            self._apply_large_accession_text(self.accession_edit.toPlainText())
+            return
+        self.accession_edit.hidden_accessions = []
         self.current_accessions = parsed.values
         self._hidden_accession_count = 0
         self.invalid_accessions = parsed.invalid_values
@@ -3024,6 +3576,31 @@ class DcmGetWindow(QMainWindow):
         if self._is_busy():
             return
         self._populate_waiting_rows(parsed.values)
+
+    def _apply_large_accession_text(self, text: str) -> None:
+        parsed = parse_accessions(text)
+        self.current_accessions = parsed.values
+        self.invalid_accessions = parsed.invalid_values
+        previous = self.accession_edit.blockSignals(True)
+        if len(parsed.values) > TASK_TABLE_DETAIL_LIMIT:
+            self._hidden_accession_count = len(parsed.values)
+            self.accession_edit.hidden_accessions = list(parsed.values)
+            self.accession_edit.clear()
+            self.accession_edit.setPlaceholderText(
+                f"已粘贴 {len(parsed.values):,} 个检查号；为保持界面流畅，明细已隐藏"
+            )
+        else:
+            self._hidden_accession_count = 0
+            self.accession_edit.hidden_accessions = []
+            self.accession_edit.setPlainText("\n".join(parsed.values))
+        self.accession_edit.blockSignals(previous)
+        self.accession_summary.setText(
+            f"有效 {len(parsed.values):,} · 空行 {parsed.blank_count:,} · "
+            f"重复 {parsed.duplicate_count:,} · 无效 {len(parsed.invalid_values):,}"
+        )
+        self._update_task_form_summary()
+        if not self._is_busy():
+            self._populate_waiting_rows(parsed.values)
 
     def _populate_waiting_rows(self, accessions: list[str]) -> None:
         self._task_table_summary_mode = len(accessions) > TASK_TABLE_DETAIL_LIMIT
@@ -3495,6 +4072,7 @@ class DcmGetWindow(QMainWindow):
             self._refresh_entitlement_status()
             self._append_log("授权", entitlement_message, "success")
 
+        checkpoint_was_created = resume_checkpoint is None
         if resume_checkpoint is None:
             if not self.task_store.try_acquire_lease():
                 QMessageBox.warning(
@@ -3521,6 +4099,22 @@ class DcmGetWindow(QMainWindow):
                 return
         else:
             checkpoint = resume_checkpoint
+        try:
+            self._ensure_task_ledger_batch(checkpoint)
+        except TaskLedgerError as exc:
+            self._append_log("验收", str(exc), "error")
+            if checkpoint_was_created:
+                try:
+                    self.task_store.clear(checkpoint.task_id)
+                except TaskStateError:
+                    pass
+            self.task_store.release_lease()
+            QMessageBox.critical(
+                self,
+                "无法建立任务台账",
+                f"{exc}\n\n为避免任务完成后无法追溯，本次下载没有启动。",
+            )
+            return
         self.tools = check.tools
         self._active_accessions = accessions
         self._active_task_id = checkpoint.task_id
@@ -3543,6 +4137,7 @@ class DcmGetWindow(QMainWindow):
         self._progress_offset = len(self._prior_results)
         self._pdi_source_files = []
         self.last_pdi_result = None
+        self._last_acceptance_report = None
         self._accepted_partial_results = False
         self._reset_pdi_status_card()
         self._populate_waiting_rows(display_accessions)
@@ -3585,6 +4180,7 @@ class DcmGetWindow(QMainWindow):
             task_id=checkpoint.task_id,
             log_directory=task_log_directory,
             fallback_log_directory=self.instance_log_directory,
+            task_ledger=self.task_ledger,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -3641,6 +4237,11 @@ class DcmGetWindow(QMainWindow):
             and self._resume_checkpoint is not None
             and self._resume_checkpoint.phase == "download_retryable"
         )
+        safety_paused = bool(
+            download_retryable
+            and self._resume_checkpoint is not None
+            and self._resume_checkpoint.interrupted_reason
+        )
         pdi_pending = not running and bool(self._pdi_task_id)
         recovery_pending = resume_pending or pdi_pending
         self.preflight_card.setVisible(not running and not recovery_pending)
@@ -3649,7 +4250,9 @@ class DcmGetWindow(QMainWindow):
         )
         self.start_button.setEnabled(not running and not pdi_pending)
         self.start_button.setText(
-            "重试失败项"
+            "继续安全暂停任务"
+            if safety_paused
+            else "重试失败项"
             if download_retryable
             else "继续未完成任务"
             if resume_pending
@@ -3669,6 +4272,8 @@ class DcmGetWindow(QMainWindow):
         self.discard_resume_button.setText(
             "放弃 PDI 恢复并新建"
             if pdi_pending
+            else "放弃安全暂停任务并新建"
+            if safety_paused
             else "放弃失败项并新建"
             if download_retryable
             else "放弃续传并新建"
@@ -3684,8 +4289,8 @@ class DcmGetWindow(QMainWindow):
         )
         self.retry_button.setVisible(retry_available)
         self.retry_button.setEnabled(retry_available)
-        self.accept_partial_button.setVisible(download_retryable)
-        self.accept_partial_button.setEnabled(download_retryable)
+        self.accept_partial_button.setVisible(download_retryable and not safety_paused)
+        self.accept_partial_button.setEnabled(download_retryable and not safety_paused)
         can_open_existing_pdi = not running and not recovery_pending
         self.open_existing_pdi_button.setVisible(can_open_existing_pdi)
         self.open_existing_pdi_button.setEnabled(can_open_existing_pdi)
@@ -3701,6 +4306,7 @@ class DcmGetWindow(QMainWindow):
         )
         self.settings_button.setEnabled(not running)
         self.registration_button.setEnabled(not running)
+        self.maintenance_button.setEnabled(not running)
 
     def _on_worker_state(self, state: str) -> None:
         workspace_phase = {
@@ -3713,6 +4319,7 @@ class DcmGetWindow(QMainWindow):
             "pause_pending": "当前检查号完成后暂停…",
             "paused": "任务已暂停，接收器保持监听",
             "stopping": "正在停止后台进程…",
+            "safety_paused": "任务已安全暂停，正在保存恢复点…",
             "completed": "任务已完成",
             "partial": "任务完成，部分检查号失败",
             "cancelled": "任务已取消",
@@ -3864,8 +4471,15 @@ class DcmGetWindow(QMainWindow):
                 summary = merge_checkpoint_summary(checkpoint, summary)
                 if not summary.cancelled:
                     if summary.exit_code == 2:
-                        self.task_store.set_phase(task_id, "download_retryable")
+                        self.task_store.set_phase(
+                            task_id,
+                            "download_retryable",
+                            interrupted_reason=summary.interrupted_reason,
+                        )
                         active_checkpoint.phase = "download_retryable"
+                        active_checkpoint.interrupted_reason = (
+                            summary.interrupted_reason
+                        )
                     elif self.config.pdi_export_enabled and pdi_has_files:
                         self.task_store.set_phase(task_id, "pdi_pending")
                         active_checkpoint.phase = "pdi_pending"
@@ -3903,6 +4517,13 @@ class DcmGetWindow(QMainWindow):
             and summary.exit_code == 0
             and pdi_has_files
         )
+        if not pdi_should_run:
+            if summary.cancelled:
+                self._export_acceptance_report(task_id)
+            elif download_retryable:
+                self._export_acceptance_report(task_id)
+            else:
+                self._complete_task_ledger(task_id, "completed")
         workspace_phase = (
             "cancelled"
             if summary.cancelled
@@ -3962,6 +4583,20 @@ class DcmGetWindow(QMainWindow):
             return
         if summary.cancelled:
             title, message = "任务已取消", "已停止下载，已收到的 DICOM 文件已保留。"
+        elif summary.interrupted_reason:
+            pending_count = (
+                len(self._resume_checkpoint.pending_accessions)
+                if self._resume_checkpoint is not None
+                else sum(
+                    result.status == AccessionStatus.CANCELLED
+                    for result in summary.results
+                )
+            )
+            title = "任务已安全暂停"
+            message = (
+                f"{summary.interrupted_reason}\n\n"
+                f"尚有 {pending_count:,} 个检查号待处理。修复问题后点击“继续安全暂停任务”。"
+            )
         elif summary.exit_code == 2 and not self._accepted_partial_results:
             title = "任务部分完成"
             message = f"有 {len(summary.failed_accessions)} 个检查号失败，可点击“重试失败项”。"
@@ -3971,12 +4606,14 @@ class DcmGetWindow(QMainWindow):
         else:
             title = "任务部分完成" if pdi_problem else "下载完成"
             message = "所有检查号均已处理完成。"
-        message += (
+        result_details = (
             f"\n\n结果：新增 {summary.new_file_count:,}；"
             f"已存在跳过 {summary.existing_skipped_count:,}；"
-            f"冲突保留 {summary.conflict_preserved_count:,}；"
-            f"失败 {len(summary.failed_accessions):,}。"
+            f"冲突保留 {summary.conflict_preserved_count:,}"
         )
+        if summary.failed_accessions or not summary.interrupted_reason:
+            result_details += f"；失败 {len(summary.failed_accessions):,}"
+        message += result_details + "。"
         if pdi_message:
             message += "\n\n" + pdi_message
         QMessageBox.information(self, title, message)
@@ -4079,8 +4716,13 @@ class DcmGetWindow(QMainWindow):
         message = str(getattr(result, "message", "") or status_text or "PDI 导出已结束")
         warnings = list(getattr(result, "warnings", []) or [])
         output_directory = str(getattr(result, "output_directory", "") or "")
+        volume_count = max(1, int(getattr(result, "volume_count", 1) or 1))
         if status_text == "完成" and output_directory:
-            message = f"PDI 便携阅片目录已生成：{Path(output_directory).name}"
+            message = (
+                f"PDI 已生成 {volume_count} 卷：{Path(output_directory).name}"
+                if volume_count > 1
+                else f"PDI 便携阅片目录已生成：{Path(output_directory).name}"
+            )
         if warnings:
             message += f" 共 {len(warnings)} 条警告，详见运行日志。"
 
@@ -4110,10 +4752,24 @@ class DcmGetWindow(QMainWindow):
         self.pdi_progress_bar.setValue(1 if status_text in {"完成", "部分成功"} else 0)
         output_exists = bool(output_directory and Path(output_directory).exists())
         self.pdi_open_button.setEnabled(output_exists)
-        self.pdi_view_button.setEnabled(
-            bool(output_exists and pdi_viewer_command(output_directory))
+        self.pdi_view_button.setEnabled(self._pdi_viewer_directory() is not None)
+        self.pdi_view_button.setText(
+            "打开第 1 卷影像" if volume_count > 1 else "打开影像"
         )
         self.pdi_retry_button.setEnabled(False)
+        ledger_task_id = self._pdi_task_id
+        if status_text in {"完成", "部分成功", "失败", "已取消"}:
+            ledger_status = {
+                "完成": "completed",
+                "部分成功": "partial",
+                "失败": "failed",
+                "已取消": "cancelled",
+            }[status_text]
+            self._complete_task_ledger(
+                ledger_task_id,
+                ledger_status,
+                pdi_result=result,
+            )
         self._save_pdi_checkpoint_status(completed=status_text == "完成")
 
         if status_text == "完成":
@@ -4141,6 +4797,18 @@ class DcmGetWindow(QMainWindow):
         self.pdi_view_button.setEnabled(False)
         self.pdi_open_button.setEnabled(False)
         self.pdi_retry_button.setEnabled(False)
+        if self._pdi_task_id:
+            try:
+                ledger = self._get_task_ledger()
+                ledger.record_pdi_result(
+                    self._pdi_task_id,
+                    "failed",
+                    message=message,
+                )
+                ledger.complete_batch(self._pdi_task_id, "failed")
+            except TaskLedgerError as exc:
+                self._append_log("验收", f"任务台账更新失败：{exc}", "error")
+            self._export_acceptance_report(self._pdi_task_id)
         self._save_pdi_checkpoint_status(completed=False)
         self._pending_pdi_completion = (
             f"PDI 导出失败：{message}",
@@ -4214,6 +4882,7 @@ class DcmGetWindow(QMainWindow):
         self.pdi_progress_bar.setRange(0, 100)
         self.pdi_progress_bar.setValue(0)
         self.pdi_view_button.setEnabled(False)
+        self.pdi_view_button.setText("打开影像")
         self.pdi_open_button.setEnabled(False)
         self.pdi_retry_button.setEnabled(False)
 
@@ -4226,8 +4895,22 @@ class DcmGetWindow(QMainWindow):
         path = Path(directory).expanduser()
         return path.resolve() if path.is_dir() else None
 
-    def _open_pdi_viewer(self) -> None:
+    def _pdi_viewer_directory(self) -> Path | None:
+        directories = list(
+            getattr(self.last_pdi_result, "output_directories", []) or []
+        )
+        candidates = [*directories]
         root = self._pdi_output_directory()
+        if root is not None:
+            candidates.append(str(root))
+        for value in candidates:
+            path = Path(value).expanduser()
+            if path.is_dir() and pdi_viewer_command(path):
+                return path.resolve()
+        return None
+
+    def _open_pdi_viewer(self) -> None:
+        root = self._pdi_viewer_directory()
         if root is None:
             QMessageBox.warning(
                 self,
@@ -4575,6 +5258,7 @@ class DcmGetWindow(QMainWindow):
         except TaskStateError as exc:
             self._append_log("恢复", str(exc), "error")
         self.progress_label.setText("任务中断，可点击开始或在下次启动时继续")
+        self._export_acceptance_report(self._active_task_id)
         self.task_store.release_lease()
         if self.worker_thread is None:
             self._finish_worker(set_idle=False)
@@ -4837,6 +5521,13 @@ class DcmGetWindow(QMainWindow):
             or checkpoint.phase != "download_retryable"
         ):
             return
+        if checkpoint.interrupted_reason or checkpoint.pending_accessions:
+            QMessageBox.warning(
+                self,
+                "任务仍有待处理项",
+                "安全暂停任务不能直接接受当前结果；请修复问题后继续任务。",
+            )
+            return
         failed_count = sum(
             result.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL}
             for result in checkpoint.results
@@ -4888,6 +5579,7 @@ class DcmGetWindow(QMainWindow):
             self._start_pdi_export(source_files)
             return
 
+        self._complete_task_ledger(stored.task_id, "accepted_partial")
         self.task_store.release_lease()
         self._set_running(False)
         self.progress_label.setText("已接受当前结果，恢复记录已结束")
@@ -5006,6 +5698,305 @@ class DcmGetWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
+    def _operation_config(self) -> AppConfig:
+        values = self.config.to_dict()
+        destination = self.destination_edit.text().strip()
+        if destination:
+            values["dicom_destination_folder"] = destination
+        return AppConfig.from_dict(values)
+
+    def _run_health_check(self) -> None:
+        try:
+            from .health import run_health_check
+
+            report = run_health_check(
+                self._operation_config(),
+                project_root=self.project_root,
+                minimum_free_bytes=self.config.minimum_free_space_bytes,
+                check_pacs=True,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "健康检查失败", str(exc))
+            return
+        labels = {"ok": "通过", "warning": "警告", "error": "失败"}
+        lines = [
+            f"[{labels.get(item.status, item.status)}] {item.summary}"
+            for item in report.checks
+        ]
+        message = "\n".join(lines)
+        if report.status == "error":
+            QMessageBox.warning(self, "健康检查发现问题", message)
+        else:
+            QMessageBox.information(self, "健康检查完成", message)
+
+    def _default_export_directory(self) -> str:
+        downloads = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+        return downloads or str(Path.home())
+
+    def _create_support_bundle(self) -> None:
+        default_path = Path(self._default_export_directory()) / (
+            f"DcmGet-support-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存脱敏支持包",
+            str(default_path),
+            "ZIP 压缩包 (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            from .support_bundle import create_support_bundle
+
+            result = create_support_bundle(
+                selected,
+                self._operation_config(),
+                project_root=self.project_root,
+                diagnostic_directory=diagnostic_log_directory(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "支持包生成失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "支持包已生成",
+            f"已生成默认脱敏的诊断支持包：\n{result.path}\n\n"
+            "支持包不包含 DICOM、注册码、试用状态或检查号文件。",
+        )
+
+    def _backup_profiles(self) -> None:
+        default_path = Path(self._default_export_directory()) / (
+            f"DcmGet-profiles-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "备份全部 Profile 配置",
+            str(default_path),
+            "DcmGet Profile 备份 (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            from .profile_backup import create_profile_backup
+
+            result = create_profile_backup(selected)
+        except Exception as exc:
+            QMessageBox.critical(self, "Profile 备份失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Profile 备份完成",
+            f"已备份 {len(result.profile_numbers)} 个 Profile：\n{result.path}\n\n"
+            "备份不包含授权和试用信息。",
+        )
+
+    def _manage_profiles(self) -> None:
+        try:
+            from .profile_dialog import ProfileManagerDialog
+
+            dialog = ProfileManagerDialog(
+                self,
+                project_root=self.project_root,
+                current_profile_number=self.profile_number,
+            )
+            dialog.exec_()
+        except Exception as exc:
+            record_exception("DcmGetWindow._manage_profiles", exc)
+            QMessageBox.critical(self, "Profile 管理失败", str(exc))
+
+    def _restore_profiles(self) -> None:
+        if self._is_busy() or self._resume_checkpoint is not None or self._pdi_task_id:
+            QMessageBox.information(
+                self,
+                "当前任务尚未结束",
+                "请先完成或明确放弃当前下载/PDI 恢复任务，再恢复 Profile。",
+            )
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Profile 备份",
+            self._default_export_directory(),
+            "DcmGet Profile 备份 (*.zip)",
+        )
+        if not selected:
+            return
+        answer = QMessageBox.question(
+            self,
+            "恢复 Profile 配置与显示名",
+            "恢复会替换备份中对应的 Profile 配置与显示名；当前内容会先自动备份。\n\n"
+            "继续恢复吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            from .profile_backup import restore_profile_backup
+
+            result = restore_profile_backup(
+                selected,
+                owned_profile_lock=self.profile_lock,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Profile 恢复失败", str(exc))
+            return
+        if (
+            self.profile_number is not None
+            and self.profile_number in result.profile_numbers
+        ):
+            try:
+                self.config = load_config(self.config_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Profile 已恢复但无法重新载入",
+                    f"配置已经写入磁盘，但当前窗口无法重新载入：{exc}\n\n"
+                    "请立即关闭并重新启动 DcmGet。",
+                )
+                return
+            self.settings_page.set_config(self.config)
+            self.destination_edit.setText(self.config.dicom_destination_folder)
+            self._sync_quick_pdi_controls_from_config()
+            self._refresh_tool_status()
+            try:
+                from .profile_manager import read_profile_display_name
+
+                self.instance_label = read_profile_display_name(
+                    self.config_path,
+                    self.profile_number,
+                )
+                instance_title = (
+                    f" - {self.instance_label}" if self.instance_label else ""
+                )
+                self.setWindowTitle(
+                    f"DcmGet {__version__}{instance_title} - DICOM 下载工作台"
+                )
+                instance_suffix = (
+                    f" · {self.instance_label}" if self.instance_label else ""
+                )
+                self.app_subtitle.setText(
+                    f"DICOM 批量下载工作台{instance_suffix}"
+                )
+            except Exception as exc:
+                self._append_log(
+                    "Profile",
+                    f"配置已重新载入，但显示名刷新失败：{exc}",
+                    "warning",
+                )
+        QMessageBox.information(
+            self,
+            "Profile 恢复完成",
+            f"已恢复 Profile：{'、'.join(map(str, result.profile_numbers))}\n\n"
+            "请重新启动 DcmGet，使恢复的配置完全生效。"
+            + (
+                f"\n恢复前快照：{result.previous_backup}"
+                if result.previous_backup
+                else ""
+            ),
+        )
+
+    def _verify_existing_pdi(self) -> None:
+        if self._is_busy():
+            QMessageBox.information(self, "后台任务运行中", "请等待当前后台任务结束后再验证 PDI。")
+            return
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择要验证的 PDI 或分卷根目录",
+            self.config.pdi_output_folder or self.destination_edit.text(),
+        )
+        if not selected:
+            return
+        dialog = QProgressDialog("正在准备 PDI 完整性验证…", "取消验证", 0, 0, self)
+        dialog.setWindowTitle("验证 PDI/U盘")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        thread = QThread(self)
+        worker = PdiVerifyWorker(selected)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_pdi_verify_progress)
+        worker.finished.connect(self._on_pdi_verify_finished)
+        worker.failed.connect(self._on_pdi_verify_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        dialog.canceled.connect(worker.request_cancel)
+        thread.finished.connect(self._on_pdi_verify_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.pdi_verify_dialog = dialog
+        self.pdi_verify_thread = thread
+        self.pdi_verify_worker = worker
+        dialog.show()
+        thread.start()
+
+    def _on_pdi_verify_progress(
+        self,
+        _root: str,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        dialog = self.pdi_verify_dialog
+        if dialog is None:
+            return
+        dialog.setLabelText(message or "正在验证 PDI…")
+        if total > 0:
+            dialog.setRange(0, total)
+            dialog.setValue(max(0, min(current, total)))
+        else:
+            dialog.setRange(0, 0)
+
+    def _on_pdi_verify_finished(self, completed: object) -> None:
+        if isinstance(completed, dict):
+            items = list(completed.get("items") or [])
+            cancelled = bool(completed.get("cancelled"))
+        else:
+            items = list(completed or [])
+            cancelled = False
+        cancelled = cancelled or any(
+            str(getattr(getattr(result, "status", ""), "value", "")) == "cancelled"
+            for result, _reports in items
+        )
+        dialog = self.pdi_verify_dialog
+        if dialog is not None:
+            dialog.close()
+        if cancelled or not items:
+            QMessageBox.information(self, "PDI 验证已取消", "验证已取消，没有修改 PDI 文件。")
+            return
+        failed = sum(
+            str(getattr(getattr(result, "status", ""), "value", "")) == "failed"
+            for result, _reports in items
+        )
+        warnings = sum(
+            str(getattr(getattr(result, "status", ""), "value", "")) == "warning"
+            for result, _reports in items
+        )
+        report_paths = [str(reports.html_path) for _result, reports in items]
+        message = (
+            f"已验证 {len(items)} 个 PDI 卷：失败 {failed}，警告 {warnings}。\n\n"
+            f"验收报告：\n" + "\n".join(report_paths)
+        )
+        if failed:
+            QMessageBox.warning(self, "PDI 验证未通过", message)
+        else:
+            QMessageBox.information(self, "PDI 验证完成", message)
+        if report_paths:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(report_paths[0]))
+
+    def _on_pdi_verify_failed(self, message: str) -> None:
+        if self.pdi_verify_dialog is not None:
+            self.pdi_verify_dialog.close()
+        QMessageBox.critical(self, "PDI 验证失败", message)
+
+    def _on_pdi_verify_thread_finished(self) -> None:
+        if self.sender() is not self.pdi_verify_thread:
+            return
+        self.pdi_verify_worker = None
+        self.pdi_verify_thread = None
+        self.pdi_verify_dialog = None
+
     def _toggle_log_panel(self) -> None:
         self._set_log_panel_expanded(not self._log_panel_expanded)
 
@@ -5120,11 +6111,14 @@ class DcmGetWindow(QMainWindow):
                 event.ignore()
                 return
             pdi_running = self.pdi_worker is not None
+            pdi_verifying = self.pdi_verify_worker is not None
             answer = QMessageBox.question(
                 self,
                 "退出 DcmGet",
                 (
-                    "PDI 便携目录仍在生成。取消导出并退出吗？"
+                    "PDI 完整性仍在验证。取消验证并退出吗？"
+                    if pdi_verifying
+                    else "PDI 便携目录仍在生成。取消导出并退出吗？"
                     if pdi_running
                     else "下载仍在进行。停止任务并退出吗？"
                 ),
@@ -5136,10 +6130,12 @@ class DcmGetWindow(QMainWindow):
                 return
             self._closing_after_cancel = True
             self.pause_button.setEnabled(False)
-            active_worker = self.pdi_worker or self.worker
+            active_worker = self.pdi_verify_worker or self.pdi_worker or self.worker
             if active_worker is not None:
                 active_worker.request_cancel()
-            active_thread = self.pdi_thread or self.worker_thread
+            active_thread = (
+                self.pdi_verify_thread or self.pdi_thread or self.worker_thread
+            )
             if active_thread:
                 active_thread.finished.connect(self.close)
             self.progress_label.setText("正在停止后台进程并退出…")

@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -45,6 +45,14 @@ class AccessionStatus(str, Enum):
     PARTIAL = "部分成功"
     FAILED = "失败"
     CANCELLED = "已取消"
+
+
+class ResultVerificationStatus(str, Enum):
+    """Non-blocking ownership verification for permissively received files."""
+
+    MATCHED = "核对通过"
+    MISMATCH = "内容不匹配"
+    UNVERIFIABLE = "无法核对"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +84,32 @@ class AccessionResult:
     new_file_count: int = 0
     existing_skipped_count: int = 0
     conflict_preserved_count: int = 0
+    verification_status: ResultVerificationStatus = (
+        ResultVerificationStatus.UNVERIFIABLE
+    )
+    verification_message: str = ""
+    actual_accessions: list[str] = field(default_factory=list)
+    study_instance_uids: list[str] = field(default_factory=list)
+    series_instance_count: int = 0
+    sop_instance_count: int = 0
+    local_verified_files: int = 0
+    pacs_completed_suboperations: int | None = None
+    move_return_code: int | None = None
+    move_dimse_status: int | None = None
+    attempt_count: int = 1
+    transient_failure: bool = False
+    safety_pause_reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReceivedDicomMetadata:
+    file_path: str
+    actual_accession_number: str = ""
+    study_instance_uid: str = ""
+    series_instance_uid: str = ""
+    sop_instance_uid: str = ""
+    size_bytes: int = 0
+    metadata_error: str = ""
 
 
 @dataclass(slots=True)
@@ -86,6 +120,12 @@ class ArchiveStats:
     existing_skipped_count: int = 0
     conflict_preserved_count: int = 0
     conflict_files: list[Path] = field(default_factory=list)
+    source_accessions: set[str] = field(default_factory=set)
+    missing_accession_count: int = 0
+    study_instance_uids: set[str] = field(default_factory=set)
+    series_instance_uids: set[str] = field(default_factory=set)
+    sop_instance_uids: set[str] = field(default_factory=set)
+    observations: list[ReceivedDicomMetadata] = field(default_factory=list)
 
 
 class _ArchiveDisposition(str, Enum):
@@ -105,11 +145,14 @@ class BatchSummary:
     results: list[AccessionResult] = field(default_factory=list)
     cancelled: bool = False
     staging_directory: str = ""
+    interrupted_reason: str = ""
 
     @property
     def exit_code(self) -> int:
         if self.cancelled:
             return 130
+        if self.interrupted_reason:
+            return 2
         if any(r.status in {AccessionStatus.FAILED, AccessionStatus.PARTIAL} for r in self.results):
             return 2
         return 0
@@ -156,6 +199,9 @@ ProgressCallback = Callable[[int, int, AccessionResult], None]
 ReadyCallback = Callable[[], None]
 ArchiveErrorCallback = Callable[[Path, str], None]
 ProcessCallback = Callable[[str, int, str, bool], None]
+AuditCallback = Callable[
+    [AccessionResult, tuple[ReceivedDicomMetadata, ...]], None
+]
 
 
 @dataclass(slots=True)
@@ -587,6 +633,14 @@ def preflight(
         os.close(descriptor)
         Path(probe_name).unlink()
         checks.append(("保存目录", True, "目录可写"))
+        _append_disk_space_check(
+            checks,
+            errors,
+            "dicom_destination_folder",
+            "保存目录空间",
+            destination,
+            config.minimum_free_space_bytes,
+        )
     except OSError as exc:
         message = f"保存目录不可写：{exc}"
         errors["dicom_destination_folder"] = message
@@ -606,6 +660,14 @@ def preflight(
             os.close(descriptor)
             Path(probe_name).unlink()
             checks.append(("PDI 输出目录", True, f"目录可写：{pdi_root}"))
+            _append_disk_space_check(
+                checks,
+                errors,
+                "pdi_output_folder",
+                "PDI 输出空间",
+                pdi_root,
+                config.minimum_free_space_bytes,
+            )
         except OSError as exc:
             message = f"PDI 输出目录不可写：{exc}"
             errors["pdi_output_folder"] = message
@@ -630,6 +692,107 @@ def preflight(
     return PreflightResult(tools, errors, checks)
 
 
+def _append_disk_space_check(
+    checks: list[tuple[str, bool, str]],
+    errors: dict[str, str],
+    field: str,
+    label: str,
+    path: Path,
+    minimum_free_space_bytes: int,
+) -> None:
+    if minimum_free_space_bytes <= 0:
+        checks.append((label, True, "未启用最低可用空间限制"))
+        return
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError as exc:
+        message = f"无法读取磁盘可用空间：{exc}"
+        errors.setdefault(field, message)
+        checks.append((label, False, message))
+        return
+    ok = free >= minimum_free_space_bytes
+    message = (
+        f"可用空间 {_format_bytes(free)}，最低保留 {_format_bytes(minimum_free_space_bytes)}"
+    )
+    checks.append((label, ok, message))
+    if not ok:
+        errors.setdefault(field, message)
+
+
+def _format_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024 or unit == "TB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TB"
+
+
+def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
+    if not attempts:
+        raise ValueError("至少需要一次下载尝试")
+    final = attempts[-1]
+    if len(attempts) == 1:
+        return replace(final, attempt_count=max(1, final.attempt_count))
+
+    archived_files = list(
+        dict.fromkeys(path for result in attempts for path in result.archived_files)
+    )
+    actual_accessions = sorted(
+        {value for result in attempts for value in result.actual_accessions}
+    )
+    study_uids = sorted(
+        {value for result in attempts for value in result.study_instance_uids}
+    )
+    verification_status = final.verification_status
+    verification_message = final.verification_message
+    verified_attempts = [result for result in attempts if result.local_verified_files]
+    if any(
+        result.verification_status == ResultVerificationStatus.MISMATCH
+        for result in verified_attempts
+    ):
+        verification_status = ResultVerificationStatus.MISMATCH
+        mismatch = next(
+            result
+            for result in verified_attempts
+            if result.verification_status == ResultVerificationStatus.MISMATCH
+        )
+        verification_message = mismatch.verification_message
+    elif verified_attempts and any(
+        result.verification_status == ResultVerificationStatus.UNVERIFIABLE
+        for result in verified_attempts
+    ):
+        verification_status = ResultVerificationStatus.UNVERIFIABLE
+        verification_message = next(
+            result.verification_message
+            for result in verified_attempts
+            if result.verification_status == ResultVerificationStatus.UNVERIFIABLE
+        )
+    duration = sum(result.duration_seconds for result in attempts)
+    received_bytes = sum(result.received_bytes for result in attempts)
+    return replace(
+        final,
+        file_count=max(final.file_count, len(archived_files)),
+        duration_seconds=duration,
+        message=f"第 {len(attempts)} 次尝试完成；{final.message}",
+        received_bytes=received_bytes,
+        speed_bytes_per_second=(received_bytes / duration if duration > 0 else 0.0),
+        archived_files=archived_files or list(final.archived_files),
+        verification_status=verification_status,
+        verification_message=verification_message,
+        actual_accessions=actual_accessions,
+        study_instance_uids=study_uids,
+        series_instance_count=max(
+            result.series_instance_count for result in attempts
+        ),
+        sop_instance_count=max(result.sop_instance_count for result in attempts),
+        local_verified_files=max(
+            result.local_verified_files for result in attempts
+        ),
+        attempt_count=sum(max(1, result.attempt_count) for result in attempts),
+    )
+
+
 def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         if os.name == "nt":
@@ -651,6 +814,7 @@ class DownloadRunner:
         progress_callback: ProgressCallback | None = None,
         ready_callback: ReadyCallback | None = None,
         process_callback: ProcessCallback | None = None,
+        audit_callback: AuditCallback | None = None,
         log_file_name: str = "dcmget.log",
         log_directory: str | Path | None = None,
         fallback_log_directory: str | Path | None = None,
@@ -664,6 +828,9 @@ class DownloadRunner:
         self._move_started_notified = False
         self.process_callback = process_callback or (
             lambda _kind, _pid, _executable, _active: None
+        )
+        self.audit_callback = audit_callback or (
+            lambda _result, _observations: None
         )
         if Path(log_file_name).name != log_file_name or not log_file_name:
             raise ValueError("日志文件名无效")
@@ -827,6 +994,7 @@ class DownloadRunner:
                 )
             self._start_storescp(staging)
             self.state_callback("downloading")
+            consecutive_transient_failures = 0
             for index, accession in enumerate(values, 1):
                 if self._cancel.is_set():
                     summary.cancelled = True
@@ -837,13 +1005,41 @@ class DownloadRunner:
                     self._append_cancelled(summary, values[index - 1 :])
                     break
 
-                result = self._download_one(accession, staging, index, len(values))
+                disk_issue = self._disk_space_issue(staging)
+                if disk_issue:
+                    summary.interrupted_reason = disk_issue
+                    self.state_callback("safety_paused")
+                    self._emit("磁盘", disk_issue, "error")
+                    break
+
+                result = self._download_accession_with_retry(
+                    accession, staging, index, len(values)
+                )
                 summary.results.append(result)
                 self.progress_callback(index, len(values), result)
 
                 if result.status == AccessionStatus.CANCELLED:
                     summary.cancelled = True
                     self._append_cancelled(summary, values[index:])
+                    break
+                if result.safety_pause_reason:
+                    summary.interrupted_reason = result.safety_pause_reason
+                    self.state_callback("safety_paused")
+                    break
+                if result.transient_failure:
+                    consecutive_transient_failures += 1
+                else:
+                    consecutive_transient_failures = 0
+                if (
+                    consecutive_transient_failures
+                    >= self.config.circuit_breaker_failures
+                ):
+                    summary.interrupted_reason = (
+                        f"连续 {consecutive_transient_failures} 个检查号发生网络或关联故障，"
+                        "批次已安全暂停；请先检查 PACS、网络和 AE 配置后重试"
+                    )
+                    self.state_callback("safety_paused")
+                    self._emit("PACS", summary.interrupted_reason, "error")
                     break
         finally:
             try:
@@ -866,6 +1062,58 @@ class DownloadRunner:
         else:
             self.state_callback("completed")
         return summary
+
+    def _download_accession_with_retry(
+        self,
+        accession: str,
+        staging: Path,
+        index: int,
+        total: int,
+    ) -> AccessionResult:
+        attempts: list[AccessionResult] = []
+        maximum_attempts = 1 + self.config.auto_retry_attempts
+        for attempt in range(1, maximum_attempts + 1):
+            result = self._download_one(accession, staging, index, total)
+            attempts.append(result)
+            if not result.transient_failure or self._cancel.is_set():
+                break
+            if attempt >= maximum_attempts:
+                break
+            delay = self.config.auto_retry_backoff_seconds * attempt
+            self._emit(
+                "重试",
+                f"{accession} 发生瞬时网络或关联故障，{delay} 秒后进行第 {attempt + 1} 次尝试",
+                "warning",
+            )
+            if self._cancel.wait(delay):
+                break
+        return _combine_retry_attempts(attempts)
+
+    def _disk_space_issue(self, staging: Path) -> str:
+        minimum = self.config.minimum_free_space_bytes
+        if minimum <= 0:
+            return ""
+        paths = {
+            Path(self.config.dicom_destination_folder).expanduser(),
+            staging,
+        }
+        checked_devices: set[int] = set()
+        for path in paths:
+            try:
+                existing = path if path.exists() else path.parent
+                device = existing.stat().st_dev
+                if device in checked_devices:
+                    continue
+                checked_devices.add(device)
+                free = shutil.disk_usage(existing).free
+            except OSError as exc:
+                return f"无法检查磁盘可用空间：{path}（{exc}）"
+            if free < minimum:
+                return (
+                    f"磁盘可用空间仅 {_format_bytes(free)}，低于最低保留值 "
+                    f"{_format_bytes(minimum)}；批次已安全暂停"
+                )
+        return ""
 
     def _wait_if_paused(self) -> bool:
         with self._pause_condition:
@@ -994,6 +1242,7 @@ class DownloadRunner:
         last_received_bytes = 0
         last_sample_at = started
         receiver_exit_code: int | None = None
+        safety_pause_reason = ""
         try:
             self._emit("movescu", f"开始检查号 {accession}", "info")
             self._emit("movescu", _display_command(command), "debug")
@@ -1037,6 +1286,11 @@ class DownloadRunner:
                             speed_bytes_per_second=sample_speed,
                         ),
                     )
+                    safety_pause_reason = self._disk_space_issue(staging)
+                    if safety_pause_reason:
+                        self._emit("磁盘", safety_pause_reason, "error")
+                        self._terminate_process_safely(process)
+                        break
                 time.sleep(0.1)
             return_code = process.wait()
             transfer_finished = time.monotonic()
@@ -1097,6 +1351,13 @@ class DownloadRunner:
             + archive_stats.existing_skipped_count
             + archive_stats.conflict_preserved_count
         )
+        if accepted_file_count:
+            verification_status, verification_message = reconcile_archive_stats(
+                accession, archive_stats
+            )
+        else:
+            verification_status = ResultVerificationStatus.UNVERIFIABLE
+            verification_message = "本次未收到可核对的 DICOM 文件"
         rejected_detail = (
             f"{len(rejected)} 个匿名或归档失败文件留在私有暂存目录（原因见日志）"
             if self._anonymizer
@@ -1190,11 +1451,24 @@ class DownloadRunner:
             if rejected:
                 message += f"，{rejected_detail}"
 
+        if (
+            accepted_file_count
+            and verification_status != ResultVerificationStatus.MATCHED
+        ):
+            message += f"；归属核对：{verification_message}"
+
+        transient_failure = bool(
+            not safety_pause_reason
+            and receiver_exit_code is None
+            and return_code != 0
+            and not _move_has_final_response(diagnostics)
+        )
+
         level = "success" if status == AccessionStatus.COMPLETED else (
             "warning" if status in {AccessionStatus.NO_DATA, AccessionStatus.PARTIAL, AccessionStatus.CANCELLED} else "error"
         )
         self._emit("movescu", f"{accession}：{message}", level)
-        return AccessionResult(
+        result = AccessionResult(
             accession=accession,
             status=status,
             file_count=accepted_file_count,
@@ -1207,7 +1481,24 @@ class DownloadRunner:
             new_file_count=archive_stats.new_file_count,
             existing_skipped_count=archive_stats.existing_skipped_count,
             conflict_preserved_count=archive_stats.conflict_preserved_count,
+            verification_status=verification_status,
+            verification_message=verification_message,
+            actual_accessions=sorted(archive_stats.source_accessions),
+            study_instance_uids=sorted(archive_stats.study_instance_uids),
+            series_instance_count=len(archive_stats.series_instance_uids),
+            sop_instance_count=len(archive_stats.sop_instance_uids),
+            local_verified_files=accepted_file_count,
+            pacs_completed_suboperations=diagnostics.completed_suboperations,
+            move_return_code=return_code,
+            move_dimse_status=diagnostics.dimse_status_code,
+            transient_failure=transient_failure,
+            safety_pause_reason=safety_pause_reason,
         )
+        try:
+            self.audit_callback(result, tuple(archive_stats.observations))
+        except Exception as exc:
+            self._emit("验收台账", f"无法写入检查号 {accession} 的验收记录：{exc}", "error")
+        return result
 
     def _start_movescu_process(
         self, command: list[str]
@@ -1492,6 +1783,30 @@ def _archive_result_message(file_count: int, stats: ArchiveStats) -> str:
     )
 
 
+def reconcile_archive_stats(
+    requested_accession: str,
+    stats: ArchiveStats,
+) -> tuple[ResultVerificationStatus, str]:
+    """Classify returned metadata without rejecting otherwise valid DICOM."""
+
+    requested = requested_accession.strip()
+    observed = sorted(value for value in stats.source_accessions if value)
+    mismatched = [value for value in observed if value != requested]
+    if mismatched:
+        preview = "、".join(mismatched[:3])
+        suffix = "…" if len(mismatched) > 3 else ""
+        return (
+            ResultVerificationStatus.MISMATCH,
+            f"返回检查号与请求不一致：{preview}{suffix}；文件已保留，需人工核对",
+        )
+    if stats.missing_accession_count or not observed:
+        return (
+            ResultVerificationStatus.UNVERIFIABLE,
+            f"{stats.missing_accession_count or len(stats.sop_instance_uids)} 个文件缺少可核对的检查号；文件已保留",
+        )
+    return ResultVerificationStatus.MATCHED, "返回检查号与请求一致"
+
+
 def _archive_dicom_files(
     files: Iterable[Path],
     destination_root: Path,
@@ -1525,10 +1840,15 @@ def _archive_dicom_files(
         if cancel_event is not None and cancel_event.is_set():
             break
         temporary: Path | None = None
+        source_accession = ""
+        source_study_uid = ""
+        source_series_uid = ""
+        source_sop_uid = ""
         metadata = {
             "PatientID": "UNKNOWN_PATIENT",
             "AccessionNumber": fallback_accession or "UNKNOWN_ACCESSION",
             "StudyInstanceUID": "UNKNOWN_STUDY",
+            "SeriesInstanceUID": "",
             "SOPInstanceUID": "",
         }
         try:
@@ -1537,6 +1857,18 @@ def _archive_dicom_files(
                 raise ValueError(validation_error)
             if anonymizer:
                 dataset = dcmread(source, force=True)
+                source_accession = str(
+                    getattr(dataset, "AccessionNumber", "") or ""
+                ).strip()
+                source_study_uid = str(
+                    getattr(dataset, "StudyInstanceUID", "") or ""
+                ).strip()
+                source_series_uid = str(
+                    getattr(dataset, "SeriesInstanceUID", "") or ""
+                ).strip()
+                source_sop_uid = str(
+                    getattr(dataset, "SOPInstanceUID", "") or ""
+                ).strip()
                 if not str(getattr(dataset, "PatientID", "") or "").strip():
                     dataset.PatientID = str(
                         getattr(dataset, "StudyInstanceUID", "") or "UNKNOWN_PATIENT"
@@ -1555,6 +1887,18 @@ def _archive_dicom_files(
                     force=True,
                     specific_tags=list(metadata),
                 )
+                source_accession = str(
+                    getattr(dataset, "AccessionNumber", "") or ""
+                ).strip()
+                source_study_uid = str(
+                    getattr(dataset, "StudyInstanceUID", "") or ""
+                ).strip()
+                source_series_uid = str(
+                    getattr(dataset, "SeriesInstanceUID", "") or ""
+                ).strip()
+                source_sop_uid = str(
+                    getattr(dataset, "SOPInstanceUID", "") or ""
+                ).strip()
             for field in metadata:
                 value = str(getattr(dataset, field, "") or "").strip()
                 if value:
@@ -1582,7 +1926,7 @@ def _archive_dicom_files(
             {
                 field: value
                 for field, value in metadata.items()
-                if field != "SOPInstanceUID"
+                if field not in {"SeriesInstanceUID", "SOPInstanceUID"}
             },
         )
         try:
@@ -1624,6 +1968,30 @@ def _archive_dicom_files(
                 error_callback(source, str(exc))
             rejected.append(source)
             continue
+        if source_accession:
+            archive_stats.source_accessions.add(source_accession)
+        else:
+            archive_stats.missing_accession_count += 1
+        if source_study_uid:
+            archive_stats.study_instance_uids.add(source_study_uid)
+        if source_series_uid:
+            archive_stats.series_instance_uids.add(source_series_uid)
+        if source_sop_uid:
+            archive_stats.sop_instance_uids.add(source_sop_uid)
+        try:
+            published_size = publication.path.stat().st_size
+        except OSError:
+            published_size = 0
+        archive_stats.observations.append(
+            ReceivedDicomMetadata(
+                file_path=str(publication.path),
+                actual_accession_number=source_accession,
+                study_instance_uid=source_study_uid,
+                series_instance_uid=source_series_uid,
+                sop_instance_uid=source_sop_uid,
+                size_bytes=published_size,
+            )
+        )
         if publication.disposition == _ArchiveDisposition.PUBLISHED:
             archive_stats.new_file_count += 1
         elif publication.disposition == _ArchiveDisposition.EXISTING_SKIPPED:

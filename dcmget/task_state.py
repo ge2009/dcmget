@@ -15,7 +15,12 @@ from filelock import FileLock, Timeout
 import psutil
 
 from .config import AppConfig
-from .core import AccessionResult, AccessionStatus, BatchSummary
+from .core import (
+    AccessionResult,
+    AccessionStatus,
+    BatchSummary,
+    ResultVerificationStatus,
+)
 from .runtime import ensure_application_state_dir
 
 
@@ -50,6 +55,7 @@ class TaskCheckpoint:
     created_at: str
     phase: str
     pdi_attempt_id: str = ""
+    interrupted_reason: str = ""
 
     @property
     def pending_accessions(self) -> list[str]:
@@ -230,6 +236,11 @@ class TaskCheckpointStore:
                             if checkpoint.pdi_attempt_id
                             else []
                         ),
+                        *(
+                            [("interrupted_reason", checkpoint.interrupted_reason)]
+                            if checkpoint.interrupted_reason
+                            else []
+                        ),
                     ],
                 )
                 results = checkpoint.result_by_accession
@@ -347,6 +358,7 @@ class TaskCheckpointStore:
                 created_at=metadata["created_at"],
                 phase=phase,
                 pdi_attempt_id=pdi_attempt_id,
+                interrupted_reason=metadata.get("interrupted_reason", ""),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskStateError("任务恢复点内容不完整或版本不受支持") from exc
@@ -415,7 +427,13 @@ class TaskCheckpointStore:
         except OSError as exc:
             raise TaskStateError(f"无法清除已完成任务恢复点：{exc}") from exc
 
-    def set_phase(self, task_id: str, phase: str) -> None:
+    def set_phase(
+        self,
+        task_id: str,
+        phase: str,
+        *,
+        interrupted_reason: str = "",
+    ) -> None:
         if phase not in TASK_PHASES:
             raise TaskStateError(f"不支持的任务阶段：{phase}")
         try:
@@ -426,6 +444,18 @@ class TaskCheckpointStore:
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES ('phase', ?)",
                     (phase,),
                 )
+                if phase == "download_retryable" and interrupted_reason:
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO metadata(key, value)
+                        VALUES ('interrupted_reason', ?)
+                        """,
+                        (interrupted_reason,),
+                    )
+                else:
+                    connection.execute(
+                        "DELETE FROM metadata WHERE key = 'interrupted_reason'"
+                    )
         except TaskStateError:
             raise
         except sqlite3.Error as exc:
@@ -434,18 +464,22 @@ class TaskCheckpointStore:
     def prepare_download_retry(
         self, task_id: str, *, include_archived_files: bool = True
     ) -> TaskCheckpoint:
-        """Make failed/partial rows pending while retaining received files."""
+        """Resume pending work and retry failed/partial rows.
+
+        A safety pause can happen before the next accession starts, leaving no
+        failed result at all.  Such untouched rows are already pending and must
+        remain resumable after the operator fixes the disk or network issue.
+        """
 
         try:
             with closing(sqlite3.connect(self.path)) as connection, connection:
                 if _metadata_value(connection, "task_id") != task_id:
                     raise TaskStateError("活动任务已改变，拒绝重试旧任务")
                 if _metadata_value(connection, "phase") != "download_retryable":
-                    raise TaskStateError("当前任务没有可重试的下载失败项")
+                    raise TaskStateError("当前任务不处于可继续或可重试状态")
                 cursor = connection.execute(
                     "SELECT accession, result_json FROM accessions ORDER BY position"
                 )
-                retry_count = 0
                 while batch := cursor.fetchmany(500):
                     for accession, result_json in batch:
                         if not result_json:
@@ -482,14 +516,21 @@ class TaskCheckpointStore:
                             """,
                             (retained, str(accession)),
                         )
-                        retry_count += 1
-                if retry_count == 0:
-                    raise TaskStateError("当前任务没有可重试的下载失败项")
+                pending_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM accessions WHERE result_json IS NULL"
+                    ).fetchone()[0]
+                )
+                if pending_count == 0:
+                    raise TaskStateError("当前任务没有可继续的未处理或失败项")
                 connection.execute(
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES ('phase', 'downloading')"
                 )
                 connection.execute(
                     "DELETE FROM metadata WHERE key = 'pdi_attempt_id'"
+                )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key = 'interrupted_reason'"
                 )
         except TaskStateError:
             raise
@@ -690,6 +731,7 @@ def merge_checkpoint_summary(
         results=merged,
         cancelled=current.cancelled,
         staging_directory=current.staging_directory,
+        interrupted_reason=current.interrupted_reason,
     )
 
 
@@ -882,6 +924,51 @@ def _merge_partial_result(
         new_file_count=new_file_count,
         existing_skipped_count=existing_skipped_count,
         conflict_preserved_count=conflict_preserved_count,
+        verification_status=(
+            ResultVerificationStatus.MISMATCH
+            if ResultVerificationStatus.MISMATCH
+            in {prior.verification_status, current.verification_status}
+            else ResultVerificationStatus.UNVERIFIABLE
+            if ResultVerificationStatus.UNVERIFIABLE
+            in {prior.verification_status, current.verification_status}
+            else ResultVerificationStatus.MATCHED
+        ),
+        verification_message=(
+            current.verification_message or prior.verification_message
+        ),
+        actual_accessions=sorted(
+            set(prior.actual_accessions) | set(current.actual_accessions)
+        ),
+        study_instance_uids=sorted(
+            set(prior.study_instance_uids) | set(current.study_instance_uids)
+        ),
+        series_instance_count=max(
+            prior.series_instance_count, current.series_instance_count
+        ),
+        sop_instance_count=max(prior.sop_instance_count, current.sop_instance_count),
+        local_verified_files=max(
+            prior.local_verified_files, current.local_verified_files
+        ),
+        pacs_completed_suboperations=(
+            current.pacs_completed_suboperations
+            if current.pacs_completed_suboperations is not None
+            else prior.pacs_completed_suboperations
+        ),
+        move_return_code=(
+            current.move_return_code
+            if current.move_return_code is not None
+            else prior.move_return_code
+        ),
+        move_dimse_status=(
+            current.move_dimse_status
+            if current.move_dimse_status is not None
+            else prior.move_dimse_status
+        ),
+        attempt_count=max(1, prior.attempt_count) + max(1, current.attempt_count),
+        transient_failure=current.transient_failure,
+        safety_pause_reason=(
+            current.safety_pause_reason or prior.safety_pause_reason
+        ),
     )
 
 
@@ -895,6 +982,19 @@ def _result_to_json(result: AccessionResult) -> str:
             "new_file_count": result.new_file_count,
             "existing_skipped_count": result.existing_skipped_count,
             "conflict_preserved_count": result.conflict_preserved_count,
+            "verification_status": result.verification_status.value,
+            "verification_message": result.verification_message,
+            "actual_accessions": list(result.actual_accessions),
+            "study_instance_uids": list(result.study_instance_uids),
+            "series_instance_count": result.series_instance_count,
+            "sop_instance_count": result.sop_instance_count,
+            "local_verified_files": result.local_verified_files,
+            "pacs_completed_suboperations": result.pacs_completed_suboperations,
+            "move_return_code": result.move_return_code,
+            "move_dimse_status": result.move_dimse_status,
+            "attempt_count": result.attempt_count,
+            "transient_failure": result.transient_failure,
+            "safety_pause_reason": result.safety_pause_reason,
             "message": result.message,
             "output_directory": result.output_directory,
             "received_bytes": result.received_bytes,
@@ -916,6 +1016,12 @@ def _result_from_json(
     archived_values = raw.get("archived_files", [])
     if not isinstance(archived_values, list):
         raise ValueError("invalid archived files")
+    actual_accessions = raw.get("actual_accessions", [])
+    study_instance_uids = raw.get("study_instance_uids", [])
+    if not isinstance(actual_accessions, list) or not isinstance(
+        study_instance_uids, list
+    ):
+        raise ValueError("invalid verification metadata")
     file_count = max(int(raw.get("file_count", 0)), len(archived_values))
     archive_stats_known = any(
         key in raw
@@ -950,4 +1056,30 @@ def _result_from_json(
         conflict_preserved_count=max(
             0, int(raw.get("conflict_preserved_count", 0))
         ),
+        verification_status=ResultVerificationStatus(
+            str(
+                raw.get(
+                    "verification_status",
+                    ResultVerificationStatus.UNVERIFIABLE.value,
+                )
+            )
+        ),
+        verification_message=str(raw.get("verification_message", "")),
+        actual_accessions=[str(value) for value in actual_accessions],
+        study_instance_uids=[str(value) for value in study_instance_uids],
+        series_instance_count=max(0, int(raw.get("series_instance_count", 0))),
+        sop_instance_count=max(0, int(raw.get("sop_instance_count", 0))),
+        local_verified_files=max(0, int(raw.get("local_verified_files", 0))),
+        pacs_completed_suboperations=_optional_int(
+            raw.get("pacs_completed_suboperations")
+        ),
+        move_return_code=_optional_int(raw.get("move_return_code")),
+        move_dimse_status=_optional_int(raw.get("move_dimse_status")),
+        attempt_count=max(1, int(raw.get("attempt_count", 1))),
+        transient_failure=bool(raw.get("transient_failure", False)),
+        safety_pause_reason=str(raw.get("safety_pause_reason", "")),
     )
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(value)

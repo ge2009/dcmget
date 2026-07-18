@@ -291,6 +291,11 @@ def run_ui_self_test(config_path: str) -> int:
                 instance_label=profile.label,
                 settings_name=profile.settings_name,
                 log_directory=profile.log_directory,
+                **(
+                    {"profile_lock": profile.slot_lock}
+                    if hasattr(profile, "slot_lock")
+                    else {}
+                ),
             )
             window.show()
             app.processEvents()
@@ -408,6 +413,11 @@ def main(argv: list[str] | None = None) -> int:
             instance_label=profile.label,
             settings_name=profile.settings_name,
             log_directory=profile.log_directory,
+            **(
+                {"profile_lock": profile.slot_lock}
+                if hasattr(profile, "slot_lock")
+                else {}
+            ),
         )
         activation.set_activation_handler(
             window.external_activation_requested.emit

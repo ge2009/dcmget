@@ -28,6 +28,10 @@ AE_TITLE_LABELS = {
 }
 
 DEFAULT_ANONYMIZATION_PROFILE = "research"
+DEFAULT_MINIMUM_FREE_SPACE_BYTES = 2 * 1024**3
+DEFAULT_AUTO_RETRY_ATTEMPTS = 2
+DEFAULT_AUTO_RETRY_BACKOFF_SECONDS = 3
+DEFAULT_CIRCUIT_BREAKER_FAILURES = 5
 ANONYMIZATION_PROFILE_OPTIONS = (
     (
         "basic",
@@ -66,7 +70,7 @@ def validate_ae_title(value: object, label: str = "AE Title") -> str:
 
 @dataclass(slots=True)
 class AppConfig:
-    config_version: int = 6
+    config_version: int = 7
     dcmtk_bin_dir: str = ""
     access_numbers_file_path: str = "access.txt"
     dicom_destination_folder: str = "Dicom"
@@ -84,6 +88,11 @@ class AppConfig:
     pdi_institution_name: str = ""
     pdi_output_folder: str = ""
     pdi_include_ohif_viewer: bool = True
+    pdi_volume_size_bytes: int = 0
+    minimum_free_space_bytes: int = DEFAULT_MINIMUM_FREE_SPACE_BYTES
+    auto_retry_attempts: int = DEFAULT_AUTO_RETRY_ATTEMPTS
+    auto_retry_backoff_seconds: int = DEFAULT_AUTO_RETRY_BACKOFF_SECONDS
+    circuit_breaker_failures: int = DEFAULT_CIRCUIT_BREAKER_FAILURES
     max_log_file_size_bytes: int = 104_857_600
 
     @classmethod
@@ -95,7 +104,7 @@ class AppConfig:
         if is_legacy:
             legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
-                "config_version": 6,
+                "config_version": 7,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
                 "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
@@ -113,6 +122,11 @@ class AppConfig:
                 "pdi_institution_name": "",
                 "pdi_output_folder": "",
                 "pdi_include_ohif_viewer": True,
+                "pdi_volume_size_bytes": 0,
+                "minimum_free_space_bytes": DEFAULT_MINIMUM_FREE_SPACE_BYTES,
+                "auto_retry_attempts": DEFAULT_AUTO_RETRY_ATTEMPTS,
+                "auto_retry_backoff_seconds": DEFAULT_AUTO_RETRY_BACKOFF_SECONDS,
+                "circuit_breaker_failures": DEFAULT_CIRCUIT_BREAKER_FAILURES,
                 "max_log_file_size_bytes": data.get(
                     "max_log_file_size_bytes", 104_857_600
                 ),
@@ -127,7 +141,7 @@ class AppConfig:
             field: data.get(field, getattr(defaults, field))
             for field in asdict(defaults)
         }
-        values["config_version"] = 6
+        values["config_version"] = 7
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
         values["max_concurrent_moves"] = _as_int(
@@ -135,6 +149,21 @@ class AppConfig:
         )
         values["max_log_file_size_bytes"] = _as_int(
             values["max_log_file_size_bytes"], 104_857_600
+        )
+        values["pdi_volume_size_bytes"] = _as_int(
+            values["pdi_volume_size_bytes"], 0
+        )
+        values["minimum_free_space_bytes"] = _as_int(
+            values["minimum_free_space_bytes"], DEFAULT_MINIMUM_FREE_SPACE_BYTES
+        )
+        values["auto_retry_attempts"] = _as_int(
+            values["auto_retry_attempts"], DEFAULT_AUTO_RETRY_ATTEMPTS
+        )
+        values["auto_retry_backoff_seconds"] = _as_int(
+            values["auto_retry_backoff_seconds"], DEFAULT_AUTO_RETRY_BACKOFF_SECONDS
+        )
+        values["circuit_breaker_failures"] = _as_int(
+            values["circuit_breaker_failures"], DEFAULT_CIRCUIT_BREAKER_FAILURES
         )
         for field in AE_TITLE_LABELS:
             value = values[field]
@@ -179,6 +208,16 @@ class AppConfig:
             errors["max_concurrent_moves"] = "并发下载数必须在 1 到 8 之间"
         if self.max_log_file_size_bytes < 1024:
             errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
+        if self.minimum_free_space_bytes < 0:
+            errors["minimum_free_space_bytes"] = "磁盘保留空间不能为负数"
+        if not 0 <= self.auto_retry_attempts <= 10:
+            errors["auto_retry_attempts"] = "自动重试次数必须在 0 到 10 之间"
+        if not 0 <= self.auto_retry_backoff_seconds <= 300:
+            errors["auto_retry_backoff_seconds"] = "重试等待时间必须在 0 到 300 秒之间"
+        if not 2 <= self.circuit_breaker_failures <= 100:
+            errors["circuit_breaker_failures"] = "连续失败暂停阈值必须在 2 到 100 之间"
+        if self.pdi_volume_size_bytes < 0:
+            errors["pdi_volume_size_bytes"] = "PDI 分卷容量不能为负数"
         if (
             self.anonymization_enabled
             and self.anonymization_profile not in ANONYMIZATION_PROFILE_IDS

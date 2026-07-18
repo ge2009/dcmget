@@ -15,7 +15,12 @@ import pytest
 
 import dcmget.task_state as task_state_module
 from dcmget.config import AppConfig
-from dcmget.core import AccessionResult, AccessionStatus, BatchSummary
+from dcmget.core import (
+    AccessionResult,
+    AccessionStatus,
+    BatchSummary,
+    ResultVerificationStatus,
+)
 from dcmget.task_state import (
     TaskCheckpointStore,
     TaskStateError,
@@ -65,6 +70,43 @@ def test_lightweight_load_omits_paths_but_keeps_status_and_counts(tmp_path):
         "/dicom/one.dcm",
         "/dicom/two.dcm",
     ]
+
+
+def test_checkpoint_round_trips_delivery_verification_fields(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    expected = AccessionResult(
+        "A001",
+        AccessionStatus.COMPLETED,
+        file_count=2,
+        verification_status=ResultVerificationStatus.MISMATCH,
+        verification_message="返回检查号不一致",
+        actual_accessions=["OTHER001"],
+        study_instance_uids=["1.2.3"],
+        series_instance_count=2,
+        sop_instance_count=2,
+        local_verified_files=2,
+        pacs_completed_suboperations=2,
+        move_return_code=0,
+        move_dimse_status=0,
+        attempt_count=2,
+        transient_failure=False,
+    )
+
+    store.record_result(checkpoint.task_id, expected)
+    restored = store.load_required().results[0]
+
+    assert restored.verification_status == ResultVerificationStatus.MISMATCH
+    assert restored.verification_message == "返回检查号不一致"
+    assert restored.actual_accessions == ["OTHER001"]
+    assert restored.study_instance_uids == ["1.2.3"]
+    assert restored.series_instance_count == 2
+    assert restored.sop_instance_count == 2
+    assert restored.local_verified_files == 2
+    assert restored.pacs_completed_suboperations == 2
+    assert restored.move_return_code == 0
+    assert restored.move_dimse_status == 0
+    assert restored.attempt_count == 2
 
 
 def test_cancelled_item_stays_pending_and_retained_files_merge_on_resume(tmp_path):
@@ -244,6 +286,72 @@ def test_failed_and_partial_results_can_be_retried_after_restart(tmp_path):
     )
     assert merged.status == AccessionStatus.COMPLETED
     assert merged.archived_files == ["/dicom/kept.dcm", "/dicom/new.dcm"]
+
+
+def test_safety_pause_with_only_pending_items_can_resume_after_restart(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(
+        AppConfig(), ["DONE", "PENDING-1", "PENDING-2"], trial_required=False
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("DONE", AccessionStatus.COMPLETED),
+    )
+    reason = "磁盘可用空间低于最低保留值；批次已安全暂停"
+    store.set_phase(
+        checkpoint.task_id,
+        "download_retryable",
+        interrupted_reason=reason,
+    )
+
+    paused = store.load_required()
+    assert paused.interrupted_reason == reason
+    assert paused.pending_accessions == ["PENDING-1", "PENDING-2"]
+
+    resumed = store.prepare_download_retry(checkpoint.task_id)
+
+    assert resumed.phase == "downloading"
+    assert resumed.interrupted_reason == ""
+    assert resumed.pending_accessions == ["PENDING-1", "PENDING-2"]
+    assert [result.accession for result in resumed.results] == ["DONE"]
+
+
+def test_safety_pause_resumes_pending_and_resets_failed_and_partial(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(
+        AppConfig(),
+        ["DONE", "FAILED", "PARTIAL", "PENDING"],
+        trial_required=False,
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("DONE", AccessionStatus.COMPLETED),
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("FAILED", AccessionStatus.FAILED),
+    )
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "PARTIAL",
+            AccessionStatus.PARTIAL,
+            archived_files=["/dicom/kept.dcm"],
+        ),
+    )
+    store.set_phase(
+        checkpoint.task_id,
+        "download_retryable",
+        interrupted_reason="PACS 连续关联失败，批次已安全暂停",
+    )
+
+    resumed = store.prepare_download_retry(checkpoint.task_id)
+
+    assert resumed.pending_accessions == ["FAILED", "PARTIAL", "PENDING"]
+    assert [result.accession for result in resumed.results] == ["DONE"]
+    assert resumed.partial_results["PARTIAL"].archived_files == [
+        "/dicom/kept.dcm"
+    ]
 
 
 def test_conflict_only_partial_result_remains_visible_after_retry(tmp_path):
