@@ -141,6 +141,19 @@ def test_task_control_and_live_updates_cover_background_operation() -> None:
     assert "beforeunload" not in javascript
 
 
+def test_task_start_freezes_the_preflighted_draft_and_confirms_targets() -> None:
+    javascript = _javascript()
+
+    assert 'parseAccessions($("#accession-input").value, { schedule: false })' in javascript
+    assert "const draft = taskDraft();" in javascript
+    assert "const signature = JSON.stringify(draft);" in javascript
+    assert "() => submitStartTask(draft, signature)" in javascript
+    assert "signature !== draftSignature()" in javascript
+    assert "body: draft" in javascript
+    for label in ("Profile：", "PACS：", "保存目录：", "PDI："):
+        assert label in javascript
+
+
 def test_large_tasks_use_aggregate_rendering_after_200_accessions() -> None:
     source, _document_parser = _document()
     javascript = _javascript()
@@ -160,6 +173,8 @@ def test_logs_default_to_errors_until_user_opts_in() -> None:
     assert 'new Set(["ERROR", "CRITICAL"])' in javascript
     assert 'id="detailed-log-toggle" type="checkbox"' in source
     assert "默认仅显示错误日志" in source
+    assert "scrollIntoView" not in javascript
+    assert "list.scrollTop = list.scrollHeight" in javascript
 
 
 def test_recovery_large_batch_and_sse_contracts_are_visible() -> None:
@@ -314,6 +329,55 @@ def test_profile_management_configures_before_launch_and_exposes_service_control
     assert 'api("/api/operations/windows-service-start"' in javascript
     assert 'runOperation("windows-service-stop")' in javascript
     assert "stopButton.hidden = !result.supported" in javascript
+
+
+def test_clinical_workspace_icons_collapse_and_busy_states_are_self_contained() -> None:
+    source, _document_parser = _document()
+    css = CSS.read_text(encoding="utf-8")
+    javascript = _javascript()
+
+    assert 'class="icon-sprite"' in source
+    assert 'id="icon-dicom"' in source
+    assert 'href="#icon-download"' in source
+    assert 'id="toggle-task-editor"' in source
+    assert 'aria-controls="task-editor-body"' in source
+    assert "setTaskEditorCollapsed" in javascript
+    assert "taskActionPending" in javascript
+    assert "pdiActionPending" in javascript
+    assert 'setAttribute("aria-busy", "true")' in javascript
+    assert "directoryRequestId" in javascript
+    assert "requestId !== state.directoryRequestId" in javascript
+    assert "@keyframes page-enter" in css
+    assert "@keyframes progress-sheen" in css
+
+
+def test_compact_desktop_keeps_the_task_editor_two_column_until_840px() -> None:
+    source, _document_parser = _document()
+    css = CSS.read_text(encoding="utf-8")
+
+    desktop_block = css.split("@media (max-width: 1080px)", 1)[1].split(
+        "@media (max-width: 840px)", 1
+    )[0]
+    compact_block = css.split("@media (max-width: 840px)", 1)[1]
+    assert ".editor-grid" not in desktop_block
+    assert ".editor-grid" in compact_block
+    for name in ("任务", "设置", "运维"):
+        assert f'aria-label="{name}"' in source
+
+
+def test_verification_terminal_states_and_profile_form_validation_are_explicit() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+
+    for status in (
+        "verification_completed",
+        "verification_failed",
+        "verification_cancelled",
+    ):
+        assert javascript.count(status) >= 2
+    assert 'id="profile-config-cancel"' in source
+    assert "form.reportValidity()" in javascript
+    assert '$("#profile-config-form").addEventListener("submit"' in javascript
 
 
 def test_offline_license_activation_exposes_machine_code_and_token_input() -> None:

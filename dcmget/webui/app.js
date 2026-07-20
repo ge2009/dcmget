@@ -20,6 +20,9 @@ const TASK_STATUS = {
   pdi_running: ["正在导出 PDI", "working"],
   pdi_retryable: ["PDI 可重试", "warning"],
   verifying: ["正在校验 PDI", "working"],
+  verification_completed: ["PDI 校验完成", "success"],
+  verification_failed: ["PDI 校验失败", "error"],
+  verification_cancelled: ["PDI 校验已取消", "neutral"],
   shutting_down: ["后台正在退出", "warning"],
   shutdown_failed: ["后台退出异常", "error"],
   recovery_error: ["恢复点异常", "error"],
@@ -36,6 +39,7 @@ const TASK_STATUS = {
 
 const TERMINAL_STATUSES = new Set([
   "completed", "partial", "partial_success", "failed", "cancelled", "canceled",
+  "verification_completed", "verification_failed", "verification_cancelled",
 ]);
 
 const state = {
@@ -56,7 +60,12 @@ const state = {
   startedAt: 0,
   refreshTimer: 0,
   preflightTimer: 0,
+  accessionInputTimer: 0,
   preflightRequestId: 0,
+  directoryRequestId: 0,
+  taskActionPending: false,
+  pdiActionPending: false,
+  taskEditorCollapsed: false,
   initialized: false,
   localSession: true,
   profiles: [],
@@ -131,6 +140,12 @@ function setText(selector, value) {
   if (element) element.textContent = value == null || value === "" ? "—" : String(value);
 }
 
+function setButtonLabel(button, value) {
+  const label = $("span", button);
+  if (label && $("svg.icon", button)) label.textContent = String(value);
+  else button.textContent = String(value);
+}
+
 function showToast(message, duration = 3200) {
   const toast = document.createElement("div");
   toast.className = "toast";
@@ -193,7 +208,9 @@ function parseAccessions(raw, { schedule = true } = {}) {
   let duplicate = 0;
   let invalid = 0;
 
-  String(raw || "").split(/\r?\n/).forEach((line) => {
+  const source = String(raw || "");
+  const lines = source ? source.split(/\r?\n/) : [];
+  lines.forEach((line) => {
     const value = line.trim();
     if (!value) {
       blank += 1;
@@ -272,6 +289,7 @@ function schedulePreflight(delay = 450) {
 }
 
 function resetPreflightChecks() {
+  $(".preflight-block").classList.remove("is-success");
   $$("#preflight-list li").forEach((item) => {
     item.dataset.state = "pending";
     setText($(".check-icon", item), "·");
@@ -321,6 +339,7 @@ function renderPreflight(payload, signature = draftSignature()) {
   }
   state.preflightOk = allOk;
   state.preflightSignature = allOk ? signature : "";
+  $(".preflight-block").classList.toggle("is-success", allOk);
   setStatusBadge($("#task-readiness"), allOk ? "completed" : "failed", allOk ? "预检通过" : "预检未通过");
   updateStartAvailability();
 }
@@ -343,7 +362,7 @@ async function runPreflight({ requireAccessions = true, silent = false } = {}) {
   const signature = draftSignature();
   const requestId = ++state.preflightRequestId;
   button.disabled = true;
-  button.textContent = "检查中…";
+  setButtonLabel(button, "检查中…");
   try {
     const result = await api("/api/preflight", { method: "POST", body: taskDraft() });
     if (requestId !== state.preflightRequestId || signature !== draftSignature()) return false;
@@ -358,32 +377,52 @@ async function runPreflight({ requireAccessions = true, silent = false } = {}) {
   } finally {
     if (requestId === state.preflightRequestId) {
       button.disabled = false;
-      button.textContent = "重新检查";
+      setButtonLabel(button, "重新检查");
     }
   }
 }
 
 async function startTask() {
+  window.clearTimeout(state.accessionInputTimer);
+  parseAccessions($("#accession-input").value, { schedule: false });
   if (!state.preflightOk || state.preflightSignature !== draftSignature()) {
     const ok = await runPreflight();
     if (!ok) return;
   }
+  const draft = taskDraft();
+  const signature = JSON.stringify(draft);
+  if (!state.preflightOk || state.preflightSignature !== signature) {
+    showAlert("任务内容已经改变，请重新完成预检。", "无法开始下载");
+    return;
+  }
+  const profile = state.bootstrap.profile || {};
+  const config = state.config || {};
+  const profileName = profile.name || profile.id || state.bootstrap.profile_name || "default";
+  const pacs = `${config.pacs_server_ip || "—"}:${config.pacs_server_port || "—"} / ${config.pacs_ae_title || "—"}`;
+  const pdi = draft.pdi.enabled ? `开启${draft.pdi.output_folder ? `（${draft.pdi.output_folder}）` : ""}` : "关闭";
   await confirmAction(
     "确认开始下载",
-    `将向 PACS 提交 ${state.parsedAccessions.length.toLocaleString()} 个检查号。确认后立即交给后台执行。`,
-    submitStartTask,
+    `Profile：${profileName}\nPACS：${pacs}\n保存目录：${draft.destination}\nPDI：${pdi}\n\n将提交 ${draft.accessions.length.toLocaleString()} 个检查号，确认后立即交给后台执行。`,
+    () => submitStartTask(draft, signature),
     { confirmLabel: "确认并开始", tone: "primary" },
   );
 }
 
-async function submitStartTask() {
+async function submitStartTask(draft, signature) {
+  window.clearTimeout(state.accessionInputTimer);
+  parseAccessions($("#accession-input").value, { schedule: false });
+  if (signature !== draftSignature() || state.preflightSignature !== signature) {
+    showAlert("确认期间任务内容发生了变化，请重新预检后再开始。", "任务未启动");
+    updateStartAvailability();
+    return;
+  }
   const button = $("#start-task-button");
   button.disabled = true;
-  button.textContent = "正在创建…";
+  setButtonLabel(button, "正在创建…");
   try {
     const result = await api("/api/task/start", {
       method: "POST",
-      body: taskDraft(),
+      body: draft,
     });
     state.task = result.task || result;
     state.startedAt = Date.now();
@@ -393,7 +432,7 @@ async function submitStartTask() {
     showAlert(error.message, "任务启动失败");
     updateStartAvailability();
   } finally {
-    button.textContent = "开始下载";
+    setButtonLabel(button, "开始下载");
   }
 }
 
@@ -485,6 +524,17 @@ function showTaskEditor() {
   state.task = null;
   $("#task-editor").hidden = false;
   $("#task-runtime").hidden = true;
+  setTaskEditorCollapsed(false);
+}
+
+function setTaskEditorCollapsed(collapsed) {
+  state.taskEditorCollapsed = Boolean(collapsed);
+  const editor = $("#task-editor");
+  const button = $("#toggle-task-editor");
+  editor.classList.toggle("is-collapsed", state.taskEditorCollapsed);
+  $("#task-editor-body").hidden = state.taskEditorCollapsed;
+  button.setAttribute("aria-expanded", String(!state.taskEditorCollapsed));
+  setText("#toggle-task-editor-label", state.taskEditorCollapsed ? "展开" : "收起");
 }
 
 function renderTaskDetails(task, total) {
@@ -534,12 +584,40 @@ function renderTaskDetails(task, total) {
 }
 
 async function taskAction(action, body = {}) {
+  if (state.taskActionPending) return;
+  const controls = [
+    "#pause-task-button", "#resume-task-button", "#cancel-task-button",
+    "#retry-task-button", "#accept-partial-button", "#new-task-button",
+  ].map((selector) => $(selector));
+  state.taskActionPending = true;
+  $("#task-runtime").setAttribute("aria-busy", "true");
+  controls.forEach((button) => { button.disabled = true; });
   try {
     const result = await api(`/api/task/${action}`, { method: "POST", body });
     state.task = result.task || result;
     renderTask(state.task);
   } catch (error) {
     showAlert(error.message, "任务操作失败");
+  } finally {
+    state.taskActionPending = false;
+    $("#task-runtime").removeAttribute("aria-busy");
+    controls.forEach((button) => { button.disabled = false; });
+  }
+}
+
+async function runPdiAction(callback) {
+  if (state.pdiActionPending) return;
+  const controls = ["#open-pdi-button", "#verify-pdi-button", "#retry-pdi-button"]
+    .map((selector) => $(selector));
+  state.pdiActionPending = true;
+  $("#pdi-runtime").setAttribute("aria-busy", "true");
+  controls.forEach((button) => { button.disabled = true; });
+  try {
+    await callback();
+  } finally {
+    state.pdiActionPending = false;
+    $("#pdi-runtime").removeAttribute("aria-busy");
+    controls.forEach((button) => { button.disabled = false; });
   }
 }
 
@@ -582,8 +660,9 @@ function visibleLogs() {
 }
 
 function renderLogs() {
-  const logs = visibleLogs();
   const list = $("#log-list");
+  const keepAtBottom = list.hidden || list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+  const logs = visibleLogs();
   list.replaceChildren();
   $("#empty-log-state").hidden = logs.length > 0;
   list.hidden = logs.length === 0;
@@ -603,7 +682,7 @@ function renderLogs() {
     row.append(time, source, message);
     list.append(row);
   });
-  if (list.lastElementChild) list.lastElementChild.scrollIntoView({ block: "nearest" });
+  if (keepAtBottom && list.lastElementChild) list.scrollTop = list.scrollHeight;
 }
 
 function showPage(pageName) {
@@ -848,6 +927,8 @@ function scheduleTaskRefresh() {
 async function openDirectoryDialog(target, purpose) {
   state.directoryTarget = target;
   state.directoryPurpose = purpose;
+  state.currentDirectory = "";
+  $("#directory-select-button").disabled = true;
   const dialog = $("#directory-dialog");
   const titles = {
     destination: "选择 DICOM 保存目录",
@@ -860,20 +941,32 @@ async function openDirectoryDialog(target, purpose) {
 }
 
 async function loadDirectories(path = "") {
+  const requestId = ++state.directoryRequestId;
+  const dialog = $("#directory-dialog");
+  const selectButton = $("#directory-select-button");
+  state.currentDirectory = "";
+  selectButton.disabled = true;
+  dialog.setAttribute("aria-busy", "true");
   $("#directory-error").hidden = true;
   const query = new URLSearchParams({ purpose: state.directoryPurpose });
   if (path) query.set("path", path);
   try {
     const result = await api(`/api/files/directories?${query.toString()}`);
+    if (requestId !== state.directoryRequestId) return;
     state.currentDirectory = result.path || result.current || path || "";
     $("#directory-current-path").value = state.currentDirectory;
     $("#directory-up-button").dataset.path = result.parent || "";
     renderDirectories(result.directories || result.items || result.children || []);
+    selectButton.disabled = !state.currentDirectory;
   } catch (error) {
+    if (requestId !== state.directoryRequestId) return;
     const message = $("#directory-error");
     message.textContent = error.message;
     message.hidden = false;
+    $("#directory-current-path").value = "";
     renderDirectories([]);
+  } finally {
+    if (requestId === state.directoryRequestId) dialog.removeAttribute("aria-busy");
   }
 }
 
@@ -906,6 +999,7 @@ function renderDirectories(directories) {
       button.setAttribute("aria-selected", "true");
       state.currentDirectory = path;
       $("#directory-current-path").value = path;
+      $("#directory-select-button").disabled = false;
     });
     item.append(button);
     list.append(item);
@@ -914,6 +1008,10 @@ function renderDirectories(directories) {
 
 async function importAccessions(file) {
   if (!file) return;
+  state.preflightOk = false;
+  state.preflightSignature = "";
+  resetPreflightChecks();
+  updateStartAvailability();
   const extension = file.name.split(".").pop().toLowerCase();
   if (extension === "xlsx") {
     try {
@@ -1157,6 +1255,12 @@ function profileConfigPayload() {
 }
 
 async function saveProfileConfiguration(launchAfterSave) {
+  const form = $("#profile-config-form");
+  if (!form.reportValidity()) return;
+  const buttons = [$("#profile-save-button"), $("#profile-save-launch-button")];
+  if (buttons.some((button) => button.disabled)) return;
+  buttons.forEach((button) => { button.disabled = true; });
+  form.setAttribute("aria-busy", "true");
   const error = $("#profile-config-error");
   error.hidden = true;
   try {
@@ -1173,6 +1277,9 @@ async function saveProfileConfiguration(launchAfterSave) {
   } catch (exception) {
     error.textContent = exception.message;
     error.hidden = false;
+  } finally {
+    form.removeAttribute("aria-busy");
+    buttons.forEach((button) => { button.disabled = false; });
   }
 }
 
@@ -1363,10 +1470,9 @@ function bindEvents() {
   $("#dismiss-alert").addEventListener("click", clearAlert);
   $$(".nav-item[data-page]").forEach((button) => button.addEventListener("click", () => showPage(button.dataset.page)));
 
-  let inputTimer = 0;
   $("#accession-input").addEventListener("input", () => {
-    window.clearTimeout(inputTimer);
-    inputTimer = window.setTimeout(() => parseAccessions($("#accession-input").value), 120);
+    window.clearTimeout(state.accessionInputTimer);
+    state.accessionInputTimer = window.setTimeout(() => parseAccessions($("#accession-input").value), 120);
   });
   $("#destination-input").addEventListener("input", invalidatePreflight);
   $("#quick-pdi-enabled").addEventListener("change", (event) => {
@@ -1389,11 +1495,17 @@ function bindEvents() {
   dropzone.addEventListener("drop", (event) => importAccessions(event.dataTransfer.files[0]));
 
   $("#run-preflight-button").addEventListener("click", () => runPreflight());
+  $("#toggle-task-editor").addEventListener("click", () => setTaskEditorCollapsed(!state.taskEditorCollapsed));
   $("#start-task-button").addEventListener("click", startTask);
   $("#pause-task-button").addEventListener("click", () => taskAction("pause"));
   $("#resume-task-button").addEventListener("click", () => taskAction("resume"));
   $("#retry-task-button").addEventListener("click", () => taskAction("retry"));
-  $("#accept-partial-button").addEventListener("click", () => taskAction("accept-partial"));
+  $("#accept-partial-button").addEventListener("click", () => confirmAction(
+    "接受已有文件",
+    "将保留已经接收的文件，并把当前任务作为部分结果结束；尚未完成的检查号不会继续下载。确认接受吗？",
+    () => taskAction("accept-partial"),
+    { confirmLabel: "接受已有文件", tone: "primary" },
+  ));
   $("#cancel-task-button").addEventListener("click", () => confirmAction(
     "停止当前任务",
     "将停止当前 movescu，但已经收到的文件和恢复点会保留。确认停止吗？",
@@ -1407,15 +1519,15 @@ function bindEvents() {
     resetPreflightChecks();
     showTaskEditor();
   });
-  $("#open-pdi-button").addEventListener("click", async () => {
+  $("#open-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
       const result = await api("/api/pdi/open", { method: "POST", body: { task_id: state.task?.id } });
       showToast(result.message || "已在 DcmGet 主机打开 PDI 目录");
     } catch (error) {
       showAlert(error.message, "无法打开 PDI");
     }
-  });
-  $("#verify-pdi-button").addEventListener("click", async () => {
+  }));
+  $("#verify-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
       const result = await api("/api/pdi/verify", { method: "POST", body: { task_id: state.task?.id } });
       showToast(result.message || (result.ok ? "PDI 校验通过" : "PDI 校验未通过"));
@@ -1423,8 +1535,8 @@ function bindEvents() {
     } catch (error) {
       showAlert(error.message, "PDI 校验失败");
     }
-  });
-  $("#retry-pdi-button").addEventListener("click", async () => {
+  }));
+  $("#retry-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
       const result = await api("/api/pdi/retry", { method: "POST", body: { task_id: state.task?.id } });
       renderTask(result.task || result);
@@ -1432,7 +1544,7 @@ function bindEvents() {
     } catch (error) {
       showAlert(error.message, "PDI 重试失败");
     }
-  });
+  }));
 
   $("#detailed-log-toggle").addEventListener("change", (event) => {
     state.showDetailedLogs = event.target.checked;
@@ -1466,7 +1578,7 @@ function bindEvents() {
     }
   });
   $("#directory-select-button").addEventListener("click", () => {
-    if (!state.currentDirectory || !state.directoryTarget) return;
+    if ($("#directory-select-button").disabled || !state.currentDirectory || !state.directoryTarget) return;
     state.directoryTarget.value = state.currentDirectory;
     state.directoryTarget.dispatchEvent(new Event("input", { bubbles: true }));
     $("#directory-dialog").close();
@@ -1479,6 +1591,11 @@ function bindEvents() {
   $("#stop-all-services-button").addEventListener("click", stopAllServices);
   $("#profile-save-button").addEventListener("click", () => saveProfileConfiguration(false));
   $("#profile-save-launch-button").addEventListener("click", () => saveProfileConfiguration(true));
+  $("#profile-config-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveProfileConfiguration($("#profile-config-form").dataset.launchAfterSave === "true");
+  });
+  $("#profile-config-cancel").addEventListener("click", () => $("#profile-config-dialog").close("cancel"));
   $("#activate-license-button").addEventListener("click", activateLicense);
   $("#copy-machine-code-button").addEventListener("click", async () => {
     const code = $("#license-machine-code").textContent.trim();

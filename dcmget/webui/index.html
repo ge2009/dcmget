@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#0b6b78">
+  <meta name="theme-color" content="#087481">
   <title>DcmGet · 影像交付工作台</title>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
@@ -14,10 +14,66 @@
     <div class="fatal-banner">DcmGet Web 需要启用 JavaScript，所有程序资源均来自本机，不会连接互联网。</div>
   </noscript>
 
+  <svg class="icon-sprite" aria-hidden="true">
+    <symbol id="icon-dicom" viewBox="0 0 24 24">
+      <rect x="4" y="3" width="13" height="13" rx="3"></rect>
+      <path d="M8 7h5M8 10h5M8 13h3"></path>
+      <path d="M13.5 18.5h6M16.5 15.5v6"></path>
+    </symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24">
+      <path d="M12 3v11M8 10l4 4 4-4"></path>
+      <path d="M5 17v2h14v-2"></path>
+    </symbol>
+    <symbol id="icon-sliders" viewBox="0 0 24 24">
+      <path d="M4 7h8M16 7h4M4 17h4M12 17h8"></path>
+      <circle cx="14" cy="7" r="2"></circle>
+      <circle cx="10" cy="17" r="2"></circle>
+    </symbol>
+    <symbol id="icon-activity" viewBox="0 0 24 24">
+      <path d="M3 12h4l2.2-5 4.1 10 2.3-5H21"></path>
+    </symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24">
+      <path d="M3.5 7.5h6l2-2h9v13h-17z"></path>
+    </symbol>
+    <symbol id="icon-upload" viewBox="0 0 24 24">
+      <path d="M12 16V5M8 9l4-4 4 4"></path>
+      <path d="M5 18v2h14v-2"></path>
+    </symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24">
+      <path d="M19 8a7 7 0 1 0 .2 7"></path>
+      <path d="M19 4v4h-4"></path>
+    </symbol>
+    <symbol id="icon-chevron-up" viewBox="0 0 24 24">
+      <path d="m7 14 5-5 5 5"></path>
+    </symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24">
+      <path d="m8 5 11 7-11 7z"></path>
+    </symbol>
+    <symbol id="icon-pause" viewBox="0 0 24 24">
+      <path d="M8 5v14M16 5v14"></path>
+    </symbol>
+    <symbol id="icon-stop" viewBox="0 0 24 24">
+      <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+    </symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24">
+      <path d="M12 5v14M5 12h14"></path>
+    </symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24">
+      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+      <path d="M16 8V5H5v11h3"></path>
+    </symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24">
+      <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"></path>
+    </symbol>
+    <symbol id="icon-save" viewBox="0 0 24 24">
+      <path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6"></path>
+    </symbol>
+  </svg>
+
   <div id="app-shell" class="app-shell" hidden>
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">D</span>
+        <span class="brand-mark" aria-hidden="true"><svg class="icon icon--brand"><use href="#icon-dicom"></use></svg></span>
         <span>
           <strong>DcmGet</strong>
           <small>影像交付工作台</small>
@@ -38,14 +94,14 @@
 
     <aside class="sidebar" aria-label="主导航">
       <nav class="main-nav">
-        <button class="nav-item is-active" type="button" data-page="home" aria-current="page">
-          <span class="nav-icon" aria-hidden="true">⌂</span><span>任务</span>
+        <button class="nav-item is-active" type="button" data-page="home" aria-current="page" aria-label="任务" title="任务">
+          <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-download"></use></svg></span><span>任务</span>
         </button>
-        <button class="nav-item" type="button" data-page="settings">
-          <span class="nav-icon" aria-hidden="true">⚙</span><span>设置</span>
+        <button class="nav-item" type="button" data-page="settings" aria-label="设置" title="设置">
+          <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-sliders"></use></svg></span><span>设置</span>
         </button>
-        <button class="nav-item" type="button" data-page="operations">
-          <span class="nav-icon" aria-hidden="true">◇</span><span>运维</span>
+        <button class="nav-item" type="button" data-page="operations" aria-label="运维" title="运维">
+          <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-activity"></use></svg></span><span>运维</span>
         </button>
       </nav>
       <div class="sidebar-foot">
@@ -75,7 +131,7 @@
             <p class="page-description">批量提交检查号，下载由本机后台持续执行；关闭浏览器不会停止后台下载。</p>
           </div>
           <div class="page-heading-actions">
-            <button id="open-destination-button" class="button button--secondary" type="button">在主机打开目标目录</button>
+            <button id="open-destination-button" class="button button--secondary" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-folder"></use></svg><span>在主机打开目标目录</span></button>
           </div>
         </div>
 
@@ -92,19 +148,22 @@
           <div class="card-header">
             <div>
               <h2 id="new-task-title">新建下载任务</h2>
-              <p>每行一个检查号；空行忽略，重复项自动去除。</p>
+              <p>导入检查号，确认目录与预检结果，然后开始下载。</p>
             </div>
-            <span id="task-readiness" class="status-badge status-badge--neutral">等待输入</span>
+            <div class="card-header-actions">
+              <span id="task-readiness" class="status-badge status-badge--neutral">等待输入</span>
+              <button id="toggle-task-editor" class="button button--quiet button--small" type="button" aria-controls="task-editor-body" aria-expanded="true"><svg class="icon toggle-chevron" aria-hidden="true"><use href="#icon-chevron-up"></use></svg><span id="toggle-task-editor-label">收起</span></button>
+            </div>
           </div>
 
-          <div class="editor-grid">
+          <div id="task-editor-body" class="editor-grid">
             <div class="accession-column">
-              <label class="field-label" for="accession-input">检查号</label>
+              <label class="editor-section-title" for="accession-input"><span class="step-index">1</span><span><strong>导入检查号</strong><small>每行一个；自动忽略空行并去重。</small></span></label>
               <div id="accession-dropzone" class="dropzone">
                 <textarea id="accession-input" rows="11" spellcheck="false" placeholder="粘贴检查号，例如：&#10;202601261643&#10;CT202108130339"></textarea>
                 <div class="dropzone-actions">
                   <span>也可以拖入 TXT、CSV 或 XLSX 文件</span>
-                  <label class="button button--secondary button--small" for="accession-file">选择文件</label>
+                  <label class="button button--secondary button--small" for="accession-file"><svg class="icon" aria-hidden="true"><use href="#icon-upload"></use></svg><span>选择文件</span></label>
                   <input id="accession-file" type="file" accept=".txt,.csv,.xlsx,text/plain,text/csv" hidden>
                 </div>
               </div>
@@ -117,11 +176,12 @@
             </div>
 
             <div class="task-options">
+              <div class="editor-section-title"><span class="step-index">2</span><span><strong>保存与启动</strong><small>确认输出目录，并完成自动预检。</small></span></div>
               <label class="field">
                 <span>DICOM 保存目录</span>
                 <div class="input-action">
                   <input id="destination-input" type="text" autocomplete="off" placeholder="运行 DcmGet 的主机目录">
-                  <button id="browse-destination" class="button button--secondary" type="button">浏览主机</button>
+                  <button id="browse-destination" class="button button--secondary" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-folder"></use></svg><span>浏览主机</span></button>
                 </div>
                 <small>局域网访问时，此路径不是当前浏览器电脑上的目录。</small>
               </label>
@@ -146,7 +206,7 @@
               <div class="preflight-block">
                 <div class="section-label-row">
                   <span class="field-label">启动预检</span>
-                  <button id="run-preflight-button" class="text-button" type="button">重新检查</button>
+                  <button id="run-preflight-button" class="text-button text-button--icon" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>重新检查</span></button>
                 </div>
                 <ul id="preflight-list" class="check-list" aria-live="polite">
                   <li data-check="config"><span class="check-icon">·</span><span>配置完整</span><small>尚未检查</small></li>
@@ -155,7 +215,7 @@
                   <li data-check="receiver"><span class="check-icon">·</span><span>接收端口</span><small>尚未检查</small></li>
                 </ul>
               </div>
-              <button id="start-task-button" class="button button--primary button--large full-width" type="button" disabled>开始下载</button>
+              <button id="start-task-button" class="button button--primary button--large full-width" type="button" disabled><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg><span>开始下载</span></button>
               <p id="start-task-hint" class="form-hint">输入检查号并完成预检后即可开始。</p>
             </div>
           </div>
@@ -184,13 +244,13 @@
             <article class="metric"><span>已用时间</span><strong id="metric-duration">00:00</strong></article>
           </div>
           <div class="runtime-actions">
-            <button id="pause-task-button" class="button button--secondary" type="button">暂停</button>
-            <button id="resume-task-button" class="button button--primary" type="button" hidden>继续</button>
-            <button id="cancel-task-button" class="button button--danger-quiet" type="button">停止任务</button>
+            <button id="pause-task-button" class="button button--secondary" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-pause"></use></svg><span>暂停</span></button>
+            <button id="resume-task-button" class="button button--primary" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg><span>继续</span></button>
+            <button id="cancel-task-button" class="button button--danger-quiet" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg><span>停止任务</span></button>
             <span class="action-separator"></span>
             <button id="retry-task-button" class="button button--secondary" type="button" hidden>重试失败项</button>
             <button id="accept-partial-button" class="button button--secondary" type="button" hidden>接受已有文件</button>
-            <button id="new-task-button" class="button button--primary" type="button" hidden>新建任务</button>
+            <button id="new-task-button" class="button button--primary" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg><span>新建任务</span></button>
           </div>
           <div id="pdi-runtime" class="pdi-runtime" hidden>
             <div>
@@ -225,9 +285,9 @@
             </div>
             <div class="inline-actions">
               <label class="checkbox-label"><input id="detailed-log-toggle" type="checkbox"> 显示详细日志</label>
-              <button id="copy-errors-button" class="button button--quiet button--small" type="button">复制</button>
-              <button id="clear-logs-button" class="button button--quiet button--small" type="button">清空显示</button>
-              <button id="open-log-directory-button" class="button button--quiet button--small" type="button">日志目录</button>
+              <button id="copy-errors-button" class="button button--quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-copy"></use></svg><span>复制</span></button>
+              <button id="clear-logs-button" class="button button--quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg><span>清空显示</span></button>
+              <button id="open-log-directory-button" class="button button--quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-folder"></use></svg><span>日志目录</span></button>
             </div>
           </div>
           <div id="empty-log-state" class="empty-state">
@@ -242,7 +302,7 @@
       <section id="page-settings" class="page" data-page-panel="settings" aria-labelledby="settings-title" hidden>
         <div class="page-heading">
           <div><p class="eyebrow">配置</p><h1 id="settings-title">设置</h1><p class="page-description">更改保存后只影响后续新任务。</p></div>
-          <div class="page-heading-actions"><button id="save-settings-button" class="button button--primary" type="submit" form="settings-form">保存设置</button></div>
+          <div class="page-heading-actions"><button id="save-settings-button" class="button button--primary" type="submit" form="settings-form"><svg class="icon" aria-hidden="true"><use href="#icon-save"></use></svg><span>保存设置</span></button></div>
         </div>
         <form id="settings-form" class="settings-layout">
           <section class="card settings-card" aria-labelledby="pacs-settings-title">
@@ -341,11 +401,11 @@
             <div class="inline-actions">
               <button class="button button--secondary" type="button" data-operation="profile-backup">备份 Profile</button>
               <button class="button button--secondary" type="button" data-operation="open-data-directory">在主机打开数据目录</button>
-              <button id="shutdown-service-button" class="button button--danger-quiet" type="button">关闭 DcmGet 后台</button>
+              <button id="shutdown-service-button" class="button button--danger-quiet" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg><span>关闭 DcmGet 后台</span></button>
             </div>
           </section>
           <section id="profile-management-card" class="card operations-card operations-card--wide">
-            <div class="card-header"><div><h2>Profile 管理</h2><p>先配置 PACS、接收端口和 Web 端口，再启动独立任务实例。</p><span id="windows-service-state" class="status-badge status-badge--neutral" hidden>kayisoft-dcmget · 检查中</span></div><div class="inline-actions"><button id="start-all-profiles-button" class="button button--primary button--small" type="button">启动全部</button><button id="stop-all-services-button" class="button button--danger-quiet button--small" type="button">停止全部</button><button id="refresh-profiles-button" class="button button--secondary button--small" type="button">刷新</button></div></div>
+            <div class="card-header"><div><h2>Profile 管理</h2><p>先配置 PACS、接收端口和 Web 端口，再启动独立任务实例。</p><span id="windows-service-state" class="status-badge status-badge--neutral" hidden>kayisoft-dcmget · 检查中</span></div><div class="inline-actions"><button id="start-all-profiles-button" class="button button--primary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg><span>启动全部</span></button><button id="stop-all-services-button" class="button button--danger-quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg><span>停止全部</span></button><button id="refresh-profiles-button" class="button button--secondary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>刷新</span></button></div></div>
             <div class="table-wrap profile-table-wrap">
               <table class="data-table">
                 <thead><tr><th>名称</th><th>PACS</th><th>接收</th><th>Web 端口</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead>
@@ -355,7 +415,7 @@
             <p id="profile-management-hint" class="form-hint">SCP 接收端口、Web 端口以及其他 Profile 已使用的端口不能重复；保存时会自动检查并提示。</p>
           </section>
           <section class="card operations-card">
-            <div class="card-header"><div><h2>健康检查</h2><p>检查工具、目录、端口、数据库和磁盘状态。</p></div><button id="refresh-health-button" class="button button--secondary button--small" type="button">重新检查</button></div>
+            <div class="card-header"><div><h2>健康检查</h2><p>检查工具、目录、端口、数据库和磁盘状态。</p></div><button id="refresh-health-button" class="button button--secondary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>重新检查</span></button></div>
             <ul id="health-list" class="health-list" aria-live="polite"><li class="health-placeholder">尚未执行健康检查</li></ul>
           </section>
           <section class="card operations-card">
@@ -436,7 +496,7 @@
         </div>
       </div>
       <p id="profile-config-error" class="field-error" role="alert" hidden></p>
-      <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="profile-save-button" class="button button--secondary" type="button">仅保存</button><button id="profile-save-launch-button" class="button button--primary" type="button">保存并启动</button></div>
+      <div class="dialog-actions"><button id="profile-config-cancel" class="button button--secondary" type="button">取消</button><button id="profile-save-button" class="button button--secondary" type="button">仅保存</button><button id="profile-save-launch-button" class="button button--primary" type="button">保存并启动</button></div>
     </form>
   </dialog>
 
