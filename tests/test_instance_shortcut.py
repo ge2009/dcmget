@@ -1,12 +1,7 @@
 from __future__ import annotations
 
-import os
-import subprocess
-from pathlib import Path
-
 import pytest
 
-import dcmget.instance_shortcut as shortcut_module
 from dcmget.instance_shortcut import (
     InstanceShortcutError,
     ShortcutExistsError,
@@ -14,6 +9,7 @@ from dcmget.instance_shortcut import (
     create_instance_shortcut,
     default_instance_shortcut_name,
     normalize_shortcut_name,
+    profile_web_url,
 )
 
 
@@ -76,6 +72,21 @@ def test_source_launch_targets_python_and_ui_entrypoint(tmp_path):
     assert launch.working_directory == tmp_path.resolve()
 
 
+def test_profile_web_launch_adds_explicit_open_flag(tmp_path):
+    executable = tmp_path / "DcmGet.exe"
+    executable.write_bytes(b"MZ")
+
+    launch = build_instance_launch_command(
+        7,
+        project_root=tmp_path,
+        executable=executable,
+        frozen=True,
+        open_profile_web=True,
+    )
+
+    assert launch.arguments == ("--profile", "7", "--open-profile-web")
+
+
 @pytest.mark.parametrize("profile_number", [0, 10000, True, "bad"])
 def test_launch_rejects_invalid_profile_numbers(tmp_path, profile_number):
     executable = tmp_path / "DcmGet.exe"
@@ -113,37 +124,27 @@ def test_source_launch_rejects_missing_entrypoint(tmp_path):
         )
 
 
-def test_macos_shortcut_contains_quoted_profile_launch_and_is_executable(tmp_path):
-    project = tmp_path / "Project With Spaces"
-    project.mkdir()
-    (project / "DICOM_download_ui.py").write_text("", encoding="utf-8")
-    executable = tmp_path / "Python 3.12" / "python3"
-    executable.parent.mkdir()
-    executable.write_bytes(b"python")
+def test_macos_shortcut_is_a_direct_profile_web_location(tmp_path):
     desktop = tmp_path / "Desktop"
 
     result = create_instance_shortcut(
         4,
         "dcmget-6666-AE",
         desktop,
-        project_root=project,
-        executable=executable,
-        frozen=False,
+        web_port=8787,
         platform="darwin",
     )
 
-    assert result.name == "dcmget-6666-AE.command"
+    assert result.name == "dcmget-6666-AE.webloc"
     content = result.read_text(encoding="utf-8")
-    assert "--profile 4" in content
-    assert "Project With Spaces" in content
-    if os.name != "nt":
-        assert result.stat().st_mode & 0o111
+    assert "http://127.0.0.1:8787/" in content
+    assert "--profile" not in content
 
 
 def test_existing_shortcut_requires_explicit_overwrite(tmp_path):
     desktop = tmp_path / "Desktop"
     desktop.mkdir()
-    existing = desktop / "dcmget-6666-AE.command"
+    existing = desktop / "dcmget-6666-AE.webloc"
     existing.write_text("old", encoding="utf-8")
 
     with pytest.raises(ShortcutExistsError) as captured:
@@ -151,9 +152,7 @@ def test_existing_shortcut_requires_explicit_overwrite(tmp_path):
             1,
             "dcmget-6666-AE",
             desktop,
-            project_root=tmp_path,
-            executable=tmp_path / "python3",
-            frozen=False,
+            web_port=8787,
             platform="darwin",
         )
 
@@ -161,38 +160,54 @@ def test_existing_shortcut_requires_explicit_overwrite(tmp_path):
     assert existing.read_text(encoding="utf-8") == "old"
 
 
-def test_windows_shortcut_uses_powershell_without_shell_and_passes_exact_arguments(
-    tmp_path, monkeypatch
-):
-    calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        Path(kwargs["env"]["DCMGET_SHORTCUT_TEMP"]).write_bytes(b"lnk")
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(shortcut_module.shutil, "which", lambda _name: "powershell.exe")
-    monkeypatch.setattr(shortcut_module.subprocess, "run", fake_run)
-    executable = tmp_path / "DcmGet Portable.exe"
-    executable.write_bytes(b"MZ")
-
+def test_windows_shortcut_is_a_direct_profile_web_url(tmp_path):
     result = create_instance_shortcut(
         12,
         "dcmget-7777-AE12",
         tmp_path / "Desktop",
-        project_root=tmp_path,
-        executable=executable,
-        frozen=True,
+        web_port=8899,
         platform="win32",
     )
 
-    command, kwargs = calls[0]
-    assert command[:3] == ["powershell.exe", "-NoProfile", "-NonInteractive"]
-    assert kwargs["shell"] is False
-    assert kwargs["env"]["DCMGET_SHORTCUT_TARGET"].endswith("DcmGet Portable.exe")
-    assert kwargs["env"]["DCMGET_SHORTCUT_ARGUMENTS"] == "--profile 12"
-    assert result.name == "dcmget-7777-AE12.lnk"
-    assert result.read_bytes() == b"lnk"
+    assert result.name == "dcmget-7777-AE12.url"
+    assert result.read_text(encoding="utf-8") == (
+        "[InternetShortcut]\nURL=http://127.0.0.1:8899/\nIconIndex=0\n"
+    )
+
+
+def test_linux_shortcut_uses_desktop_link_without_starting_a_process(tmp_path):
+    result = create_instance_shortcut(
+        2,
+        "dcmget-6667-AE02",
+        tmp_path,
+        web_port=8788,
+        platform="linux",
+    )
+
+    assert result.name == "dcmget-6667-AE02.desktop"
+    content = result.read_text(encoding="utf-8")
+    assert "Type=Link" in content
+    assert "URL=http://127.0.0.1:8788/" in content
+    assert "Exec=" not in content
+
+
+def test_shortcut_requires_a_valid_loopback_profile_url(tmp_path):
+    with pytest.raises(InstanceShortcutError, match="必须提供 Profile Web 端口"):
+        create_instance_shortcut(
+            1,
+            "dcmget",
+            tmp_path,
+            platform="win32",
+        )
+    with pytest.raises(InstanceShortcutError, match="本机 Profile Web 地址"):
+        create_instance_shortcut(
+            1,
+            "dcmget",
+            tmp_path,
+            url="https://example.com/",
+            platform="win32",
+        )
+    assert profile_web_url(8787) == "http://127.0.0.1:8787/"
 
 
 def test_filesystem_errors_are_reported_as_shortcut_errors(tmp_path):
@@ -204,8 +219,6 @@ def test_filesystem_errors_are_reported_as_shortcut_errors(tmp_path):
             1,
             "dcmget-6666-AE",
             destination,
-            project_root=tmp_path,
-            executable=tmp_path / "python3",
-            frozen=False,
+            web_port=8787,
             platform="darwin",
         )

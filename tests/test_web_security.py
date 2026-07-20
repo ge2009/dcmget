@@ -15,6 +15,7 @@ from dcmget.web_security import (
     SessionStore,
     UnsafePathError,
     WebSecurityError,
+    bootstrap_web_security,
     discover_local_hosts,
 )
 
@@ -67,6 +68,20 @@ def test_password_store_rejects_symlink_and_modified_kdf_parameters(tmp_path: Pa
         pytest.skip(f"当前系统不允许创建测试符号链接：{exc}")
     with pytest.raises(WebSecurityError, match="认证文件无效"):
         store.load_or_create()
+
+
+def test_passwordless_security_bootstrap_ignores_legacy_auth_file(tmp_path: Path):
+    state = tmp_path / "profile"
+    state.mkdir()
+    legacy = state / "web-auth.json"
+    legacy.write_text("not valid json", encoding="utf-8")
+
+    security = bootstrap_web_security(state)
+
+    assert security.bootstrap_password is None
+    assert security.status()["authenticated"] is True
+    assert security.status()["passwordless"] is True
+    assert legacy.read_text(encoding="utf-8") == "not valid json"
 
 
 def test_session_store_expires_and_revokes(monkeypatch):

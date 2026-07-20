@@ -49,6 +49,8 @@ class ProfileInfo:
     number: int
     display_name: str
     config_path: Path
+    pacs_server_ip: str
+    pacs_server_port: int
     calling_ae_title: str
     pacs_ae_title: str
     storage_ae_title: str
@@ -150,7 +152,12 @@ class ProfileManager:
     def get_profile(self, profile_number: int | str) -> ProfileInfo:
         return self._profile_info(_profile_number(profile_number))
 
-    def recommend_available_port(self, starting_port: int = 6666) -> int:
+    def recommend_available_port(
+        self,
+        starting_port: int = 6666,
+        *,
+        excluded_ports: tuple[int, ...] = (),
+    ) -> int:
         try:
             start = int(starting_port)
         except (TypeError, ValueError) as exc:
@@ -166,6 +173,7 @@ class ProfileManager:
             for profile in self.list_profiles()
             for port in (profile.storage_port, profile.web_port)
         }
+        used_ports.update(int(port) for port in excluded_ports)
         candidates = range(start, 65536)
         wrapped = range(MIN_RECOMMENDED_PORT, start)
         for candidate in (*candidates, *wrapped):
@@ -205,7 +213,10 @@ class ProfileManager:
                 if source_config.web_port < 65535
                 else MIN_RECOMMENDED_PORT
             )
-            recommended_web_port = self.recommend_available_port(starting_web_port)
+            recommended_web_port = self.recommend_available_port(
+                starting_web_port,
+                excluded_ports=(recommended_port,),
+            )
             cloned_config = replace(
                 source_config,
                 storage_port=recommended_port,
@@ -263,6 +274,127 @@ class ProfileManager:
             allocation_lock.release()
         return self.get_profile(number)
 
+    def update_profile(
+        self,
+        profile_number: int | str,
+        *,
+        display_name: str | None = None,
+        pacs_server_ip: str | None = None,
+        pacs_server_port: int | None = None,
+        calling_ae_title: str | None = None,
+        pacs_ae_title: str | None = None,
+        storage_ae_title: str | None = None,
+        storage_port: int | None = None,
+        web_port: int | None = None,
+        dicom_destination_folder: str | None = None,
+    ) -> ProfileInfo:
+        """Update one stopped profile after validating all reserved ports."""
+
+        number = _profile_number(profile_number)
+        normalized_name = (
+            _display_name(display_name) if display_name is not None else None
+        )
+        changes: dict[str, object] = {}
+        for field, value in (
+            ("pacs_server_ip", pacs_server_ip),
+            ("calling_ae_title", calling_ae_title),
+            ("pacs_ae_title", pacs_ae_title),
+            ("storage_ae_title", storage_ae_title),
+            ("dicom_destination_folder", dicom_destination_folder),
+        ):
+            if value is not None:
+                if not isinstance(value, str):
+                    raise ProfileManagerError(f"{field} 必须是文本")
+                changes[field] = value.strip()
+        for field, value in (
+            ("pacs_server_port", pacs_server_port),
+            ("storage_port", storage_port),
+            ("web_port", web_port),
+        ):
+            if value is not None:
+                changes[field] = _port_number(value, field)
+
+        allocation_lock = self._acquire_allocation_lock()
+        profile_lock: FileLock | None = None
+        previous: AppConfig | None = None
+        previous_name = ""
+        metadata_existed = False
+        config_saved = False
+        try:
+            try:
+                profile_lock = self._acquire_profile_lock(number)
+            except ProfileInUseError:
+                raise ProfileInUseError(
+                    f"实例 {number} 正在运行，请先停止后再修改配置"
+                ) from None
+            previous = self._load_profile_config(number)
+            updated = replace(previous, **changes)
+            errors = updated.validate()
+            if errors:
+                detail = "；".join(dict.fromkeys(errors.values()))
+                raise ProfileManagerError(f"实例 {number} 配置校验失败：{detail}")
+            self._validate_config_ports(
+                number,
+                updated,
+                check_system_ports=True,
+            )
+
+            metadata_path = self._metadata_path(number)
+            metadata_existed = metadata_path.is_file()
+            previous_name = self._read_display_name(number)
+            save_config(self._config_path(number), updated)
+            _make_private(self._config_path(number))
+            config_saved = True
+            if normalized_name is not None:
+                self._write_metadata(number, normalized_name)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            if config_saved and previous is not None:
+                try:
+                    save_config(self._config_path(number), previous)
+                    _make_private(self._config_path(number))
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"配置回滚失败：{rollback_exc}")
+                if normalized_name is not None:
+                    try:
+                        if metadata_existed:
+                            self._write_metadata(number, previous_name)
+                        else:
+                            self._metadata_path(number).unlink(missing_ok=True)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"名称回滚失败：{rollback_exc}")
+            if isinstance(exc, ProfileManagerError) and not rollback_errors:
+                raise
+            detail = f"保存实例 {number} 配置失败：{exc}"
+            if rollback_errors:
+                detail += "；" + "；".join(rollback_errors)
+            raise ProfileManagerError(detail) from exc
+        finally:
+            if profile_lock is not None and profile_lock.is_locked:
+                profile_lock.release()
+            allocation_lock.release()
+        return self.get_profile(number)
+
+    def validate_profile_ports(
+        self,
+        profile_number: int | str,
+        *,
+        check_system_ports: bool = False,
+    ) -> None:
+        """Raise a Chinese actionable error for duplicate or occupied ports."""
+
+        number = _profile_number(profile_number)
+        allocation_lock = self._acquire_allocation_lock()
+        try:
+            config = self._load_profile_config(number)
+            self._validate_config_ports(
+                number,
+                config,
+                check_system_ports=check_system_ports,
+            )
+        finally:
+            allocation_lock.release()
+
     def delete_profile(self, profile_number: int | str) -> None:
         number = _profile_number(profile_number)
         allocation_lock = self._acquire_allocation_lock()
@@ -305,6 +437,8 @@ class ProfileManager:
             number=number,
             display_name=self._read_display_name(number),
             config_path=config_path,
+            pacs_server_ip=config.pacs_server_ip,
+            pacs_server_port=config.pacs_server_port,
             calling_ae_title=config.calling_ae_title,
             pacs_ae_title=config.pacs_ae_title,
             storage_ae_title=config.storage_ae_title,
@@ -314,6 +448,54 @@ class ProfileManager:
             is_running=self._profile_is_running(number),
             has_recovery=self._recovery_path(number).is_file(),
         )
+
+    def _validate_config_ports(
+        self,
+        number: int,
+        config: AppConfig,
+        *,
+        check_system_ports: bool,
+    ) -> None:
+        ports = (
+            ("DICOM 接收端口", config.storage_port),
+            ("Web 端口", config.web_port),
+        )
+        for label, port in ports:
+            if isinstance(port, bool) or not 1 <= int(port) <= 65535:
+                raise ProfileManagerError(
+                    f"实例 {number} 的{label}必须在 1 到 65535 之间"
+                )
+        if config.storage_port == config.web_port:
+            raise ProfileManagerError(
+                f"实例 {number} 的 DICOM 接收端口 {config.storage_port} "
+                "不能与 Web 端口相同"
+            )
+        for profile in self.list_profiles():
+            if profile.number == number:
+                continue
+            other_ports = (
+                ("DICOM 接收端口", profile.storage_port),
+                ("Web 端口", profile.web_port),
+            )
+            for label, port in ports:
+                for other_label, other_port in other_ports:
+                    if port == other_port:
+                        raise ProfileManagerError(
+                            f"实例 {number} 的{label} {port} 与实例 "
+                            f"{profile.number} 的{other_label}冲突，请修改后再启动"
+                        )
+        if not check_system_ports:
+            return
+        for label, port in ports:
+            try:
+                available = bool(self._port_probe(self.bind_host, port))
+            except OSError:
+                available = False
+            if not available:
+                raise ProfileManagerError(
+                    f"实例 {number} 的{label} {port} 已被其他程序占用，"
+                    "请修改后再启动"
+                )
 
     def _load_profile_config(self, number: int) -> AppConfig:
         config_path = self._require_config_path(number)
@@ -502,6 +684,24 @@ def _display_name(value: object) -> str:
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in name):
         raise ProfileManagerError("Profile 显示名不能包含控制字符")
     return name
+
+
+def _port_number(value: object, field: str) -> int:
+    labels = {
+        "pacs_server_port": "PACS 端口",
+        "storage_port": "DICOM 接收端口",
+        "web_port": "Web 端口",
+    }
+    label = labels.get(field, "端口")
+    if isinstance(value, bool):
+        raise ProfileManagerError(f"{label}必须在 1 到 65535 之间")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ProfileManagerError(f"{label}必须在 1 到 65535 之间") from exc
+    if not 1 <= port <= 65535:
+        raise ProfileManagerError(f"{label}必须在 1 到 65535 之间")
+    return port
 
 
 def _profile_sort_key(path: Path) -> tuple[int, str]:

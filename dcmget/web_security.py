@@ -638,10 +638,11 @@ class WebSecurityContext:
 
     def status(self) -> dict[str, object]:
         return {
-            "authenticated": False,
+            "authenticated": True,
+            "passwordless": True,
             "insecure_http": True,
             "transport": "http",
-            "warning": "局域网 HTTP 登录信息不会加密，请仅在可信内网使用。",
+            "warning": "局域网 HTTP 未加密，请仅在可信内网使用。",
         }
 
 
@@ -651,10 +652,15 @@ def bootstrap_web_security(
     session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS,
 ) -> WebSecurityContext:
     password_store = PasswordStore(state_directory)
-    initial_password = password_store.load_or_create()
+    # Password authentication was removed from the Web workspace.  Keep the
+    # store object only as a compatibility holder for the private state path;
+    # deliberately do not read or rewrite a legacy web-auth.json.  A damaged
+    # credential left by an older release must not prevent the application
+    # from starting in passwordless mode.
+    _private_directory(password_store.state_directory)
     return WebSecurityContext(
         password_store=password_store,
         sessions=SessionStore(ttl_seconds=session_ttl_seconds),
         login_limiter=LoginRateLimiter(),
-        bootstrap_password=initial_password,
+        bootstrap_password=None,
     )

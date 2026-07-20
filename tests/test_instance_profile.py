@@ -964,3 +964,71 @@ def test_legacy_migration_refuses_to_race_an_active_old_instance(
 def test_explicit_profile_number_is_validated(tmp_path, value):
     with pytest.raises(InstanceProfileError, match="实例编号"):
         acquire_instance_profile(value, **_profile_kwargs(tmp_path))
+
+
+def test_profile_web_browser_waits_until_http_service_is_ready():
+    import DICOM_download_ui as entry
+
+    attempts = 0
+    opened: list[tuple[str, int]] = []
+
+    class _Response:
+        def close(self) -> None:
+            return None
+
+    def probe(_url: str, **_kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("service is still starting")
+        return _Response()
+
+    assert entry._open_browser_when_ready(
+        "http://127.0.0.1:8787/",
+        timeout=1,
+        poll_interval=0,
+        urlopen=probe,
+        opener=lambda url, new=0: opened.append((url, new)) or True,
+    )
+    assert attempts == 2
+    assert opened == [("http://127.0.0.1:8787/", 1)]
+
+
+def test_profile_web_browser_is_not_opened_when_service_never_starts():
+    import DICOM_download_ui as entry
+
+    opened: list[str] = []
+
+    assert not entry._open_browser_when_ready(
+        "http://127.0.0.1:8787/",
+        timeout=0.01,
+        poll_interval=0.001,
+        urlopen=lambda _url, **_kwargs: (_ for _ in ()).throw(OSError("down")),
+        opener=lambda url, **_kwargs: opened.append(url) or True,
+    )
+    assert opened == []
+
+
+def test_profile_web_launch_and_service_browser_flags_are_parsed():
+    import DICOM_download_ui as entry
+
+    args = entry.build_parser().parse_args(
+        [
+            "--profile",
+            "3",
+            "--open-profile-web",
+            "--no-open-browser",
+            "--storage-port",
+            "6777",
+            "--web-port",
+            "8899",
+        ]
+    )
+
+    assert args.profile == 3
+    assert args.open_profile_web
+    assert args.no_open_browser
+    assert args.storage_port == 6777
+    assert args.web_port == 8899
+    assert not entry._activation_requests_browser({"action": "ensure-running"})
+    assert entry._activation_requests_browser({"action": "open-profile-web"})

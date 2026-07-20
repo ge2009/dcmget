@@ -139,34 +139,11 @@ code {
   font-weight: 700;
 }
 
-.auth-screen {
-  display: grid;
-  min-height: 100vh;
-  place-items: center;
-  padding: 28px;
-  background:
-    linear-gradient(135deg, rgb(11 107 120 / 8%) 0 20%, transparent 20% 100%),
-    var(--bg);
-}
-
-.auth-panel {
-  width: min(100%, 440px);
-  padding: 34px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow-md);
-}
-
 .brand {
   display: flex;
   align-items: center;
   min-width: max-content;
   gap: 11px;
-}
-
-.brand--auth {
-  margin-bottom: 38px;
 }
 
 .brand-mark {
@@ -195,21 +172,6 @@ code {
 .brand small {
   color: var(--text-muted);
   font-size: .75rem;
-}
-
-.auth-copy h1 {
-  font-size: 1.75rem;
-}
-
-.auth-foot {
-  margin: 20px 0 0;
-  color: var(--text-muted);
-  font-size: .82rem;
-  text-align: center;
-}
-
-.stack > * + * {
-  margin-top: 15px;
 }
 
 .eyebrow {
@@ -643,7 +605,6 @@ code {
 }
 
 input[type="text"],
-input[type="password"],
 select,
 textarea {
   width: 100%;
@@ -654,7 +615,6 @@ textarea {
 }
 
 input[type="text"],
-input[type="password"],
 select {
   min-height: 41px;
   padding: 8px 11px;
@@ -1426,9 +1386,25 @@ dialog::backdrop {
   font-weight: 800;
 }
 
-.confirm-password-field {
-  margin-top: 16px;
-  text-align: left;
+.profile-config-shell {
+  width: min(820px, calc(100vw - 32px));
+}
+
+.profile-config-section {
+  padding: 16px 0;
+  border-top: 1px solid var(--border);
+}
+
+.profile-config-section:first-of-type {
+  border-top: 0;
+}
+
+.profile-config-section h3 {
+  margin-bottom: 12px;
+  color: var(--primary);
+  font-size: .82rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
 }
 
 .toast-region {
@@ -1562,14 +1538,6 @@ dialog::backdrop {
 }
 
 @media (max-width: 620px) {
-  .auth-screen {
-    padding: 14px;
-  }
-
-  .auth-panel {
-    padding: 25px 20px;
-  }
-
   .card-header,
   .runtime-heading {
     padding: 16px;

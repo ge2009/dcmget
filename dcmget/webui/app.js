@@ -59,6 +59,8 @@ const state = {
   preflightRequestId: 0,
   initialized: false,
   localSession: true,
+  profiles: [],
+  windowsService: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -113,7 +115,10 @@ async function api(path, options = {}) {
   if (rotatedToken) state.csrfToken = rotatedToken;
 
   if (!response.ok) {
-    if (response.status === 401 && path !== "/api/login") showLogin(false);
+    if (response.status === 401 && path !== "/api/bootstrap") {
+      state.csrfToken = "";
+      window.setTimeout(loadBootstrap, 0);
+    }
     const message = payload?.message || payload?.error || payload?.detail
       || `请求失败（HTTP ${response.status}）`;
     throw new ApiError(String(message), response.status, payload);
@@ -365,20 +370,20 @@ async function startTask() {
   }
   await confirmAction(
     "确认开始下载",
-    `将向 PACS 提交 ${state.parsedAccessions.length.toLocaleString()} 个检查号。请输入管理员密码后开始。`,
-    (password) => submitStartTask(password),
-    { requirePassword: true, confirmLabel: "确认并开始", tone: "primary" },
+    `将向 PACS 提交 ${state.parsedAccessions.length.toLocaleString()} 个检查号。确认后立即交给后台执行。`,
+    submitStartTask,
+    { confirmLabel: "确认并开始", tone: "primary" },
   );
 }
 
-async function submitStartTask(password) {
+async function submitStartTask() {
   const button = $("#start-task-button");
   button.disabled = true;
   button.textContent = "正在创建…";
   try {
     const result = await api("/api/task/start", {
       method: "POST",
-      body: { ...taskDraft(), password },
+      body: taskDraft(),
     });
     state.task = result.task || result;
     state.startedAt = Date.now();
@@ -542,30 +547,22 @@ async function confirmAction(
   title,
   message,
   callback,
-  { requirePassword = false, confirmLabel = "确认", tone = "danger" } = {},
+  { confirmLabel = "确认", tone = "danger" } = {},
 ) {
   const dialog = $("#confirm-dialog");
-  const passwordField = $("#confirm-password-field");
-  const passwordInput = $("#confirm-password");
   const confirmButton = $("#confirm-action-button");
   setText("#confirm-title", title);
   setText("#confirm-message", message);
-  passwordField.hidden = !requirePassword;
-  passwordInput.required = requirePassword;
-  passwordInput.value = "";
   confirmButton.textContent = confirmLabel;
   confirmButton.classList.toggle("button--primary", tone === "primary");
   confirmButton.classList.toggle("button--danger", tone !== "primary");
   dialog.returnValue = "";
   const onClose = async () => {
     dialog.removeEventListener("close", onClose);
-    const password = passwordInput.value;
-    passwordInput.value = "";
-    if (dialog.returnValue === "confirm") await callback(password);
+    if (dialog.returnValue === "confirm") await callback();
   };
   dialog.addEventListener("close", onClose);
   dialog.showModal();
-  if (requirePassword) passwordInput.focus();
 }
 
 function addLog(entry) {
@@ -625,88 +622,13 @@ function showPage(pageName) {
   if (pageName === "operations") refreshOperations();
 }
 
-function authState(payload) {
-  return payload?.auth || payload?.authentication || payload || {};
-}
-
-function showLogin(firstRun = false, canSetupHere = true) {
-  $("#app-shell").hidden = true;
-  $("#login-screen").hidden = false;
-  $("#login-error").hidden = true;
-  const remoteSetupBlocked = firstRun && !canSetupHere;
-  $("#login-form").hidden = remoteSetupBlocked;
-  setText("#login-title", remoteSetupBlocked ? "等待本机初始化" : firstRun ? "设置首次访问密码" : "登录 DcmGet");
-  setText("#login-hint", remoteSetupBlocked
-    ? "首次密码只能在运行 DcmGet 的主机本机设置。请在主机打开此页面完成初始化，然后刷新本页。"
-    : firstRun
-      ? "这是首次启动。请设置仅用于当前 DcmGet Profile 的访问密码。"
-      : "请输入管理员设置的访问密码。");
-  $("#login-password").setAttribute("autocomplete", firstRun ? "new-password" : "current-password");
-  $("#login-confirm-field").hidden = !firstRun;
-  $("#login-password-confirm").required = Boolean(firstRun);
-  $("#login-form").dataset.firstRun = firstRun ? "true" : "false";
-  if (!remoteSetupBlocked) $("#login-password").focus();
-}
-
 function showApplication() {
-  $("#login-screen").hidden = true;
   $("#app-shell").hidden = false;
-}
-
-async function login(event) {
-  event.preventDefault();
-  const password = $("#login-password").value;
-  const firstRun = $("#login-form").dataset.firstRun === "true";
-  const confirmPassword = $("#login-password-confirm").value;
-  const error = $("#login-error");
-  error.hidden = true;
-  if (firstRun && password !== confirmPassword) {
-    error.textContent = "两次输入的密码不一致。";
-    error.hidden = false;
-    $("#login-password-confirm").focus();
-    return;
-  }
-  try {
-    const result = await api(firstRun ? "/api/setup" : "/api/login", {
-      method: "POST",
-      body: { password, confirm_password: confirmPassword, setup: firstRun },
-    });
-    $("#login-password").value = "";
-    $("#login-password-confirm").value = "";
-    if (result.bootstrap) applyBootstrap(result.bootstrap);
-    else await loadBootstrap();
-  } catch (exception) {
-    error.textContent = exception.message;
-    error.hidden = false;
-    $("#login-password").select();
-  }
-}
-
-async function logout() {
-  try {
-    await api("/api/logout", { method: "POST", body: {} });
-  } catch (_) {
-    // A cleared or expired session has the same visible result.
-  }
-  closeEvents();
-  state.initialized = false;
-  window.clearTimeout(state.preflightTimer);
-  showLogin(false);
 }
 
 function applyBootstrap(payload) {
   state.bootstrap = payload || {};
   state.csrfToken = payload.csrf_token || payload.csrfToken || state.csrfToken;
-  const auth = authState(payload);
-  const authenticated = auth.authenticated ?? payload.authenticated ?? false;
-  const firstRun = auth.first_run || auth.requires_password_setup || auth.setup_required
-    || payload.first_run || payload.setup_required;
-  if (!authenticated) {
-    const canSetupHere = auth.can_setup_here ?? payload.can_setup_here ?? true;
-    showLogin(Boolean(firstRun), Boolean(canSetupHere));
-    return;
-  }
-
   showApplication();
   state.config = payload.config || {};
   populateSettings(state.config);
@@ -726,11 +648,9 @@ async function loadBootstrap() {
     const payload = await api("/api/bootstrap");
     applyBootstrap(payload);
   } catch (error) {
-    if (error.status === 401) return;
-    showLogin(false);
-    const loginError = $("#login-error");
-    loginError.textContent = `无法连接 DcmGet 后台：${error.message}`;
-    loginError.hidden = false;
+    showApplication();
+    setConnectionState("disconnected", "后台连接失败");
+    showAlert(`无法连接 DcmGet 后台：${error.message}`, "连接失败");
   }
 }
 
@@ -790,7 +710,6 @@ function populateSettings(config) {
   const derived = {
     ...config,
     web_lan_enabled: !["127.0.0.1", "::1"].includes(config.web_bind_address),
-    web_auth_required: true,
     pdi_volume_size_gb: config.pdi_volume_size_gb ?? (Number(config.pdi_volume_size_bytes || 0) / 1024 ** 3),
     minimum_free_space_gb: config.minimum_free_space_gb ?? (Number(config.minimum_free_space_bytes || 0) / 1024 ** 3),
     max_log_file_size_mb: config.max_log_file_size_mb ?? (Number(config.max_log_file_size_bytes || 0) / 1024 ** 2),
@@ -835,7 +754,6 @@ function settingsPayload() {
   delete data.max_log_file_size_mb;
   delete data.pdi_volume_size_gb;
   delete data.web_lan_enabled;
-  delete data.web_auth_required;
   return data;
 }
 
@@ -1038,13 +956,13 @@ async function runOperation(name, body = {}) {
   }
 }
 
-async function shutdownService(password) {
+async function shutdownService() {
   const button = $("#shutdown-service-button");
   button.disabled = true;
   try {
     const result = await api("/api/operations/shutdown", {
       method: "POST",
-      body: { password },
+      body: {},
     });
     state.initialized = false;
     window.clearTimeout(state.preflightTimer);
@@ -1058,7 +976,7 @@ async function shutdownService(password) {
 }
 
 async function refreshOperations() {
-  const refreshes = [refreshHealth(), refreshLicense(), refreshReleaseNotes()];
+  const refreshes = [refreshHealth(), refreshLicense(), refreshReleaseNotes(), refreshWindowsServiceStatus()];
   if (state.localSession) refreshes.push(refreshProfiles());
   await Promise.allSettled(refreshes);
 }
@@ -1078,22 +996,24 @@ function profileActionButton(label, action, profile, disabled = false) {
 }
 
 function renderProfiles(profiles) {
+  state.profiles = Array.isArray(profiles) ? profiles : [];
   const body = $("#profile-table-body");
   body.replaceChildren();
-  if (!profiles.length) {
+  if (!state.profiles.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     cell.textContent = "尚未创建 Profile。";
     row.append(cell);
     body.append(row);
     return;
   }
-  profiles.forEach((profile) => {
+  state.profiles.forEach((profile) => {
     const row = document.createElement("tr");
     const stateLabel = [profile.is_running ? "运行中" : "空闲", profile.has_recovery ? "有恢复任务" : ""].filter(Boolean).join(" · ");
     const values = [
       profile.display_name || `Profile ${profile.number}`,
+      `${profile.pacs_server_ip || "—"}:${profile.pacs_server_port || "—"} · ${profile.pacs_ae_title || "—"}`,
       `${profile.storage_ae_title || "—"}:${profile.storage_port || "—"}`,
       profile.web_port || "—",
       profile.destination_directory || "—",
@@ -1106,10 +1026,14 @@ function renderProfiles(profiles) {
     });
     const actions = document.createElement("td");
     actions.className = "profile-actions";
+    if (profile.is_running) {
+      actions.append(profileActionButton("打开页面", openProfileWeb, profile));
+    } else {
+      actions.append(profileActionButton("配置并启动", launchProfile, profile));
+    }
     actions.append(
-      profileActionButton("启动", launchProfile, profile),
+      profileActionButton("配置", configureProfile, profile, profile.is_running),
       profileActionButton("复制", cloneProfile, profile),
-      profileActionButton("重命名", renameProfile, profile),
       profileActionButton("快捷方式", createProfileShortcut, profile),
       profileActionButton("删除", deleteProfile, profile, profile.is_running || profile.has_recovery),
     );
@@ -1122,7 +1046,7 @@ async function refreshProfiles() {
   try {
     const result = await profileOperation("list");
     renderProfiles(result.profiles || []);
-    setText("#profile-management-hint", "复制后请确认新接收 AE，并在 PACS 中同步 Move Destination 映射。");
+    setText("#profile-management-hint", "启动前可修改 PACS、AE、目录和端口；保存时会检查当前 Profile、其他 Profile及本机端口占用。");
   } catch (error) {
     renderProfiles([]);
     setText("#profile-management-hint", error.message);
@@ -1138,7 +1062,8 @@ async function cloneProfile(profile) {
       display_name: name,
     });
     await refreshProfiles();
-    showToast(`已创建 Profile ${result.profile.number}；接收端口 ${result.recommended_port}，Web 端口 ${result.recommended_web_port}`);
+    showToast(`已创建 Profile ${result.profile.number}；请确认参数后启动。`);
+    openProfileConfig(result.profile, true);
   } catch (error) {
     showAlert(error.message, "复制 Profile 失败");
   }
@@ -1173,12 +1098,81 @@ async function deleteProfile(profile) {
 }
 
 async function launchProfile(profile) {
+  openProfileConfig(profile, true);
+}
+
+function configureProfile(profile) {
+  openProfileConfig(profile, false);
+}
+
+function openProfileWeb(profile) {
+  const url = profile.web_url || `${window.location.protocol}//127.0.0.1:${profile.web_port}/`;
+  window.open(url, `_dcmget_profile_${profile.number}`, "noopener");
+}
+
+function openProfileConfig(profile, launchAfterSave) {
+  const dialog = $("#profile-config-dialog");
+  const form = $("#profile-config-form");
+  const fields = {
+    profile_number: profile.number,
+    display_name: profile.display_name || `Profile ${profile.number}`,
+    dicom_destination_folder: profile.destination_directory || "",
+    pacs_server_ip: profile.pacs_server_ip || "",
+    pacs_server_port: profile.pacs_server_port || 104,
+    calling_ae_title: profile.calling_ae_title || "DCMGET",
+    pacs_ae_title: profile.pacs_ae_title || "PACS",
+    storage_ae_title: profile.storage_ae_title || "DCMGET",
+    storage_port: profile.storage_port || 6666,
+    web_port: profile.web_port || 8787,
+  };
+  for (const [name, value] of Object.entries(fields)) {
+    const input = form.elements.namedItem(name);
+    if (input) input.value = String(value ?? "");
+  }
+  form.dataset.launchAfterSave = launchAfterSave ? "true" : "false";
+  $("#profile-config-error").hidden = true;
+  $("#profile-save-launch-button").hidden = !launchAfterSave;
+  setText("#profile-config-title", launchAfterSave ? "配置并启动 Profile" : "配置 Profile");
+  dialog.showModal();
+  $("#profile-config-name").focus();
+}
+
+function profileConfigPayload() {
+  const form = $("#profile-config-form");
+  const body = {};
+  for (const element of form.elements) {
+    if (!element.name) continue;
+    body[element.name] = element.value.trim();
+  }
+  for (const field of ["profile_number", "pacs_server_port", "storage_port", "web_port"]) {
+    body[field] = Number.parseInt(body[field], 10);
+  }
+  if (!Number.isInteger(body.storage_port) || !Number.isInteger(body.web_port)) {
+    throw new Error("SCP 接收端口和 Web 端口必须是整数。");
+  }
+  if (body.storage_port === body.web_port) {
+    throw new Error("SCP 接收端口不能与 Web 端口相同。");
+  }
+  return body;
+}
+
+async function saveProfileConfiguration(launchAfterSave) {
+  const error = $("#profile-config-error");
+  error.hidden = true;
   try {
-    await profileOperation("launch", { profile_number: profile.number });
-    showToast(`已在主机启动 Profile ${profile.number}`);
-    window.setTimeout(refreshProfiles, 800);
-  } catch (error) {
-    showAlert(error.message, "启动 Profile 失败");
+    const payload = profileConfigPayload();
+    const result = await profileOperation("update", payload);
+    if (launchAfterSave) {
+      await profileOperation("launch", { profile_number: payload.profile_number });
+      showToast(`Profile ${payload.profile_number} 已保存并启动`);
+    } else {
+      showToast(`Profile ${payload.profile_number} 配置已保存`);
+    }
+    $("#profile-config-dialog").close();
+    await refreshProfiles();
+  } catch (exception) {
+    error.textContent = exception.message;
+    error.hidden = false;
   }
 }
 
@@ -1188,10 +1182,73 @@ async function createProfileShortcut(profile) {
       profile_number: profile.number,
       overwrite: false,
     });
-    showToast(`快捷方式已创建：${result.shortcut.path}`);
+    showToast(`Web 页面快捷方式已创建：${result.shortcut.path}`);
   } catch (error) {
     showAlert(error.message, "创建快捷方式失败");
   }
+}
+
+async function startAllProfiles() {
+  const button = $("#start-all-profiles-button");
+  button.disabled = true;
+  try {
+    const service = state.windowsService || await refreshWindowsServiceStatus();
+    if (service?.supported && !["running", "starting"].includes(service.status)) {
+      const startedService = await api("/api/operations/windows-service-start", { method: "POST", body: {} });
+      state.windowsService = startedService;
+      showToast("kayisoft-dcmget 服务启动命令已提交，将自动启动全部 Profile");
+      window.setTimeout(refreshWindowsServiceStatus, 1000);
+      return;
+    }
+    const result = await profileOperation("launch-all");
+    const started = Number(result.started_count ?? result.started?.length ?? 0);
+    const skipped = Number(result.skipped_count ?? result.skipped?.length ?? 0);
+    showToast(`已启动 ${started} 个 Profile${skipped ? `，跳过 ${skipped} 个` : ""}`);
+    window.setTimeout(refreshProfiles, 900);
+  } catch (error) {
+    showAlert(error.message, "启动全部 Profile 失败");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshWindowsServiceStatus() {
+  const badge = $("#windows-service-state");
+  const stopButton = $("#stop-all-services-button");
+  try {
+    const result = await api("/api/operations/windows-service-status", { method: "POST", body: {} });
+    state.windowsService = result;
+    badge.hidden = !result.supported;
+    stopButton.hidden = !result.supported;
+    if (result.supported) {
+      const status = normalizeStatus(result.status);
+      setStatusBadge(badge, status, `kayisoft-dcmget · ${result.status_label || result.status}`);
+    }
+    return result;
+  } catch (error) {
+    state.windowsService = null;
+    badge.hidden = false;
+    stopButton.hidden = false;
+    setStatusBadge(badge, "failed", "kayisoft-dcmget · 状态异常");
+    return null;
+  }
+}
+
+async function stopAllServices() {
+  await confirmAction(
+    "停止全部 DcmGet 服务",
+    "将停止 kayisoft-dcmget 服务，以及其启动的全部 Profile、storescp、movescu 和 PDI 子进程。已下载文件和恢复点会保留。",
+    async () => {
+      try {
+        const result = await runOperation("windows-service-stop");
+        if (result?.ok) setConnectionState("disconnected", "全部服务正在停止");
+        else if (result) showAlert(result.message || "当前环境不支持 Windows 服务控制。", "停止全部服务失败");
+      } catch (error) {
+        showAlert(error.message, "停止全部服务失败");
+      }
+    },
+    { confirmLabel: "确认停止全部", tone: "danger" },
+  );
 }
 
 async function refreshHealth() {
@@ -1303,8 +1360,6 @@ function renderReleaseNotes(releases) {
 }
 
 function bindEvents() {
-  $("#login-form").addEventListener("submit", login);
-  $("#logout-button").addEventListener("click", logout);
   $("#dismiss-alert").addEventListener("click", clearAlert);
   $$(".nav-item[data-page]").forEach((button) => button.addEventListener("click", () => showPage(button.dataset.page)));
 
@@ -1420,6 +1475,10 @@ function bindEvents() {
   $("#settings-form").addEventListener("submit", saveSettings);
   $("#refresh-health-button").addEventListener("click", refreshHealth);
   $("#refresh-profiles-button").addEventListener("click", refreshProfiles);
+  $("#start-all-profiles-button").addEventListener("click", startAllProfiles);
+  $("#stop-all-services-button").addEventListener("click", stopAllServices);
+  $("#profile-save-button").addEventListener("click", () => saveProfileConfiguration(false));
+  $("#profile-save-launch-button").addEventListener("click", () => saveProfileConfiguration(true));
   $("#activate-license-button").addEventListener("click", activateLicense);
   $("#copy-machine-code-button").addEventListener("click", async () => {
     const code = $("#license-machine-code").textContent.trim();
@@ -1433,9 +1492,9 @@ function bindEvents() {
   });
   $("#shutdown-service-button").addEventListener("click", () => confirmAction(
     "关闭 DcmGet 后台",
-    "后台关闭后，当前浏览器将无法继续操作；正在运行的下载会安全停止并保留恢复点。请输入管理员密码确认。",
-    (password) => shutdownService(password),
-    { requirePassword: true, confirmLabel: "确认关闭", tone: "danger" },
+    "后台关闭后，当前浏览器将无法继续操作；正在运行的下载会安全停止并保留恢复点。",
+    shutdownService,
+    { confirmLabel: "确认关闭", tone: "danger" },
   ));
   $$('[data-operation]').forEach((button) => button.addEventListener("click", () => runOperation(button.dataset.operation)));
   $("#open-destination-button").addEventListener("click", () => runOperation("open-destination"));

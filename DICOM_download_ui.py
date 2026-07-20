@@ -11,6 +11,8 @@ import os
 import socket
 import sys
 import threading
+import time
+import urllib.error
 import urllib.request
 import uuid
 import webbrowser
@@ -52,6 +54,7 @@ from dcmget.runtime import (
 from dcmget.single_instance import SingleInstance
 from dcmget.task_state import TaskCheckpointStore
 from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
+from dcmget.windows_service_control import windows_service_operation_handlers
 from dcmget.web_security import DirectoryRoot, discover_local_hosts
 from dcmget.web_server import DcmGetWebServer
 
@@ -71,6 +74,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         type=_positive_profile_number,
         help="指定实例编号（正整数）；未指定时自动选择空闲实例",
+    )
+    parser.add_argument(
+        "--open-profile-web",
+        action="store_true",
+        help="启动或唤醒指定实例，并在服务就绪后打开 Web 页面",
+    )
+    parser.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--profile-name", help="启动前保存 Profile 显示名")
+    parser.add_argument("--pacs-server-ip", help="启动前保存 PACS 地址")
+    parser.add_argument("--pacs-server-port", type=int, help="启动前保存 PACS 端口")
+    parser.add_argument("--calling-ae-title", help="启动前保存本机调用 AE")
+    parser.add_argument("--pacs-ae-title", help="启动前保存 PACS AE")
+    parser.add_argument("--storage-ae-title", help="启动前保存接收 AE")
+    parser.add_argument("--storage-port", type=int, help="启动前保存 DICOM 接收端口")
+    parser.add_argument("--web-port", type=int, help="启动前保存 Web 端口")
+    parser.add_argument(
+        "--dicom-destination-folder",
+        help="启动前保存 DICOM 目标目录",
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test-report", help=argparse.SUPPRESS)
@@ -92,6 +117,25 @@ def _positive_profile_number(value: str) -> int:
     if number < 1 or number > 9999:
         raise argparse.ArgumentTypeError("实例编号必须在 1 到 9999 之间")
     return number
+
+
+def _profile_updates(args: argparse.Namespace) -> dict[str, object]:
+    fields = {
+        "display_name": "profile_name",
+        "pacs_server_ip": "pacs_server_ip",
+        "pacs_server_port": "pacs_server_port",
+        "calling_ae_title": "calling_ae_title",
+        "pacs_ae_title": "pacs_ae_title",
+        "storage_ae_title": "storage_ae_title",
+        "storage_port": "storage_port",
+        "web_port": "web_port",
+        "dicom_destination_folder": "dicom_destination_folder",
+    }
+    return {
+        config_field: value
+        for config_field, argument_name in fields.items()
+        if (value := getattr(args, argument_name, None)) is not None
+    }
 
 
 def run_self_test(config_path: str, report_path: str | None = None) -> int:
@@ -311,6 +355,11 @@ def _available_port(host: str, preferred: int, *, excluded: set[int] | None = No
 
 
 def _profile_web_config(profile: InstanceProfile) -> AppConfig:
+    manager = ProfileManager(
+        config_root=profile.config_path.parents[2],
+        state_root=profile.state_directory.parents[1],
+    )
+    manager.validate_profile_ports(profile.number, check_system_ports=True)
     config = load_config(profile.config_path)
     web_errors = {
         field: message
@@ -319,21 +368,58 @@ def _profile_web_config(profile: InstanceProfile) -> AppConfig:
     }
     if web_errors:
         raise RuntimeError("；".join(web_errors.values()))
-    selected = _available_port(
-        config.web_bind_address,
-        config.web_port,
-        excluded={config.storage_port},
-    )
-    if selected != config.web_port:
-        LOGGER.warning(
-            "Web port %s is occupied; profile %s moved to %s",
-            config.web_port,
-            profile.number,
-            selected,
-        )
-        config.web_port = selected
     save_config(profile.config_path, config)
     return config
+
+
+def _open_browser_when_ready(
+    url: str,
+    *,
+    timeout: float = 15.0,
+    poll_interval: float = 0.1,
+    opener=None,
+    urlopen=None,
+) -> bool:
+    """Open the browser only after the profile Web service answers HTTP."""
+
+    open_url = opener or webbrowser.open
+    probe = urlopen or urllib.request.urlopen
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() <= deadline:
+        try:
+            response = probe(url, timeout=min(0.5, max(0.05, timeout)))
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        except urllib.error.HTTPError:
+            # An HTTP response proves that the intended service is listening.
+            pass
+        except (OSError, urllib.error.URLError, TimeoutError):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.0, poll_interval))
+            continue
+        try:
+            return bool(open_url(url, new=1))
+        except Exception as exc:
+            record_exception("无法打开 DcmGet Web 页面", exc)
+            return False
+    LOGGER.error("Web service did not become ready before browser open: %s", url)
+    return False
+
+
+def _schedule_browser_open(url: str) -> None:
+    opener = threading.Thread(
+        target=_open_browser_when_ready,
+        args=(url,),
+        name="dcmget-web-opener",
+        daemon=True,
+    )
+    opener.start()
+
+
+def _activation_requests_browser(payload: dict[str, object]) -> bool:
+    return str(payload.get("action", "activate")) != "ensure-running"
 
 
 def _lan_hosts() -> tuple[str, ...]:
@@ -508,6 +594,7 @@ def _operation_handlers(
         "acceptance-report": acceptance_report,
         "profile-backup": profile_backup,
         "support-bundle": support_bundle,
+        **windows_service_operation_handlers(),
         **profile_operations.handlers(),
     }
 
@@ -605,6 +692,19 @@ def main(argv: list[str] | None = None) -> int:
             return run_web_self_test(args.config)
 
         migrate_legacy_task_state(args.config)
+        updates = _profile_updates(args)
+        if (updates or args.open_profile_web) and args.profile is None:
+            raise RuntimeError(
+                "启动前修改配置或打开 Profile Web 页面时，必须指定 --profile N"
+            )
+        if updates:
+            ProfileManager().update_profile(args.profile, **updates)
+        if args.no_open_browser:
+            activation_action = "ensure-running"
+        elif args.open_profile_web:
+            activation_action = "open-profile-web"
+        else:
+            activation_action = "activate"
         try:
             profile = acquire_instance_profile(
                 args.profile,
@@ -616,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
             notifier = SingleInstance(instance_activation_path(args.profile))
             try:
                 if notifier.notify_existing(
-                    {"action": "activate", "profile": args.profile}
+                    {"action": activation_action, "profile": args.profile}
                 ):
                     return 0
             finally:
@@ -630,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise busy_error
         activation = SingleInstance(profile.activation_path)
         if not activation.start(
-            {"action": "activate", "profile": profile.number}
+            {"action": activation_action, "profile": profile.number}
         ):
             profile.close()
             profile = None
@@ -673,7 +773,11 @@ def main(argv: list[str] | None = None) -> int:
             operation_handlers=_operation_handlers(profile, service),
         )
         activation.set_activation_handler(
-            lambda _payload: webbrowser.open(server.url, new=1)
+            lambda payload: (
+                _schedule_browser_open(server.url)
+                if _activation_requests_browser(payload)
+                else None
+            )
         )
         checkpoint = task_store.load(include_archived_files=False)
         if checkpoint is not None:
@@ -682,13 +786,10 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 record_exception("未完成任务自动恢复失败", exc)
 
-        if config.web_open_browser:
-            opener = threading.Timer(
-                0.8,
-                lambda: webbrowser.open(server.url, new=1),
-            )
-            opener.daemon = True
-            opener.start()
+        if not args.no_open_browser and (
+            args.open_profile_web or config.web_open_browser
+        ):
+            _schedule_browser_open(server.url)
     except Exception as exc:
         if server is not None:
             try:

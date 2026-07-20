@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import struct
 from pathlib import Path
 
@@ -20,7 +22,8 @@ from dcmget.architecture import (
 from dcmget.pdi_server import PdiRequestHandler
 from dcmget.release_notes import load_release_notes
 from scripts.build_deploy_bundle import VERSION as DEPLOY_VERSION, source_files
-from scripts.build_windows import validate_release_version
+import scripts.build_windows as windows_build
+from scripts.build_windows import prepare_winsw_service_wrapper, validate_release_version
 
 
 def _write_pe(path: Path, machine: int) -> Path:
@@ -78,6 +81,43 @@ def test_runtime_guard_rejects_32_bit_and_native_windows_arm64(tmp_path: Path):
         ensure_supported_runtime(
             platform_name="win32", executable=arm64, pointer_bits=64
         )
+
+
+def test_windows_build_downloads_only_pinned_amd64_winsw(
+    tmp_path: Path, monkeypatch
+):
+    payload_path = _write_pe(tmp_path / "source.exe", IMAGE_FILE_MACHINE_AMD64)
+    payload = payload_path.read_bytes()
+    expected = hashlib.sha256(payload).hexdigest()
+    target = tmp_path / "runtime" / "WinSW-x64.exe"
+    requests = []
+
+    def open_fixture(request, *, timeout):
+        requests.append((request.full_url, timeout))
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr(windows_build, "WINSW_SHA256", expected)
+    assert prepare_winsw_service_wrapper(target, opener=open_fixture) == target.resolve()
+    assert target.read_bytes() == payload
+    assert requests == [(windows_build.WINSW_URL, 120)]
+
+    assert prepare_winsw_service_wrapper(
+        target,
+        opener=lambda *_args, **_kwargs: pytest.fail("verified WinSW was downloaded again"),
+    ) == target.resolve()
+
+
+def test_windows_build_rejects_winsw_checksum_mismatch(tmp_path: Path, monkeypatch):
+    payload = _write_pe(tmp_path / "source.exe", IMAGE_FILE_MACHINE_AMD64).read_bytes()
+    target = tmp_path / "WinSW-x64.exe"
+    monkeypatch.setattr(windows_build, "WINSW_SHA256", "0" * 64)
+
+    with pytest.raises(RuntimeError, match="WinSW v2.12.0 SHA-256"):
+        prepare_winsw_service_wrapper(
+            target,
+            opener=lambda *_args, **_kwargs: io.BytesIO(payload),
+        )
+    assert not target.exists()
 
 
 def test_source_deploy_contains_transitive_requirement_files():
@@ -246,8 +286,10 @@ def test_windows_release_validates_real_profile_shortcut_properties():
 
     assert "Verify real profile desktop shortcut" in workflow
     assert "default_instance_shortcut_name(6666, 'DCMGET')" in workflow
-    assert 'shortcut.Arguments -ne "--profile 6"' in workflow
-    assert "WScript.Shell" in workflow
+    assert "web_port=8787" in workflow
+    assert '"dcmget-6666-DCMGET.url"' in workflow
+    assert "URL=http://127\\.0\\.0\\.1:8787/" in workflow
+    assert "WScript.Shell" not in workflow
     assert "Portable EXE is missing profile shortcut support" in workflow
 
 
@@ -298,6 +340,95 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert "/DAppVersion=2.0.0" not in workflow
 
 
+def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CloseApplications=no" in installer
+    assert "function PrepareToInstall(var NeedsRestart: Boolean): String;" in installer
+    assert "Get-CimInstance Win32_Process" in installer
+    assert "ExecutablePath" in installer
+    assert "$path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)" in installer
+    for name in ("DcmGet.exe", "DcmGetPdiServer.exe", "storescp.exe", "movescu.exe"):
+        assert name in installer
+    assert 'taskkill.exe" /PID ([string]$target.ProcessId) /T /F' in installer
+    assert "Get-Process -Name" not in installer
+
+    assert "Installer did not stop managed process" in workflow
+    assert "Installer left a managed child process running" in workflow
+    assert "Installer killed same-named process outside install directory" in workflow
+    assert '$outsideTool = Join-Path $outsideRoot "storescp.exe"' in workflow
+
+
+def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    template = (root / "packaging/windows/kayisoft-dcmget.xml.template").read_text(
+        encoding="utf-8"
+    )
+    host = (root / "packaging/windows/kayisoft-dcmget-host.ps1").read_text(
+        encoding="utf-8"
+    )
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert windows_build.WINSW_URL.endswith("/v2.12.0/WinSW-x64.exe")
+    assert (
+        windows_build.WINSW_SHA256
+        == "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+    )
+    assert "<id>kayisoft-dcmget</id>" in template
+    assert "<user>LocalSystem</user>" in template
+    assert "<domain>NT AUTHORITY</domain>" not in template
+    assert "<startmode>Automatic</startmode>" in template
+    assert "<stopparentprocessfirst>true</stopparentprocessfirst>" in template
+    assert "<securityDescriptor>" in template
+    assert ";;;BU)" in template
+    assert "@APPDATA@" in template and "@LOCALAPPDATA@" in template
+    assert "kayisoft-dcmget-host.ps1" in template
+    assert "--no-open-browser" in host
+    assert "Get-ConfiguredProfileNumbers" in host
+    assert "$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)" in host
+    assert "foreach ($number in $managedProfileNumbers)" in host
+    assert "foreach ($number in @(Get-ConfiguredProfileNumbers))" not in host
+    assert "while ($true)" in host
+    assert "Start-Sleep -Seconds 2" in host
+
+    assert 'DestName: "{#ServiceWrapperName}"' in installer
+    assert "ConfigureAndInstallDcmGetService" in installer
+    assert "  RequestExistingServiceStop();" in installer
+    assert installer.index("  RequestExistingServiceStop();") < installer.index(
+        "$names = @(''DcmGet.exe''"
+    )
+    assert 'Parameters: "stop"' in installer
+    assert 'Parameters: "uninstall"' in installer
+    assert 'Parameters: "start"' in installer
+    assert "Check: ShouldStartDcmGetService" in installer
+    assert "ServiceExistedBeforeInstall" in installer
+    assert "ServiceWasActiveBeforeInstall" in installer
+    assert "$service.Status -ne ''Stopped''" in installer
+    assert 'Name: "{autoprograms}\\DcmGet 启动全部"' in installer
+    assert 'Name: "{autoprograms}\\DcmGet 停止全部"' in installer
+    assert 'Filename: "{sys}\\sc.exe"' in installer
+    assert 'Filename: "{autoprograms}\\DcmGet.url"' in installer
+    assert 'String: "{code:GetPrimaryWebUrl}"' in installer
+    assert "instances\\i1\\config.json" in installer
+    assert "WebPort := 8787" in installer
+    assert "Content: AnsiString;" in installer
+    assert "GetEnv('HOMEDRIVE') + GetEnv('HOMEPATH')" in installer
+
+    assert "Verify pinned WinSW service wrapper" in workflow
+    assert "WinSW checksum mismatch" in workflow
+    assert "kayisoft-dcmget" in workflow
+    assert "Service tree process survived stop" in workflow
+    assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
+    assert "Uninstall left kayisoft-dcmget service behind" in workflow
+
+
 def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
@@ -327,7 +458,7 @@ def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
     assert 'Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb' in workflow
     assert '$rules.Count -ne 1' in workflow
     assert '$portFilters[0].LocalPort.ToString() -ne "Any"' in workflow
-    assert '"storage_port":16666' in workflow
+    assert '`"storage_port`":16666' in workflow
     assert "Upgrade left the legacy storescp program rule behind" in workflow
     assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
     assert '$applicationFilters.Count -ne 1' in workflow

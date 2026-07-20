@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
@@ -38,6 +39,13 @@ DIST_ROOT = BUILD_ROOT / "dist"
 RELEASE_ROOT = ROOT / "release" / "windows"
 PLATFORM_RUNTIME = ROOT / ".runtime" / "dcmtk" / "windows-x86_64"
 OHIF_RUNTIME = ROOT / ".runtime" / "ohif" / "ohif-3.12.6"
+WINSW_VERSION = "2.12.0"
+WINSW_URL = (
+    "https://github.com/winsw/winsw/releases/download/"
+    f"v{WINSW_VERSION}/WinSW-x64.exe"
+)
+WINSW_SHA256 = "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+WINSW_EXECUTABLE = ROOT / ".runtime" / "winsw" / f"v{WINSW_VERSION}" / "WinSW-x64.exe"
 MINIMAL_DCMTK_RUNTIME = BUILD_ROOT / "dcmtk-runtime"
 DCMTK_PACKAGE_DIRECTORY = "dcmtk-3.7.0-win64-dynamic"
 WINDOWS_DCMTK_PE_FILES = (
@@ -117,6 +125,40 @@ def find_ohif_payload() -> Path:
             "scripts/prepare_ohif.py"
         )
     return OHIF_RUNTIME
+
+
+def prepare_winsw_service_wrapper(
+    destination: str | Path = WINSW_EXECUTABLE,
+    *,
+    opener=urllib.request.urlopen,
+) -> Path:
+    """Download and verify the pinned WinSW AMD64 service wrapper."""
+
+    target = Path(destination).expanduser().resolve()
+    if target.is_file() and file_sha256(target) == WINSW_SHA256:
+        require_amd64_pe(target, "WinSW 服务包装器")
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    request = urllib.request.Request(
+        WINSW_URL,
+        headers={"User-Agent": f"DcmGet/{APP_VERSION} Windows release builder"},
+    )
+    try:
+        with opener(request, timeout=120) as response, temporary.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+        actual = file_sha256(temporary)
+        if actual != WINSW_SHA256:
+            raise RuntimeError(
+                "WinSW v2.12.0 SHA-256 校验失败："
+                f"expected={WINSW_SHA256}, actual={actual}"
+            )
+        require_amd64_pe(temporary, "WinSW 服务包装器")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
 
 def stage_minimal_windows_dcmtk(
@@ -340,6 +382,7 @@ def verify_built_architecture(version: str) -> tuple[Path, ...]:
         DIST_ROOT / "DcmGet" / "DcmGet.exe",
         DIST_ROOT / "DcmGetPdiServer.exe",
         RELEASE_ROOT / f"DcmGet-{version}-windows-x64-portable.exe",
+        WINSW_EXECUTABLE,
     ]
     for root in (MINIMAL_DCMTK_RUNTIME, DIST_ROOT / "DcmGet"):
         for name in WINDOWS_DCMTK_PE_FILES:
@@ -437,6 +480,8 @@ def build_payloads(version: str) -> None:
     for name in WINDOWS_DCMTK_PE_FILES:
         require_amd64_pe(dcmtk_bin / name, f"DCMTK {name}")
     ohif = find_ohif_payload()
+    winsw = prepare_winsw_service_wrapper()
+    print(f"Verified WinSW {WINSW_VERSION}: {winsw}")
     from PyInstaller.__main__ import run as run_pyinstaller
 
     if BUILD_ROOT.exists():

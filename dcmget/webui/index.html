@@ -14,43 +14,6 @@
     <div class="fatal-banner">DcmGet Web 需要启用 JavaScript，所有程序资源均来自本机，不会连接互联网。</div>
   </noscript>
 
-  <section id="login-screen" class="auth-screen" aria-labelledby="login-title" hidden>
-    <div class="auth-panel">
-      <div class="brand brand--auth" aria-label="DcmGet">
-        <span class="brand-mark" aria-hidden="true">D</span>
-        <span>
-          <strong>DcmGet</strong>
-          <small>影像交付工作台</small>
-        </span>
-      </div>
-      <div class="auth-copy">
-        <p class="eyebrow">本地安全访问</p>
-        <h1 id="login-title">登录 DcmGet</h1>
-        <p id="login-hint" class="muted">请输入管理员设置的访问密码。</p>
-      </div>
-      <form id="login-form" class="stack" autocomplete="on">
-        <label class="field">
-          <span>访问密码</span>
-          <input id="login-password" name="password" type="password" required autocomplete="current-password" maxlength="128" autofocus>
-        </label>
-        <label id="login-confirm-field" class="field" hidden>
-          <span>再次输入密码</span>
-          <input id="login-password-confirm" name="confirm_password" type="password" autocomplete="new-password" maxlength="128">
-        </label>
-        <p id="login-error" class="field-error" role="alert" hidden></p>
-        <button class="button button--primary button--large" type="submit">登录</button>
-      </form>
-      <div class="notice notice--warning compact-notice">
-        <span class="notice-icon" aria-hidden="true">!</span>
-        <div>
-          <strong>仅限可信内网</strong>
-          <p>当前使用 HTTP，密码和页面流量未加密。不要通过公网、访客 Wi-Fi 或不可信网络访问。</p>
-        </div>
-      </div>
-      <p class="auth-foot">程序完全离线运行；关闭此页面不会停止正在执行的下载。</p>
-    </div>
-  </section>
-
   <div id="app-shell" class="app-shell" hidden>
     <header class="topbar">
       <div class="brand">
@@ -70,9 +33,6 @@
           <span class="status-dot" aria-hidden="true"></span>
           <span>正在连接</span>
         </span>
-        <button id="logout-button" class="icon-button" type="button" title="退出登录" aria-label="退出登录">
-          <span aria-hidden="true">↪</span>
-        </button>
       </div>
     </header>
 
@@ -347,10 +307,10 @@
           </section>
 
           <section class="card settings-card settings-card--wide" aria-labelledby="web-settings-title">
-            <div class="card-header"><div><h2 id="web-settings-title">Web 访问</h2><p>控制浏览器连接范围和登录安全。</p></div></div>
+            <div class="card-header"><div><h2 id="web-settings-title">Web 访问</h2><p>控制浏览器连接范围和服务端口；打开页面即可直接使用。</p></div></div>
             <div class="notice notice--warning">
               <span class="notice-icon" aria-hidden="true">!</span>
-              <div><strong>HTTP 流量未加密</strong><p>局域网访问仅可用于受控、可信的院内网络。不要将端口映射到公网。</p></div>
+              <div><strong>仅限可信内网</strong><p>HTTP 流量未加密，局域网访问仅可用于受控、可信的院内网络。不要将端口映射到公网。</p></div>
             </div>
             <div class="form-grid form-grid--two">
               <label class="switch-row field--wide" for="setting-lan-enabled">
@@ -358,12 +318,8 @@
                 <span class="switch"><input id="setting-lan-enabled" name="web_lan_enabled" type="checkbox"><span aria-hidden="true"></span></span>
               </label>
               <label class="field"><span>监听端口</span><input name="web_port" type="text" inputmode="numeric"><small>修改监听范围或端口后，重启 DcmGet 生效。</small></label>
-              <label class="field"><span>会话空闲超时（分钟）</span><input name="web_session_timeout_minutes" type="text" inputmode="numeric"></label>
+              <label class="field"><span>浏览器会话时长（分钟）</span><input name="web_session_timeout_minutes" type="text" inputmode="numeric"><small>会话失效后刷新页面即可自动恢复，无需登录。</small></label>
               <label class="checkbox-label field--wide"><input name="web_open_browser" type="checkbox"> 启动 DcmGet 后自动打开系统浏览器</label>
-              <label class="switch-row field--wide" for="setting-auth-required">
-                <span><strong>要求密码登录</strong><small>允许局域网访问时不能关闭。</small></span>
-                <span class="switch"><input id="setting-auth-required" name="web_auth_required" type="checkbox" checked disabled><span aria-hidden="true"></span></span>
-              </label>
             </div>
           </section>
           <div class="settings-footer"><p id="settings-status" class="form-hint" role="status"></p><button class="button button--primary" type="submit">保存设置</button></div>
@@ -389,14 +345,14 @@
             </div>
           </section>
           <section id="profile-management-card" class="card operations-card operations-card--wide">
-            <div class="card-header"><div><h2>Profile 管理</h2><p>复制一个 Profile 即可用独立接收端口和 Web 端口运行另一个任务。</p></div><button id="refresh-profiles-button" class="button button--secondary button--small" type="button">刷新</button></div>
+            <div class="card-header"><div><h2>Profile 管理</h2><p>先配置 PACS、接收端口和 Web 端口，再启动独立任务实例。</p><span id="windows-service-state" class="status-badge status-badge--neutral" hidden>kayisoft-dcmget · 检查中</span></div><div class="inline-actions"><button id="start-all-profiles-button" class="button button--primary button--small" type="button">启动全部</button><button id="stop-all-services-button" class="button button--danger-quiet button--small" type="button">停止全部</button><button id="refresh-profiles-button" class="button button--secondary button--small" type="button">刷新</button></div></div>
             <div class="table-wrap profile-table-wrap">
               <table class="data-table">
-                <thead><tr><th>名称</th><th>接收</th><th>Web 端口</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead>
-                <tbody id="profile-table-body"><tr><td colspan="6">正在读取 Profile…</td></tr></tbody>
+                <thead><tr><th>名称</th><th>PACS</th><th>接收</th><th>Web 端口</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="profile-table-body"><tr><td colspan="7">正在读取 Profile…</td></tr></tbody>
               </table>
             </div>
-            <p id="profile-management-hint" class="form-hint">复制后请确认新接收 AE，并在 PACS 中同步 Move Destination 映射。</p>
+            <p id="profile-management-hint" class="form-hint">SCP 接收端口、Web 端口以及其他 Profile 已使用的端口不能重复；保存时会自动检查并提示。</p>
           </section>
           <section class="card operations-card">
             <div class="card-header"><div><h2>健康检查</h2><p>检查工具、目录、端口、数据库和磁盘状态。</p></div><button id="refresh-health-button" class="button button--secondary button--small" type="button">重新检查</button></div>
@@ -447,12 +403,40 @@
       <div class="confirm-symbol" aria-hidden="true">!</div>
       <h2 id="confirm-title">确认操作</h2>
       <p id="confirm-message">是否继续？</p>
-      <label id="confirm-password-field" class="field confirm-password-field" hidden>
-        <span>管理员密码</span>
-        <input id="confirm-password" type="password" autocomplete="current-password" maxlength="128">
-        <small>密码仅用于本次敏感操作确认，不会保存在页面中。</small>
-      </label>
       <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="confirm-action-button" class="button button--danger" value="confirm">确认</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="profile-config-dialog" class="directory-dialog" aria-labelledby="profile-config-title">
+    <form id="profile-config-form" method="dialog" class="dialog-shell profile-config-shell">
+      <div class="dialog-header"><div><p class="eyebrow">启动前配置</p><h2 id="profile-config-title">配置 Profile</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
+      <input id="profile-config-number" name="profile_number" type="hidden">
+      <div class="profile-config-section">
+        <h3>实例信息</h3>
+        <div class="form-grid form-grid--two">
+          <label class="field field--wide"><span>Profile 名称</span><input id="profile-config-name" name="display_name" type="text" maxlength="80" required></label>
+          <label class="field field--wide"><span>影像目标目录</span><input id="profile-config-destination" name="dicom_destination_folder" type="text" required></label>
+        </div>
+      </div>
+      <div class="profile-config-section">
+        <h3>PACS 服务端</h3>
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>PACS 地址</span><input id="profile-config-pacs-ip" name="pacs_server_ip" type="text" required></label>
+          <label class="field"><span>PACS 端口</span><input id="profile-config-pacs-port" name="pacs_server_port" type="text" inputmode="numeric" required></label>
+          <label class="field"><span>本机调用 AE</span><input id="profile-config-calling-ae" name="calling_ae_title" type="text" maxlength="16" required></label>
+          <label class="field"><span>PACS AE</span><input id="profile-config-pacs-ae" name="pacs_ae_title" type="text" maxlength="16" required></label>
+        </div>
+      </div>
+      <div class="profile-config-section">
+        <h3>本地接收与 Web</h3>
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>接收 AE</span><input id="profile-config-storage-ae" name="storage_ae_title" type="text" maxlength="16" required></label>
+          <label class="field"><span>SCP 接收端口</span><input id="profile-config-storage-port" name="storage_port" type="text" inputmode="numeric" required></label>
+          <label class="field"><span>Web 端口</span><input id="profile-config-web-port" name="web_port" type="text" inputmode="numeric" required><small>不能与接收端口或其他 Profile 端口重复。</small></label>
+        </div>
+      </div>
+      <p id="profile-config-error" class="field-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="profile-save-button" class="button button--secondary" type="button">仅保存</button><button id="profile-save-launch-button" class="button button--primary" type="button">保存并启动</button></div>
     </form>
   </dialog>
 

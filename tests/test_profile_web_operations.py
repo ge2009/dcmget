@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 import dcmget.profile_web_operations as operations_module
 from dcmget.config import AppConfig, save_config
@@ -41,13 +42,18 @@ def _write_profile(
     return path
 
 
-def _operations(tmp_path: Path, **kwargs: object) -> ProfileWebOperations:
+def _operations(
+    tmp_path: Path,
+    *,
+    port_probe=lambda _host, _port: True,
+    **kwargs: object,
+) -> ProfileWebOperations:
     executable = tmp_path / "python.exe"
     executable.write_bytes(b"MZ")
     entrypoint = tmp_path / "DICOM_download_ui.py"
     entrypoint.write_text("print('ok')\n", encoding="utf-8")
     return ProfileWebOperations(
-        manager=_manager(tmp_path, port_probe=lambda _host, _port: True),
+        manager=_manager(tmp_path, port_probe=port_probe),
         project_root=tmp_path,
         executable=executable,
         frozen=False,
@@ -65,8 +71,11 @@ def test_list_profiles_returns_json_safe_profiles(tmp_path):
     profile = result["profiles"][0]
     assert profile["number"] == 1
     assert profile["display_name"] == "实例 1"
+    assert profile["pacs_server_ip"] == "127.0.0.1"
+    assert profile["pacs_server_port"] == 8104
     assert profile["storage_port"] == 6667
     assert profile["web_port"] == 8788
+    assert profile["dicom_destination_folder"] == str(tmp_path / "dicom-1")
     assert isinstance(profile["config_path"], str)
     assert profile["storage_ae_title"] == "AE01"
 
@@ -90,6 +99,49 @@ def test_clone_rename_and_delete_round_trip(tmp_path):
     assert operations.list_profiles()["count"] == 1
 
 
+def test_update_profile_saves_full_launch_configuration(tmp_path):
+    _write_profile(tmp_path, 1)
+    operations = _operations(tmp_path)
+
+    result = operations.update_profile(
+        {
+            "profile_number": 1,
+            "display_name": "CT 下载",
+            "pacs_server_ip": "172.16.0.20",
+            "pacs_server_port": 104,
+            "calling_ae_title": "MACGET",
+            "pacs_ae_title": "PACS02",
+            "storage_ae_title": "MACGET",
+            "storage_port": 6777,
+            "web_port": 8899,
+            "dicom_destination_folder": str(tmp_path / "result"),
+        }
+    )
+
+    assert result["ok"]
+    assert result["warnings"] == []
+    assert result["errors"] == {}
+    assert result["profile"]["display_name"] == "CT 下载"
+    assert result["profile"]["pacs_server_ip"] == "172.16.0.20"
+    assert result["profile"]["storage_port"] == 6777
+    assert result["profile"]["web_port"] == 8899
+
+
+def test_update_profile_rejects_running_instance(tmp_path):
+    _write_profile(tmp_path, 1)
+    lock_path = tmp_path / "state" / "instances" / "i1.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock = FileLock(str(lock_path))
+    lock.acquire(timeout=0)
+    try:
+        with pytest.raises(RuntimeError, match="先停止后再修改"):
+            _operations(tmp_path).update_profile(
+                {"profile_number": 1, "web_port": 8899}
+            )
+    finally:
+        lock.release()
+
+
 def test_launch_profile_uses_subprocess_popen_without_shell(tmp_path, monkeypatch):
     _write_profile(tmp_path, 3)
     calls: list[tuple[list[str], dict[str, object]]] = []
@@ -108,9 +160,56 @@ def test_launch_profile_uses_subprocess_popen_without_shell(tmp_path, monkeypatc
     command, kwargs = calls[0]
     assert result["pid"] == 43210
     assert command[0].endswith("python.exe")
-    assert command[-2:] == ["--profile", "3"]
+    assert command[-3:] == ["--profile", "3", "--no-open-browser"]
     assert kwargs["shell"] is False
     assert str(kwargs["cwd"]).endswith(str(tmp_path))
+    assert result["url"] == "http://127.0.0.1:8787/"
+
+
+def test_launch_all_starts_idle_profiles_and_skips_running_profile(
+    tmp_path,
+):
+    _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    _write_profile(tmp_path, 2, port=6667, web_port=8788)
+    lock_path = tmp_path / "state" / "instances" / "i1.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock = FileLock(str(lock_path))
+    lock.acquire(timeout=0)
+    calls: list[list[str]] = []
+
+    class _FakeProcess:
+        pid = 43210
+
+    def fake_popen(command: list[str], **_kwargs: object) -> _FakeProcess:
+        calls.append(command)
+        return _FakeProcess()
+
+    try:
+        result = _operations(tmp_path, popen=fake_popen).launch_all_profiles()
+    finally:
+        lock.release()
+
+    assert result["ok"]
+    assert result["started_count"] == 1
+    assert result["skipped_count"] == 1
+    assert result["error_count"] == 0
+    assert result["started"][0]["profile_number"] == 2
+    assert result["skipped"][0]["profile_number"] == 1
+    assert calls[0][-3:] == ["--profile", "2", "--no-open-browser"]
+
+
+def test_launch_all_returns_per_profile_port_errors(tmp_path):
+    _write_profile(tmp_path, 1, port=6666, web_port=8787)
+
+    result = _operations(
+        tmp_path,
+        port_probe=lambda _host, port: port != 8787,
+    ).launch_all_profiles()
+
+    assert not result["ok"]
+    assert result["started_count"] == 0
+    assert result["error_count"] == 1
+    assert "Web 端口 8787 已被其他程序占用" in result["errors"][0]["error"]
 
 
 def test_create_shortcut_defaults_to_desktop_and_profile_based_name(
@@ -130,7 +229,8 @@ def test_create_shortcut_defaults_to_desktop_and_profile_based_name(
         captured["name"] = name
         captured["destination_directory"] = Path(destination_directory)
         captured["overwrite"] = kwargs["overwrite"]
-        path = Path(destination_directory) / f"{name}.command"
+        captured["web_port"] = kwargs["web_port"]
+        path = Path(destination_directory) / f"{name}.url"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
         return path
@@ -148,9 +248,11 @@ def test_create_shortcut_defaults_to_desktop_and_profile_based_name(
     assert captured["name"] == "dcmget-7777-AE05"
     assert captured["destination_directory"] == (tmp_path / "Desktop").resolve()
     assert captured["overwrite"] is True
+    assert captured["web_port"] == 8787
     assert result["shortcut"]["destination_directory"] == str(
         (tmp_path / "Desktop").resolve()
     )
+    assert result["url"] == "http://127.0.0.1:8787/"
 
 
 @pytest.mark.parametrize(

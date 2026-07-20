@@ -52,7 +52,8 @@ def test_web_frontend_is_a_self_contained_es_module_application() -> None:
     assert CSS.is_file()
     assert JAVASCRIPT.is_file()
     assert len(document.ids) == len(set(document.ids))
-    assert {"login-screen", "app-shell", "page-home", "page-settings", "page-operations"} <= set(document.ids)
+    assert {"app-shell", "page-home", "page-settings", "page-operations"} <= set(document.ids)
+    assert "login-screen" not in document.ids
     assert any(
         script.get("type") == "module" and script.get("src") == "/assets/app.js"
         for script in document.scripts
@@ -121,8 +122,6 @@ def test_health_ui_distinguishes_intentional_http_warning_from_failure() -> None
     assert javascript.count("fetch(") == 1
     assert 'method: "POST"' in javascript
     assert 'method: "PUT"' in javascript
-    assert 'firstRun ? "/api/setup" : "/api/login"' in javascript
-    assert 'api("/api/logout"' in javascript
     assert 'api("/api/preflight"' in javascript
     assert 'api("/api/task/start"' in javascript
     assert 'api("/api/pdi/open"' in javascript
@@ -171,18 +170,20 @@ def test_recovery_large_batch_and_sse_contracts_are_visible() -> None:
     assert "task?.status_counts?.[key]" in javascript
     assert "payload.payload ?? payload.data ?? payload" in javascript
     assert "scheduleTaskRefresh()" in javascript
-    assert "can_setup_here" in javascript
-    assert "首次密码只能在运行 DcmGet 的主机本机设置" in javascript
+    assert "showLogin" not in javascript
+    assert 'type="password"' not in INDEX.read_text(encoding="utf-8")
 
 
-def test_login_and_lan_settings_explain_plain_http_risk() -> None:
+def test_passwordless_lan_settings_explain_plain_http_risk() -> None:
     source, _document_parser = _document()
 
     assert source.count("仅限可信内网") >= 1
-    assert source.count("HTTP") >= 2
+    assert source.count("HTTP") >= 1
     assert "流量未加密" in source
     assert 'id="setting-lan-enabled"' in source
-    assert 'id="setting-auth-required"' in source
+    assert "访问密码" not in source
+    assert "登录 DcmGet" not in source
+    assert "打开页面即可直接使用" in source
     assert "不要将端口映射到公网" in source
 
 
@@ -233,7 +234,7 @@ def test_settings_cover_clinical_network_reliability_privacy_and_pdi() -> None:
     present_names = set(re.findall(r'\bname="([^"]+)"', source))
     assert expected_names <= present_names
     assert 'data.web_bind_address = data.web_lan_enabled ? "0.0.0.0" : "127.0.0.1"' in _javascript()
-    assert 'id="setting-auth-required" name="web_auth_required" type="checkbox" checked disabled' in source
+    assert 'name="web_auth_required"' not in source
     assert 'name="max_concurrent_moves"' not in source
 
 
@@ -274,16 +275,45 @@ def test_preflight_runs_automatically_and_discards_stale_responses() -> None:
     assert '$("#run-preflight-button").addEventListener("click", () => runPreflight())' in javascript
 
 
-def test_start_and_local_shutdown_require_current_password_confirmation() -> None:
+def test_start_and_local_shutdown_are_passwordless_but_keep_confirmation() -> None:
     source, _document_parser = _document()
     javascript = _javascript()
 
-    assert 'id="confirm-password" type="password" autocomplete="current-password"' in source
+    assert 'type="password"' not in source
     assert 'id="shutdown-service-button"' in source
-    assert 'body: { ...taskDraft(), password }' in javascript
+    assert 'body: taskDraft()' in javascript
     assert 'api("/api/operations/shutdown"' in javascript
-    assert "requirePassword: true" in javascript
+    assert "requirePassword" not in javascript
     assert '"#shutdown-service-button"' in javascript
+
+
+def test_profile_management_configures_before_launch_and_exposes_service_controls() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+
+    assert 'id="profile-config-dialog"' in source
+    assert 'id="profile-save-launch-button"' in source
+    for name in (
+        "pacs_server_ip",
+        "pacs_server_port",
+        "calling_ae_title",
+        "pacs_ae_title",
+        "storage_ae_title",
+        "storage_port",
+        "web_port",
+        "dicom_destination_folder",
+    ):
+        assert f'name="{name}"' in source
+    assert "SCP 接收端口不能与 Web 端口相同" in javascript
+    assert 'profileOperation("update"' in javascript
+    assert 'profileOperation("launch-all"' in javascript
+    assert 'id="start-all-profiles-button"' in source
+    assert 'id="stop-all-services-button"' in source
+    assert 'id="windows-service-state"' in source
+    assert 'api("/api/operations/windows-service-status"' in javascript
+    assert 'api("/api/operations/windows-service-start"' in javascript
+    assert 'runOperation("windows-service-stop")' in javascript
+    assert "stopButton.hidden = !result.supported" in javascript
 
 
 def test_offline_license_activation_exposes_machine_code_and_token_input() -> None:

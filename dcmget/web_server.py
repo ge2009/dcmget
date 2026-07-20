@@ -420,13 +420,36 @@ def create_web_app(
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         return response
 
-    def require_session(request: Request) -> WebSession:
+    def request_session(
+        request: Request,
+        *,
+        create: bool = False,
+    ) -> tuple[WebSession | None, bool]:
         token = request.cookies.get(SESSION_COOKIE)
         session = security.sessions.get(token)
         if session is None or not hmac_compare(session.remote_ip, _client_ip(request)):
             if token:
                 security.sessions.revoke(token)
-            raise HTTPException(status_code=401, detail="请先登录")
+            if create:
+                return security.sessions.create(_client_ip(request)), True
+            return None, False
+        return session, False
+
+    def attach_session_cookie(response: Response, session: WebSession) -> None:
+        response.set_cookie(
+            SESSION_COOKIE,
+            session.token,
+            max_age=security.sessions.ttl_seconds,
+            path="/",
+            secure=False,
+            httponly=True,
+            samesite="strict",
+        )
+
+    def require_session(request: Request) -> WebSession:
+        session, _created = request_session(request)
+        if session is None:
+            raise HTTPException(status_code=401, detail="会话已失效，请刷新页面")
         return session
 
     def require_csrf(
@@ -445,11 +468,6 @@ def create_web_app(
         if not session.local or not is_loopback_address(_client_ip(request)):
             raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
         return session
-
-    def require_password_confirmation(payload: Mapping[str, Any]) -> None:
-        password = payload.get("password")
-        if not isinstance(password, str) or not security.password_store.verify(password):
-            raise HTTPException(status_code=403, detail="密码错误")
 
     @app.get("/", include_in_schema=False)
     @app.get("/login", include_in_schema=False)
@@ -473,38 +491,32 @@ def create_web_app(
             return FileResponse(candidate, media_type="image/png")
         return Response(status_code=204)
 
-    async def bootstrap_payload(request: Request) -> dict[str, object]:
-        token = request.cookies.get(SESSION_COOKIE)
-        session = security.sessions.get(token)
+    async def bootstrap_payload(
+        request: Request,
+        session: WebSession,
+    ) -> dict[str, object]:
         local_request = is_loopback_address(_client_ip(request))
-        authenticated = bool(
-            session is not None and hmac_compare(session.remote_ip, _client_ip(request))
-        )
-        setup_required = not security.password_store.setup_complete()
         payload: dict[str, object] = {
             "version": __version__,
             "auth": {
-                "authenticated": authenticated,
-                "setup_required": setup_required,
-                "first_run": setup_required,
+                "authenticated": True,
+                "setup_required": False,
+                "first_run": False,
+                "passwordless": True,
             },
-            "authenticated": authenticated,
-            "setup_required": setup_required,
-            "can_setup_here": setup_required and is_loopback_address(_client_ip(request)),
-            "csrf_token": session.csrf_token if authenticated and session else None,
+            "authenticated": True,
+            "setup_required": False,
+            "can_setup_here": False,
+            "csrf_token": session.csrf_token,
             "web": {
                 "url": str(request.base_url),
                 "lan_url": str(metadata.get("lan_url") or request.base_url),
                 "lan_enabled": server_host in {"0.0.0.0", "::"},
-                "local_session": bool(
-                    local_request and (not authenticated or (session and session.local))
-                ),
+                "local_session": bool(local_request and session.local),
                 "insecure_http": True,
                 "warning": "当前为局域网 HTTP，请仅在可信内网使用。",
             },
         }
-        if not authenticated:
-            return payload
         snapshot_value = await _invoke(service, "snapshot")
         snapshot = snapshot_value if isinstance(snapshot_value, dict) else {}
         config = current_config()
@@ -524,129 +536,64 @@ def create_web_app(
         return payload
 
     @app.get("/api/bootstrap")
-    async def bootstrap(request: Request) -> dict[str, object]:
-        return await bootstrap_payload(request)
+    async def bootstrap(request: Request) -> Response:
+        session, created = request_session(request, create=True)
+        assert session is not None
+        response = JSONResponse(await bootstrap_payload(request, session))
+        if created:
+            attach_session_cookie(response, session)
+        return response
 
     @app.post("/api/setup")
     async def setup(request: Request) -> Response:
-        if not is_loopback_address(_client_ip(request)):
-            raise HTTPException(
-                status_code=403,
-                detail="首次密码只能在运行 DcmGet 的服务器本机设置",
-            )
-        if security.password_store.setup_complete():
-            raise HTTPException(status_code=409, detail="管理员密码已经完成初始化")
-        payload = await _json_body(request)
-        password = payload.get("password")
-        confirm = payload.get("confirm_password", password)
-        if not isinstance(password, str) or password != confirm:
-            raise HTTPException(status_code=400, detail="两次输入的密码不一致")
-        try:
-            security.password_store.replace(password)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        security.bootstrap_password = None
-        security.sessions.revoke_all()
-        session = security.sessions.create(_client_ip(request))
-        result = await bootstrap_payload(request)
-        result["authenticated"] = True
-        result["setup_required"] = False
-        result["can_setup_here"] = False
-        result["csrf_token"] = session.csrf_token
-        result["auth"] = {
-            "authenticated": True,
-            "setup_required": False,
-            "first_run": False,
-        }
-        # ``bootstrap_payload`` ran before the new cookie existed; append the
-        # authenticated application data explicitly.
-        snapshot_value = await _invoke(service, "snapshot")
-        snapshot = snapshot_value if isinstance(snapshot_value, dict) else {}
-        result.update(
-            {
-                "config": current_config().to_dict(),
-                "task": _task_view(snapshot),
-                "license": {
-                    **dict(snapshot.get("authorization", {}) or {}),
-                    "machine_code": machine_code(),
-                },
-                "profile": metadata,
-            }
-        )
+        # Compatibility endpoint for older frontends.  Password fields are
+        # accepted but ignored; opening the workspace now creates an anonymous
+        # IP-bound session instead of an administrator account.
+        await _json_body(request)
+        session, _created = request_session(request, create=True)
+        assert session is not None
+        result = await bootstrap_payload(request, session)
         response = JSONResponse({"bootstrap": result, "csrf_token": session.csrf_token})
-        response.set_cookie(
-            SESSION_COOKIE,
-            session.token,
-            max_age=security.sessions.ttl_seconds,
-            path="/",
-            secure=False,
-            httponly=True,
-            samesite="strict",
-        )
+        attach_session_cookie(response, session)
         return response
 
     @app.post("/api/login")
     async def login(request: Request) -> Response:
-        remote_ip = _client_ip(request)
-        if not security.password_store.setup_complete():
-            raise HTTPException(
-                status_code=503,
-                detail="请先在运行 DcmGet 的服务器本机设置管理员密码",
-            )
-        retry_after = security.login_limiter.retry_after(remote_ip)
-        if retry_after:
-            return JSONResponse(
-                status_code=429,
-                headers={"Retry-After": str(retry_after)},
-                content={"detail": "登录失败次数过多，请稍后重试"},
-            )
-        payload = await _json_body(request)
-        password = payload.get("password")
-        if not isinstance(password, str) or not security.password_store.verify(password):
-            retry_after = security.login_limiter.failure(remote_ip)
-            headers = {"Retry-After": str(retry_after)} if retry_after else None
-            return JSONResponse(
-                status_code=429 if retry_after else 401,
-                headers=headers,
-                content={"detail": "管理员密码错误"},
-            )
-        security.login_limiter.success(remote_ip)
-        session = security.sessions.create(remote_ip)
+        # Compatibility endpoint: no credentials are read or verified.
+        await _json_body(request)
+        session, _created = request_session(request, create=True)
+        assert session is not None
         response = JSONResponse(
             {
                 "authenticated": True,
+                "passwordless": True,
                 "csrf_token": session.csrf_token,
                 "expires_at": session.expires_at,
                 "insecure_http": True,
                 "warning": "当前为局域网 HTTP，请仅在可信内网使用。",
             }
         )
-        response.set_cookie(
-            SESSION_COOKIE,
-            session.token,
-            max_age=security.sessions.ttl_seconds,
-            path="/",
-            secure=False,
-            httponly=True,
-            samesite="strict",
-        )
+        attach_session_cookie(response, session)
         return response
 
     @app.get("/api/session")
-    async def session_status(request: Request) -> dict[str, object]:
-        token = request.cookies.get(SESSION_COOKIE)
-        session = security.sessions.get(token)
-        authenticated = bool(
-            session is not None and hmac_compare(session.remote_ip, _client_ip(request))
+    async def session_status(request: Request) -> Response:
+        session, created = request_session(request, create=True)
+        assert session is not None
+        response = JSONResponse(
+            {
+                "authenticated": True,
+                "passwordless": True,
+                "setup_required": False,
+                "csrf_token": session.csrf_token,
+                "expires_at": session.expires_at,
+                "insecure_http": True,
+                "warning": "当前为局域网 HTTP，请仅在可信内网使用。",
+            }
         )
-        return {
-            "authenticated": authenticated,
-            "setup_required": not security.password_store.setup_complete(),
-            "csrf_token": session.csrf_token if authenticated and session else None,
-            "expires_at": session.expires_at if authenticated and session else None,
-            "insecure_http": True,
-            "warning": "当前为局域网 HTTP，请仅在可信内网使用。",
-        }
+        if created:
+            attach_session_cookie(response, session)
+        return response
 
     @app.post("/api/logout")
     async def logout(
@@ -661,23 +608,16 @@ def create_web_app(
     @app.post("/api/admin/password")
     async def change_password(
         request: Request,
-        session: WebSession = Depends(require_csrf),
+        _session: WebSession = Depends(require_csrf),
     ) -> Response:
-        payload = await _json_body(request)
-        current = payload.get("current_password")
-        new = payload.get("new_password")
-        if not isinstance(current, str) or not security.password_store.verify(current):
-            raise HTTPException(status_code=403, detail="当前密码错误")
-        if not isinstance(new, str):
-            raise HTTPException(status_code=400, detail="新密码无效")
-        try:
-            security.password_store.replace(new)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        security.sessions.revoke_all()
-        response = JSONResponse({"ok": True, "login_required": True})
-        response.delete_cookie(SESSION_COOKIE, path="/")
-        return response
+        await _json_body(request)
+        return JSONResponse(
+            {
+                "ok": True,
+                "passwordless": True,
+                "login_required": False,
+            }
+        )
 
     @app.get("/api/snapshot")
     async def snapshot(_session: WebSession = Depends(require_session)) -> dict[str, object]:
@@ -705,7 +645,6 @@ def create_web_app(
         _session: WebSession = Depends(require_csrf),
     ) -> Any:
         payload = await _json_body(request)
-        require_password_confirmation(payload)
         nonlocal last_config
         config = _task_config(current_config(), payload)
         accessions = _validated_accessions(payload.get("accessions"))
@@ -1158,14 +1097,18 @@ def create_web_app(
         "acceptance-report",
         "profile-list",
         "profile-clone",
+        "profile-update",
         "profile-rename",
         "profile-delete",
         "profile-launch",
+        "profile-launch-all",
         "profile-shortcut",
+        "windows-service-status",
+        "windows-service-start",
+        "windows-service-stop",
     }
 
-    async def shutdown_application(payload: Mapping[str, Any]) -> dict[str, Any]:
-        require_password_confirmation(payload)
+    async def shutdown_application() -> dict[str, Any]:
         result = await _invoke(service, "shutdown")
         if shutdown_callback is not None:
             # Let this response leave the socket before stopping uvicorn.
@@ -1183,7 +1126,8 @@ def create_web_app(
         if name == "shutdown":
             if not session.local or not is_loopback_address(_client_ip(request)):
                 raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
-            return await shutdown_application(await _json_body(request))
+            await _json_body(request)
+            return await shutdown_application()
         handler = handlers.get(name)
         if handler is None:
             raise HTTPException(status_code=501, detail=f"当前服务未配置运维操作：{name}")
@@ -1207,7 +1151,8 @@ def create_web_app(
         request: Request,
         _session: WebSession = Depends(require_local_csrf),
     ) -> Any:
-        return await shutdown_application(await _json_body(request))
+        await _json_body(request)
+        return await shutdown_application()
 
     @app.get("/api/events")
     async def events(

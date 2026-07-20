@@ -14,6 +14,7 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [filelock](https://github.com/tox-dev/py-filelock)：The Unlicense。
 - [PyInstaller](https://pyinstaller.org/)：GPL 2.0-or-later，并带有适用于所生成应用的 bootloader exception。
 - [OHIF Viewer 3.12.6](https://github.com/OHIF/Viewers/tree/v3.12.6)：MIT License。DcmGet 固定使用官方 `@ohif/app` npm tarball，校验字节数和 SHA-256 后仅安全解包 `package/dist`，覆盖仅允许本地 DICOM JSON 数据源的配置并生成逐文件 SHA-256 清单；PDI 查看器目录随附 `LICENSE-OHIF.txt`、`THIRD_PARTY-OHIF.md` 和来源清单。
+- [WinSW 2.12.0](https://github.com/winsw/winsw/releases/tag/v2.12.0)：MIT License。Windows x64 安装版固定下载并校验官方 `WinSW-x64.exe`，将其重命名为 `kayisoft-dcmget.exe`，用于注册和控制同名 Windows 服务；安装目录随附 `LICENSE-WINSW.txt`。
 - Python 及标准库：遵循 [Python Software Foundation License](https://docs.python.org/3/license.html)。
 
 各组件的完整许可文本与实际安装版本随附文件为准。

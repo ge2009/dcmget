@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<service>
+  <id>kayisoft-dcmget</id>
+  <name>Kayisoft DcmGet</name>
+  <description>DcmGet DICOM download and local Web workstation service</description>
+  <executable>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</executable>
+  <arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;%BASE%\kayisoft-dcmget-host.ps1&quot; -Executable &quot;%BASE%\DcmGet.exe&quot; -AppDataRoot &quot;@APPDATA@&quot; -LocalAppDataRoot &quot;@LOCALAPPDATA@&quot; -UserProfileRoot &quot;@USERPROFILE@&quot;</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <env name="APPDATA" value="@APPDATA@" />
+  <env name="LOCALAPPDATA" value="@LOCALAPPDATA@" />
+  <env name="USERPROFILE" value="@USERPROFILE@" />
+  <serviceaccount>
+    <user>LocalSystem</user>
+  </serviceaccount>
+  <securityDescriptor>D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWRPWP;;;BU)</securityDescriptor>
+  <startmode>Automatic</startmode>
+  <stoptimeout>30sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <hidewindow>true</hidewindow>
+  <logpath>@LOCALAPPDATA@\DcmGet\logs\service</logpath>
+  <log mode="roll" />
+</service>

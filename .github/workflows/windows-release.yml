@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.0.1
+        default: 3.1.0
 
 permissions:
   contents: read
@@ -66,6 +66,7 @@ jobs:
           path: |
             .runtime/dcmtk/windows-x86_64
             .runtime/downloads
+            .runtime/winsw/v2.12.0
           key: dcmtk-3.7.0-integrity-v2-windows-x86_64
 
       - name: Prepare DCMTK
@@ -88,6 +89,14 @@ jobs:
 
       - name: Verify AMD64 application and DCMTK payloads
         run: python scripts/build_windows.py --version "${{ inputs.version }}" --verify-architecture-only
+
+      - name: Verify pinned WinSW service wrapper
+        shell: pwsh
+        run: |
+          $winsw = (Resolve-Path ".runtime/winsw/v2.12.0/WinSW-x64.exe").Path
+          $actual = (Get-FileHash $winsw -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+          if ($actual -ne $expected) { throw "WinSW checksum mismatch: $actual" }
 
       - name: Verify minimal DCMTK runtime and tools
         shell: pwsh
@@ -131,18 +140,12 @@ jobs:
           $env:DCMGET_TEST_EXE = Join-Path $fixture "DcmGet.exe"
           $env:DCMGET_TEST_DESKTOP = Join-Path $fixture "Desktop"
           Copy-Item "build/windows/dist/DcmGet/DcmGet.exe" $env:DCMGET_TEST_EXE -Force
-          python -c "import os; from dcmget.instance_shortcut import create_instance_shortcut, default_instance_shortcut_name; create_instance_shortcut(6, default_instance_shortcut_name(6666, 'DCMGET'), os.environ['DCMGET_TEST_DESKTOP'], executable=os.environ['DCMGET_TEST_EXE'], frozen=True, platform='win32')"
+          python -c "import os; from dcmget.instance_shortcut import create_instance_shortcut, default_instance_shortcut_name; create_instance_shortcut(6, default_instance_shortcut_name(6666, 'DCMGET'), os.environ['DCMGET_TEST_DESKTOP'], web_port=8787, executable=os.environ['DCMGET_TEST_EXE'], frozen=True, platform='win32')"
           if ($LASTEXITCODE -ne 0) { throw "Could not create profile shortcut" }
-          $link = Join-Path $env:DCMGET_TEST_DESKTOP "dcmget-6666-DCMGET.lnk"
-          if (-not (Test-Path $link -PathType Leaf)) { throw "Profile shortcut was not created" }
-          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
-          if (-not [IO.Path]::GetFullPath($shortcut.TargetPath).Equals([IO.Path]::GetFullPath($env:DCMGET_TEST_EXE), [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Profile shortcut target is incorrect: $($shortcut.TargetPath)"
-          }
-          if ($shortcut.Arguments -ne "--profile 6") { throw "Profile shortcut arguments are incorrect: $($shortcut.Arguments)" }
-          if (-not [IO.Path]::GetFullPath($shortcut.WorkingDirectory).Equals([IO.Path]::GetFullPath($fixture), [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Profile shortcut working directory is incorrect: $($shortcut.WorkingDirectory)"
-          }
+          $link = Join-Path $env:DCMGET_TEST_DESKTOP "dcmget-6666-DCMGET.url"
+          if (-not (Test-Path $link -PathType Leaf)) { throw "Profile URL shortcut was not created" }
+          $content = Get-Content $link -Raw
+          if ($content -notmatch '(?m)^URL=http://127\.0\.0\.1:8787/$') { throw "Profile URL shortcut target is incorrect: $content" }
 
       - name: Verify embedded Web, OHIF and PDI resources
         shell: pwsh
@@ -415,7 +418,8 @@ jobs:
           $license = (Resolve-Path "LICENSE").Path
           $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
           $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
-          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "packaging/windows/dcmget.iss"
+          $winsw = (Resolve-Path ".runtime/winsw/v2.12.0/WinSW-x64.exe").Path
+          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "/DWinSWPath=$winsw" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
       - name: Sign installer before testing exact release artifact
@@ -436,6 +440,57 @@ jobs:
           $trialPath = Join-Path $configDir "trial.json"
           $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
           $uninstallRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          $serviceName = "kayisoft-dcmget"
+
+          function Wait-DcmGetServiceStatus([string]$expected, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              if ($null -ne $service -and $service.Status.ToString() -eq $expected) { return $service }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $actual = if ($null -eq $service) { "missing" } else { $service.Status.ToString() }
+            throw "Service $serviceName status is $actual, expected $expected"
+          }
+
+          function Wait-DcmGetProfile([int]$profileNumber, [int]$webPort, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $process = @(
+                Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { ([string]$_.CommandLine) -match "--profile\s+$profileNumber(?:\s|$)" }
+              )
+              if ($process.Count -eq 1) {
+                try {
+                  $client = [Net.Sockets.TcpClient]::new()
+                  $client.Connect("127.0.0.1", $webPort)
+                  $client.Dispose()
+                  return $process[0]
+                } catch {
+                  if ($null -ne $client) { $client.Dispose() }
+                }
+              }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "Profile $profileNumber did not become ready on Web port $webPort"
+          }
+
+          function Get-FreeTcpPort {
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            try { return ([Net.IPEndPoint]$listener.LocalEndpoint).Port }
+            finally { $listener.Stop() }
+          }
+
+          function Test-TcpPortOpen([int]$port) {
+            $client = [Net.Sockets.TcpClient]::new()
+            try {
+              $pending = $client.ConnectAsync("127.0.0.1", $port)
+              return $pending.Wait(500) -and $client.Connected
+            } catch { return $false }
+            finally { $client.Dispose() }
+          }
+
           Remove-Item $configDir -Recurse -Force -ErrorAction SilentlyContinue
 
           $install = Start-Process $baseline -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
@@ -445,7 +500,8 @@ jobs:
           if ($baselineRecords[0].DisplayVersion -ne "2.6.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.6.1" }
           if ($baselineRecords[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Baseline installation directory is incorrect" }
           New-Item -ItemType Directory -Force $configDir | Out-Null
-          [IO.File]::WriteAllText($configPath, '{"config_version":2,"pacs_server_ip":"upgrade-preserve.invalid","storage_port":16666}', [Text.UTF8Encoding]::new($false))
+          $upgradeWebPort = Get-FreeTcpPort
+          [IO.File]::WriteAllText($configPath, "{`"config_version`":2,`"pacs_server_ip`":`"upgrade-preserve.invalid`",`"storage_port`":16666,`"web_port`":$upgradeWebPort}", [Text.UTF8Encoding]::new($false))
           Set-Content $licensePath "upgrade-license-sentinel"
           python -c "from dcmget.licensing import consume_trial; consume_trial()"
           if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
@@ -455,8 +511,55 @@ jobs:
           $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
           $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
 
+          # Replace the three inactive helper executables with a deterministic long-running
+          # fixture.  The upgrade must end these processes and their ping children,
+          # while preserving the same-named process outside the installation root.
+          # DcmGet.exe itself is verified below while it is genuinely service-hosted;
+          # never overwrite an executable that the installed service may be running.
+          $managedExecutablePaths = @(
+            (Join-Path $installDir "_internal\DcmGetPdiServer.exe"),
+            (Join-Path $installDir "_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe"),
+            (Join-Path $installDir "_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\movescu.exe")
+          )
+          foreach ($managedPath in $managedExecutablePaths) {
+            if (-not (Test-Path $managedPath -PathType Leaf)) { throw "Upgrade process fixture is missing: $managedPath" }
+            Copy-Item "$env:SystemRoot\System32\cmd.exe" $managedPath -Force
+          }
+          $managedProcesses = @(
+            $managedExecutablePaths | ForEach-Object {
+              Start-Process $_ -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+            }
+          )
+          $outsideRoot = Join-Path $env:RUNNER_TEMP "DcmGetOutsideProcess"
+          New-Item -ItemType Directory -Force $outsideRoot | Out-Null
+          $outsideTool = Join-Path $outsideRoot "storescp.exe"
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" $outsideTool -Force
+          $outsideProcess = Start-Process $outsideTool -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+          Start-Sleep -Seconds 1
+          $managedChildIds = @()
+          foreach ($managedProcess in $managedProcesses) {
+            $managedProcess.Refresh()
+            if ($managedProcess.HasExited) { throw "Managed process fixture exited before upgrade: $($managedProcess.Id)" }
+            $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($managedProcess.Id)")
+            if ($children.Count -lt 1) { throw "Managed process fixture has no child: $($managedProcess.Id)" }
+            $managedChildIds += @($children | ForEach-Object ProcessId)
+          }
+          $outsideProcess.Refresh()
+          if ($outsideProcess.HasExited) { throw "Outside process fixture exited before upgrade" }
+
           $upgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer failed with exit code $($upgrade.ExitCode)" }
+          foreach ($managedProcess in $managedProcesses) {
+            $managedProcess.Refresh()
+            if (-not $managedProcess.HasExited) { throw "Installer did not stop managed process $($managedProcess.Id)" }
+          }
+          foreach ($childId in $managedChildIds) {
+            if (Get-Process -Id $childId -ErrorAction SilentlyContinue) { throw "Installer left a managed child process running: $childId" }
+          }
+          $outsideProcess.Refresh()
+          if ($outsideProcess.HasExited) { throw "Installer killed same-named process outside install directory" }
+          taskkill /PID $outsideProcess.Id /T /F | Out-Null
+          Remove-Item $outsideRoot -Recurse -Force
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
           if (-not (Test-Path "$env:LOCALAPPDATA\DcmGet\logs")) { throw "Diagnostic log directory is missing" }
           $diagnosticShortcuts = @(
@@ -530,6 +633,202 @@ jobs:
           Assert-DcmGetFirewallRule "DcmGet Receiver TCP" $expectedReceiver
           Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb
 
+          $serviceWrapper = Join-Path $installDir "kayisoft-dcmget.exe"
+          $serviceConfig = Join-Path $installDir "kayisoft-dcmget.xml"
+          $serviceHost = Join-Path $installDir "kayisoft-dcmget-host.ps1"
+          @($serviceWrapper, $serviceConfig, $serviceHost, (Join-Path $installDir "LICENSE-WINSW.txt")) | ForEach-Object {
+            if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) { throw "Installed service resource is missing: $_" }
+          }
+          $wrapperHash = (Get-FileHash $serviceWrapper -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($wrapperHash -ne "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da") {
+            throw "Installed WinSW checksum mismatch: $wrapperHash"
+          }
+          [xml]$serviceXml = Get-Content -LiteralPath $serviceConfig -Raw
+          if ($serviceXml.service.id -ne $serviceName) { throw "Installed service ID is incorrect" }
+          if ($serviceXml.service.serviceaccount.user -ne "LocalSystem") { throw "Installed service is not LocalSystem" }
+          if ($null -ne $serviceXml.service.serviceaccount.domain) { throw "LocalSystem service unexpectedly has a domain" }
+          if ($serviceXml.service.securityDescriptor -ne "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWRPWP;;;BU)") {
+            throw "Installed service security descriptor is incorrect"
+          }
+          $configuredEnvironment = @{}
+          @($serviceXml.service.env) | ForEach-Object { $configuredEnvironment[[string]$_.name] = [string]$_.value }
+          if ($configuredEnvironment.APPDATA -ne $env:APPDATA) { throw "Service APPDATA does not belong to the installing user" }
+          if ($configuredEnvironment.LOCALAPPDATA -ne $env:LOCALAPPDATA) { throw "Service LOCALAPPDATA does not belong to the installing user" }
+          if ($configuredEnvironment.USERPROFILE -ne $env:USERPROFILE) { throw "Service USERPROFILE does not belong to the installing user" }
+
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          $serviceRecord = Get-CimInstance Win32_Service -Filter "Name = '$serviceName'"
+          if ($null -eq $serviceRecord) { throw "Installed service record is missing" }
+          if ($serviceRecord.StartMode -ne "Auto") { throw "Installed service is not automatic" }
+          if (-not ([string]$serviceRecord.PathName).Trim('"').Equals($serviceWrapper, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Installed service points to the wrong wrapper: $($serviceRecord.PathName)"
+          }
+
+          $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
+          for ($attempt = 0; $attempt -lt 120 -and -not (Test-Path $profile1ConfigPath -PathType Leaf); $attempt++) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not (Test-Path $profile1ConfigPath -PathType Leaf)) { throw "Service did not initialize Profile 1" }
+          $profile1Config = Get-Content $profile1ConfigPath -Raw | ConvertFrom-Json
+          $profile1Process = Wait-DcmGetProfile 1 ([int]$profile1Config.web_port)
+
+          # A newly cloned Profile must not be adopted by the service host before
+          # the user has finished its explicit pre-start configuration.
+          $profile2StoragePort = Get-FreeTcpPort
+          do { $profile2WebPort = Get-FreeTcpPort } while ($profile2WebPort -eq $profile2StoragePort)
+          $profile2Directory = Join-Path $configDir "instances\i2"
+          New-Item -ItemType Directory -Force $profile2Directory | Out-Null
+          $profile2Config = Get-Content $profile1ConfigPath -Raw | ConvertFrom-Json
+          $profile2Config.storage_port = $profile2StoragePort
+          $profile2Config.web_port = $profile2WebPort
+          $profile2Config.storage_ae_title = "DCMGET2"
+          $profile2Config.dicom_destination_folder = Join-Path $env:RUNNER_TEMP "DcmGetProfile2Output"
+          $profile2Config | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $profile2Directory "config.json") -Encoding utf8NoBOM
+          Start-Sleep -Seconds 4
+          $unexpectedProfile2 = @(
+            Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { ([string]$_.CommandLine) -match "--profile\s+2(?:\s|$)" }
+          )
+          if ($unexpectedProfile2.Count -ne 0 -or (Test-TcpPortOpen $profile2WebPort)) {
+            throw "Service host adopted a newly cloned Profile before explicit startup configuration"
+          }
+
+          & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not stop service before Profile snapshot restart" }
+          Wait-DcmGetServiceStatus "Stopped" | Out-Null
+          & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not restart service for Profile snapshot" }
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          $profile1Process = Wait-DcmGetProfile 1 ([int]$profile1Config.web_port)
+          $profile2Process = Wait-DcmGetProfile 2 $profile2WebPort
+
+          $profile1Hash = (Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash
+          $profile2ConfigPath = Join-Path $profile2Directory "config.json"
+          $profile2Hash = (Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash
+          $serviceProfileIdsBeforeUpgrade = @([int]$profile1Process.ProcessId, [int]$profile2Process.ProcessId)
+
+          # Reinstall the same release while the service is active.  This proves
+          # service-aware upgrade stop/refresh/start behavior and config retention.
+          $serviceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+          if ($serviceUpgrade.ExitCode -ne 0) { throw "Service-aware upgrade failed with code $($serviceUpgrade.ExitCode)" }
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          foreach ($oldProfileId in $serviceProfileIdsBeforeUpgrade) {
+            if (Get-Process -Id $oldProfileId -ErrorAction SilentlyContinue) { throw "Service-aware upgrade left old Profile process running: $oldProfileId" }
+          }
+          if ((Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash -ne $profile1Hash) { throw "Service-aware upgrade changed Profile 1 configuration" }
+          if ((Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash -ne $profile2Hash) { throw "Service-aware upgrade changed Profile 2 configuration" }
+          Wait-DcmGetProfile 1 ([int]$profile1Config.web_port) | Out-Null
+          Wait-DcmGetProfile 2 $profile2WebPort | Out-Null
+
+          # A repair/upgrade must preserve an intentionally stopped service.
+          & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not stop service before stopped-state upgrade test" }
+          Wait-DcmGetServiceStatus "Stopped" | Out-Null
+          $stoppedServiceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+          if ($stoppedServiceUpgrade.ExitCode -ne 0) { throw "Stopped-service upgrade failed with code $($stoppedServiceUpgrade.ExitCode)" }
+          Start-Sleep -Seconds 2
+          $serviceAfterStoppedUpgrade = Get-Service -Name $serviceName -ErrorAction Stop
+          if ($serviceAfterStoppedUpgrade.Status -ne "Stopped") { throw "Stopped-service upgrade unexpectedly restarted the service" }
+          & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not restart service after stopped-state upgrade test" }
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          Wait-DcmGetProfile 1 ([int]$profile1Config.web_port) | Out-Null
+          Wait-DcmGetProfile 2 $profile2WebPort | Out-Null
+
+          $startMenuRoots = @(
+            (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"),
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs")
+          )
+          foreach ($shortcutName in @("DcmGet.url", "DcmGet 启动全部.lnk", "DcmGet 停止全部.lnk")) {
+            if (-not ($startMenuRoots | Where-Object { Test-Path (Join-Path $_ $shortcutName) -PathType Leaf })) {
+              throw "Installed shortcut is missing: $shortcutName"
+            }
+          }
+          $webShortcut = $startMenuRoots | ForEach-Object { Join-Path $_ "DcmGet.url" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not (Select-String -LiteralPath $webShortcut -Pattern "^URL=http://127\.0\.0\.1:$upgradeWebPort/$" -Quiet)) {
+            throw "Installed DcmGet shortcut does not open the Web page"
+          }
+
+          # Replace only the service host with a deterministic child-tree fixture.
+          # WinSW must terminate helper and grandchild processes when the service stops.
+          & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
+          Wait-DcmGetServiceStatus "Stopped" | Out-Null
+          $serviceHostBackup = Join-Path $env:RUNNER_TEMP "kayisoft-dcmget-host.real.ps1"
+          Copy-Item $serviceHost $serviceHostBackup -Force
+          $serviceTreeFixture = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
+          Remove-Item $serviceTreeFixture -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $serviceTreeFixture | Out-Null
+          foreach ($fixtureName in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
+            Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $serviceTreeFixture $fixtureName) -Force
+          }
+          $fixtureHostSource = @'
+param([string]$Executable, [string]$AppDataRoot, [string]$LocalAppDataRoot, [string]$UserProfileRoot)
+$fixtureRoot = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
+$children = @()
+foreach ($name in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
+    $children += Start-Process (Join-Path $fixtureRoot $name) -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+}
+$children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
+while ($true) { Start-Sleep -Seconds 1 }
+'@
+          [IO.File]::WriteAllText($serviceHost, $fixtureHostSource, [Text.UTF8Encoding]::new($false))
+          & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not start service process-tree fixture" }
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          $serviceTreePidFile = Join-Path $serviceTreeFixture "pids.txt"
+          for ($attempt = 0; $attempt -lt 80 -and -not (Test-Path $serviceTreePidFile -PathType Leaf); $attempt++) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not (Test-Path $serviceTreePidFile -PathType Leaf)) { throw "Service process-tree fixture did not start" }
+          $serviceTreeIds = @([int[]](Get-Content $serviceTreePidFile))
+          foreach ($directId in @($serviceTreeIds)) {
+            $serviceTreeIds += @(
+              Get-CimInstance Win32_Process -Filter "ParentProcessId = $directId" -ErrorAction SilentlyContinue |
+                ForEach-Object { [int]$_.ProcessId }
+            )
+          }
+          & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not stop service process-tree fixture" }
+          Wait-DcmGetServiceStatus "Stopped" | Out-Null
+          Start-Sleep -Seconds 1
+          foreach ($serviceTreeId in @($serviceTreeIds | Sort-Object -Unique)) {
+            if (Get-Process -Id $serviceTreeId -ErrorAction SilentlyContinue) { throw "Service tree process survived stop: $serviceTreeId" }
+          }
+          Copy-Item $serviceHostBackup $serviceHost -Force
+          Remove-Item $serviceTreeFixture -Recurse -Force
+          & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not restart real DcmGet service host" }
+          Wait-DcmGetServiceStatus "Running" | Out-Null
+          Wait-DcmGetProfile 1 ([int]$profile1Config.web_port) | Out-Null
+          Wait-DcmGetProfile 2 $profile2WebPort | Out-Null
+
+          # Builtin Users receive only query/start/stop rights.  Running sc.exe
+          # under a fresh ordinary account proves daily operations need no UAC.
+          $opsUser = "DcmGetOpsCI"
+          $opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N")
+          & "$env:SystemRoot\System32\net.exe" user $opsUser $opsPasswordText /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not create ordinary service-control test user" }
+          try {
+            $opsCredential = [PSCredential]::new(
+              "$env:COMPUTERNAME\$opsUser",
+              (ConvertTo-SecureString $opsPasswordText -AsPlainText -Force)
+            )
+            function Invoke-ScAsOrdinaryUser([string[]]$scArguments) {
+              $result = Start-Process "$env:SystemRoot\System32\sc.exe" -ArgumentList $scArguments -Credential $opsCredential -LoadUserProfile -WindowStyle Hidden -Wait -PassThru
+              if ($result.ExitCode -ne 0) { throw "Ordinary user sc.exe failed ($($scArguments -join ' ')): $($result.ExitCode)" }
+            }
+            Invoke-ScAsOrdinaryUser @("query", $serviceName)
+            Invoke-ScAsOrdinaryUser @("stop", $serviceName)
+            Wait-DcmGetServiceStatus "Stopped" | Out-Null
+            Invoke-ScAsOrdinaryUser @("query", $serviceName)
+            Invoke-ScAsOrdinaryUser @("start", $serviceName)
+            Wait-DcmGetServiceStatus "Running" | Out-Null
+            Wait-DcmGetProfile 1 ([int]$profile1Config.web_port) | Out-Null
+            Wait-DcmGetProfile 2 $profile2WebPort | Out-Null
+          } finally {
+            & "$env:SystemRoot\System32\net.exe" user $opsUser /delete | Out-Null
+          }
+
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
           $upgradeWeb = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--web-self-test", "--config", "`"$configPath`"") -Wait -PassThru
@@ -541,8 +840,19 @@ jobs:
           if ($diagnosticLogs.Count -lt 1) { throw "Installed self-test did not write a process-specific diagnostic log" }
           $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
+          if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "Uninstall left kayisoft-dcmget service behind" }
+          $serviceSurvivors = @(
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object {
+                ([string]$_.ExecutablePath).StartsWith($installDir + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+                ([string]$_.CommandLine).IndexOf("kayisoft-dcmget-host.ps1", [StringComparison]::OrdinalIgnoreCase) -ge 0
+              }
+          )
+          if ($serviceSurvivors.Count -ne 0) { throw "Uninstall left DcmGet service processes behind: $($serviceSurvivors.ProcessId -join ', ')" }
           if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Uninstall removed or changed the user configuration" }
+          if ((Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash -ne $profile1Hash) { throw "Uninstall removed or changed Profile 1 configuration" }
+          if ((Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash -ne $profile2Hash) { throw "Uninstall removed or changed Profile 2 configuration" }
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Uninstall removed or changed the license" }
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
@@ -562,6 +872,7 @@ jobs:
             --amd64-pe build/windows/dist/DcmGet/DcmGet.exe `
             --amd64-pe build/windows/dist/DcmGetPdiServer.exe `
             --amd64-pe "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" `
+            --amd64-pe ".runtime/winsw/v2.12.0/WinSW-x64.exe" `
             --dcmtk-bin "build/windows/dcmtk-runtime/dcmtk-3.7.0-win64-dynamic/bin" `
             --verify-existing-signatures
 

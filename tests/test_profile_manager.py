@@ -69,6 +69,8 @@ def test_list_profiles_exposes_identity_endpoint_and_status(tmp_path):
     assert profile.number == 2
     assert profile.display_name == "实例 2"
     assert profile.config_path == config_path
+    assert profile.pacs_server_ip == "127.0.0.1"
+    assert profile.pacs_server_port == 8104
     assert profile.calling_ae_title == "CALLING"
     assert profile.pacs_ae_title == "PACS01"
     assert profile.storage_ae_title == "DCMGET2"
@@ -141,6 +143,133 @@ def test_recommend_port_skips_profile_ports_and_failed_local_bind(tmp_path):
 
     assert manager.recommend_available_port(7000) == 7002
     assert checked == [7002]
+
+
+def test_update_profile_saves_launch_fields_before_start(tmp_path):
+    config_path = _write_profile(tmp_path, 1)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    profile = manager.update_profile(
+        1,
+        display_name="CT 夜班",
+        pacs_server_ip="172.16.0.10",
+        pacs_server_port=104,
+        calling_ae_title="MACGET",
+        pacs_ae_title="PACS02",
+        storage_ae_title="MACGET",
+        storage_port=6777,
+        web_port=8899,
+        dicom_destination_folder=str(tmp_path / "night-output"),
+    )
+
+    saved = load_config(config_path)
+    assert profile.display_name == "CT 夜班"
+    assert profile.pacs_server_ip == "172.16.0.10"
+    assert profile.pacs_server_port == 104
+    assert profile.calling_ae_title == "MACGET"
+    assert profile.pacs_ae_title == "PACS02"
+    assert profile.storage_ae_title == "MACGET"
+    assert profile.storage_port == 6777
+    assert profile.web_port == 8899
+    assert profile.destination_directory == str(tmp_path / "night-output")
+    assert saved.to_dict()["storage_port"] == 6777
+
+
+def test_update_rejects_same_profile_scp_and_web_port_without_saving(tmp_path):
+    config_path = _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    with pytest.raises(ProfileManagerError, match="Web 端口不能与 DICOM 接收端口相同"):
+        manager.update_profile(1, web_port=6666)
+
+    saved = load_config(config_path)
+    assert (saved.storage_port, saved.web_port) == (6666, 8787)
+
+
+def test_update_rejects_cross_profile_port_conflict_without_saving(tmp_path):
+    config_path = _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    _write_profile(tmp_path, 2, port=7777, web_port=8888)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    with pytest.raises(
+        ProfileManagerError,
+        match=r"实例 1 的DICOM 接收端口 8888 与实例 2 的Web 端口冲突",
+    ):
+        manager.update_profile(1, storage_port=8888)
+
+    assert load_config(config_path).storage_port == 6666
+
+
+def test_update_rejects_port_occupied_by_another_program(tmp_path):
+    config_path = _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    manager = _manager(
+        tmp_path,
+        port_probe=lambda _host, port: port != 8899,
+    )
+
+    with pytest.raises(
+        ProfileManagerError,
+        match=r"实例 1 的Web 端口 8899 已被其他程序占用",
+    ):
+        manager.update_profile(1, web_port=8899)
+
+    assert load_config(config_path).web_port == 8787
+
+
+def test_startup_port_validation_rejects_invalid_saved_port(tmp_path):
+    _write_profile(tmp_path, 1, port=0, web_port=8787)
+
+    with pytest.raises(
+        ProfileManagerError,
+        match=r"实例 1 的DICOM 接收端口必须在 1 到 65535 之间",
+    ):
+        _manager(tmp_path).validate_profile_ports(1)
+
+
+def test_update_refuses_a_running_profile(tmp_path):
+    _write_profile(tmp_path, 1)
+    lock_path = tmp_path / "state" / "instances" / "i1.lock"
+    lock_path.parent.mkdir(parents=True)
+    running_lock = FileLock(str(lock_path))
+    running_lock.acquire(timeout=0)
+    try:
+        with pytest.raises(ProfileInUseError, match="先停止后再修改"):
+            _manager(tmp_path).update_profile(1, web_port=8899)
+    finally:
+        running_lock.release()
+
+
+def test_update_rolls_back_config_when_display_name_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+    monkeypatch.setattr(
+        manager,
+        "_write_metadata",
+        lambda _number, _name: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(ProfileManagerError, match="保存实例 1 配置失败"):
+        manager.update_profile(
+            1,
+            display_name="新名称",
+            storage_port=6777,
+        )
+
+    assert load_config(config_path).storage_port == 6666
+    assert not config_path.with_name("profile-meta.json").exists()
+
+
+def test_clone_never_reuses_its_new_receiver_port_for_web(tmp_path):
+    _write_profile(tmp_path, 1, port=6666, web_port=6667)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    result = manager.clone_profile(1)
+
+    assert result.recommended_port == 6668
+    assert result.recommended_web_port == 6669
 
 
 def test_delete_refuses_running_profile(tmp_path):
