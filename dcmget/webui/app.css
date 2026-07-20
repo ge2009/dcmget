@@ -1426,6 +1426,11 @@ dialog::backdrop {
   font-weight: 800;
 }
 
+.confirm-password-field {
+  margin-top: 16px;
+  text-align: left;
+}
+
 .toast-region {
   position: fixed;
   z-index: 100;

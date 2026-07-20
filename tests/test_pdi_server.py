@@ -122,6 +122,11 @@ def _request(
 
 def _expire_idle_server(server: PdiHttpServer) -> None:
     with server._idle_condition:
+        if not server._idle_condition.wait_for(
+            lambda: server._active_requests == 0,
+            timeout=3,
+        ):
+            raise AssertionError("PDI 测试请求未在超时内结束")
         server._last_activity = (
             time.monotonic() - server.idle_timeout_seconds - 1
         )

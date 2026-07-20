@@ -1323,7 +1323,7 @@ def _attribution_status(
     *,
     anonymized_output: bool,
 ) -> AttributionStatus:
-    explicit = observed.attribution_status
+    explicit = getattr(observed, "attribution_status", None)
     if explicit is not None:
         try:
             return AttributionStatus(str(getattr(explicit, "value", explicit)))

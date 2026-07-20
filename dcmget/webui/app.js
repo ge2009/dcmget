@@ -55,6 +55,9 @@ const state = {
   currentDirectory: "",
   startedAt: 0,
   refreshTimer: 0,
+  preflightTimer: 0,
+  preflightRequestId: 0,
+  initialized: false,
   localSession: true,
 };
 
@@ -178,7 +181,7 @@ function formatDuration(value) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function parseAccessions(raw) {
+function parseAccessions(raw, { schedule = true } = {}) {
   const values = [];
   const seen = new Set();
   let blank = 0;
@@ -206,7 +209,7 @@ function parseAccessions(raw) {
   state.parsedAccessions = values;
   state.parseStats = { blank, duplicate, invalid };
   renderImportSummary();
-  invalidatePreflight();
+  invalidatePreflight(schedule);
   return values;
 }
 
@@ -244,13 +247,23 @@ function draftSignature() {
   return JSON.stringify(taskDraft());
 }
 
-function invalidatePreflight() {
+function invalidatePreflight(schedule = true) {
   if (state.preflightSignature && state.preflightSignature !== draftSignature()) {
     state.preflightOk = false;
     state.preflightSignature = "";
     resetPreflightChecks();
   }
   updateStartAvailability();
+  if (schedule && state.initialized) schedulePreflight();
+}
+
+function schedulePreflight(delay = 450) {
+  window.clearTimeout(state.preflightTimer);
+  if (!state.initialized || !$("#destination-input").value.trim()) return;
+  state.preflightTimer = window.setTimeout(
+    () => runPreflight({ requireAccessions: false, silent: true }),
+    delay,
+  );
 }
 
 function resetPreflightChecks() {
@@ -283,7 +296,7 @@ function normalizeChecks(payload) {
   ]));
 }
 
-function renderPreflight(payload) {
+function renderPreflight(payload, signature = draftSignature()) {
   const checks = normalizeChecks(payload);
   const aliases = {
     config: ["config", "configuration"],
@@ -302,40 +315,46 @@ function renderPreflight(payload) {
     setText($("small", item), check?.message || check?.detail || (ok ? "已就绪" : "未通过"));
   }
   state.preflightOk = allOk;
-  state.preflightSignature = allOk ? draftSignature() : "";
+  state.preflightSignature = allOk ? signature : "";
   setStatusBadge($("#task-readiness"), allOk ? "completed" : "failed", allOk ? "预检通过" : "预检未通过");
   updateStartAvailability();
 }
 
-async function runPreflight() {
-  clearAlert();
-  parseAccessions($("#accession-input").value);
-  if (!state.parsedAccessions.length) {
+async function runPreflight({ requireAccessions = true, silent = false } = {}) {
+  if (!silent) clearAlert();
+  parseAccessions($("#accession-input").value, { schedule: false });
+  if (requireAccessions && !state.parsedAccessions.length) {
     showAlert("请先输入至少一个有效检查号。", "无法预检");
     $("#accession-input").focus();
     return false;
   }
-  if (!$("#destination-input").value.trim()) {
+  if (requireAccessions && !$("#destination-input").value.trim()) {
     showAlert("请选择运行 DcmGet 主机上的保存目录。", "无法预检");
     $("#destination-input").focus();
     return false;
   }
 
   const button = $("#run-preflight-button");
+  const signature = draftSignature();
+  const requestId = ++state.preflightRequestId;
   button.disabled = true;
   button.textContent = "检查中…";
   try {
     const result = await api("/api/preflight", { method: "POST", body: taskDraft() });
-    renderPreflight(result);
-    if (!state.preflightOk) showAlert(result.message || "部分检查未通过，请根据红色项目修复后重试。", "预检未通过");
+    if (requestId !== state.preflightRequestId || signature !== draftSignature()) return false;
+    renderPreflight(result, signature);
+    if (!state.preflightOk && !silent) showAlert(result.message || "部分检查未通过，请根据红色项目修复后重试。", "预检未通过");
     return state.preflightOk;
   } catch (error) {
-    renderPreflight({ ok: false });
-    showAlert(error.message, "预检失败");
+    if (requestId !== state.preflightRequestId || signature !== draftSignature()) return false;
+    renderPreflight({ ok: false }, signature);
+    if (!silent) showAlert(error.message, "预检失败");
     return false;
   } finally {
-    button.disabled = false;
-    button.textContent = "重新检查";
+    if (requestId === state.preflightRequestId) {
+      button.disabled = false;
+      button.textContent = "重新检查";
+    }
   }
 }
 
@@ -344,11 +363,23 @@ async function startTask() {
     const ok = await runPreflight();
     if (!ok) return;
   }
+  await confirmAction(
+    "确认开始下载",
+    `将向 PACS 提交 ${state.parsedAccessions.length.toLocaleString()} 个检查号。请输入管理员密码后开始。`,
+    (password) => submitStartTask(password),
+    { requirePassword: true, confirmLabel: "确认并开始", tone: "primary" },
+  );
+}
+
+async function submitStartTask(password) {
   const button = $("#start-task-button");
   button.disabled = true;
   button.textContent = "正在创建…";
   try {
-    const result = await api("/api/task/start", { method: "POST", body: taskDraft() });
+    const result = await api("/api/task/start", {
+      method: "POST",
+      body: { ...taskDraft(), password },
+    });
     state.task = result.task || result;
     state.startedAt = Date.now();
     renderTask(state.task);
@@ -507,16 +538,34 @@ async function taskAction(action, body = {}) {
   }
 }
 
-async function confirmAction(title, message, callback) {
+async function confirmAction(
+  title,
+  message,
+  callback,
+  { requirePassword = false, confirmLabel = "确认", tone = "danger" } = {},
+) {
   const dialog = $("#confirm-dialog");
+  const passwordField = $("#confirm-password-field");
+  const passwordInput = $("#confirm-password");
+  const confirmButton = $("#confirm-action-button");
   setText("#confirm-title", title);
   setText("#confirm-message", message);
+  passwordField.hidden = !requirePassword;
+  passwordInput.required = requirePassword;
+  passwordInput.value = "";
+  confirmButton.textContent = confirmLabel;
+  confirmButton.classList.toggle("button--primary", tone === "primary");
+  confirmButton.classList.toggle("button--danger", tone !== "primary");
+  dialog.returnValue = "";
   const onClose = async () => {
     dialog.removeEventListener("close", onClose);
-    if (dialog.returnValue === "confirm") await callback();
+    const password = passwordInput.value;
+    passwordInput.value = "";
+    if (dialog.returnValue === "confirm") await callback(password);
   };
   dialog.addEventListener("close", onClose);
   dialog.showModal();
+  if (requirePassword) passwordInput.focus();
 }
 
 function addLog(entry) {
@@ -640,6 +689,8 @@ async function logout() {
     // A cleared or expired session has the same visible result.
   }
   closeEvents();
+  state.initialized = false;
+  window.clearTimeout(state.preflightTimer);
   showLogin(false);
 }
 
@@ -666,6 +717,8 @@ function applyBootstrap(payload) {
   if (task) renderTask(task);
   else showTaskEditor();
   connectEvents();
+  state.initialized = true;
+  if (!state.task && $("#destination-input").value.trim()) schedulePreflight(0);
 }
 
 async function loadBootstrap() {
@@ -706,6 +759,7 @@ function renderEnvironment(payload) {
     '[data-operation="open-data-directory"]',
     '[data-operation="open-log-directory"]',
     '[data-operation="acceptance-report"]',
+    "#shutdown-service-button",
   ].forEach((selector) => {
     const control = $(selector);
     if (control) control.hidden = !state.localSession;
@@ -746,6 +800,17 @@ function populateSettings(config) {
     if (element.type === "checkbox") element.checked = Boolean(derived[element.name]);
     else element.value = derived[element.name] ?? "";
   }
+  syncPdiSettingsUi();
+}
+
+function syncPdiSettingsUi() {
+  const enabled = $("#setting-pdi-enabled").checked;
+  $("#setting-pdi-options").hidden = !enabled;
+  setStatusBadge(
+    $("#pdi-setting-state"),
+    enabled ? "completed" : "idle",
+    enabled ? "已启用" : "默认关闭",
+  );
 }
 
 function settingsPayload() {
@@ -840,7 +905,7 @@ function handleServerEvent(event) {
     return;
   }
   const type = payload.type || event.type;
-  const data = payload.data ?? payload.payload ?? payload;
+  const data = payload.payload ?? payload.data ?? payload;
   if ([
     "task", "task_started", "state", "progress", "task_state", "task_progress",
     "pdi_progress", "pdi_finished", "verification_progress",
@@ -970,6 +1035,25 @@ async function runOperation(name, body = {}) {
   } catch (error) {
     showAlert(error.message, "运维操作失败");
     return null;
+  }
+}
+
+async function shutdownService(password) {
+  const button = $("#shutdown-service-button");
+  button.disabled = true;
+  try {
+    const result = await api("/api/operations/shutdown", {
+      method: "POST",
+      body: { password },
+    });
+    state.initialized = false;
+    window.clearTimeout(state.preflightTimer);
+    closeEvents();
+    setConnectionState("disconnected", "后台已关闭");
+    showToast(result.message || "DcmGet 后台已安全关闭，可以关闭浏览器页面。", 6000);
+  } catch (error) {
+    button.disabled = false;
+    showAlert(error.message, "关闭后台失败");
   }
 }
 
@@ -1234,6 +1318,7 @@ function bindEvents() {
     $("#quick-pdi-folder-row").hidden = !event.target.checked;
     invalidatePreflight();
   });
+  $("#setting-pdi-enabled").addEventListener("change", syncPdiSettingsUi);
   $("#quick-pdi-folder").addEventListener("input", invalidatePreflight);
   $("#accession-file").addEventListener("change", (event) => importAccessions(event.target.files[0]));
 
@@ -1248,7 +1333,7 @@ function bindEvents() {
   }));
   dropzone.addEventListener("drop", (event) => importAccessions(event.dataTransfer.files[0]));
 
-  $("#run-preflight-button").addEventListener("click", runPreflight);
+  $("#run-preflight-button").addEventListener("click", () => runPreflight());
   $("#start-task-button").addEventListener("click", startTask);
   $("#pause-task-button").addEventListener("click", () => taskAction("pause"));
   $("#resume-task-button").addEventListener("click", () => taskAction("resume"));
@@ -1261,6 +1346,8 @@ function bindEvents() {
   ));
   $("#new-task-button").addEventListener("click", () => {
     $("#accession-input").value = "";
+    $("#quick-pdi-enabled").checked = Boolean(state.config.pdi_export_enabled);
+    $("#quick-pdi-folder-row").hidden = !$("#quick-pdi-enabled").checked;
     parseAccessions("");
     resetPreflightChecks();
     showTaskEditor();
@@ -1344,6 +1431,12 @@ function bindEvents() {
       showAlert("浏览器拒绝了剪贴板权限。", "无法复制");
     }
   });
+  $("#shutdown-service-button").addEventListener("click", () => confirmAction(
+    "关闭 DcmGet 后台",
+    "后台关闭后，当前浏览器将无法继续操作；正在运行的下载会安全停止并保留恢复点。请输入管理员密码确认。",
+    (password) => shutdownService(password),
+    { requirePassword: true, confirmLabel: "确认关闭", tone: "danger" },
+  ));
   $$('[data-operation]').forEach((button) => button.addEventListener("click", () => runOperation(button.dataset.operation)));
   $("#open-destination-button").addEventListener("click", () => runOperation("open-destination"));
   $("#open-log-directory-button").addEventListener("click", () => runOperation("open-log-directory"));

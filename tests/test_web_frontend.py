@@ -169,7 +169,7 @@ def test_recovery_large_batch_and_sse_contracts_are_visible() -> None:
     for status in ("interrupted", "download_retryable", "pdi_retryable", "recovery_error"):
         assert f"{status}:" in javascript
     assert "task?.status_counts?.[key]" in javascript
-    assert "payload.data ?? payload.payload ?? payload" in javascript
+    assert "payload.payload ?? payload.data ?? payload" in javascript
     assert "scheduleTaskRefresh()" in javascript
     assert "can_setup_here" in javascript
     assert "首次密码只能在运行 DcmGet 的主机本机设置" in javascript
@@ -235,6 +235,55 @@ def test_settings_cover_clinical_network_reliability_privacy_and_pdi() -> None:
     assert 'data.web_bind_address = data.web_lan_enabled ? "0.0.0.0" : "127.0.0.1"' in _javascript()
     assert 'id="setting-auth-required" name="web_auth_required" type="checkbox" checked disabled' in source
     assert 'name="max_concurrent_moves"' not in source
+
+
+def test_pacs_and_local_receiver_settings_are_separate_groups() -> None:
+    source, _document_parser = _document()
+
+    pacs_start = source.index('id="pacs-settings-title"')
+    receiver_start = source.index('id="receiver-settings-title"')
+    storage_start = source.index('id="storage-settings-title"')
+    assert pacs_start < receiver_start < storage_start
+    assert source.index('name="pacs_server_ip"', pacs_start, receiver_start) > pacs_start
+    assert source.index('name="pacs_ae_title"', pacs_start, receiver_start) > pacs_start
+    assert source.index('name="calling_ae_title"', receiver_start, storage_start) > receiver_start
+    assert source.index('name="storage_ae_title"', receiver_start, storage_start) > receiver_start
+    assert source.index('name="storage_port"', receiver_start, storage_start) > receiver_start
+
+
+def test_pdi_is_off_by_default_but_preserves_an_explicit_saved_preference() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+
+    assert '默认关闭' in source
+    assert 'id="quick-pdi-enabled" type="checkbox"' in source
+    assert 'id="setting-pdi-enabled" name="pdi_export_enabled" type="checkbox"' in source
+    assert 'id="quick-pdi-enabled" type="checkbox" checked' not in source
+    assert '$("#quick-pdi-enabled").checked = Boolean(config.pdi_export_enabled)' in javascript
+    assert 'id="setting-pdi-options"' in source
+    assert 'syncPdiSettingsUi()' in javascript
+
+
+def test_preflight_runs_automatically_and_discards_stale_responses() -> None:
+    javascript = _javascript()
+
+    assert "schedulePreflight(0)" in javascript
+    assert "runPreflight({ requireAccessions: false, silent: true })" in javascript
+    assert "const requestId = ++state.preflightRequestId" in javascript
+    assert "requestId !== state.preflightRequestId || signature !== draftSignature()" in javascript
+    assert '$("#run-preflight-button").addEventListener("click", () => runPreflight())' in javascript
+
+
+def test_start_and_local_shutdown_require_current_password_confirmation() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+
+    assert 'id="confirm-password" type="password" autocomplete="current-password"' in source
+    assert 'id="shutdown-service-button"' in source
+    assert 'body: { ...taskDraft(), password }' in javascript
+    assert 'api("/api/operations/shutdown"' in javascript
+    assert "requirePassword: true" in javascript
+    assert '"#shutdown-service-button"' in javascript
 
 
 def test_offline_license_activation_exposes_machine_code_and_token_input() -> None:

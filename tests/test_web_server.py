@@ -228,6 +228,7 @@ def test_first_password_setup_is_local_only_and_then_bootstraps_app(web: WebFixt
     assert bootstrap["task"]["status"] == "idle"
     assert bootstrap["web"]["local_session"] is True
     assert web.client.get("/").status_code == 200
+    assert web.client.get("/favicon.ico").status_code == 204
     assert web.client.get("/assets/app.js").status_code == 200
 
 
@@ -316,9 +317,27 @@ def test_task_routes_build_server_side_config_and_tools(web: WebFixture):
         "receiver",
     }
 
-    response = web.client.post(
+    missing_password = web.client.post(
         "/api/task/start",
         json=payload,
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert missing_password.status_code == 403
+    assert missing_password.json()["detail"] == "密码错误"
+    assert web.service.started_with is None
+
+    wrong_password = web.client.post(
+        "/api/task/start",
+        json={**payload, "password": "wrong-password"},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert wrong_password.status_code == 403
+    assert wrong_password.json()["detail"] == "密码错误"
+    assert web.service.started_with is None
+
+    response = web.client.post(
+        "/api/task/start",
+        json={**payload, "password": "a-secure-admin-password"},
         headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
     )
 
@@ -440,7 +459,7 @@ def test_remote_authenticated_session_cannot_shutdown_server(web: WebFixture):
     assert remote.get("/api/bootstrap").json()["web"]["local_session"] is False
     denied = remote.post(
         "/api/ops/shutdown",
-        json={},
+        json={"password": "another-secure-admin-password"},
         headers={
             "Origin": "http://192.168.1.50:8787",
             "X-CSRF-Token": remote_csrf,
@@ -449,14 +468,74 @@ def test_remote_authenticated_session_cannot_shutdown_server(web: WebFixture):
     assert denied.status_code == 403
     assert not web.service.stopped
 
-    local = web.client.post(
+    missing_password = web.client.post(
         "/api/ops/shutdown",
         json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert missing_password.status_code == 403
+    assert missing_password.json()["detail"] == "密码错误"
+    assert not web.service.stopped
+
+    wrong_password = web.client.post(
+        "/api/ops/shutdown",
+        json={"password": "wrong-password"},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert wrong_password.status_code == 403
+    assert wrong_password.json()["detail"] == "密码错误"
+    assert not web.service.stopped
+
+    local = web.client.post(
+        "/api/operations/shutdown",
+        json={"password": "another-secure-admin-password"},
         headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
     )
     assert local.status_code == 200
     assert web.service.stopped
     assert callback_calls == []
+
+
+def test_sensitive_confirmation_uses_the_current_password_after_change(
+    web: WebFixture,
+):
+    original_password = "original-secure-password"
+    current_password = "replacement-secure-password"
+    csrf = web.setup(original_password)
+    changed = web.client.post(
+        "/api/admin/password",
+        json={
+            "current_password": original_password,
+            "new_password": current_password,
+        },
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert changed.status_code == 200
+
+    login = web.client.post(
+        "/api/login",
+        json={"password": current_password},
+        headers=LOCAL_ORIGIN,
+    )
+    assert login.status_code == 200
+    current_csrf = login.json()["csrf_token"]
+
+    stale = web.client.post(
+        "/api/ops/shutdown",
+        json={"password": original_password},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": current_csrf},
+    )
+    assert stale.status_code == 403
+    assert stale.json()["detail"] == "密码错误"
+    assert not web.service.stopped
+
+    confirmed = web.client.post(
+        "/api/ops/shutdown",
+        json={"password": current_password},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": current_csrf},
+    )
+    assert confirmed.status_code == 200
+    assert web.service.stopped
 
 
 def test_login_rate_limit_returns_retry_after(web: WebFixture):

@@ -387,7 +387,7 @@ def create_web_app(
 
     app = FastAPI(
         title="DcmGet Web",
-        version="3.0.0",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -446,12 +446,32 @@ def create_web_app(
             raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
         return session
 
+    def require_password_confirmation(payload: Mapping[str, Any]) -> None:
+        password = payload.get("password")
+        if not isinstance(password, str) or not security.password_store.verify(password):
+            raise HTTPException(status_code=403, detail="密码错误")
+
     @app.get("/", include_in_schema=False)
     @app.get("/login", include_in_schema=False)
     async def index() -> Response:
         if index_path is None:
             return HTMLResponse(_default_login_html())
         return FileResponse(index_path, media_type="text/html")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        candidate = (
+            resolved_project_root / "logo.png"
+            if resolved_project_root is not None
+            else None
+        )
+        if (
+            candidate is not None
+            and candidate.is_file()
+            and not candidate.is_symlink()
+        ):
+            return FileResponse(candidate, media_type="image/png")
+        return Response(status_code=204)
 
     async def bootstrap_payload(request: Request) -> dict[str, object]:
         token = request.cookies.get(SESSION_COOKIE)
@@ -685,6 +705,7 @@ def create_web_app(
         _session: WebSession = Depends(require_csrf),
     ) -> Any:
         payload = await _json_body(request)
+        require_password_confirmation(payload)
         nonlocal last_config
         config = _task_config(current_config(), payload)
         accessions = _validated_accessions(payload.get("accessions"))
@@ -1143,6 +1164,14 @@ def create_web_app(
         "profile-shortcut",
     }
 
+    async def shutdown_application(payload: Mapping[str, Any]) -> dict[str, Any]:
+        require_password_confirmation(payload)
+        result = await _invoke(service, "shutdown")
+        if shutdown_callback is not None:
+            # Let this response leave the socket before stopping uvicorn.
+            threading.Timer(0.15, shutdown_callback).start()
+        return {"ok": True, "result": result}
+
     @app.post("/api/operations/{name}")
     async def operation(
         name: str,
@@ -1151,6 +1180,10 @@ def create_web_app(
     ) -> Any:
         if name in {"health", "release-notes"}:
             raise HTTPException(status_code=405, detail="操作方法不允许")
+        if name == "shutdown":
+            if not session.local or not is_loopback_address(_client_ip(request)):
+                raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
+            return await shutdown_application(await _json_body(request))
         handler = handlers.get(name)
         if handler is None:
             raise HTTPException(status_code=501, detail=f"当前服务未配置运维操作：{name}")
@@ -1171,13 +1204,10 @@ def create_web_app(
 
     @app.post("/api/ops/shutdown")
     async def shutdown(
+        request: Request,
         _session: WebSession = Depends(require_local_csrf),
     ) -> Any:
-        result = await _invoke(service, "shutdown")
-        if shutdown_callback is not None:
-            # Let this response leave the socket before stopping uvicorn.
-            threading.Timer(0.15, shutdown_callback).start()
-        return {"ok": True, "result": result}
+        return await shutdown_application(await _json_body(request))
 
     @app.get("/api/events")
     async def events(

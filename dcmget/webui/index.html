@@ -169,7 +169,7 @@
                 <label class="switch-row" for="quick-pdi-enabled">
                   <span>
                     <strong>生成 PDI 便携目录</strong>
-                    <small>任务完成后自动生成 DICOMDIR 和离线中文查看器。</small>
+                    <small>默认关闭；按当前任务开启后生成 DICOMDIR 和离线中文查看器。</small>
                   </span>
                   <span class="switch"><input id="quick-pdi-enabled" type="checkbox"><span aria-hidden="true"></span></span>
                 </label>
@@ -286,12 +286,18 @@
         </div>
         <form id="settings-form" class="settings-layout">
           <section class="card settings-card" aria-labelledby="pacs-settings-title">
-            <div class="card-header"><div><h2 id="pacs-settings-title">PACS 连接</h2><p>查询服务器及本机 DICOM 身份。</p></div></div>
+            <div class="card-header"><div><h2 id="pacs-settings-title">PACS 服务端</h2><p>配置提供查询和 C-MOVE 服务的 PACS。</p></div></div>
             <div class="form-grid form-grid--two">
               <label class="field"><span>PACS 地址</span><input name="pacs_server_ip" type="text" autocomplete="off" required></label>
               <label class="field"><span>PACS 端口</span><input name="pacs_server_port" type="text" inputmode="numeric" required></label>
-              <label class="field"><span>本机调用 AE</span><input name="calling_ae_title" type="text" maxlength="16" required></label>
-              <label class="field"><span>PACS AE</span><input name="pacs_ae_title" type="text" maxlength="16" required></label>
+              <label class="field field--wide"><span>PACS AE</span><input name="pacs_ae_title" type="text" maxlength="16" required></label>
+            </div>
+          </section>
+
+          <section class="card settings-card" aria-labelledby="receiver-settings-title">
+            <div class="card-header"><div><h2 id="receiver-settings-title">本地 DICOM 接收端</h2><p>配置本机调用身份及 storescp 接收端。</p></div></div>
+            <div class="form-grid form-grid--two">
+              <label class="field field--wide"><span>本机调用 AE</span><input name="calling_ae_title" type="text" maxlength="16" required></label>
               <label class="field"><span>接收 AE</span><input name="storage_ae_title" type="text" maxlength="16" required></label>
               <label class="field"><span>监听端口</span><input name="storage_port" type="text" inputmode="numeric" required></label>
             </div>
@@ -327,12 +333,12 @@
           </section>
 
           <section class="card settings-card" aria-labelledby="pdi-settings-title">
-            <div class="card-header"><div><h2 id="pdi-settings-title">PDI 便携目录</h2><p>生成标准 DICOMDIR 与完全离线的中文查看器。</p></div></div>
+            <div class="card-header"><div><h2 id="pdi-settings-title">PDI 便携目录</h2><p>生成标准 DICOMDIR 与完全离线的中文查看器。</p></div><span id="pdi-setting-state" class="status-badge status-badge--neutral">默认关闭</span></div>
             <label class="switch-row" for="setting-pdi-enabled">
-              <span><strong>任务完成后自动生成</strong><small>未匿名数据可能包含患者隐私。</small></span>
+              <span><strong>新任务默认生成</strong><small>默认关闭；未匿名数据可能包含患者隐私。</small></span>
               <span class="switch"><input id="setting-pdi-enabled" name="pdi_export_enabled" type="checkbox"><span aria-hidden="true"></span></span>
             </label>
-            <div class="form-grid form-grid--two">
+            <div id="setting-pdi-options" class="form-grid form-grid--two" hidden>
               <label class="field"><span>机构名称</span><input name="pdi_institution_name" type="text"></label>
               <label class="field"><span>PDI 输出目录</span><input name="pdi_output_folder" type="text"></label>
               <label class="field"><span>单卷容量（GB）</span><input name="pdi_volume_size_gb" type="text" inputmode="decimal"><small>0 表示不分卷。</small></label>
@@ -379,6 +385,7 @@
             <div class="inline-actions">
               <button class="button button--secondary" type="button" data-operation="profile-backup">备份 Profile</button>
               <button class="button button--secondary" type="button" data-operation="open-data-directory">在主机打开数据目录</button>
+              <button id="shutdown-service-button" class="button button--danger-quiet" type="button">关闭 DcmGet 后台</button>
             </div>
           </section>
           <section id="profile-management-card" class="card operations-card operations-card--wide">
@@ -440,6 +447,11 @@
       <div class="confirm-symbol" aria-hidden="true">!</div>
       <h2 id="confirm-title">确认操作</h2>
       <p id="confirm-message">是否继续？</p>
+      <label id="confirm-password-field" class="field confirm-password-field" hidden>
+        <span>管理员密码</span>
+        <input id="confirm-password" type="password" autocomplete="current-password" maxlength="128">
+        <small>密码仅用于本次敏感操作确认，不会保存在页面中。</small>
+      </label>
       <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="confirm-action-button" class="button button--danger" value="confirm">确认</button></div>
     </form>
   </dialog>

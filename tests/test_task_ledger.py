@@ -11,6 +11,7 @@ from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
 
 import dcmget.task_ledger as task_ledger_module
+from dcmget.core import ReceivedDicomMetadata
 from dcmget.task_ledger import (
     AttributionStatus,
     ObservedDicom,
@@ -207,6 +208,34 @@ class _RunnerResult:
     duration_seconds: float = 1.25
     file_count: int = 1
     received_bytes: int = 512
+
+
+def test_download_runner_received_metadata_is_accepted_by_ledger(tmp_path: Path):
+    ledger = TaskLedger(tmp_path / "ledger.sqlite3")
+    batch_id = ledger.create_batch(["REQ-RUNNER"])
+    result = _RunnerResult(
+        "REQ-RUNNER",
+        _Status.COMPLETED,
+        [str(tmp_path / "received.dcm")],
+    )
+    received = ReceivedDicomMetadata(
+        file_path=str(tmp_path / "received.dcm"),
+        actual_accession_number="REQ-RUNNER",
+        study_instance_uid="1.2.826.0.1.3680043.10.991.80",
+        series_instance_uid="1.2.826.0.1.3680043.10.991.80.1",
+        sop_instance_uid="1.2.826.0.1.3680043.10.991.80.1.1",
+        size_bytes=1024,
+    )
+
+    ledger.record_runner_result(
+        batch_id,
+        result,
+        observed_instances=[received],
+    )
+
+    request = ledger.load_batch(batch_id).requests[0]
+    assert request.attribution_status == "matched"
+    assert request.instances[0].sop_instance_uid.endswith("991.80.1.1")
 
 
 def test_download_runner_adapter_accepts_pre_anonymization_metadata(tmp_path: Path):
