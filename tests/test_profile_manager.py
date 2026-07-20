@@ -14,6 +14,7 @@ from dcmget.profile_manager import (
     ProfileManagerError,
     ProfileNotFoundError,
     ProfileRecoveryExistsError,
+    WINDOWS_MANAGEMENT_PORT,
 )
 
 
@@ -145,6 +146,17 @@ def test_recommend_port_skips_profile_ports_and_failed_local_bind(tmp_path):
     assert checked == [7002]
 
 
+def test_recommend_port_always_skips_windows_management_port(tmp_path):
+    checked: list[int] = []
+    manager = _manager(
+        tmp_path,
+        port_probe=lambda _host, port: checked.append(port) or True,
+    )
+
+    assert manager.recommend_available_port(WINDOWS_MANAGEMENT_PORT) == 8787
+    assert checked == [8787]
+
+
 def test_update_profile_saves_launch_fields_before_start(tmp_path):
     config_path = _write_profile(tmp_path, 1)
     manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
@@ -214,6 +226,36 @@ def test_update_rejects_port_occupied_by_another_program(tmp_path):
         manager.update_profile(1, web_port=8899)
 
     assert load_config(config_path).web_port == 8787
+
+
+@pytest.mark.parametrize("field", ["storage_port", "web_port"])
+def test_update_rejects_windows_management_port_without_rewriting_config(
+    tmp_path,
+    field,
+):
+    config_path = _write_profile(tmp_path, 1, port=6666, web_port=8787)
+    before = config_path.read_bytes()
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    with pytest.raises(ProfileManagerError, match="Windows 管理中心保留端口"):
+        manager.update_profile(1, **{field: WINDOWS_MANAGEMENT_PORT})
+
+    assert config_path.read_bytes() == before
+
+
+def test_saved_management_port_is_reported_without_rewriting_config(tmp_path):
+    config_path = _write_profile(
+        tmp_path,
+        1,
+        port=6666,
+        web_port=WINDOWS_MANAGEMENT_PORT,
+    )
+    before = config_path.read_bytes()
+
+    with pytest.raises(ProfileManagerError, match="Windows 管理中心保留端口"):
+        _manager(tmp_path).validate_profile_ports(1)
+
+    assert config_path.read_bytes() == before
 
 
 def test_startup_port_validation_rejects_invalid_saved_port(tmp_path):

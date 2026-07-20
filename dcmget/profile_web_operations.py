@@ -13,7 +13,12 @@ from .instance_shortcut import (
     default_instance_shortcut_name,
     profile_web_url,
 )
-from .profile_manager import ProfileCloneResult, ProfileInfo, ProfileManager
+from .profile_manager import (
+    ProfileCloneResult,
+    ProfileInfo,
+    ProfileManager,
+    ProfileManagerError,
+)
 from .runtime import is_frozen, resource_root
 
 
@@ -250,8 +255,15 @@ class ProfileWebOperations:
             },
         }
 
-    @staticmethod
-    def _serialize_profile(profile: ProfileInfo) -> JsonDict:
+    def _serialize_profile(self, profile: ProfileInfo) -> JsonDict:
+        issues: list[str] = []
+        try:
+            self.manager.validate_profile_ports(
+                profile.number,
+                check_system_ports=not profile.is_running,
+            )
+        except ProfileManagerError as exc:
+            issues.append(str(exc))
         return {
             "number": profile.number,
             "display_name": profile.display_name,
@@ -267,6 +279,7 @@ class ProfileWebOperations:
             "dicom_destination_folder": profile.destination_directory,
             "is_running": profile.is_running,
             "has_recovery": profile.has_recovery,
+            "issues": issues,
         }
 
     def _serialize_clone_result(self, result: ProfileCloneResult) -> JsonDict:

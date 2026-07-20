@@ -23,6 +23,7 @@ from dcmget.instance_profile import (
     migrate_legacy_checkpoint_to_profile,
     migrate_task_catalog_to_profiles,
 )
+from dcmget.profile_manager import WINDOWS_MANAGEMENT_PORT
 from dcmget.task_manager import TaskCatalog
 from dcmget.task_state import TaskCheckpoint, TaskCheckpointStore, TaskStateError
 
@@ -221,6 +222,43 @@ def test_profile_slots_keep_config_state_logs_and_settings_isolated(tmp_path):
     explicit = acquire_instance_profile("2", **kwargs)
     assert explicit.number == 2
     explicit.close()
+
+
+def test_new_profile_moves_template_off_windows_management_port_without_rewriting_template(
+    tmp_path,
+):
+    kwargs = _profile_kwargs(tmp_path)
+    template = kwargs["template_config_path"]
+    save_config(
+        template,
+        AppConfig(storage_port=6666, web_port=WINDOWS_MANAGEMENT_PORT),
+    )
+    original = template.read_bytes()
+
+    profile = acquire_instance_profile(**kwargs)
+    try:
+        assert load_config(profile.config_path).web_port == 8787
+    finally:
+        profile.close()
+
+    assert template.read_bytes() == original
+
+
+def test_existing_profile_on_management_port_is_never_rewritten_during_claim(
+    tmp_path,
+):
+    kwargs = _profile_kwargs(tmp_path)
+    config_path = kwargs["config_root"] / "instances" / "i1" / "config.json"
+    save_config(
+        config_path,
+        AppConfig(storage_port=6666, web_port=WINDOWS_MANAGEMENT_PORT),
+    )
+    original = config_path.read_bytes()
+
+    profile = acquire_instance_profile(1, **kwargs)
+    profile.close()
+
+    assert config_path.read_bytes() == original
 
 
 def test_instance_activation_path_is_stable_without_claiming_profile(tmp_path):

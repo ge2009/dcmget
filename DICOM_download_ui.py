@@ -41,6 +41,7 @@ from dcmget.instance_profile import (
     migrate_task_catalog_to_profiles,
 )
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
+from dcmget.management_server import run_windows_management_server
 from dcmget.profile_manager import ProfileManager
 from dcmget.profile_web_operations import ProfileWebOperations
 from dcmget.release_notes import load_release_notes
@@ -82,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-open-browser",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--windows-management",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -683,6 +689,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ensure_supported_runtime()
         args = build_parser().parse_args(arguments)
+        if args.windows_management:
+            return run_windows_management_server(
+                project_root=PROJECT_ROOT,
+                static_root=validate_web_resources(PROJECT_ROOT),
+                trusted_hosts=_lan_hosts(),
+            )
         prepare_windows_portable_dcmtk(PROJECT_ROOT)
         if args.self_test:
             if args.self_test_report:

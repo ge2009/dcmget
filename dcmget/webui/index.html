@@ -68,6 +68,16 @@
     <symbol id="icon-save" viewBox="0 0 24 24">
       <path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6"></path>
     </symbol>
+    <symbol id="icon-grid" viewBox="0 0 24 24">
+      <rect x="4" y="4" width="6" height="6" rx="1.5"></rect>
+      <rect x="14" y="4" width="6" height="6" rx="1.5"></rect>
+      <rect x="4" y="14" width="6" height="6" rx="1.5"></rect>
+      <rect x="14" y="14" width="6" height="6" rx="1.5"></rect>
+    </symbol>
+    <symbol id="icon-external" viewBox="0 0 24 24">
+      <path d="M14 5h5v5M19 5l-8 8"></path>
+      <path d="M18 13v6H5V6h6"></path>
+    </symbol>
   </svg>
 
   <div id="app-shell" class="app-shell" hidden>
@@ -100,8 +110,8 @@
         <button class="nav-item" type="button" data-page="settings" aria-label="设置" title="设置">
           <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-sliders"></use></svg></span><span>设置</span>
         </button>
-        <button class="nav-item" type="button" data-page="operations" aria-label="运维" title="运维">
-          <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-activity"></use></svg></span><span>运维</span>
+        <button class="nav-item" type="button" data-page="operations" aria-label="管理" title="管理">
+          <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-grid"></use></svg></span><span>管理</span>
         </button>
       </nav>
       <div class="sidebar-foot">
@@ -387,9 +397,20 @@
       </section>
 
       <section id="page-operations" class="page" data-page-panel="operations" aria-labelledby="operations-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">维护</p><h1 id="operations-title">运维中心</h1><p class="page-description">检查环境、收集支持材料并管理当前 Profile。</p></div></div>
+        <div class="page-heading"><div><p id="operations-eyebrow" class="eyebrow">实例与维护</p><h1 id="operations-title">管理中心</h1><p id="operations-description" class="page-description">统一查看 Profile、修复配置并进入各自的任务页面。</p></div></div>
+        <section id="manager-overview" class="manager-overview" aria-labelledby="manager-overview-title" hidden>
+          <div class="manager-overview__copy">
+            <span class="manager-overview__icon" aria-hidden="true"><svg class="icon"><use href="#icon-grid"></use></svg></span>
+            <div><p class="eyebrow">Windows 服务入口</p><h2 id="manager-overview-title">所有下载实例，一处管理</h2><p>管理中心独立于 Profile 运行；即使某个接收端口配置冲突，也可以在这里定位并修复。</p></div>
+          </div>
+          <dl class="manager-overview__metrics">
+            <div><dt>Profile</dt><dd id="manager-profile-count">—</dd></div>
+            <div><dt>运行中</dt><dd id="manager-running-count">—</dd></div>
+            <div><dt>需要处理</dt><dd id="manager-issue-count">—</dd></div>
+          </dl>
+        </section>
         <div class="operations-grid">
-          <section class="card operations-card">
+          <section id="operation-runtime-card" class="card operations-card" data-manager-hidden>
             <div class="card-header"><div><h2>运行身份</h2><p>每个 Profile 使用独立配置、端口和任务目录。</p></div></div>
             <dl class="detail-list">
               <div><dt>Profile</dt><dd id="operation-profile">—</dd></div>
@@ -405,20 +426,17 @@
             </div>
           </section>
           <section id="profile-management-card" class="card operations-card operations-card--wide">
-            <div class="card-header"><div><h2>Profile 管理</h2><p>先配置 PACS、接收端口和 Web 端口，再启动独立任务实例。</p><span id="windows-service-state" class="status-badge status-badge--neutral" hidden>kayisoft-dcmget · 检查中</span></div><div class="inline-actions"><button id="start-all-profiles-button" class="button button--primary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg><span>启动全部</span></button><button id="stop-all-services-button" class="button button--danger-quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg><span>停止全部</span></button><button id="refresh-profiles-button" class="button button--secondary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>刷新</span></button></div></div>
-            <div class="table-wrap profile-table-wrap">
-              <table class="data-table">
-                <thead><tr><th>名称</th><th>PACS</th><th>接收</th><th>Web 端口</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead>
-                <tbody id="profile-table-body"><tr><td colspan="7">正在读取 Profile…</td></tr></tbody>
-              </table>
+            <div class="card-header profile-workbench-header"><div><h2>Profile 工作台</h2><p>每个 Profile 使用独立 AE、SCP 端口、Web 端口和保存目录。</p><span id="windows-service-state" class="status-badge status-badge--neutral" hidden>kayisoft-dcmget · 检查中</span></div><div class="inline-actions"><button id="start-all-profiles-button" class="button button--primary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg><span>启动全部</span></button><button id="stop-all-services-button" class="button button--danger-quiet button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg><span>停止全部</span></button><button id="refresh-profiles-button" class="button button--secondary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>刷新</span></button></div></div>
+            <div id="profile-grid" class="profile-grid" aria-live="polite">
+              <div class="profile-empty">正在读取 Profile…</div>
             </div>
-            <p id="profile-management-hint" class="form-hint">SCP 接收端口、Web 端口以及其他 Profile 已使用的端口不能重复；保存时会自动检查并提示。</p>
+            <p id="profile-management-hint" class="form-hint">从当前主机地址进入不同 Web 端口；SCP、Web 和管理中心端口必须保持唯一。</p>
           </section>
-          <section class="card operations-card">
+          <section class="card operations-card" data-manager-hidden>
             <div class="card-header"><div><h2>健康检查</h2><p>检查工具、目录、端口、数据库和磁盘状态。</p></div><button id="refresh-health-button" class="button button--secondary button--small" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg><span>重新检查</span></button></div>
             <ul id="health-list" class="health-list" aria-live="polite"><li class="health-placeholder">尚未执行健康检查</li></ul>
           </section>
-          <section class="card operations-card">
+          <section class="card operations-card" data-manager-hidden>
             <div class="card-header"><div><h2>软件授权</h2><p>每台电脑使用独立机器码；未注册时可免费执行 30 个任务。</p></div></div>
             <dl class="detail-list">
               <div><dt>机器码</dt><dd><code id="license-machine-code">—</code></dd></div>
@@ -430,7 +448,7 @@
               <button id="copy-machine-code-button" class="button button--secondary" type="button">复制机器码</button>
             </div>
           </section>
-          <section class="card operations-card">
+          <section class="card operations-card" data-manager-hidden>
             <div class="card-header"><div><h2>诊断与支持</h2><p>支持包默认隐藏患者身份、检查号和 PACS 连接信息。</p></div></div>
             <div class="operation-actions">
               <button class="operation-button" type="button" data-operation="open-log-directory"><strong>日志目录</strong><span>查看主机上的完整运行日志</span></button>
@@ -438,7 +456,7 @@
               <button class="operation-button" type="button" data-operation="acceptance-report"><strong>生成验收报告</strong><span>导出环境与任务结果摘要</span></button>
             </div>
           </section>
-          <section class="card operations-card">
+          <section id="release-notes-card" class="card operations-card">
             <div class="card-header"><div><h2>版本说明</h2><p>当前版本的新增能力和修复。</p></div></div>
             <div id="release-notes" class="release-notes"><p class="muted">正在加载版本信息…</p></div>
           </section>

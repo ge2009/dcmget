@@ -24,6 +24,8 @@ MIN_RECOMMENDED_PORT = 1024
 MAX_PROFILE_NUMBER = 9999
 MAX_DISPLAY_NAME_LENGTH = 80
 MAX_METADATA_BYTES = 16 * 1024
+WINDOWS_MANAGEMENT_PORT = 8786
+RESERVED_PROFILE_PORTS = frozenset({WINDOWS_MANAGEMENT_PORT})
 
 _PROFILE_DIRECTORY = re.compile(r"i([1-9][0-9]{0,3})")
 
@@ -173,6 +175,7 @@ class ProfileManager:
             for profile in self.list_profiles()
             for port in (profile.storage_port, profile.web_port)
         }
+        used_ports.update(RESERVED_PROFILE_PORTS)
         used_ports.update(int(port) for port in excluded_ports)
         candidates = range(start, 65536)
         wrapped = range(MIN_RECOMMENDED_PORT, start)
@@ -464,6 +467,11 @@ class ProfileManager:
             if isinstance(port, bool) or not 1 <= int(port) <= 65535:
                 raise ProfileManagerError(
                     f"实例 {number} 的{label}必须在 1 到 65535 之间"
+                )
+            if int(port) in RESERVED_PROFILE_PORTS:
+                raise ProfileManagerError(
+                    f"实例 {number} 的{label} {port} 是 Windows 管理中心保留端口，"
+                    "请改用其他端口"
                 )
         if config.storage_port == config.web_port:
             raise ProfileManagerError(

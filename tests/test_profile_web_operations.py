@@ -78,6 +78,18 @@ def test_list_profiles_returns_json_safe_profiles(tmp_path):
     assert profile["dicom_destination_folder"] == str(tmp_path / "dicom-1")
     assert isinstance(profile["config_path"], str)
     assert profile["storage_ae_title"] == "AE01"
+    assert profile["issues"] == []
+
+
+def test_list_profiles_surfaces_port_conflicts_without_hiding_other_profiles(tmp_path):
+    _write_profile(tmp_path, 1, port=6666, web_port=8787, storage_ae="AE01")
+    _write_profile(tmp_path, 3, port=6666, web_port=8789, storage_ae="AE03")
+
+    profiles = _operations(tmp_path).list_profiles()["profiles"]
+
+    assert len(profiles) == 2
+    assert all(profile["issues"] for profile in profiles)
+    assert all("6666" in profile["issues"][0] for profile in profiles)
 
 
 def test_clone_rename_and_delete_round_trip(tmp_path):

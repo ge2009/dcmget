@@ -68,6 +68,7 @@ const state = {
   taskEditorCollapsed: false,
   initialized: false,
   localSession: true,
+  managerMode: false,
   profiles: [],
   windowsService: null,
 };
@@ -685,20 +686,31 @@ function renderLogs() {
   if (keepAtBottom && list.lastElementChild) list.scrollTop = list.scrollHeight;
 }
 
-function showPage(pageName) {
+function requestedPage(fallback = "home") {
+  const requested = new URLSearchParams(window.location.search).get("page");
+  return ["home", "settings", "operations"].includes(requested) ? requested : fallback;
+}
+
+function showPage(pageName, { syncUrl = true } = {}) {
+  const allowedPage = state.managerMode ? "operations" : pageName;
   $$("[data-page-panel]").forEach((panel) => {
-    const active = panel.dataset.pagePanel === pageName;
+    const active = panel.dataset.pagePanel === allowedPage;
     panel.hidden = !active;
     panel.classList.toggle("is-active", active);
   });
   $$(".nav-item[data-page]").forEach((button) => {
-    const active = button.dataset.page === pageName;
+    const active = button.dataset.page === allowedPage;
     button.classList.toggle("is-active", active);
     if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
+  if (syncUrl) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("page", allowedPage);
+    window.history.replaceState({}, "", url);
+  }
   $("#main-content").focus({ preventScroll: true });
-  if (pageName === "operations") refreshOperations();
+  if (allowedPage === "operations") refreshOperations();
 }
 
 function showApplication() {
@@ -708,17 +720,31 @@ function showApplication() {
 function applyBootstrap(payload) {
   state.bootstrap = payload || {};
   state.csrfToken = payload.csrf_token || payload.csrfToken || state.csrfToken;
+  state.managerMode = payload.profile?.mode === "manager";
+  document.body.classList.toggle("manager-mode", state.managerMode);
   showApplication();
   state.config = payload.config || {};
   populateSettings(state.config);
   $("#destination-input").value = state.config.dicom_destination_folder || "";
   renderEnvironment(payload);
   renderLicense(payload.license || {});
+  if (state.managerMode) {
+    document.title = "DcmGet · 管理中心";
+    $("#manager-overview").hidden = false;
+    setText("#operations-eyebrow", "Windows 服务工作台");
+    setText("#operations-title", "DcmGet 管理中心");
+    setText("#operations-description", "统一管理这台 Windows 主机上的 Profile，并通过独立链接进入各自任务页面。");
+    setConnectionState("connected", "管理中心已连接");
+    state.initialized = true;
+    showPage("operations", { syncUrl: false });
+    return;
+  }
   const task = payload.task || payload.active_task;
   if (task) renderTask(task);
   else showTaskEditor();
   connectEvents();
   state.initialized = true;
+  showPage(requestedPage("home"), { syncUrl: false });
   if (!state.task && $("#destination-input").value.trim()) schedulePreflight(0);
 }
 
@@ -739,9 +765,15 @@ function renderEnvironment(payload) {
   const receiver = payload.receiver || {};
   const web = payload.web || {};
   state.localSession = web.local_session !== false;
-  setText("#header-profile", `Profile ${profile.name || profile.id || payload.profile_name || "default"}`);
-  setText("#header-pacs", `PACS ${config.pacs_server_ip || "—"}:${config.pacs_server_port || "—"} · ${config.pacs_ae_title || "—"}`);
-  setText("#header-receiver", `接收 ${config.storage_ae_title || "—"}:${config.storage_port || "—"}`);
+  if (state.managerMode) {
+    setText("#header-profile", "Windows 管理中心");
+    setText("#header-pacs", "kayisoft-dcmget");
+    setText("#header-receiver", `管理端口 ${profile.manager_port || window.location.port || "8786"}`);
+  } else {
+    setText("#header-profile", `Profile ${profile.name || profile.id || payload.profile_name || "default"}`);
+    setText("#header-pacs", `PACS ${config.pacs_server_ip || "—"}:${config.pacs_server_port || "—"} · ${config.pacs_ae_title || "—"}`);
+    setText("#header-receiver", `接收 ${config.storage_ae_title || "—"}:${config.storage_port || "—"}`);
+  }
   setText("#operation-profile", profile.name || profile.id || payload.profile_name || "default");
   setText("#operation-data-dir", profile.data_dir || payload.data_dir);
   setText("#operation-version", payload.version || payload.app_version);
@@ -751,7 +783,7 @@ function renderEnvironment(payload) {
   setText("#operation-web-url", url);
   setText("#lan-url", url);
   $("#lan-notice").hidden = !(web.lan_enabled ?? config.web_lan_enabled ?? payload.lan_enabled);
-  $("#profile-management-card").hidden = !state.localSession;
+  $("#profile-management-card").hidden = !(state.localSession || state.managerMode);
   [
     "#open-destination-button",
     "#open-log-directory-button",
@@ -1074,8 +1106,12 @@ async function shutdownService() {
 }
 
 async function refreshOperations() {
+  if (state.managerMode) {
+    await Promise.allSettled([refreshProfiles(), refreshWindowsServiceStatus(), refreshReleaseNotes()]);
+    return;
+  }
   const refreshes = [refreshHealth(), refreshLicense(), refreshReleaseNotes(), refreshWindowsServiceStatus()];
-  if (state.localSession) refreshes.push(refreshProfiles());
+  if (state.localSession || state.managerMode) refreshes.push(refreshProfiles());
   await Promise.allSettled(refreshes);
 }
 
@@ -1093,50 +1129,152 @@ function profileActionButton(label, action, profile, disabled = false) {
   return button;
 }
 
+function profileIssues(profile) {
+  const raw = profile.issues || profile.validation_errors || profile.errors || [];
+  if (Array.isArray(raw)) return raw.map((item) => String(item?.message || item)).filter(Boolean);
+  if (raw && typeof raw === "object") return Object.values(raw).map((item) => String(item?.message || item)).filter(Boolean);
+  if (profile.validation_error) return [String(profile.validation_error)];
+  if (profile.last_error) return [String(profile.last_error)];
+  return [];
+}
+
+function profilePageUrl(profile, page = "home") {
+  const url = new URL(window.location.href);
+  url.port = String(profile.web_port);
+  url.pathname = "/";
+  url.search = "";
+  url.searchParams.set("page", page);
+  url.hash = "";
+  return url.toString();
+}
+
+function openProfilePage(profile, page = "home") {
+  window.open(profilePageUrl(profile, page), `_dcmget_profile_${profile.number}_${page}`, "noopener");
+}
+
+function profilePageButton(label, page, profile, primary = false) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `button ${primary ? "button--primary" : "button--secondary"} button--small`;
+  const icon = document.createElement("svg");
+  icon.setAttribute("class", "icon");
+  icon.setAttribute("aria-hidden", "true");
+  const use = document.createElement("use");
+  use.setAttribute("href", "#icon-external");
+  icon.append(use);
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.append(icon, text);
+  button.addEventListener("click", () => openProfilePage(profile, page));
+  return button;
+}
+
+function profileFact(label, value) {
+  const wrapper = document.createElement("div");
+  const term = document.createElement("dt");
+  const detail = document.createElement("dd");
+  term.textContent = label;
+  detail.textContent = value || "—";
+  detail.title = value || "";
+  wrapper.append(term, detail);
+  return wrapper;
+}
+
+function updateManagerOverview(profiles) {
+  if (!state.managerMode) return;
+  const running = profiles.filter((profile) => profile.is_running).length;
+  const issues = profiles.filter((profile) => profileIssues(profile).length).length;
+  setText("#manager-profile-count", profiles.length);
+  setText("#manager-running-count", running);
+  setText("#manager-issue-count", issues);
+}
+
 function renderProfiles(profiles) {
   state.profiles = Array.isArray(profiles) ? profiles : [];
-  const body = $("#profile-table-body");
-  body.replaceChildren();
+  const grid = $("#profile-grid");
+  grid.replaceChildren();
+  updateManagerOverview(state.profiles);
   if (!state.profiles.length) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.colSpan = 7;
-    cell.textContent = "尚未创建 Profile。";
-    row.append(cell);
-    body.append(row);
+    const empty = document.createElement("div");
+    empty.className = "profile-empty";
+    empty.textContent = "尚未创建 Profile。";
+    grid.append(empty);
     return;
   }
   state.profiles.forEach((profile) => {
-    const row = document.createElement("tr");
-    const stateLabel = [profile.is_running ? "运行中" : "空闲", profile.has_recovery ? "有恢复任务" : ""].filter(Boolean).join(" · ");
-    const values = [
-      profile.display_name || `Profile ${profile.number}`,
-      `${profile.pacs_server_ip || "—"}:${profile.pacs_server_port || "—"} · ${profile.pacs_ae_title || "—"}`,
-      `${profile.storage_ae_title || "—"}:${profile.storage_port || "—"}`,
-      profile.web_port || "—",
-      profile.destination_directory || "—",
-      stateLabel,
-    ];
-    values.forEach((value) => {
-      const cell = document.createElement("td");
-      cell.textContent = String(value);
-      row.append(cell);
-    });
-    const actions = document.createElement("td");
-    actions.className = "profile-actions";
-    if (profile.is_running) {
-      actions.append(profileActionButton("打开页面", openProfileWeb, profile));
-    } else {
-      actions.append(profileActionButton("配置并启动", launchProfile, profile));
+    const issues = profileIssues(profile);
+    const card = document.createElement("article");
+    card.className = "profile-card";
+    card.dataset.state = issues.length ? "issue" : (profile.is_running ? "running" : "idle");
+
+    const header = document.createElement("div");
+    header.className = "profile-card__header";
+    const identity = document.createElement("div");
+    identity.className = "profile-card__identity";
+    const name = document.createElement("h3");
+    name.textContent = profile.display_name || `Profile ${profile.number}`;
+    const number = document.createElement("p");
+    number.textContent = `Profile ${profile.number}`;
+    identity.append(name, number);
+    const status = document.createElement("span");
+    const tone = issues.length ? "error" : (profile.is_running ? "success" : "neutral");
+    status.className = `status-badge status-badge--${tone}`;
+    status.textContent = issues.length ? "需要处理" : (profile.is_running ? "运行中" : "未启动");
+    header.append(identity, status);
+
+    const facts = document.createElement("dl");
+    facts.className = "profile-card__facts";
+    facts.append(
+      profileFact("PACS", `${profile.pacs_server_ip || "—"}:${profile.pacs_server_port || "—"}`),
+      profileFact("调用 / PACS AE", `${profile.calling_ae_title || "—"} / ${profile.pacs_ae_title || "—"}`),
+      profileFact("DICOM 接收", `${profile.storage_ae_title || "—"}:${profile.storage_port || "—"}`),
+      profileFact("Web 入口", `${window.location.hostname}:${profile.web_port || "—"}`),
+    );
+
+    card.append(header, facts);
+    if (issues.length) {
+      const issue = document.createElement("p");
+      issue.className = "profile-card__issue";
+      issue.textContent = issues[0];
+      issue.title = issues.join("\n");
+      card.append(issue);
     }
-    actions.append(
+
+    const actions = document.createElement("div");
+    actions.className = "profile-card__actions";
+    if (profile.is_running) {
+      actions.append(
+        profilePageButton("任务", "home", profile, true),
+        profilePageButton("设置", "settings", profile),
+        profilePageButton("运维", "operations", profile),
+      );
+    } else {
+      actions.append(profileActionButton(issues.length ? "修复配置" : "配置并启动", launchProfile, profile));
+    }
+    card.append(actions);
+
+    const footer = document.createElement("div");
+    footer.className = "profile-card__footer";
+    const path = document.createElement("span");
+    path.className = "profile-card__path";
+    path.textContent = profile.destination_directory || "尚未设置保存目录";
+    path.title = profile.destination_directory || "";
+    const more = document.createElement("details");
+    more.className = "profile-more";
+    const summary = document.createElement("summary");
+    summary.textContent = "更多";
+    const menu = document.createElement("div");
+    menu.className = "profile-more__menu";
+    menu.append(
       profileActionButton("配置", configureProfile, profile, profile.is_running),
       profileActionButton("复制", cloneProfile, profile),
-      profileActionButton("快捷方式", createProfileShortcut, profile),
+      profileActionButton("创建快捷方式", createProfileShortcut, profile),
       profileActionButton("删除", deleteProfile, profile, profile.is_running || profile.has_recovery),
     );
-    row.append(actions);
-    body.append(row);
+    more.append(summary, menu);
+    footer.append(path, more);
+    card.append(footer);
+    grid.append(card);
   });
 }
 
@@ -1144,7 +1282,9 @@ async function refreshProfiles() {
   try {
     const result = await profileOperation("list");
     renderProfiles(result.profiles || []);
-    setText("#profile-management-hint", "启动前可修改 PACS、AE、目录和端口；保存时会检查当前 Profile、其他 Profile及本机端口占用。");
+    setText("#profile-management-hint", state.managerMode
+      ? "页面链接自动使用当前 Windows 主机地址；修复配置后，kayisoft-dcmget 会重新尝试启动对应 Profile。"
+      : "启动前可修改 PACS、AE、目录和端口；保存时会检查当前 Profile、其他 Profile及本机端口占用。");
   } catch (error) {
     renderProfiles([]);
     setText("#profile-management-hint", error.message);
@@ -1204,8 +1344,7 @@ function configureProfile(profile) {
 }
 
 function openProfileWeb(profile) {
-  const url = profile.web_url || `${window.location.protocol}//127.0.0.1:${profile.web_port}/`;
-  window.open(url, `_dcmget_profile_${profile.number}`, "noopener");
+  openProfilePage(profile, "home");
 }
 
 function openProfileConfig(profile, launchAfterSave) {
@@ -1631,10 +1770,19 @@ function bindEvents() {
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && !$("#app-shell").hidden) refreshTask();
+    if (!document.hidden && !$("#app-shell").hidden) {
+      if (state.managerMode) refreshOperations();
+      else refreshTask();
+    }
   });
   window.setInterval(() => {
-    if (!document.hidden && state.task && !TERMINAL_STATUSES.has(normalizeStatus(state.task.status))) refreshTask();
+    if (document.hidden) return;
+    if (state.managerMode) {
+      refreshProfiles();
+      refreshWindowsServiceStatus();
+    } else if (state.task && !TERMINAL_STATUSES.has(normalizeStatus(state.task.status))) {
+      refreshTask();
+    }
   }, 15000);
 }
 

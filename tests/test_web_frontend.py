@@ -96,12 +96,13 @@ def test_all_state_changing_requests_use_the_csrf_api_wrapper() -> None:
     assert 'headers.set("X-CSRF-Token", state.csrfToken || "")' in javascript
 
 
-def test_remote_sessions_hide_host_only_controls_and_skip_profile_refresh() -> None:
+def test_remote_profile_pages_hide_host_controls_but_manager_can_refresh_profiles() -> None:
     javascript = _javascript()
 
     assert "web.local_session !== false" in javascript
-    assert '$("#profile-management-card").hidden = !state.localSession' in javascript
-    assert 'if (state.localSession) refreshes.push(refreshProfiles())' in javascript
+    assert '$("#profile-management-card").hidden = !(state.localSession || state.managerMode)' in javascript
+    assert "state.managerMode = payload.profile?.mode === \"manager\"" in javascript
+    assert "if (state.localSession || state.managerMode) refreshes.push(refreshProfiles())" in javascript
     for operation in ("open-data-directory", "open-log-directory", "acceptance-report"):
         assert f'[data-operation="{operation}"]' in javascript
 
@@ -331,6 +332,26 @@ def test_profile_management_configures_before_launch_and_exposes_service_control
     assert "stopButton.hidden = !result.supported" in javascript
 
 
+def test_windows_management_hub_has_profile_cards_remote_links_and_deep_pages() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+    css = CSS.read_text(encoding="utf-8")
+
+    assert 'id="manager-overview"' in source
+    assert 'id="profile-grid"' in source
+    assert "所有下载实例，一处管理" in source
+    assert "profilePageUrl(profile, page" in javascript
+    assert "url.port = String(profile.web_port)" in javascript
+    assert 'url.searchParams.set("page", page)' in javascript
+    assert 'payload.profile?.mode === "manager"' in javascript
+    assert 'showPage("operations", { syncUrl: false })' in javascript
+    assert 'window.location.hostname' in javascript
+    assert "127.0.0.1:${profile.web_port}" not in javascript
+    assert ".manager-overview" in css
+    assert ".profile-card" in css
+    assert '.manager-mode .nav-item[data-page="home"]' in css
+
+
 def test_clinical_workspace_icons_collapse_and_busy_states_are_self_contained() -> None:
     source, _document_parser = _document()
     css = CSS.read_text(encoding="utf-8")
@@ -361,7 +382,7 @@ def test_compact_desktop_keeps_the_task_editor_two_column_until_840px() -> None:
     compact_block = css.split("@media (max-width: 840px)", 1)[1]
     assert ".editor-grid" not in desktop_block
     assert ".editor-grid" in compact_block
-    for name in ("任务", "设置", "运维"):
+    for name in ("任务", "设置", "管理"):
         assert f'aria-label="{name}"' in source
 
 

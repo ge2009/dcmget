@@ -19,26 +19,44 @@ if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
 }
 
 $profileRoot = Join-Path $env:APPDATA "DcmGet\instances"
+$managementProcess = $null
+$managementRetryAfter = $null
 $processes = @{}
 $retryAfter = @{}
+$managedProfiles = @{}
+$profileMissingAfter = @{}
+
+function Test-CompleteProfileConfig([string]$Path) {
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        $content = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($content) -or -not $content.TrimStart().StartsWith("{")) {
+            return $false
+        }
+        $parsed = ConvertFrom-Json -InputObject $content -ErrorAction Stop
+        return $parsed -is [PSCustomObject]
+    } catch {
+        return $false
+    }
+}
 
 function Get-ConfiguredProfileNumbers {
     if (-not (Test-Path -LiteralPath $profileRoot -PathType Container)) {
-        return @(1)
+        return @()
     }
     $numbers = @(
         Get-ChildItem -LiteralPath $profileRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.Name -match '^i([1-9][0-9]{0,3})$' -and
                 ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
-                (Test-Path -LiteralPath (Join-Path $_.FullName "config.json") -PathType Leaf)
+                (Test-CompleteProfileConfig (Join-Path $_.FullName "config.json"))
             } |
             ForEach-Object { [int]$_.Name.Substring(1) } |
             Sort-Object -Unique
     )
-    if ($numbers.Count -eq 0) {
-        return @(1)
-    }
     return $numbers
 }
 
@@ -51,6 +69,22 @@ function Test-RunningProcess([object]$Process) {
     } catch {
         return $false
     }
+}
+
+function Start-DcmGetManagement {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $application
+    $startInfo.Arguments = "--windows-management --no-open-browser"
+    $startInfo.WorkingDirectory = Split-Path -Parent $application
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) {
+        throw "Could not start DcmGet management hub"
+    }
+    $script:managementProcess = $process
+    $script:managementRetryAfter = [DateTime]::UtcNow.AddSeconds(10)
+    Write-Output "Started DcmGet management hub (PID $($process.Id))."
 }
 
 function Start-DcmGetProfile([int]$Number) {
@@ -69,29 +103,144 @@ function Start-DcmGetProfile([int]$Number) {
     Write-Output "Started DcmGet profile $Number (PID $($process.Id))."
 }
 
-function Stop-DcmGetProfiles {
-    foreach ($process in @($script:processes.Values)) {
-        if (-not (Test-RunningProcess $process)) {
-            continue
-        }
-        try {
-            & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$process.Id) /T /F 2>$null | Out-Null
-            $taskkillExitCode = $LASTEXITCODE
-            [void]$process.WaitForExit(5000)
-            if ($taskkillExitCode -ne 0 -or (Test-RunningProcess $process)) {
-                Write-Warning "DcmGet profile process $($process.Id) survived taskkill (exit code $taskkillExitCode)."
+function Get-InstalledProfileProcesses {
+    $records = @(
+        Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $path = [string]$_.ExecutablePath
+                $command = [string]$_.CommandLine
+                if (
+                    [string]::Equals($path, $application, [StringComparison]::OrdinalIgnoreCase) -and
+                    $command -match '(?i)(?:^|\s)--profile(?:\s+|=)([1-9][0-9]{0,3})(?:\s|$)'
+                ) {
+                    try {
+                        $process = [Diagnostics.Process]::GetProcessById([int]$_.ProcessId)
+                        if (Test-RunningProcess $process) {
+                            [PSCustomObject]@{
+                                Number = [int]$Matches[1]
+                                Process = $process
+                            }
+                        }
+                    } catch {
+                        # The process exited between the CIM snapshot and adoption.
+                    }
+                }
             }
-        } catch {
-            Write-Warning "Could not stop DcmGet profile process $($process.Id): $($_.Exception.Message)"
+    )
+    return $records
+}
+
+function Stop-DcmGetProcess([object]$Process, [string]$Description) {
+    if (-not (Test-RunningProcess $Process)) {
+        return
+    }
+    try {
+        & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$Process.Id) /T /F 2>$null | Out-Null
+        $taskkillExitCode = $LASTEXITCODE
+        [void]$Process.WaitForExit(5000)
+        if ($taskkillExitCode -ne 0 -or (Test-RunningProcess $Process)) {
+            Write-Warning "$Description process $($Process.Id) survived taskkill (exit code $taskkillExitCode)."
         }
+    } catch {
+        Write-Warning "Could not stop $Description process $($Process.Id): $($_.Exception.Message)"
     }
 }
 
+function Stop-DcmGetProcesses {
+    if ($null -ne $script:managementProcess) {
+        Stop-DcmGetProcess $script:managementProcess "DcmGet management hub"
+    }
+    foreach ($number in @($script:processes.Keys)) {
+        $process = $script:processes[$number]
+        if ($null -eq $process) {
+            continue
+        }
+        Stop-DcmGetProcess $process "DcmGet profile $number"
+    }
+}
+
+function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
+    $configuredNumbers = @(Get-ConfiguredProfileNumbers)
+    $configured = @{}
+    foreach ($number in $configuredNumbers) {
+        $configured[[int]$number] = $true
+    }
+    if ($KeepDefaultProfile -and -not $configured.ContainsKey(1)) {
+        $configured[1] = $true
+    }
+
+    foreach ($number in @($script:managedProfiles.Keys)) {
+        if ($configured.ContainsKey([int]$number)) {
+            [void]$script:profileMissingAfter.Remove([int]$number)
+            continue
+        }
+        $removeAfter = $script:profileMissingAfter[[int]$number]
+        if ($null -eq $removeAfter) {
+            $script:profileMissingAfter[[int]$number] = [DateTime]::UtcNow.AddSeconds(4)
+            continue
+        }
+        if ([DateTime]::UtcNow -lt $removeAfter) {
+            continue
+        }
+        if ($script:processes.ContainsKey([int]$number)) {
+            Stop-DcmGetProcess $script:processes[[int]$number] "deleted DcmGet profile $number"
+        }
+        [void]$script:managedProfiles.Remove([int]$number)
+        [void]$script:processes.Remove([int]$number)
+        [void]$script:retryAfter.Remove([int]$number)
+        [void]$script:profileMissingAfter.Remove([int]$number)
+        Write-Output "Stopped supervising deleted DcmGet profile $number."
+    }
+
+    foreach ($record in @(Get-InstalledProfileProcesses)) {
+        $number = [int]$record.Number
+        if (-not $configured.ContainsKey($number)) {
+            continue
+        }
+        $tracked = $script:processes[$number]
+        if ($script:managedProfiles.ContainsKey($number) -and (Test-RunningProcess $tracked)) {
+            continue
+        }
+        $script:managedProfiles[$number] = $true
+        $script:processes[$number] = $record.Process
+        $script:retryAfter[$number] = [DateTime]::UtcNow.AddSeconds(10)
+        Write-Output "Adopted running DcmGet profile $number (PID $($record.Process.Id))."
+    }
+
+    return @(
+        $script:managedProfiles.Keys |
+            Where-Object { $configured.ContainsKey([int]$_) } |
+            ForEach-Object { [int]$_ } |
+            Sort-Object -Unique
+    )
+}
+
 Write-Output "DcmGet service host started; APPDATA=$env:APPDATA; LOCALAPPDATA=$env:LOCALAPPDATA"
-$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)
-Write-Output "Managing startup profile snapshot: $($managedProfileNumbers -join ', ')"
+$startupProfileNumbers = @(Get-ConfiguredProfileNumbers)
+$defaultProfilePending = $startupProfileNumbers.Count -eq 0
+if ($defaultProfilePending) {
+    $startupProfileNumbers = @(1)
+}
+foreach ($number in $startupProfileNumbers) {
+    $managedProfiles[[int]$number] = $true
+}
+Write-Output "Managing startup profile snapshot: $($startupProfileNumbers -join ', ')"
 try {
     while ($true) {
+        if (-not (Test-RunningProcess $managementProcess)) {
+            if ($null -eq $managementRetryAfter -or [DateTime]::UtcNow -ge $managementRetryAfter) {
+                try {
+                    Start-DcmGetManagement
+                } catch {
+                    $managementRetryAfter = [DateTime]::UtcNow.AddSeconds(10)
+                    Write-Warning "Could not start DcmGet management hub: $($_.Exception.Message)"
+                }
+            }
+        }
+        if ($defaultProfilePending -and (Get-ConfiguredProfileNumbers) -contains 1) {
+            $defaultProfilePending = $false
+        }
+        $managedProfileNumbers = @(Update-ManagedProfiles $defaultProfilePending)
         foreach ($number in $managedProfileNumbers) {
             if (Test-RunningProcess $processes[$number]) {
                 continue
@@ -110,5 +259,5 @@ try {
         Start-Sleep -Seconds 2
     }
 } finally {
-    Stop-DcmGetProfiles
+    Stop-DcmGetProcesses
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import inspect
 import json
 import logging
@@ -41,12 +42,35 @@ from .web_security import (
 
 LOGGER = logging.getLogger(__name__)
 SESSION_COOKIE = "dcmget_session"
+LEGACY_SESSION_COOKIE_PORT = 8787
 MAX_JSON_BODY_BYTES = 4 * 1024 * 1024
 MAX_ACCESSIONS = 100_000
 MAX_ACCESSION_LENGTH = 256
 SSE_POLL_SECONDS = 0.5
 SSE_HEARTBEAT_SECONDS = 15.0
 _SAFE_EVENT_TYPE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_IPV6_ULA_NETWORK = ipaddress.ip_network("fc00::/7")
+_MANAGEMENT_OPERATIONS = frozenset(
+    {
+        "profile-list",
+        "profile-clone",
+        "profile-update",
+        "profile-rename",
+        "profile-delete",
+        "profile-launch",
+        "profile-launch-all",
+        "profile-shortcut",
+        "windows-service-status",
+        "windows-service-start",
+        "windows-service-stop",
+    }
+)
 
 
 @runtime_checkable
@@ -87,6 +111,31 @@ class WebAppService(Protocol):
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client is not None else ""
+
+
+def session_cookie_name(server_port: int) -> str:
+    """Isolate same-host Web sessions by port while preserving Profile 8787."""
+
+    port = int(server_port)
+    if port == LEGACY_SESSION_COOKIE_PORT:
+        return SESSION_COOKIE
+    return f"{SESSION_COOKIE}_{port}"
+
+
+def is_management_peer_address(value: str) -> bool:
+    """Return whether an actual socket peer may mutate the management hub."""
+
+    try:
+        address = ipaddress.ip_address(str(value).split("%", 1)[0].strip())
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if address.is_loopback:
+        return True
+    if isinstance(address, ipaddress.IPv4Address):
+        return any(address in network for network in _RFC1918_NETWORKS)
+    return address in _IPV6_ULA_NETWORK
 
 
 async def _json_body(request: Request) -> dict[str, Any]:
@@ -327,6 +376,7 @@ def create_web_app(
     tools_provider: Callable[[AppConfig], ToolPaths] | None = None,
     preflight_provider: Callable[[AppConfig], object] | None = None,
     operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
+    management_mode: bool = False,
 ) -> FastAPI:
     """Create the offline, LAN-capable DcmGet HTTP application.
 
@@ -345,9 +395,12 @@ def create_web_app(
         except ValueError as exc:
             raise ValueError("Web 绑定地址必须是本机 IP") from exc
     host_policy = HostPolicy(server_port, trusted_hosts)
+    session_cookie = session_cookie_name(server_port)
     static_directory, index_path = _validated_static_root(static_root)
     browser = _directory_browser(directory_roots)
     metadata = dict(profile_metadata or {})
+    if management_mode:
+        metadata["mode"] = "manager"
     if config_path is not None:
         metadata.setdefault("config_path", str(Path(config_path).expanduser().resolve()))
     if project_root is not None:
@@ -360,13 +413,25 @@ def create_web_app(
     resolved_project_root = (
         Path(project_root).expanduser().resolve() if project_root is not None else None
     )
-    resolver = DcmtkResolver(resolved_project_root) if resolved_project_root else None
+    resolver = (
+        DcmtkResolver(resolved_project_root)
+        if resolved_project_root is not None and not management_mode
+        else None
+    )
     if tools_provider is None and resolver is not None:
         tools_provider = lambda config: resolver.resolve(config.dcmtk_bin_dir)
     if preflight_provider is None and resolver is not None:
         preflight_provider = lambda config: run_core_preflight(config, resolver)
     handlers = dict(operation_handlers or {})
-    last_config = load_config(resolved_config_path) if resolved_config_path else AppConfig()
+    last_config = (
+        load_config(resolved_config_path)
+        if resolved_config_path
+        else (
+            AppConfig(web_bind_address=server_host, web_port=int(server_port))
+            if management_mode
+            else AppConfig()
+        )
+    )
 
     def current_config() -> AppConfig:
         nonlocal last_config
@@ -397,12 +462,18 @@ def create_web_app(
     app.state.host_policy = host_policy
     app.state.directory_browser = browser
     app.state.profile_metadata = metadata
+    app.state.session_cookie_name = session_cookie
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next):
         if not host_policy.allows_host_header(request.headers.get("host", "")):
             return JSONResponse(status_code=421, content={"detail": "Host 不受信任"})
-        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+        if request.method.upper() in _MUTATING_HTTP_METHODS:
+            if management_mode and not is_management_peer_address(_client_ip(request)):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "管理操作只允许来自服务器本机或可信私有网络"},
+                )
             if not host_policy.allows_origin(request.headers.get("origin")):
                 return JSONResponse(status_code=403, content={"detail": "Origin 不受信任"})
         response = await call_next(request)
@@ -425,7 +496,7 @@ def create_web_app(
         *,
         create: bool = False,
     ) -> tuple[WebSession | None, bool]:
-        token = request.cookies.get(SESSION_COOKIE)
+        token = request.cookies.get(session_cookie)
         session = security.sessions.get(token)
         if session is None or not hmac_compare(session.remote_ip, _client_ip(request)):
             if token:
@@ -437,7 +508,7 @@ def create_web_app(
 
     def attach_session_cookie(response: Response, session: WebSession) -> None:
         response.set_cookie(
-            SESSION_COOKIE,
+            session_cookie,
             session.token,
             max_age=security.sessions.ttl_seconds,
             path="/",
@@ -498,6 +569,7 @@ def create_web_app(
         local_request = is_loopback_address(_client_ip(request))
         payload: dict[str, object] = {
             "version": __version__,
+            "mode": metadata.get("mode", "profile"),
             "auth": {
                 "authenticated": True,
                 "setup_required": False,
@@ -602,7 +674,7 @@ def create_web_app(
     ) -> Response:
         security.sessions.revoke(session.token)
         response = JSONResponse({"ok": True})
-        response.delete_cookie(SESSION_COOKIE, path="/")
+        response.delete_cookie(session_cookie, path="/")
         return response
 
     @app.post("/api/admin/password")
@@ -1095,17 +1167,7 @@ def create_web_app(
         "open-log-directory",
         "open-data-directory",
         "acceptance-report",
-        "profile-list",
-        "profile-clone",
-        "profile-update",
-        "profile-rename",
-        "profile-delete",
-        "profile-launch",
-        "profile-launch-all",
-        "profile-shortcut",
-        "windows-service-status",
-        "windows-service-start",
-        "windows-service-stop",
+        *_MANAGEMENT_OPERATIONS,
     }
 
     async def shutdown_application() -> dict[str, Any]:
@@ -1131,10 +1193,15 @@ def create_web_app(
         handler = handlers.get(name)
         if handler is None:
             raise HTTPException(status_code=501, detail=f"当前服务未配置运维操作：{name}")
-        if name in local_operations and (
-            not session.local or not is_loopback_address(_client_ip(request))
-        ):
-            raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
+        if name in local_operations:
+            local_peer = session.local and is_loopback_address(_client_ip(request))
+            private_manager_peer = (
+                management_mode
+                and name in _MANAGEMENT_OPERATIONS
+                and is_management_peer_address(_client_ip(request))
+            )
+            if not local_peer and not private_manager_peer:
+                raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
         payload = await _json_body(request)
         return await _call_handler(handler, payload)
 
@@ -1277,11 +1344,13 @@ class DcmGetWebServer:
         tools_provider: Callable[[AppConfig], ToolPaths] | None = None,
         preflight_provider: Callable[[AppConfig], object] | None = None,
         operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
+        management_mode: bool = False,
         log_level: str = "info",
     ):
         self.service = service
         self.host = host
         self.port = int(port)
+        self.management_mode = bool(management_mode)
         effective_ttl = (
             int(session_timeout_minutes) * 60
             if session_timeout_minutes is not None
@@ -1316,6 +1385,7 @@ class DcmGetWebServer:
             tools_provider=tools_provider,
             preflight_provider=preflight_provider,
             operation_handlers=operation_handlers,
+            management_mode=self.management_mode,
         )
 
     @property

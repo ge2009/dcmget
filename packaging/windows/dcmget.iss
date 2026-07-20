@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.1.1"
+  #define AppVersion "3.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -36,6 +36,7 @@
 #define ServiceConfigName "kayisoft-dcmget.xml"
 #define ServiceTemplateName "kayisoft-dcmget.xml.template"
 #define ServiceHostName "kayisoft-dcmget-host.ps1"
+#define ManagementUrl "http://127.0.0.1:8786/?page=operations"
 #define FirewallRule "DcmGet Receiver TCP"
 #define WebFirewallRule "DcmGet Web TCP"
 #define LegacyFirewallRule "DcmGet storescp TCP"
@@ -99,6 +100,8 @@ Type: files; Name: "{app}\{#ServiceHostName}"
 Type: files; Name: "{app}\LICENSE-WINSW.txt"
 Type: files; Name: "{autoprograms}\DcmGet.lnk"
 Type: files; Name: "{autodesktop}\DcmGet.lnk"
+Type: files; Name: "{autoprograms}\DcmGet.url"
+Type: files; Name: "{autodesktop}\DcmGet.url"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -116,10 +119,10 @@ Name: "{autoprograms}\DcmGet 启动全部"; Filename: "{sys}\sc.exe"; Parameters
 Name: "{autoprograms}\DcmGet 停止全部"; Filename: "{sys}\sc.exe"; Parameters: "stop {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
 
 [INI]
-Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{code:GetPrimaryWebUrl}"
+Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"
 Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconFile"; String: "{app}\{#AppExeName}"
 Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIndex"; String: "0"
-Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{code:GetPrimaryWebUrl}"; Tasks: desktopicon
+Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"; Tasks: desktopicon
 Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconFile"; String: "{app}\{#AppExeName}"; Tasks: desktopicon
 Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIndex"; String: "0"; Tasks: desktopicon
 
@@ -157,59 +160,6 @@ var
   ServiceWasInstalled: Boolean;
   ServiceExistedBeforeInstall: Boolean;
   ServiceWasActiveBeforeInstall: Boolean;
-
-function ReadConfiguredWebPort(ConfigPath: String): Integer;
-var
-  Content: AnsiString;
-  Tail: String;
-  Digits: String;
-  KeyPosition: Integer;
-  ColonPosition: Integer;
-  CharacterIndex: Integer;
-  ParsedPort: Integer;
-begin
-  Result := 0;
-  if not LoadStringFromFile(ConfigPath, Content) then
-    Exit;
-  KeyPosition := Pos('"web_port"', Content);
-  if KeyPosition = 0 then
-    Exit;
-  Tail := Copy(Content, KeyPosition + Length('"web_port"'), Length(Content));
-  ColonPosition := Pos(':', Tail);
-  if ColonPosition = 0 then
-    Exit;
-  CharacterIndex := ColonPosition + 1;
-  while (CharacterIndex <= Length(Tail)) and
-    ((Tail[CharacterIndex] = ' ') or (Tail[CharacterIndex] = #9) or
-     (Tail[CharacterIndex] = #10) or (Tail[CharacterIndex] = #13)) do
-    CharacterIndex := CharacterIndex + 1;
-  Digits := '';
-  while (CharacterIndex <= Length(Tail)) and
-    (Tail[CharacterIndex] >= '0') and (Tail[CharacterIndex] <= '9') do
-  begin
-    Digits := Digits + Tail[CharacterIndex];
-    CharacterIndex := CharacterIndex + 1;
-  end;
-  ParsedPort := StrToIntDef(Digits, 0);
-  if (ParsedPort >= 1) and (ParsedPort <= 65535) then
-    Result := ParsedPort;
-end;
-
-function GetPrimaryWebUrl(Param: String): String;
-var
-  WebPort: Integer;
-begin
-  WebPort := ReadConfiguredWebPort(
-    ExpandConstant('{userappdata}\DcmGet\instances\i1\config.json')
-  );
-  if WebPort = 0 then
-    WebPort := ReadConfiguredWebPort(
-      ExpandConstant('{userappdata}\DcmGet\config.json')
-    );
-  if WebPort = 0 then
-    WebPort := 8787;
-  Result := 'http://127.0.0.1:' + IntToStr(WebPort) + '/';
-end;
 
 function ServiceWrapperPath(): String;
 begin

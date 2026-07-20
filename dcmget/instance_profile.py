@@ -15,6 +15,7 @@ from filelock import FileLock, Timeout
 
 from .config import AppConfig, load_config, save_config
 from .core import AccessionStatus
+from .profile_manager import RESERVED_PROFILE_PORTS
 from .runtime import application_state_dir, default_config_path
 from .task_state import (
     TaskCheckpoint,
@@ -506,6 +507,7 @@ def _ensure_profile_config(
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not source.is_file():
         config = AppConfig()
+        _move_reserved_profile_ports(roots, config)
         if number > 1 and not preserve_source_ports:
             config.storage_port = _next_profile_port(roots, config.storage_port)
             config.web_port = _next_profile_port(
@@ -516,6 +518,7 @@ def _ensure_profile_config(
         return
     try:
         config = load_config(source)
+        _move_reserved_profile_ports(roots, config)
         if number > 1 and not preserve_source_ports:
             config.storage_port = _next_profile_port(roots, config.storage_port)
             config.web_port = _next_profile_port(
@@ -534,6 +537,7 @@ def _next_profile_port(
     reserved: set[int] | None = None,
 ) -> int:
     used_ports: set[int] = set(reserved or ())
+    used_ports.update(RESERVED_PROFILE_PORTS)
     if roots.config_profiles.is_dir():
         for path in roots.config_profiles.glob("i*/config.json"):
             try:
@@ -546,6 +550,21 @@ def _next_profile_port(
         if candidate not in used_ports:
             return candidate
     raise InstanceProfileError("没有可用的 Profile 服务端口")
+
+
+def _move_reserved_profile_ports(roots: _ProfileRoots, config: AppConfig) -> None:
+    if config.storage_port in RESERVED_PROFILE_PORTS:
+        config.storage_port = _next_profile_port(
+            roots,
+            config.storage_port,
+            reserved={config.web_port},
+        )
+    if config.web_port in RESERVED_PROFILE_PORTS:
+        config.web_port = _next_profile_port(
+            roots,
+            config.web_port,
+            reserved={config.storage_port},
+        )
 
 
 def _read_migratable_catalog(
