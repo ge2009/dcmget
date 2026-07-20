@@ -1376,6 +1376,11 @@ class DcmGetWebServer:
             host=self.host,
             port=self.port,
             log_level=self.log_level,
+            # PyInstaller's Windows ``--windowed`` mode sets stdout/stderr to
+            # None.  Uvicorn's default formatter calls ``isatty()`` on those
+            # streams while Config is constructed, before the server starts.
+            # DcmGet already installs its own rotating diagnostic handlers.
+            log_config=None,
             access_log=False,
             proxy_headers=False,
             server_header=False,

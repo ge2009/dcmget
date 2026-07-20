@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 from dcmget.config import AppConfig, save_config
 from dcmget.core import ToolPaths
 from dcmget.web_security import bootstrap_web_security
-from dcmget.web_server import create_web_app
+from dcmget.web_server import DcmGetWebServer, create_web_app
 
 
 PORT = 8787
@@ -228,6 +229,25 @@ def test_first_password_setup_is_local_only_and_then_bootstraps_app(web: WebFixt
     assert bootstrap["web"]["local_session"] is True
     assert web.client.get("/").status_code == 200
     assert web.client.get("/assets/app.js").status_code == 200
+
+
+def test_windowed_runtime_builds_uvicorn_server_without_console_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    server = DcmGetWebServer(
+        FakeService(),
+        state_directory=tmp_path / "state",
+        host="127.0.0.1",
+        port=18787,
+        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+    )
+
+    uvicorn_server = server._make_uvicorn_server()
+
+    assert uvicorn_server.config.log_config is None
 
 
 def test_host_origin_session_and_csrf_are_enforced(web: WebFixture):
