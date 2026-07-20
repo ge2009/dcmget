@@ -354,6 +354,8 @@ def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
     assert "$path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)" in installer
     for name in ("DcmGet.exe", "DcmGetPdiServer.exe", "storescp.exe", "movescu.exe"):
         assert name in installer
+    assert "$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'')" in installer
+    assert "$attempt -lt 140" in installer
     assert 'taskkill.exe" /PID ([string]$target.ProcessId) /T /F' in installer
     assert "Get-Process -Name" not in installer
 

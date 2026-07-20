@@ -807,8 +807,13 @@ jobs:
 
           # Reinstall the same release while the service is active.  This proves
           # service-aware upgrade stop/refresh/start behavior and config retention.
-          $serviceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
-          if ($serviceUpgrade.ExitCode -ne 0) { throw "Service-aware upgrade failed with code $($serviceUpgrade.ExitCode)" }
+          $serviceUpgradeLog = Join-Path $env:RUNNER_TEMP "dcmget-service-active-upgrade.log"
+          $serviceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$serviceUpgradeLog") -Wait -PassThru
+          if ($serviceUpgrade.ExitCode -ne 0) {
+            Get-Content -LiteralPath $serviceUpgradeLog -Tail 240 -ErrorAction SilentlyContinue | Write-Host
+            Write-DcmGetServiceDiagnostics
+            throw "Service-aware upgrade failed with code $($serviceUpgrade.ExitCode)"
+          }
           Wait-DcmGetServiceStatus "Running" | Out-Null
           foreach ($oldProfileId in $serviceProfileIdsBeforeUpgrade) {
             if (Get-Process -Id $oldProfileId -ErrorAction SilentlyContinue) { throw "Service-aware upgrade left old Profile process running: $oldProfileId" }
@@ -822,8 +827,13 @@ jobs:
           & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not stop service before stopped-state upgrade test" }
           Wait-DcmGetServiceStatus "Stopped" | Out-Null
-          $stoppedServiceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
-          if ($stoppedServiceUpgrade.ExitCode -ne 0) { throw "Stopped-service upgrade failed with code $($stoppedServiceUpgrade.ExitCode)" }
+          $stoppedServiceUpgradeLog = Join-Path $env:RUNNER_TEMP "dcmget-service-stopped-upgrade.log"
+          $stoppedServiceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$stoppedServiceUpgradeLog") -Wait -PassThru
+          if ($stoppedServiceUpgrade.ExitCode -ne 0) {
+            Get-Content -LiteralPath $stoppedServiceUpgradeLog -Tail 240 -ErrorAction SilentlyContinue | Write-Host
+            Write-DcmGetServiceDiagnostics
+            throw "Stopped-service upgrade failed with code $($stoppedServiceUpgrade.ExitCode)"
+          }
           Start-Sleep -Seconds 2
           $serviceAfterStoppedUpgrade = Get-Service -Name $serviceName -ErrorAction Stop
           if ($serviceAfterStoppedUpgrade.Status -ne "Stopped") { throw "Stopped-service upgrade unexpectedly restarted the service" }
