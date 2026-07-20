@@ -937,11 +937,25 @@ jobs:
           param([string]$Executable, [string]$AppDataRoot, [string]$LocalAppDataRoot, [string]$UserProfileRoot)
           $fixtureRoot = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
           $children = @()
-          foreach ($name in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
-              $children += Start-Process (Join-Path $fixtureRoot $name) -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+          try {
+              foreach ($name in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
+                  $children += Start-Process (Join-Path $fixtureRoot $name) -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+              }
+              $children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
+              while ($true) { Start-Sleep -Seconds 1 }
+          } finally {
+              foreach ($child in @($children)) {
+                  if ($null -eq $child) { continue }
+                  try {
+                      if (-not $child.HasExited) {
+                          & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$child.Id) /T /F 2>$null | Out-Null
+                          [void]$child.WaitForExit(5000)
+                      }
+                  } catch {
+                      Write-Warning "Could not stop fixture process $($child.Id): $($_.Exception.Message)"
+                  }
+              }
           }
-          $children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
-          while ($true) { Start-Sleep -Seconds 1 }
           '@
           [IO.File]::WriteAllText($serviceHost, $fixtureHostSource, [Text.UTF8Encoding]::new($false))
           & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
@@ -959,12 +973,35 @@ jobs:
                 ForEach-Object { [int]$_.ProcessId }
             )
           }
+          $serviceTreeIdentities = @(
+            foreach ($serviceTreeId in @($serviceTreeIds | Sort-Object -Unique)) {
+              $treeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $serviceTreeId" -ErrorAction SilentlyContinue
+              if ($null -ne $treeProcess) {
+                [PSCustomObject]@{
+                  ProcessId = [int]$treeProcess.ProcessId
+                  CreationTicks = [System.Management.ManagementDateTimeConverter]::ToDateTime($treeProcess.CreationDate).ToUniversalTime().Ticks
+                  Name = [string]$treeProcess.Name
+                  ParentProcessId = [int]$treeProcess.ParentProcessId
+                  ExecutablePath = [string]$treeProcess.ExecutablePath
+                  CommandLine = [string]$treeProcess.CommandLine
+                }
+              }
+            }
+          )
           & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not stop service process-tree fixture" }
           Wait-DcmGetServiceStatus "Stopped" | Out-Null
           Start-Sleep -Seconds 1
-          foreach ($serviceTreeId in @($serviceTreeIds | Sort-Object -Unique)) {
-            if (Get-Process -Id $serviceTreeId -ErrorAction SilentlyContinue) { throw "Service tree process survived stop: $serviceTreeId" }
+          foreach ($expectedProcess in $serviceTreeIdentities) {
+            $survivor = Get-CimInstance Win32_Process -Filter "ProcessId = $($expectedProcess.ProcessId)" -ErrorAction SilentlyContinue
+            if (
+              $null -ne $survivor -and
+              [System.Management.ManagementDateTimeConverter]::ToDateTime($survivor.CreationDate).ToUniversalTime().Ticks -eq $expectedProcess.CreationTicks
+            ) {
+              $expectedProcess | Format-List | Out-String | Write-Host
+              $survivor | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate | Format-List | Out-String | Write-Host
+              throw "Service tree process survived stop: $($expectedProcess.ProcessId)"
+            }
           }
           Copy-Item $serviceHostBackup $serviceHost -Force
           Remove-Item $serviceTreeFixture -Recurse -Force
