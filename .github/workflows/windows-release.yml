@@ -762,15 +762,15 @@ jobs:
             Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $serviceTreeFixture $fixtureName) -Force
           }
           $fixtureHostSource = @'
-param([string]$Executable, [string]$AppDataRoot, [string]$LocalAppDataRoot, [string]$UserProfileRoot)
-$fixtureRoot = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
-$children = @()
-foreach ($name in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
-    $children += Start-Process (Join-Path $fixtureRoot $name) -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
-}
-$children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
-while ($true) { Start-Sleep -Seconds 1 }
-'@
+          param([string]$Executable, [string]$AppDataRoot, [string]$LocalAppDataRoot, [string]$UserProfileRoot)
+          $fixtureRoot = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
+          $children = @()
+          foreach ($name in @("storescp.exe", "movescu.exe", "DcmGetPdiServer.exe")) {
+              $children += Start-Process (Join-Path $fixtureRoot $name) -ArgumentList @("/d", "/c", "ping.exe -t 127.0.0.1 >NUL") -PassThru
+          }
+          $children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
+          while ($true) { Start-Sleep -Seconds 1 }
+          '@
           [IO.File]::WriteAllText($serviceHost, $fixtureHostSource, [Text.UTF8Encoding]::new($false))
           & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not start service process-tree fixture" }
