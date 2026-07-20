@@ -66,7 +66,12 @@ jobs:
         run: python -c "from dcmget.core import DcmtkResolver; t=DcmtkResolver().resolve(); assert t.version == '3.7.0'; assert t.dcmmkdir"
 
       - name: Run unit, Web API and DICOM integration tests
+        if: runner.os != 'macOS'
         run: python -m pytest -q
+
+      - name: Run macOS tests with per-test progress
+        if: runner.os == 'macOS'
+        run: python -m pytest -vv
 
       - name: Verify offline Web service and static UI
         run: python DICOM_download_ui.py --web-self-test --config "${{ runner.temp }}/dcmget-web-self-test.json"
