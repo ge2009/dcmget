@@ -275,27 +275,15 @@ begin
     );
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function RunManagedProcessCleanup(AppDir: String; var FailureMessage: String): Boolean;
 var
-  AppDir: String;
   PowerShellPath: String;
   ScriptPath: String;
   ScriptText: String;
   Parameters: String;
   ResultCode: Integer;
 begin
-  Result := '';
-  NeedsRestart := False;
-  AppDir := ExpandConstant('{app}');
-  ServiceWasInstalled := DcmGetServiceExists();
-  ServiceExistedBeforeInstall := ServiceWasInstalled;
-  ServiceWasActiveBeforeInstall := ServiceWasInstalled and DcmGetServiceIsActive();
-  if ServiceWasInstalled and not FileExists(ServiceWrapperPath()) then
-  begin
-    Result := 'Windows 中已存在同名 kayisoft-dcmget 服务，但它不属于当前安装目录。请联系管理员处理服务名称冲突。';
-    Exit;
-  end;
-  RequestExistingServiceStop();
+  FailureMessage := '';
   PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
   ScriptPath := ExpandConstant('{tmp}\dcmget-stop-installed-processes.ps1');
 
@@ -343,7 +331,8 @@ begin
 
   if not SaveStringToFile(ScriptPath, ScriptText, False) then
   begin
-    Result := '无法准备 DcmGet 进程清理脚本，请检查临时目录权限。';
+    FailureMessage := '无法准备 DcmGet 进程清理脚本，请检查临时目录权限。';
+    Result := False;
     Exit;
   end;
 
@@ -351,11 +340,48 @@ begin
     AddQuotes(ScriptPath) + ' -InstallRoot ' + AddQuotes(AppDir);
   if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
-    Result := '无法启动 Windows PowerShell，因此不能安全结束旧版 DcmGet 进程。';
+    FailureMessage := '无法启动 Windows PowerShell，因此不能安全结束旧版 DcmGet 进程。';
+    Result := False;
     Exit;
   end;
   if ResultCode <> 0 then
-    Result := '无法结束当前安装目录中的 DcmGet 相关进程，请稍后重新运行安装程序。';
+  begin
+    FailureMessage := '无法结束当前安装目录中的 DcmGet 相关进程，请稍后重新运行安装程序。';
+    Result := False;
+    Exit;
+  end;
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AppDir: String;
+  FailureMessage: String;
+begin
+  Result := '';
+  NeedsRestart := False;
+  AppDir := ExpandConstant('{app}');
+  ServiceWasInstalled := DcmGetServiceExists();
+  ServiceExistedBeforeInstall := ServiceWasInstalled;
+  ServiceWasActiveBeforeInstall := ServiceWasInstalled and DcmGetServiceIsActive();
+  if ServiceWasInstalled and not FileExists(ServiceWrapperPath()) then
+  begin
+    Result := 'Windows 中已存在同名 kayisoft-dcmget 服务，但它不属于当前安装目录。请联系管理员处理服务名称冲突。';
+    Exit;
+  end;
+  RequestExistingServiceStop();
+  if not RunManagedProcessCleanup(AppDir, FailureMessage) then
+    Result := FailureMessage;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  FailureMessage: String;
+begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
+  if not RunManagedProcessCleanup(ExpandConstant('{app}'), FailureMessage) then
+    RaiseException(FailureMessage);
 end;
 
 function XmlEscape(Value: String): String;

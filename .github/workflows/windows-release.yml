@@ -979,7 +979,7 @@ jobs:
               if ($null -ne $treeProcess) {
                 [PSCustomObject]@{
                   ProcessId = [int]$treeProcess.ProcessId
-                  CreationTicks = ([DateTime]$treeProcess.CreationDate).ToUniversalTime().Ticks
+                  CreationTicks = [System.Management.ManagementDateTimeConverter]::ToDateTime($treeProcess.CreationDate).ToUniversalTime().Ticks
                   Name = [string]$treeProcess.Name
                   ParentProcessId = [int]$treeProcess.ParentProcessId
                   ExecutablePath = [string]$treeProcess.ExecutablePath
@@ -996,7 +996,7 @@ jobs:
             $survivor = Get-CimInstance Win32_Process -Filter "ProcessId = $($expectedProcess.ProcessId)" -ErrorAction SilentlyContinue
             if (
               $null -ne $survivor -and
-              ([DateTime]$survivor.CreationDate).ToUniversalTime().Ticks -eq $expectedProcess.CreationTicks
+              [System.Management.ManagementDateTimeConverter]::ToDateTime($survivor.CreationDate).ToUniversalTime().Ticks -eq $expectedProcess.CreationTicks
             ) {
               $expectedProcess | Format-List | Out-String | Write-Host
               $survivor | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate | Format-List | Out-String | Write-Host
@@ -1064,6 +1064,7 @@ jobs:
             Start-Sleep -Milliseconds 250
           }
           if (Test-Path $installDir) {
+            Write-Host "--- Remaining installation directory contents ---"
             Get-ChildItem $installDir -Force -Recurse -ErrorAction SilentlyContinue |
               Select-Object FullName, Length, LastWriteTime |
               Format-Table -AutoSize | Out-String | Write-Host
