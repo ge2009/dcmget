@@ -309,7 +309,14 @@ begin
     '$service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue' + #13#10 +
     'if ($null -ne $service -and $service.Status -ne ''Stopped'') {' + #13#10 +
     '  Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue' + #13#10 +
-    '  Start-Sleep -Milliseconds 500' + #13#10 +
+    '}' + #13#10 +
+    'for ($attempt = 0; $attempt -lt 140; $attempt++) {' + #13#10 +
+    '  $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue' + #13#10 +
+    '  if ($null -eq $service -or $service.Status -eq ''Stopped'') { break }' + #13#10 +
+    '  Start-Sleep -Milliseconds 250' + #13#10 +
+    '}' + #13#10 +
+    'if ($null -ne $service -and $service.Status -ne ''Stopped'') {' + #13#10 +
+    '  throw ''kayisoft-dcmget service did not stop''' + #13#10 +
     '}' + #13#10 +
     '$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'')' + #13#10 +
     'function Get-DcmGetInstalledProcess {' + #13#10 +
@@ -332,14 +339,6 @@ begin
     '$survivors = @(Get-DcmGetInstalledProcess)' + #13#10 +
     'if ($survivors.Count -ne 0) {' + #13#10 +
     '  throw (''DcmGet processes are still running: '' + (($survivors | ForEach-Object ProcessId) -join '', ''))' + #13#10 +
-    '}' + #13#10 +
-    'for ($attempt = 0; $attempt -lt 140; $attempt++) {' + #13#10 +
-    '  $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue' + #13#10 +
-    '  if ($null -eq $service -or $service.Status -eq ''Stopped'') { break }' + #13#10 +
-    '  Start-Sleep -Milliseconds 250' + #13#10 +
-    '}' + #13#10 +
-    'if ($null -ne $service -and $service.Status -ne ''Stopped'') {' + #13#10 +
-    '  throw ''kayisoft-dcmget service did not stop''' + #13#10 +
     '}' + #13#10;
 
   if not SaveStringToFile(ScriptPath, ScriptText, False) then
