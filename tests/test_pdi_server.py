@@ -605,6 +605,11 @@ def test_unauthorized_requests_do_not_renew_idle_timeout(tmp_path: Path) -> None
         )
         assert status == 200
         with server._idle_condition:
+            if not server._idle_condition.wait_for(
+                lambda: server._active_requests == 0,
+                timeout=3,
+            ):
+                raise AssertionError("PDI 就绪探测未在超时内结束")
             activity_before_unauthorized_request = server._last_activity
         status, _headers, _body = _request(server, "/api/studies")
         assert status == 403
