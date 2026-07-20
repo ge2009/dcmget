@@ -650,6 +650,25 @@ jobs:
           $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
           $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
 
+          function Write-DcmGetServiceDiagnostics {
+            Write-Host "--- sc.exe queryex ---"
+            & "$env:SystemRoot\System32\sc.exe" queryex $serviceName 2>&1 | Write-Host
+            Write-Host "--- sc.exe qc ---"
+            & "$env:SystemRoot\System32\sc.exe" qc $serviceName 2>&1 | Write-Host
+            Write-Host "--- WinSW service logs ---"
+            $serviceLogRoot = Join-Path $env:LOCALAPPDATA "DcmGet\logs\service"
+            Get-ChildItem $serviceLogRoot -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "### $($_.FullName)"
+              Get-Content $_.FullName -Tail 120 -ErrorAction SilentlyContinue | Write-Host
+            }
+            Write-Host "--- recent Service Control Manager events ---"
+            Get-WinEvent -FilterHashtable @{
+              LogName = "System"
+              ProviderName = "Service Control Manager"
+              StartTime = [DateTime]::Now.AddMinutes(-10)
+            } -ErrorAction SilentlyContinue | Select-Object -First 20 TimeCreated, Id, LevelDisplayName, Message | Format-List | Out-String | Write-Host
+          }
+
           function Wait-DcmGetServiceStatus([string]$expected, [int]$timeoutSeconds = 30) {
             $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
             do {
@@ -658,6 +677,7 @@ jobs:
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $deadline)
             $actual = if ($null -eq $service) { "missing" } else { $service.Status.ToString() }
+            Write-DcmGetServiceDiagnostics
             throw "Service $serviceName status is $actual, expected $expected"
           }
 
