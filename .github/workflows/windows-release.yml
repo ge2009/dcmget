@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 2.11.0
+        default: 3.0.0
 
 permissions:
   contents: read
@@ -144,9 +144,22 @@ jobs:
             throw "Profile shortcut working directory is incorrect: $($shortcut.WorkingDirectory)"
           }
 
-      - name: Verify embedded OHIF and PDI server resources
+      - name: Verify embedded Web, OHIF and PDI resources
         shell: pwsh
         run: |
+          function Assert-WebResources([string]$resourceRoot) {
+            $webui = Join-Path $resourceRoot "dcmget\webui"
+            @("index.html", "app.css", "app.js") | ForEach-Object {
+              $asset = Join-Path $webui $_
+              if (-not (Test-Path $asset -PathType Leaf)) {
+                throw "Missing offline DcmGet Web resource: $asset"
+              }
+              if ((Get-Item $asset).Length -eq 0) {
+                throw "Offline DcmGet Web resource is empty: $asset"
+              }
+            }
+          }
+
           function Assert-PdiResources([string]$resourceRoot) {
             $server = Join-Path $resourceRoot "DcmGetPdiServer.exe"
             $serverScript = Join-Path $resourceRoot "dcmget\pdi_server.py"
@@ -168,6 +181,7 @@ jobs:
           }
 
           $unpackedResourceRoot = (Resolve-Path "build/windows/dist/DcmGet/_internal").Path
+          Assert-WebResources $unpackedResourceRoot
           Assert-PdiResources $unpackedResourceRoot
           if (Test-Path (Join-Path $unpackedResourceRoot "DCMGET_PORTABLE_RUNTIME.json")) {
             throw "Unpacked application must not publish DCMTK to the portable user runtime"
@@ -175,6 +189,7 @@ jobs:
           $expanded = Join-Path $env:RUNNER_TEMP "dcmget-standalone-expanded"
           Expand-Archive "release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip" $expanded
           $zipResourceRoot = (Resolve-Path "$expanded/DcmGet/_internal").Path
+          Assert-WebResources $zipResourceRoot
           Assert-PdiResources $zipResourceRoot
           if (Test-Path (Join-Path $zipResourceRoot "DCMGET_PORTABLE_RUNTIME.json")) {
             throw "ZIP application must not publish DCMTK to the portable user runtime"
@@ -187,6 +202,11 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*architecture\.py" -Quiet)) { throw "Portable EXE is missing PDI architecture guard" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*instance_shortcut" -Quiet)) { throw "Portable EXE is missing profile shortcut support" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*index\.html" -Quiet)) { throw "Portable EXE is missing DcmGet Web index" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.css" -Quiet)) { throw "Portable EXE is missing DcmGet Web styles" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.js" -Quiet)) { throw "Portable EXE is missing DcmGet Web application" }
+          if (-not (Select-String -Path $archiveListing -Pattern "fastapi" -Quiet)) { throw "Portable EXE is missing FastAPI" }
+          if (-not (Select-String -Path $archiveListing -Pattern "uvicorn" -Quiet)) { throw "Portable EXE is missing Uvicorn" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
           if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom compatibility modules" }
           if (-not (Select-String -Path $archiveListing -Pattern "DCMGET_PORTABLE_RUNTIME\.json" -Quiet)) { throw "Portable EXE is missing the stable DCMTK runtime manifest" }
@@ -256,10 +276,9 @@ jobs:
           $exe = "build/windows/dist/DcmGet/DcmGet.exe"
           $process = Start-Process $exe -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Unpacked self-test failed with code $($process.ExitCode)" }
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $config = Join-Path $env:RUNNER_TEMP "dcmget-unpacked-ui-self-test.json"
-          $ui = Start-Process $exe -ArgumentList @("--ui-self-test", "--config", $config) -Wait -PassThru
-          if ($ui.ExitCode -ne 0) { throw "Unpacked UI self-test failed with code $($ui.ExitCode)" }
+          $config = Join-Path $env:RUNNER_TEMP "dcmget-unpacked-web-self-test.json"
+          $web = Start-Process $exe -ArgumentList @("--web-self-test", "--config", $config) -Wait -PassThru
+          if ($web.ExitCode -ne 0) { throw "Unpacked Web self-test failed with code $($web.ExitCode)" }
 
       - name: Smoke test portable application
         shell: pwsh
@@ -319,10 +338,9 @@ jobs:
             throw "Portable runtime left a temporary publish directory"
           }
 
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $config = Join-Path $env:RUNNER_TEMP "dcmget-portable-ui-self-test.json"
-          $ui = Start-Process $portable -ArgumentList @("--ui-self-test", "--config", $config) -Wait -PassThru
-          if ($ui.ExitCode -ne 0) { throw "Portable UI self-test failed with code $($ui.ExitCode)" }
+          $config = Join-Path $env:RUNNER_TEMP "dcmget-portable-web-self-test.json"
+          $web = Start-Process $portable -ArgumentList @("--web-self-test", "--config", $config) -Wait -PassThru
+          if ($web.ExitCode -ne 0) { throw "Portable Web self-test failed with code $($web.ExitCode)" }
 
       - name: Install Inno Setup
         shell: pwsh
@@ -449,6 +467,10 @@ jobs:
             throw "Installed DCMTK bin allowlist mismatch: $($installedDcmtkDifference | Out-String)"
           }
           $resourceRoot = Join-Path $installDir "_internal"
+          $webui = Join-Path $resourceRoot "dcmget\webui"
+          @("index.html", "app.css", "app.js") | ForEach-Object {
+            if (-not (Test-Path (Join-Path $webui $_) -PathType Leaf)) { throw "Installed DcmGet Web resource is missing: $_" }
+          }
           $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
           if (-not (Test-Path (Join-Path $resourceRoot "DcmGetPdiServer.exe") -PathType Leaf)) { throw "Installed PDI local server is missing" }
           if (-not (Test-Path (Join-Path $resourceRoot "dcmget\pdi_server.py") -PathType Leaf)) { throw "Installed portable PDI server script is missing" }
@@ -467,30 +489,41 @@ jobs:
           if ($records[0].DisplayVersion -ne "${{ inputs.version }}") { throw "Installed version is $($records[0].DisplayVersion)" }
           if ($records[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Upgrade changed the installation directory" }
 
-          $firewallRules = @(Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction Stop)
-          if ($firewallRules.Count -ne 1) { throw "Expected exactly one DcmGet receiver firewall rule, found $($firewallRules.Count)" }
+          function Assert-DcmGetFirewallRule([string]$displayName, [string]$expectedProgram) {
+            $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop)
+            if ($rules.Count -ne 1) { throw "Expected exactly one '$displayName' firewall rule, found $($rules.Count)" }
+            $rule = $rules[0]
+            if ($rule.Direction.ToString() -ne "Inbound" -or $rule.Action.ToString() -ne "Allow" -or $rule.Enabled.ToString() -ne "True" -or $rule.EdgeTraversalPolicy.ToString() -ne "Block") {
+              throw "Firewall rule '$displayName' must be enabled inbound allow with edge traversal blocked"
+            }
+            $portFilters = @($rule | Get-NetFirewallPortFilter)
+            if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") {
+              throw "Firewall rule '$displayName' must allow the configured TCP port"
+            }
+            $applicationFilters = @($rule | Get-NetFirewallApplicationFilter)
+            if ($applicationFilters.Count -ne 1) { throw "Expected one '$displayName' firewall application filter, found $($applicationFilters.Count)" }
+            $configuredProgram = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
+            $actualProgram = (Resolve-Path -LiteralPath $configuredProgram -ErrorAction Stop).ProviderPath
+            if (-not $actualProgram.Equals($expectedProgram, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Firewall program for '$displayName' is '$actualProgram', expected '$expectedProgram'"
+            }
+            $profileNames = @($rule.Profile.ToString().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($profileNames.Count -ne 2 -or $profileNames -notcontains "Domain" -or $profileNames -notcontains "Private") {
+              throw "Firewall profiles for '$displayName' must be exactly Domain and Private, found '$($rule.Profile)'"
+            }
+          }
+
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Upgrade left the legacy storescp program rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Upgrade left the legacy TCP 6666 firewall rule behind" }
-          $firewall = $firewallRules[0]
-          if ($firewall.Direction.ToString() -ne "Inbound" -or $firewall.Action.ToString() -ne "Allow" -or $firewall.Enabled.ToString() -ne "True" -or $firewall.EdgeTraversalPolicy.ToString() -ne "Block") {
-            throw "Firewall rule must be enabled inbound allow with edge traversal blocked"
-          }
-          $portFilters = @($firewall | Get-NetFirewallPortFilter)
-          if ($portFilters.Count -ne 1 -or $portFilters[0].Protocol -ne "TCP" -or $portFilters[0].LocalPort.ToString() -ne "Any") { throw "Firewall rule does not allow the configured receiver TCP port" }
-          $applicationFilters = @($firewall | Get-NetFirewallApplicationFilter)
-          if ($applicationFilters.Count -ne 1) { throw "Expected one firewall application filter, found $($applicationFilters.Count)" }
           $expectedReceiver = (Resolve-Path -LiteralPath (Join-Path $installDir "_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe") -ErrorAction Stop).ProviderPath
-          $configuredReceiver = [Environment]::ExpandEnvironmentVariables($applicationFilters[0].Program.Trim('"'))
-          $actualReceiver = (Resolve-Path -LiteralPath $configuredReceiver -ErrorAction Stop).ProviderPath
-          if (-not $actualReceiver.Equals($expectedReceiver, [StringComparison]::OrdinalIgnoreCase)) { throw "Firewall program is '$actualReceiver', expected '$expectedReceiver'" }
-          $profileNames = @($firewall.Profile.ToString().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          if ($profileNames.Count -ne 2 -or $profileNames -notcontains "Domain" -or $profileNames -notcontains "Private") { throw "Firewall profiles must be exactly Domain and Private, found '$($firewall.Profile)'" }
+          $expectedWeb = (Resolve-Path -LiteralPath (Join-Path $installDir "DcmGet.exe") -ErrorAction Stop).ProviderPath
+          Assert-DcmGetFirewallRule "DcmGet Receiver TCP" $expectedReceiver
+          Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb
 
           $process = Start-Process "$installDir/DcmGet.exe" -ArgumentList "--self-test" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installed self-test failed with code $($process.ExitCode)" }
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $upgradeUi = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--ui-self-test", "--config", "`"$configPath`"") -Wait -PassThru
-          if ($upgradeUi.ExitCode -ne 0) { throw "Installed UI self-test failed with code $($upgradeUi.ExitCode)" }
+          $upgradeWeb = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--web-self-test", "--config", "`"$configPath`"") -Wait -PassThru
+          if ($upgradeWeb.ExitCode -ne 0) { throw "Installed Web self-test failed with code $($upgradeWeb.ExitCode)" }
           $diagnosticLogs = @(
             Get-ChildItem (Join-Path $env:LOCALAPPDATA "DcmGet\logs") -Filter "dcmget-diagnostics-*.log" -File -ErrorAction SilentlyContinue |
               Where-Object { $_.Length -gt 0 }
@@ -505,6 +538,7 @@ jobs:
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
           if (-not ($diagnosticLogs | Where-Object { Test-Path $_.FullName })) { throw "Uninstall removed the diagnostic log" }
           if (Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the receiver firewall rule behind" }
+          if (Get-NetFirewallRule -DisplayName "DcmGet Web TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the Web firewall rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy storescp rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }
           Remove-Item $configDir -Recurse -Force

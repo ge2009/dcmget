@@ -53,6 +53,7 @@ class ProfileInfo:
     pacs_ae_title: str
     storage_ae_title: str
     storage_port: int
+    web_port: int
     destination_directory: str
     is_running: bool
     has_recovery: bool
@@ -62,6 +63,7 @@ class ProfileInfo:
 class ProfileCloneResult:
     source_number: int
     recommended_port: int
+    recommended_web_port: int
     profile: ProfileInfo
 
 
@@ -159,7 +161,11 @@ class ProfileManager:
         ):
             raise ProfileManagerError("起始端口必须在 1024 到 65535 之间")
 
-        used_ports = {profile.storage_port for profile in self.list_profiles()}
+        used_ports = {
+            port
+            for profile in self.list_profiles()
+            for port in (profile.storage_port, profile.web_port)
+        }
         candidates = range(start, 65536)
         wrapped = range(MIN_RECOMMENDED_PORT, start)
         for candidate in (*candidates, *wrapped):
@@ -194,9 +200,16 @@ class ProfileManager:
                 else MIN_RECOMMENDED_PORT
             )
             recommended_port = self.recommend_available_port(starting_port)
+            starting_web_port = (
+                source_config.web_port + 1
+                if source_config.web_port < 65535
+                else MIN_RECOMMENDED_PORT
+            )
+            recommended_web_port = self.recommend_available_port(starting_web_port)
             cloned_config = replace(
                 source_config,
                 storage_port=recommended_port,
+                web_port=recommended_web_port,
             )
             name = _display_name(
                 display_name if display_name is not None else f"实例 {target_number}"
@@ -231,6 +244,7 @@ class ProfileManager:
         return ProfileCloneResult(
             source_number=source_number,
             recommended_port=profile.storage_port,
+            recommended_web_port=profile.web_port,
             profile=profile,
         )
 
@@ -295,6 +309,7 @@ class ProfileManager:
             pacs_ae_title=config.pacs_ae_title,
             storage_ae_title=config.storage_ae_title,
             storage_port=config.storage_port,
+            web_port=config.web_port,
             destination_directory=config.dicom_destination_folder,
             is_running=self._profile_is_running(number),
             has_recovery=self._recovery_path(number).is_file(),

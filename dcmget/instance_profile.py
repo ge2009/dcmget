@@ -4,7 +4,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sqlite3
 import uuid
 from contextlib import closing
@@ -14,7 +13,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from .config import AppConfig, save_config
+from .config import AppConfig, load_config, save_config
 from .core import AccessionStatus
 from .runtime import application_state_dir, default_config_path
 from .task_state import (
@@ -497,26 +496,56 @@ def _ensure_profile_config(
         and legacy_custom_profile.resolve() != target.resolve()
     ):
         source = legacy_custom_profile
+        preserve_source_ports = True
     elif number > 1 and _config_path(roots, 1).is_file():
         source = _config_path(roots, 1)
+        preserve_source_ports = False
     else:
         source = roots.template_config_path
+        preserve_source_ports = False
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not source.is_file():
-        save_config(target, AppConfig())
+        config = AppConfig()
+        if number > 1 and not preserve_source_ports:
+            config.storage_port = _next_profile_port(roots, config.storage_port)
+            config.web_port = _next_profile_port(
+                roots, config.web_port, reserved={config.storage_port}
+            )
+        save_config(target, config)
         _make_private(target)
         return
-    temporary = target.with_name(
-        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
     try:
-        shutil.copy2(source, temporary)
-        _make_private(temporary)
-        os.replace(temporary, target)
-    except OSError as exc:
+        config = load_config(source)
+        if number > 1 and not preserve_source_ports:
+            config.storage_port = _next_profile_port(roots, config.storage_port)
+            config.web_port = _next_profile_port(
+                roots, config.web_port, reserved={config.storage_port}
+            )
+        save_config(target, config)
+        _make_private(target)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise InstanceProfileError(f"无法初始化实例 {number} 配置：{exc}") from exc
-    finally:
-        temporary.unlink(missing_ok=True)
+
+
+def _next_profile_port(
+    roots: _ProfileRoots,
+    starting_port: int,
+    *,
+    reserved: set[int] | None = None,
+) -> int:
+    used_ports: set[int] = set(reserved or ())
+    if roots.config_profiles.is_dir():
+        for path in roots.config_profiles.glob("i*/config.json"):
+            try:
+                config = load_config(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            used_ports.update((config.storage_port, config.web_port))
+    start = starting_port + 1 if starting_port < 65535 else 1024
+    for candidate in (*range(start, 65536), *range(1024, start)):
+        if candidate not in used_ports:
+            return candidate
+    raise InstanceProfileError("没有可用的 Profile 服务端口")
 
 
 def _read_migratable_catalog(

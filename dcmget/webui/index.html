@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#0b6b78">
+  <title>DcmGet · 影像交付工作台</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <noscript>
+    <div class="fatal-banner">DcmGet Web 需要启用 JavaScript，所有程序资源均来自本机，不会连接互联网。</div>
+  </noscript>
+
+  <section id="login-screen" class="auth-screen" aria-labelledby="login-title" hidden>
+    <div class="auth-panel">
+      <div class="brand brand--auth" aria-label="DcmGet">
+        <span class="brand-mark" aria-hidden="true">D</span>
+        <span>
+          <strong>DcmGet</strong>
+          <small>影像交付工作台</small>
+        </span>
+      </div>
+      <div class="auth-copy">
+        <p class="eyebrow">本地安全访问</p>
+        <h1 id="login-title">登录 DcmGet</h1>
+        <p id="login-hint" class="muted">请输入管理员设置的访问密码。</p>
+      </div>
+      <form id="login-form" class="stack" autocomplete="on">
+        <label class="field">
+          <span>访问密码</span>
+          <input id="login-password" name="password" type="password" required autocomplete="current-password" maxlength="128" autofocus>
+        </label>
+        <label id="login-confirm-field" class="field" hidden>
+          <span>再次输入密码</span>
+          <input id="login-password-confirm" name="confirm_password" type="password" autocomplete="new-password" maxlength="128">
+        </label>
+        <p id="login-error" class="field-error" role="alert" hidden></p>
+        <button class="button button--primary button--large" type="submit">登录</button>
+      </form>
+      <div class="notice notice--warning compact-notice">
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <div>
+          <strong>仅限可信内网</strong>
+          <p>当前使用 HTTP，密码和页面流量未加密。不要通过公网、访客 Wi-Fi 或不可信网络访问。</p>
+        </div>
+      </div>
+      <p class="auth-foot">程序完全离线运行；关闭此页面不会停止正在执行的下载。</p>
+    </div>
+  </section>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">D</span>
+        <span>
+          <strong>DcmGet</strong>
+          <small>影像交付工作台</small>
+        </span>
+      </div>
+      <div class="topbar-context" aria-label="当前运行环境">
+        <span id="header-profile" class="context-chip">Profile —</span>
+        <span id="header-pacs" class="context-chip">PACS —</span>
+        <span id="header-receiver" class="context-chip">接收器 —</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection-state" class="connection-state" data-state="connecting">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>正在连接</span>
+        </span>
+        <button id="logout-button" class="icon-button" type="button" title="退出登录" aria-label="退出登录">
+          <span aria-hidden="true">↪</span>
+        </button>
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="主导航">
+      <nav class="main-nav">
+        <button class="nav-item is-active" type="button" data-page="home" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">⌂</span><span>任务</span>
+        </button>
+        <button class="nav-item" type="button" data-page="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span><span>设置</span>
+        </button>
+        <button class="nav-item" type="button" data-page="operations">
+          <span class="nav-icon" aria-hidden="true">◇</span><span>运维</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="license-summary" class="license-summary">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>正在读取授权</span>
+        </div>
+        <button id="buy-license-button" class="text-button" type="button">查看授权</button>
+      </div>
+    </aside>
+
+    <main id="main-content" class="main-content" tabindex="-1">
+      <div id="global-alert" class="notice notice--error global-alert" role="alert" hidden>
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <div>
+          <strong id="global-alert-title">操作失败</strong>
+          <p id="global-alert-message"></p>
+        </div>
+        <button id="dismiss-alert" class="icon-button" type="button" aria-label="关闭提示">×</button>
+      </div>
+
+      <section id="page-home" class="page is-active" data-page-panel="home" aria-labelledby="home-title">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">工作台</p>
+            <h1 id="home-title">影像下载</h1>
+            <p class="page-description">批量提交检查号，下载由本机后台持续执行；关闭浏览器不会停止后台下载。</p>
+          </div>
+          <div class="page-heading-actions">
+            <button id="open-destination-button" class="button button--secondary" type="button">在主机打开目标目录</button>
+          </div>
+        </div>
+
+        <div id="lan-notice" class="notice notice--info" hidden>
+          <span class="notice-icon" aria-hidden="true">i</span>
+          <div>
+            <strong>局域网访问已开启</strong>
+            <p>当前地址：<code id="lan-url">—</code>。目录选择和“打开目录”操作均发生在运行 DcmGet 的主机上。</p>
+          </div>
+          <button id="copy-lan-url" class="button button--quiet button--small" type="button">复制地址</button>
+        </div>
+
+        <section id="task-editor" class="card task-editor" aria-labelledby="new-task-title">
+          <div class="card-header">
+            <div>
+              <h2 id="new-task-title">新建下载任务</h2>
+              <p>每行一个检查号；空行忽略，重复项自动去除。</p>
+            </div>
+            <span id="task-readiness" class="status-badge status-badge--neutral">等待输入</span>
+          </div>
+
+          <div class="editor-grid">
+            <div class="accession-column">
+              <label class="field-label" for="accession-input">检查号</label>
+              <div id="accession-dropzone" class="dropzone">
+                <textarea id="accession-input" rows="11" spellcheck="false" placeholder="粘贴检查号，例如：&#10;202601261643&#10;CT202108130339"></textarea>
+                <div class="dropzone-actions">
+                  <span>也可以拖入 TXT、CSV 或 XLSX 文件</span>
+                  <label class="button button--secondary button--small" for="accession-file">选择文件</label>
+                  <input id="accession-file" type="file" accept=".txt,.csv,.xlsx,text/plain,text/csv" hidden>
+                </div>
+              </div>
+              <div id="accession-summary" class="import-summary" aria-live="polite">
+                <span><strong id="accession-valid-count">0</strong> 个有效检查号</span>
+                <span id="accession-duplicate-summary">重复 0</span>
+                <span id="accession-blank-summary">空行 0</span>
+              </div>
+              <p id="accession-error" class="field-error" hidden></p>
+            </div>
+
+            <div class="task-options">
+              <label class="field">
+                <span>DICOM 保存目录</span>
+                <div class="input-action">
+                  <input id="destination-input" type="text" autocomplete="off" placeholder="运行 DcmGet 的主机目录">
+                  <button id="browse-destination" class="button button--secondary" type="button">浏览主机</button>
+                </div>
+                <small>局域网访问时，此路径不是当前浏览器电脑上的目录。</small>
+              </label>
+              <div class="option-card">
+                <label class="switch-row" for="quick-pdi-enabled">
+                  <span>
+                    <strong>生成 PDI 便携目录</strong>
+                    <small>任务完成后自动生成 DICOMDIR 和离线中文查看器。</small>
+                  </span>
+                  <span class="switch"><input id="quick-pdi-enabled" type="checkbox"><span aria-hidden="true"></span></span>
+                </label>
+                <div id="quick-pdi-folder-row" class="sub-option" hidden>
+                  <label class="field">
+                    <span>PDI 输出目录</span>
+                    <div class="input-action">
+                      <input id="quick-pdi-folder" type="text" autocomplete="off">
+                      <button id="browse-pdi-folder" class="button button--secondary" type="button">浏览主机</button>
+                    </div>
+                  </label>
+                </div>
+              </div>
+              <div class="preflight-block">
+                <div class="section-label-row">
+                  <span class="field-label">启动预检</span>
+                  <button id="run-preflight-button" class="text-button" type="button">重新检查</button>
+                </div>
+                <ul id="preflight-list" class="check-list" aria-live="polite">
+                  <li data-check="config"><span class="check-icon">·</span><span>配置完整</span><small>尚未检查</small></li>
+                  <li data-check="dcmtk"><span class="check-icon">·</span><span>DCMTK 工具</span><small>尚未检查</small></li>
+                  <li data-check="destination"><span class="check-icon">·</span><span>保存目录</span><small>尚未检查</small></li>
+                  <li data-check="receiver"><span class="check-icon">·</span><span>接收端口</span><small>尚未检查</small></li>
+                </ul>
+              </div>
+              <button id="start-task-button" class="button button--primary button--large full-width" type="button" disabled>开始下载</button>
+              <p id="start-task-hint" class="form-hint">输入检查号并完成预检后即可开始。</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="task-runtime" class="card task-runtime" aria-labelledby="runtime-title" hidden>
+          <div class="runtime-heading">
+            <div>
+              <p class="eyebrow">当前任务</p>
+              <h2 id="runtime-title">正在准备</h2>
+              <p id="runtime-subtitle" class="muted">后台服务正在接管任务。</p>
+            </div>
+            <span id="runtime-status" class="status-badge status-badge--working">启动中</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-label="任务总进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="progress-fill"></span>
+          </div>
+          <div class="progress-caption">
+            <span id="progress-text">0 / 0</span>
+            <strong id="progress-percent">0%</strong>
+          </div>
+          <div class="metric-grid">
+            <article class="metric"><span>当前检查号</span><strong id="metric-accession">—</strong></article>
+            <article class="metric"><span>接收文件</span><strong id="metric-files">0</strong></article>
+            <article class="metric"><span>当前速度</span><strong id="metric-speed">0 B/s</strong></article>
+            <article class="metric"><span>已用时间</span><strong id="metric-duration">00:00</strong></article>
+          </div>
+          <div class="runtime-actions">
+            <button id="pause-task-button" class="button button--secondary" type="button">暂停</button>
+            <button id="resume-task-button" class="button button--primary" type="button" hidden>继续</button>
+            <button id="cancel-task-button" class="button button--danger-quiet" type="button">停止任务</button>
+            <span class="action-separator"></span>
+            <button id="retry-task-button" class="button button--secondary" type="button" hidden>重试失败项</button>
+            <button id="accept-partial-button" class="button button--secondary" type="button" hidden>接受已有文件</button>
+            <button id="new-task-button" class="button button--primary" type="button" hidden>新建任务</button>
+          </div>
+          <div id="pdi-runtime" class="pdi-runtime" hidden>
+            <div>
+              <span class="field-label">PDI 便携目录</span>
+              <p id="pdi-runtime-message">正在等待下载完成。</p>
+            </div>
+            <span id="pdi-runtime-status" class="status-badge status-badge--neutral">等待</span>
+            <div class="inline-actions">
+              <button id="open-pdi-button" class="button button--secondary button--small" type="button">打开 PDI</button>
+              <button id="verify-pdi-button" class="button button--secondary button--small" type="button">校验</button>
+              <button id="retry-pdi-button" class="button button--secondary button--small" type="button">重试导出</button>
+            </div>
+          </div>
+          <div id="large-task-summary" class="large-task-summary" hidden>
+            <strong>大批量任务摘要</strong>
+            <p id="large-task-text">超过 200 条检查号，为保持页面流畅，已隐藏逐项列表。</p>
+            <div id="status-summary" class="status-summary"></div>
+          </div>
+          <div id="task-table-wrap" class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>检查号</th><th>状态</th><th>文件</th><th>耗时</th><th>说明</th></tr></thead>
+              <tbody id="task-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="log-card" class="card log-card" aria-labelledby="log-title">
+          <div class="card-header card-header--compact">
+            <div>
+              <h2 id="log-title">问题与日志</h2>
+              <p id="log-filter-copy">默认仅显示错误日志。</p>
+            </div>
+            <div class="inline-actions">
+              <label class="checkbox-label"><input id="detailed-log-toggle" type="checkbox"> 显示详细日志</label>
+              <button id="copy-errors-button" class="button button--quiet button--small" type="button">复制</button>
+              <button id="clear-logs-button" class="button button--quiet button--small" type="button">清空显示</button>
+              <button id="open-log-directory-button" class="button button--quiet button--small" type="button">日志目录</button>
+            </div>
+          </div>
+          <div id="empty-log-state" class="empty-state">
+            <span class="empty-state-icon" aria-hidden="true">✓</span>
+            <strong>暂无需要处理的问题</strong>
+            <p>详细运行过程仍会写入主机日志文件。</p>
+          </div>
+          <ol id="log-list" class="log-list" aria-live="polite" hidden></ol>
+        </section>
+      </section>
+
+      <section id="page-settings" class="page" data-page-panel="settings" aria-labelledby="settings-title" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">配置</p><h1 id="settings-title">设置</h1><p class="page-description">更改保存后只影响后续新任务。</p></div>
+          <div class="page-heading-actions"><button id="save-settings-button" class="button button--primary" type="submit" form="settings-form">保存设置</button></div>
+        </div>
+        <form id="settings-form" class="settings-layout">
+          <section class="card settings-card" aria-labelledby="pacs-settings-title">
+            <div class="card-header"><div><h2 id="pacs-settings-title">PACS 连接</h2><p>查询服务器及本机 DICOM 身份。</p></div></div>
+            <div class="form-grid form-grid--two">
+              <label class="field"><span>PACS 地址</span><input name="pacs_server_ip" type="text" autocomplete="off" required></label>
+              <label class="field"><span>PACS 端口</span><input name="pacs_server_port" type="text" inputmode="numeric" required></label>
+              <label class="field"><span>本机调用 AE</span><input name="calling_ae_title" type="text" maxlength="16" required></label>
+              <label class="field"><span>PACS AE</span><input name="pacs_ae_title" type="text" maxlength="16" required></label>
+              <label class="field"><span>接收 AE</span><input name="storage_ae_title" type="text" maxlength="16" required></label>
+              <label class="field"><span>监听端口</span><input name="storage_port" type="text" inputmode="numeric" required></label>
+            </div>
+          </section>
+
+          <section class="card settings-card" aria-labelledby="storage-settings-title">
+            <div class="card-header"><div><h2 id="storage-settings-title">保存与可靠性</h2><p>目录结构、磁盘保护和断线重试。</p></div></div>
+            <div class="form-grid form-grid--two">
+              <label class="field field--wide"><span>默认 DICOM 目录</span><input name="dicom_destination_folder" type="text"></label>
+              <label class="field field--wide"><span>DCMTK bin 目录</span><div class="input-action"><input id="dcmtk-bin-input" name="dcmtk_bin_dir" type="text" placeholder="留空时自动查找"><button id="browse-dcmtk" class="button button--secondary" type="button">浏览主机</button></div></label>
+              <label class="field field--wide"><span>目录模板</span><input name="directory_template" type="text"><small>可用：{PatientID}、{AccessionNumber}、{StudyInstanceUID}</small></label>
+              <label class="field"><span>磁盘最小保留空间（GB）</span><input name="minimum_free_space_gb" type="text" inputmode="decimal"></label>
+              <label class="field"><span>自动重试次数</span><input name="auto_retry_attempts" type="text" inputmode="numeric"></label>
+              <label class="field"><span>重试间隔（秒）</span><input name="auto_retry_backoff_seconds" type="text" inputmode="numeric"></label>
+              <label class="field"><span>连续失败暂停阈值</span><input name="circuit_breaker_failures" type="text" inputmode="numeric"></label>
+              <label class="field"><span>单日志上限（MB）</span><input name="max_log_file_size_mb" type="text" inputmode="numeric"></label>
+            </div>
+          </section>
+
+          <section class="card settings-card" aria-labelledby="privacy-settings-title">
+            <div class="card-header"><div><h2 id="privacy-settings-title">匿名化</h2><p>下载归档后按选定方案处理 DICOM 元数据。</p></div></div>
+            <label class="switch-row" for="setting-anonymization-enabled">
+              <span><strong>启用匿名化</strong><small>不能清除烧录在像素中的文字或面部特征。</small></span>
+              <span class="switch"><input id="setting-anonymization-enabled" name="anonymization_enabled" type="checkbox"><span aria-hidden="true"></span></span>
+            </label>
+            <label class="field"><span>匿名方案</span>
+              <select name="anonymization_profile">
+                <option value="basic">基础脱敏（院内）</option>
+                <option value="research">研究匿名（推荐）</option>
+                <option value="strict">严格元数据匿名</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="card settings-card" aria-labelledby="pdi-settings-title">
+            <div class="card-header"><div><h2 id="pdi-settings-title">PDI 便携目录</h2><p>生成标准 DICOMDIR 与完全离线的中文查看器。</p></div></div>
+            <label class="switch-row" for="setting-pdi-enabled">
+              <span><strong>任务完成后自动生成</strong><small>未匿名数据可能包含患者隐私。</small></span>
+              <span class="switch"><input id="setting-pdi-enabled" name="pdi_export_enabled" type="checkbox"><span aria-hidden="true"></span></span>
+            </label>
+            <div class="form-grid form-grid--two">
+              <label class="field"><span>机构名称</span><input name="pdi_institution_name" type="text"></label>
+              <label class="field"><span>PDI 输出目录</span><input name="pdi_output_folder" type="text"></label>
+              <label class="field"><span>单卷容量（GB）</span><input name="pdi_volume_size_gb" type="text" inputmode="decimal"><small>0 表示不分卷。</small></label>
+              <label class="checkbox-label field--wide"><input name="pdi_include_ohif_viewer" type="checkbox"> 包含离线中文 OHIF 查看器</label>
+            </div>
+          </section>
+
+          <section class="card settings-card settings-card--wide" aria-labelledby="web-settings-title">
+            <div class="card-header"><div><h2 id="web-settings-title">Web 访问</h2><p>控制浏览器连接范围和登录安全。</p></div></div>
+            <div class="notice notice--warning">
+              <span class="notice-icon" aria-hidden="true">!</span>
+              <div><strong>HTTP 流量未加密</strong><p>局域网访问仅可用于受控、可信的院内网络。不要将端口映射到公网。</p></div>
+            </div>
+            <div class="form-grid form-grid--two">
+              <label class="switch-row field--wide" for="setting-lan-enabled">
+                <span><strong>允许局域网其他电脑访问</strong><small>关闭后仅能从本机浏览器访问。</small></span>
+                <span class="switch"><input id="setting-lan-enabled" name="web_lan_enabled" type="checkbox"><span aria-hidden="true"></span></span>
+              </label>
+              <label class="field"><span>监听端口</span><input name="web_port" type="text" inputmode="numeric"><small>修改监听范围或端口后，重启 DcmGet 生效。</small></label>
+              <label class="field"><span>会话空闲超时（分钟）</span><input name="web_session_timeout_minutes" type="text" inputmode="numeric"></label>
+              <label class="checkbox-label field--wide"><input name="web_open_browser" type="checkbox"> 启动 DcmGet 后自动打开系统浏览器</label>
+              <label class="switch-row field--wide" for="setting-auth-required">
+                <span><strong>要求密码登录</strong><small>允许局域网访问时不能关闭。</small></span>
+                <span class="switch"><input id="setting-auth-required" name="web_auth_required" type="checkbox" checked disabled><span aria-hidden="true"></span></span>
+              </label>
+            </div>
+          </section>
+          <div class="settings-footer"><p id="settings-status" class="form-hint" role="status"></p><button class="button button--primary" type="submit">保存设置</button></div>
+        </form>
+      </section>
+
+      <section id="page-operations" class="page" data-page-panel="operations" aria-labelledby="operations-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">维护</p><h1 id="operations-title">运维中心</h1><p class="page-description">检查环境、收集支持材料并管理当前 Profile。</p></div></div>
+        <div class="operations-grid">
+          <section class="card operations-card">
+            <div class="card-header"><div><h2>运行身份</h2><p>每个 Profile 使用独立配置、端口和任务目录。</p></div></div>
+            <dl class="detail-list">
+              <div><dt>Profile</dt><dd id="operation-profile">—</dd></div>
+              <div><dt>数据目录</dt><dd id="operation-data-dir">—</dd></div>
+              <div><dt>Web 地址</dt><dd id="operation-web-url">—</dd></div>
+              <div><dt>应用版本</dt><dd id="operation-version">—</dd></div>
+              <div><dt>DCMTK</dt><dd id="operation-dcmtk-version">—</dd></div>
+            </dl>
+            <div class="inline-actions">
+              <button class="button button--secondary" type="button" data-operation="profile-backup">备份 Profile</button>
+              <button class="button button--secondary" type="button" data-operation="open-data-directory">在主机打开数据目录</button>
+            </div>
+          </section>
+          <section id="profile-management-card" class="card operations-card operations-card--wide">
+            <div class="card-header"><div><h2>Profile 管理</h2><p>复制一个 Profile 即可用独立接收端口和 Web 端口运行另一个任务。</p></div><button id="refresh-profiles-button" class="button button--secondary button--small" type="button">刷新</button></div>
+            <div class="table-wrap profile-table-wrap">
+              <table class="data-table">
+                <thead><tr><th>名称</th><th>接收</th><th>Web 端口</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="profile-table-body"><tr><td colspan="6">正在读取 Profile…</td></tr></tbody>
+              </table>
+            </div>
+            <p id="profile-management-hint" class="form-hint">复制后请确认新接收 AE，并在 PACS 中同步 Move Destination 映射。</p>
+          </section>
+          <section class="card operations-card">
+            <div class="card-header"><div><h2>健康检查</h2><p>检查工具、目录、端口、数据库和磁盘状态。</p></div><button id="refresh-health-button" class="button button--secondary button--small" type="button">重新检查</button></div>
+            <ul id="health-list" class="health-list" aria-live="polite"><li class="health-placeholder">尚未执行健康检查</li></ul>
+          </section>
+          <section class="card operations-card">
+            <div class="card-header"><div><h2>软件授权</h2><p>每台电脑使用独立机器码；未注册时可免费执行 30 个任务。</p></div></div>
+            <dl class="detail-list">
+              <div><dt>机器码</dt><dd><code id="license-machine-code">—</code></dd></div>
+              <div><dt>授权状态</dt><dd id="operation-license-status">正在读取</dd></div>
+            </dl>
+            <label class="field"><span>注册码</span><textarea id="license-token-input" rows="3" spellcheck="false" placeholder="粘贴 DGM1 开头的注册码"></textarea></label>
+            <div class="inline-actions">
+              <button id="activate-license-button" class="button button--primary" type="button">激活授权</button>
+              <button id="copy-machine-code-button" class="button button--secondary" type="button">复制机器码</button>
+            </div>
+          </section>
+          <section class="card operations-card">
+            <div class="card-header"><div><h2>诊断与支持</h2><p>支持包默认隐藏患者身份、检查号和 PACS 连接信息。</p></div></div>
+            <div class="operation-actions">
+              <button class="operation-button" type="button" data-operation="open-log-directory"><strong>日志目录</strong><span>查看主机上的完整运行日志</span></button>
+              <button class="operation-button" type="button" data-operation="support-bundle"><strong>生成脱敏支持包</strong><span>供技术支持分析，不包含 DICOM 文件</span></button>
+              <button class="operation-button" type="button" data-operation="acceptance-report"><strong>生成验收报告</strong><span>导出环境与任务结果摘要</span></button>
+            </div>
+          </section>
+          <section class="card operations-card">
+            <div class="card-header"><div><h2>版本说明</h2><p>当前版本的新增能力和修复。</p></div></div>
+            <div id="release-notes" class="release-notes"><p class="muted">正在加载版本信息…</p></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="directory-dialog" class="directory-dialog" aria-labelledby="directory-dialog-title">
+    <form method="dialog" class="dialog-shell">
+      <div class="dialog-header"><div><p class="eyebrow">主机文件系统</p><h2 id="directory-dialog-title">选择目录</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
+      <p class="dialog-hint">这里显示运行 DcmGet 的主机目录，不是当前浏览器所在电脑。</p>
+      <div class="directory-path-row"><button id="directory-up-button" class="button button--secondary button--small" type="button">上一级</button><input id="directory-current-path" type="text" aria-label="当前目录"><button id="directory-go-button" class="button button--secondary button--small" type="button">转到</button></div>
+      <div id="directory-error" class="field-error" role="alert" hidden></div>
+      <ul id="directory-list" class="directory-list" aria-label="子目录"></ul>
+      <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="directory-select-button" class="button button--primary" type="button">选择当前目录</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog" class="dialog-shell dialog-shell--small">
+      <div class="confirm-symbol" aria-hidden="true">!</div>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message">是否继续？</p>
+      <div class="dialog-actions"><button class="button button--secondary" value="cancel">取消</button><button id="confirm-action-button" class="button button--danger" value="confirm">确认</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

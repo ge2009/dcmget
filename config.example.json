@@ -1,5 +1,5 @@
 {
-  "config_version": 7,
+  "config_version": 8,
   "dcmtk_bin_dir": "",
   "access_numbers_file_path": "access.txt",
   "dicom_destination_folder": "Dicom/Dest",
@@ -10,6 +10,10 @@
   "storage_ae_title": "DCMGET",
   "storage_port": 6666,
   "max_concurrent_moves": 2,
+  "web_bind_address": "0.0.0.0",
+  "web_port": 8787,
+  "web_open_browser": true,
+  "web_session_timeout_minutes": 480,
   "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
   "anonymization_enabled": false,
   "anonymization_profile": "research",

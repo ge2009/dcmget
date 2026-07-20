@@ -34,6 +34,7 @@ if (-not (Test-Path $Runtime)) {
 }
 
 $RuleName = "DcmGet Receiver TCP"
+$WebRuleName = "DcmGet Web TCP"
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
@@ -46,15 +47,20 @@ if ($IsAdmin) {
         throw "无法唯一确定 storescp.exe，找到 $($ReceiverCandidates.Count) 个候选文件。"
     }
     $ReceiverProgram = $ReceiverCandidates[0].FullName
-    @("DcmGet Receiver TCP", "DcmGet storescp TCP", "DcmGet storescp TCP 6666") | ForEach-Object {
+    @("DcmGet Receiver TCP", "DcmGet Web TCP", "DcmGet storescp TCP", "DcmGet storescp TCP 6666") | ForEach-Object {
         Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     }
     New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
         -Program $ReceiverProgram -Protocol TCP `
         -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null
     Write-Host "已确认 DICOM 接收器防火墙规则：$RuleName"
+    $WebProgram = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+    New-NetFirewallRule -DisplayName $WebRuleName -Direction Inbound -Action Allow `
+        -Program $WebProgram -Protocol TCP `
+        -Profile Domain,Private -EdgeTraversalPolicy Block | Out-Null
+    Write-Host "已确认局域网 Web 防火墙规则：$WebRuleName"
 } else {
-    Write-Warning "当前不是管理员，未创建 DICOM 接收器防火墙规则。需要跨主机接收时，请以管理员身份重新运行本脚本。"
+    Write-Warning "当前不是管理员，未创建 DICOM 接收器和局域网 Web 防火墙规则。需要跨主机访问时，请以管理员身份重新运行本脚本。"
 }
 
 Write-Host "部署完成。运行 .\scripts\run_ui.ps1 启动 DcmGet。"

@@ -122,19 +122,23 @@ def test_brand_assets_are_real_hidpi_images_and_windows_icon_has_256px():
     } <= bundled
 
 
-def test_release_version_sources_and_ui_self_test_flag_stay_in_sync():
+def test_release_version_sources_and_web_self_test_flags_stay_in_sync():
     root = Path(__file__).resolve().parents[1]
     windows_workflow = (root / ".github/workflows/windows-release.yml").read_text(
         encoding="utf-8"
     )
+    entry = (root / "DICOM_download_ui.py").read_text(encoding="utf-8")
 
     assert DEPLOY_VERSION == __version__
     assert PdiRequestHandler.server_version == f"DcmGetPDI/{__version__}"
     assert f"default: {__version__}" in windows_workflow
-    assert build_parser().parse_args(["--ui-self-test"]).ui_self_test
+    assert build_parser().parse_args(["--web-self-test"]).web_self_test
+    # Keep the old automation flag as a compatibility alias for existing jobs.
+    assert build_parser().parse_args(["--ui-self-test"]).web_self_test
+    assert "Web self-test OK" in entry
 
 
-def test_gui_profile_argument_uses_the_persistent_slot_range():
+def test_web_profile_argument_uses_the_persistent_slot_range():
     parser = build_parser()
 
     assert parser.parse_args(["--profile", "1"]).profile == 1
@@ -184,8 +188,32 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     assert "ensure_supported_runtime()" in cli
     assert "Reject 32-bit Python runtimes" in ci
     assert "actions/upload-artifact" not in ci
-    assert '"PyQt5>=5.15.10,<5.16"' in project
-    assert "PyQt6" not in project
+    assert '"fastapi>=0.139.2,<0.140"' in project
+    assert '"uvicorn>=0.51,<0.52"' in project
+
+
+def test_offline_web_runtime_and_static_frontend_are_packaged():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    project = (root / "pyproject.toml").read_text(encoding="utf-8")
+    build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    assert "fastapi>=0.139.2,<0.140" in requirements
+    assert "uvicorn>=0.51,<0.52" in requirements
+    assert '"fastapi>=0.139.2,<0.140"' in project
+    assert '"uvicorn>=0.51,<0.52"' in project
+    assert "f\"{ROOT / 'dcmget' / 'webui'}:dcmget/webui\"" in build
+    assert '"--collect-submodules",\n        "uvicorn"' in build
+    assert "Assert-WebResources $unpackedResourceRoot" in workflow
+    assert "Portable EXE is missing DcmGet Web index" in workflow
+    assert "Portable EXE is missing FastAPI" in workflow
+    assert "Portable EXE is missing Uvicorn" in workflow
+    assert "0.0.0.0:8787" in readme
+    assert "HTTP 未加密" in readme
 
 
 def test_windows_release_packages_only_the_required_dcmtk_runtime():
@@ -265,12 +293,12 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert 'Join-Path $baselineRoot "packaging\\windows\\dcmget.iss"' in workflow
     assert "DcmGet-2.6.1-Setup-x64.exe" in workflow
     assert '$baselineRecords[0].DisplayVersion -ne "2.6.1"' in workflow
-    assert '$upgradeUi = Start-Process "$installDir/DcmGet.exe"' in workflow
-    assert "Installed UI self-test failed" in workflow
+    assert '$upgradeWeb = Start-Process "$installDir/DcmGet.exe"' in workflow
+    assert "Installed Web self-test failed" in workflow
     assert "/DAppVersion=2.0.0" not in workflow
 
 
-def test_windows_firewall_is_limited_to_receiver_and_private_networks():
+def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
     bootstrap = (root / "scripts/bootstrap_windows.ps1").read_text(encoding="utf-8")
@@ -285,31 +313,37 @@ def test_windows_firewall_is_limited_to_receiver_and_private_networks():
     assert "profile=domain,private" in installer
     assert 'localport=6666' not in installer
     assert '#define FirewallRule "DcmGet Receiver TCP"' in installer
+    assert '#define WebFirewallRule "DcmGet Web TCP"' in installer
     assert '#define LegacyFirewallRule "DcmGet storescp TCP"' in installer
     assert '#define LegacyPortFirewallRule "DcmGet storescp TCP 6666"' in installer
     assert "-Program $ReceiverProgram" in bootstrap
+    assert "-Program $WebProgram" in bootstrap
     assert "-LocalPort" not in bootstrap
     assert "-Profile Domain,Private" in bootstrap
     assert '$RuleName = "DcmGet Receiver TCP"' in bootstrap
+    assert '$WebRuleName = "DcmGet Web TCP"' in bootstrap
     assert '-Filter "storescp.exe" -File' in bootstrap
-    assert "$firewallRules.Count -ne 1" in workflow
-    assert 'LocalPort.ToString() -ne "Any"' in workflow
+    assert 'Assert-DcmGetFirewallRule "DcmGet Receiver TCP" $expectedReceiver' in workflow
+    assert 'Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb' in workflow
+    assert '$rules.Count -ne 1' in workflow
+    assert '$portFilters[0].LocalPort.ToString() -ne "Any"' in workflow
     assert '"storage_port":16666' in workflow
     assert "Upgrade left the legacy storescp program rule behind" in workflow
     assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
-    assert "$applicationFilters.Count -ne 1" in workflow
+    assert '$applicationFilters.Count -ne 1' in workflow
     assert (
         'Join-Path $installDir "_internal\\.runtime\\dcmtk\\windows-x86_64'
         '\\dcmtk-3.7.0-win64-dynamic\\bin\\storescp.exe"' in workflow
     )
     assert "[StringComparison]::OrdinalIgnoreCase" in workflow
-    assert "$profileNames.Count -ne 2" in workflow
+    assert '$profileNames.Count -ne 2' in workflow
     assert '$profileNames -notcontains "Domain"' in workflow
     assert '$profileNames -notcontains "Private"' in workflow
-    assert '$firewall.Direction.ToString() -ne "Inbound"' in workflow
-    assert '$firewall.Action.ToString() -ne "Allow"' in workflow
-    assert '$firewall.Enabled.ToString() -ne "True"' in workflow
-    assert '$firewall.EdgeTraversalPolicy.ToString() -ne "Block"' in workflow
+    assert '$rule.Direction.ToString() -ne "Inbound"' in workflow
+    assert '$rule.Action.ToString() -ne "Allow"' in workflow
+    assert '$rule.Enabled.ToString() -ne "True"' in workflow
+    assert '$rule.EdgeTraversalPolicy.ToString() -ne "Block"' in workflow
+    assert 'Uninstall left the Web firewall rule behind' in workflow
     assert "DCMGET_PAYLOAD.SHA256" in workflow
 
 

@@ -1,3 +1,3 @@
 """DcmGet cross-platform DICOM retrieval application."""
 
-__version__ = "2.11.0"
+__version__ = "3.0.0"

@@ -65,27 +65,11 @@ jobs:
       - name: Verify DCMTK version and PDI tools
         run: python -c "from dcmget.core import DcmtkResolver; t=DcmtkResolver().resolve(); assert t.version == '3.7.0'; assert t.dcmmkdir"
 
-      - name: Run unit and DICOM integration tests
-        run: >-
-          python -m pytest -q
-          --ignore=tests/test_auth_ui.py
-          --ignore=tests/test_diagnostics.py
-          --ignore=tests/test_pdi_ui.py
-          --ignore=tests/test_task_controller.py
-          --ignore=tests/test_task_widgets.py
-          --ignore=tests/test_ui.py
+      - name: Run unit, Web API and DICOM integration tests
+        run: python -m pytest -q
 
-      - name: Run UI tests
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: >-
-          python -m pytest -q
-          tests/test_auth_ui.py
-          tests/test_diagnostics.py
-          tests/test_pdi_ui.py
-          tests/test_task_controller.py
-          tests/test_task_widgets.py
-          tests/test_ui.py
+      - name: Verify offline Web service and static UI
+        run: python DICOM_download_ui.py --web-self-test --config "${{ runner.temp }}/dcmget-web-self-test.json"
 
   minimum-python:
     name: Python 3.10 minimum
@@ -111,10 +95,7 @@ jobs:
       - name: Verify retained pynetdicom compatibility dependency
         run: python -c "import pynetdicom; assert pynetdicom.__version__.split('.')[0] == '3'"
 
-      - name: Verify minimum supported Python and UI startup
-        env:
-          QT_QPA_PLATFORM: offscreen
+      - name: Verify minimum supported Python and Web startup
         run: |
-          python -m pytest -q -m "not integration" --ignore=tests/test_auth_ui.py --ignore=tests/test_diagnostics.py --ignore=tests/test_pdi_ui.py --ignore=tests/test_task_controller.py --ignore=tests/test_task_widgets.py --ignore=tests/test_ui.py
-          python -m pytest -q tests/test_auth_ui.py tests/test_diagnostics.py tests/test_pdi_ui.py tests/test_task_controller.py tests/test_task_widgets.py tests/test_ui.py
-          python DICOM_download_ui.py --ui-self-test --config "${{ runner.temp }}/dcmget-ui-self-test.json"
+          python -m pytest -q -m "not integration"
+          python DICOM_download_ui.py --web-self-test --config "${{ runner.temp }}/dcmget-web-self-test.json"

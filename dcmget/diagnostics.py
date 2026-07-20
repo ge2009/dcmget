@@ -8,7 +8,6 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
-import stat
 import sys
 import tempfile
 import threading
@@ -21,10 +20,6 @@ DIAGNOSTIC_LOG_NAME = "dcmget-diagnostics.log"
 CRASH_LOG_NAME = "dcmget-crash.log"
 DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024
 DEFAULT_BACKUP_COUNT = 3
-
-
-class DiagnosticsError(RuntimeError):
-    pass
 
 
 class PrivateRotatingFileHandler(RotatingFileHandler):
@@ -64,7 +59,6 @@ class _DiagnosticsState:
         self.crash_stream = crash_stream
         self.file_backed = file_backed
         self.had_unhandled_exception = False
-        self.qt_handler = None
         self.original_excepthook = sys.excepthook
         self.original_threading_excepthook = threading.excepthook
         self.original_unraisablehook = sys.unraisablehook
@@ -302,43 +296,6 @@ def _session_file_name(
     return f"{path.stem}-{token}{path.suffix}"
 
 
-def install_qt_message_handler() -> None:
-    state: _DiagnosticsState | None = None
-    try:
-        state = _ensure_diagnostics_state()
-        if state is None or state.qt_handler is not None:
-            return
-
-        from PyQt5 import QtCore
-
-        levels = {
-            int(QtCore.QtWarningMsg): logging.WARNING,
-            int(QtCore.QtCriticalMsg): logging.ERROR,
-            int(QtCore.QtFatalMsg): logging.CRITICAL,
-        }
-
-        def qt_message_handler(mode, context, message) -> None:
-            try:
-                level = levels.get(int(mode))
-                if level is None:
-                    return
-                category = str(getattr(context, "category", "") or "qt")
-                source_file = str(getattr(context, "file", "") or "")
-                source_line = int(getattr(context, "line", 0) or 0)
-                location = f" {source_file}:{source_line}" if source_file else ""
-                _safe_log(level, "Qt[%s]%s %s", category, location, message)
-                _flush_logs()
-            except Exception:
-                _write_crash_line("Qt message logging failed")
-
-        state.qt_handler = qt_message_handler
-        QtCore.qInstallMessageHandler(qt_message_handler)
-    except Exception as exc:
-        if state is not None:
-            state.qt_handler = None
-        record_exception("无法安装 Qt 消息处理器", exc)
-
-
 def record_exception(context: str, exc: BaseException) -> None:
     try:
         state = _ensure_diagnostics_state()
@@ -353,49 +310,6 @@ def record_exception(context: str, exc: BaseException) -> None:
         _flush_logs()
     except Exception:
         _write_crash_line("Exception recording failed")
-
-
-def prepare_macos_qt_plugins(plugin_root: str | Path | None = None) -> Path | None:
-    if sys.platform != "darwin":
-        return None
-    if _state is None:
-        install_diagnostics()
-    if plugin_root is None:
-        from PyQt5.QtCore import QLibraryInfo
-
-        plugin_root = QLibraryInfo.location(QLibraryInfo.PluginsPath)
-
-    root = Path(plugin_root).expanduser().resolve()
-    cocoa_plugin = root / "platforms" / "libqcocoa.dylib"
-    try:
-        if not root.is_dir():
-            raise DiagnosticsError(f"PyQt5 插件目录不存在：{root}")
-        hidden_flag = getattr(stat, "UF_HIDDEN", 0x00008000)
-        failures: list[str] = []
-        paths = [root, *(path for path in root.rglob("*") if not path.is_symlink())]
-        for path in paths:
-            try:
-                flags = _path_flags(path)
-                if flags & hidden_flag:
-                    _remove_hidden_flag(path, flags & ~hidden_flag)
-            except OSError as exc:
-                failures.append(f"{path}: {exc}")
-        if failures:
-            raise DiagnosticsError(
-                "无法清除 macOS Qt 插件的隐藏标记：" + "; ".join(failures[:3])
-            )
-        if not cocoa_plugin.is_file():
-            raise DiagnosticsError(f"缺少 macOS Qt Cocoa 平台插件：{cocoa_plugin}")
-        if _path_flags(cocoa_plugin) & hidden_flag:
-            raise DiagnosticsError(f"macOS Qt Cocoa 平台插件仍被隐藏：{cocoa_plugin}")
-    except (OSError, DiagnosticsError) as exc:
-        record_exception("macOS Qt 插件准备失败", exc)
-        raise DiagnosticsError(
-            f"无法准备 macOS 图形界面组件：{exc}。诊断日志：{diagnostic_log_path()}"
-        ) from exc
-
-    _safe_log(logging.INFO, "macOS Qt Cocoa plugin ready: %s", cocoa_plugin)
-    return cocoa_plugin
 
 
 def _install_exception_hooks() -> None:
@@ -511,11 +425,3 @@ def _make_private(path: Path, *, directory: bool = False) -> None:
         path.chmod(0o700 if directory else 0o600)
     except OSError:
         pass
-
-
-def _path_flags(path: Path) -> int:
-    return int(getattr(path.stat(follow_symlinks=False), "st_flags", 0))
-
-
-def _remove_hidden_flag(path: Path, flags: int) -> None:
-    os.chflags(path, flags, follow_symlinks=False)

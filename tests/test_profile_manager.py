@@ -32,6 +32,7 @@ def _write_profile(
     port: int = 6666,
     destination: Path | None = None,
     storage_ae: str = "DCMGET",
+    web_port: int = 8787,
 ) -> Path:
     path = tmp_path / "config" / "instances" / f"i{number}" / "config.json"
     save_config(
@@ -41,6 +42,7 @@ def _write_profile(
             pacs_ae_title="PACS01",
             storage_ae_title=storage_ae,
             storage_port=port,
+            web_port=web_port,
             dicom_destination_folder=str(destination or tmp_path / f"dicom-{number}"),
         ),
     )
@@ -71,6 +73,7 @@ def test_list_profiles_exposes_identity_endpoint_and_status(tmp_path):
     assert profile.pacs_ae_title == "PACS01"
     assert profile.storage_ae_title == "DCMGET2"
     assert profile.storage_port == 6672
+    assert profile.web_port == 8787
     assert profile.destination_directory == str(tmp_path / "dicom-2")
     assert not profile.is_running
     assert profile.has_recovery
@@ -111,20 +114,23 @@ def test_clone_allocates_new_number_and_changes_only_new_profile_port(tmp_path):
     assert result.profile.number == 3
     assert result.profile.display_name == "CT 下载 2"
     assert result.recommended_port == 6669
+    assert result.recommended_web_port == 8788
     assert result.profile.storage_port == 6669
+    assert result.profile.web_port == 8788
     assert result.profile.storage_ae_title == "SOURCE"
-    assert checked == [6668, 6669]
+    assert checked == [6668, 6669, 8788]
     assert load_config(source_path).storage_port == 6666
     cloned = load_config(result.profile.config_path)
     source = load_config(source_path)
     assert {
         **cloned.to_dict(),
         "storage_port": source.storage_port,
+        "web_port": source.web_port,
     } == source.to_dict()
 
 
 def test_recommend_port_skips_profile_ports_and_failed_local_bind(tmp_path):
-    _write_profile(tmp_path, 1, port=7000)
+    _write_profile(tmp_path, 1, port=7000, web_port=7001)
     checked: list[int] = []
 
     def probe(_host: str, port: int) -> bool:
@@ -134,7 +140,7 @@ def test_recommend_port_skips_profile_ports_and_failed_local_bind(tmp_path):
     manager = _manager(tmp_path, port_probe=probe)
 
     assert manager.recommend_available_port(7000) == 7002
-    assert checked == [7001, 7002]
+    assert checked == [7002]
 
 
 def test_delete_refuses_running_profile(tmp_path):

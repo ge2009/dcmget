@@ -1,33 +1,34 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 from io import BytesIO
+import ipaddress
 import json
+import logging
 import os
+import socket
 import sys
+import threading
+import urllib.request
 import uuid
+import webbrowser
 from pathlib import Path
 
 from dcmget import __version__
 from dcmget.diagnostics import (
     diagnostic_log_path,
     install_diagnostics,
-    install_qt_message_handler,
-    prepare_macos_qt_plugins,
     record_exception,
 )
 
 
 install_diagnostics(__version__)
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QMessageBox
-
-install_qt_message_handler()
-
-from dcmget.auth_ui import authorize_gui
+from dcmget.app_service import DcmGetAppService
 from dcmget.architecture import ensure_supported_runtime
-from dcmget.config import load_config
+from dcmget.config import AppConfig, load_config, save_config
 from dcmget.core import DcmtkResolver
 from dcmget.instance_profile import (
     InstanceProfile,
@@ -38,8 +39,9 @@ from dcmget.instance_profile import (
     migrate_task_catalog_to_profiles,
 )
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
+from dcmget.profile_manager import ProfileManager
+from dcmget.profile_web_operations import ProfileWebOperations
 from dcmget.release_notes import load_release_notes
-from dcmget.ui import APP_STYLESHEET, DcmGetWindow
 from dcmget.runtime import (
     application_state_dir,
     ensure_default_config,
@@ -48,15 +50,18 @@ from dcmget.runtime import (
     resource_root,
 )
 from dcmget.single_instance import SingleInstance
-from dcmget.task_state import TaskCheckpointStore, TaskStateError
+from dcmget.task_state import TaskCheckpointStore
 from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
+from dcmget.web_security import DirectoryRoot, discover_local_hosts
+from dcmget.web_server import DcmGetWebServer
 
 
 PROJECT_ROOT = resource_root()
+LOGGER = logging.getLogger("dcmget.diagnostics")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"DcmGet {__version__} 图形界面")
+    parser = argparse.ArgumentParser(description=f"DcmGet {__version__} 局域网 Web 工作台")
     parser.add_argument(
         "--config",
         default=str(ensure_default_config()),
@@ -69,7 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test-report", help=argparse.SUPPRESS)
-    parser.add_argument("--ui-self-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--web-self-test",
+        "--ui-self-test",
+        dest="web_self_test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -97,6 +108,7 @@ def run_self_test(config_path: str, report_path: str | None = None) -> int:
     from dcmget.pdi import PdiExporter, STUDY_INDEX
 
     load_config(config_path)
+    validate_web_resources(PROJECT_ROOT)
     trial_status()
     if f"## {__version__}" not in load_release_notes(PROJECT_ROOT):
         raise RuntimeError("版本说明文件缺失或与程序版本不一致")
@@ -257,66 +269,300 @@ def validate_frozen_pdi_resources(root: str | Path) -> None:
             raise RuntimeError(f"PDI 离线资源包含外部地址：{name}")
 
 
-def create_application() -> QApplication:
-    prepare_macos_qt_plugins()
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    app = QApplication(sys.argv[:1])
-    app.setApplicationName("DcmGet")
-    app.setApplicationVersion(__version__)
-    app.setStyleSheet(APP_STYLESHEET)
-    return app
+def validate_web_resources(root: str | Path = PROJECT_ROOT) -> Path:
+    static_root = Path(root) / "dcmget" / "webui"
+    required = tuple(static_root / name for name in ("index.html", "app.css", "app.js"))
+    missing = [path.name for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Web 离线资源缺失：{'、'.join(missing)}")
+    for path in required:
+        content = path.read_text(encoding="utf-8")
+        if "http://" in content or "https://" in content:
+            raise RuntimeError(f"Web 离线资源包含外部地址：{path.name}")
+    return static_root
 
 
-def run_ui_self_test(config_path: str) -> int:
+def _available_port(host: str, preferred: int, *, excluded: set[int] | None = None) -> int:
+    excluded = set(excluded or ())
+    candidates = (
+        *range(preferred, min(65536, preferred + 1000)),
+        *range(1024, min(preferred, 2024)),
+    )
+    for port in candidates:
+        if port in excluded:
+            continue
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                probe.bind((host, port))
+            except OSError as exc:
+                address_in_use = exc.errno in {
+                    errno.EADDRINUSE,
+                    getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE),
+                    10048,
+                } or getattr(exc, "winerror", None) == 10048
+                if not address_in_use and host not in {"0.0.0.0", "::"}:
+                    raise RuntimeError(f"无法绑定 Web 监听地址 {host}：{exc}") from exc
+                continue
+        return port
+    raise RuntimeError(f"Web 端口 {preferred} 附近没有可用端口")
+
+
+def _profile_web_config(profile: InstanceProfile) -> AppConfig:
+    config = load_config(profile.config_path)
+    web_errors = {
+        field: message
+        for field, message in config.validate().items()
+        if field in {"web_bind_address", "web_port", "web_session_timeout_minutes"}
+    }
+    if web_errors:
+        raise RuntimeError("；".join(web_errors.values()))
+    selected = _available_port(
+        config.web_bind_address,
+        config.web_port,
+        excluded={config.storage_port},
+    )
+    if selected != config.web_port:
+        LOGGER.warning(
+            "Web port %s is occupied; profile %s moved to %s",
+            config.web_port,
+            profile.number,
+            selected,
+        )
+        config.web_port = selected
+    save_config(profile.config_path, config)
+    return config
+
+
+def _lan_hosts() -> tuple[str, ...]:
+    hosts = set(discover_local_hosts())
+    try:
+        import psutil
+
+        for addresses in psutil.net_if_addrs().values():
+            for address in addresses:
+                if address.family in {socket.AF_INET, socket.AF_INET6}:
+                    hosts.add(str(address.address).split("%", 1)[0])
+    except Exception:
+        pass
+    return tuple(sorted(host for host in hosts if host))
+
+
+def _lan_url(config: AppConfig) -> str:
+    if config.web_bind_address not in {"0.0.0.0", "::"}:
+        host = config.web_bind_address
+    else:
+        candidates: list[str] = []
+        for value in _lan_hosts():
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if address.version == 4 and not address.is_loopback and not address.is_link_local:
+                candidates.append(value)
+        host = candidates[0] if candidates else "127.0.0.1"
+    return f"http://{host}:{config.web_port}/"
+
+
+def _directory_roots(config: AppConfig) -> tuple[DirectoryRoot, ...]:
+    candidates: list[tuple[str, str, Path]] = []
+    home = Path.home()
+    if home.is_dir():
+        candidates.append(("home", "用户目录", home))
+    if sys.platform == "win32":
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = Path(f"{letter}:\\")
+            if drive.is_dir():
+                candidates.append((f"drive-{letter.lower()}", f"磁盘 {letter}:", drive))
+    else:
+        for root_id, label, path in (
+            ("volumes", "外接磁盘", Path("/Volumes")),
+            ("mnt", "挂载目录", Path("/mnt")),
+            ("media", "可移动介质", Path("/media")),
+        ):
+            if path.is_dir():
+                candidates.append((root_id, label, path))
+    for root_id, label, raw in (
+        ("destination", "当前 DICOM 目录", config.dicom_destination_folder),
+        ("pdi", "当前 PDI 目录", config.pdi_output_folder),
+    ):
+        if not str(raw).strip():
+            continue
+        path = Path(raw).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            candidates.append((root_id, label, path))
+        except OSError:
+            continue
+    roots: list[DirectoryRoot] = []
+    seen: set[Path] = set()
+    for root_id, label, path in candidates:
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved in seen or resolved.is_symlink():
+            continue
+        seen.add(resolved)
+        roots.append(DirectoryRoot(root_id, label, resolved))
+    return tuple(roots)
+
+
+def _open_host_path(path: str | Path) -> dict[str, object]:
+    selected = Path(path).expanduser().resolve(strict=True)
+    if sys.platform == "win32":
+        os.startfile(str(selected))  # type: ignore[attr-defined]
+    else:
+        import subprocess
+
+        command = ["open", str(selected)] if sys.platform == "darwin" else ["xdg-open", str(selected)]
+        subprocess.Popen(
+            command,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    return {"ok": True, "message": f"已在主机打开：{selected}", "path": str(selected)}
+
+
+def _operation_handlers(
+    profile: InstanceProfile,
+    service: DcmGetAppService,
+) -> dict[str, object]:
+    def current_config(_payload: object = None) -> AppConfig:
+        return load_config(profile.config_path)
+
+    def open_destination(_payload: object = None) -> dict[str, object]:
+        return _open_host_path(current_config().dicom_destination_folder)
+
+    def open_logs(_payload: object = None) -> dict[str, object]:
+        profile.log_directory.mkdir(parents=True, exist_ok=True)
+        return _open_host_path(profile.log_directory)
+
+    def open_data(_payload: object = None) -> dict[str, object]:
+        return _open_host_path(profile.state_directory)
+
+    def open_pdi(_payload: object = None) -> dict[str, object]:
+        snapshot = service.snapshot()
+        pdi = snapshot.get("pdi")
+        output = pdi.get("output_directory", "") if isinstance(pdi, dict) else ""
+        if not output:
+            raise RuntimeError("当前任务没有可打开的 PDI 目录")
+        return _open_host_path(str(output))
+
+    def acceptance_report(_payload: object = None) -> dict[str, object]:
+        snapshot = service.snapshot()
+        task = snapshot.get("task")
+        task_id = str(task.get("id", "")) if isinstance(task, dict) else ""
+        if not task_id:
+            raise RuntimeError("当前没有可打开的验收报告")
+        report = (
+            Path(current_config().dicom_destination_folder)
+            / "_DcmGetReports"
+            / f"task-{task_id[:8]}"
+            / f"dcmget-acceptance-{task_id}.html"
+        )
+        return _open_host_path(report)
+
+    def profile_backup(_payload: object = None) -> dict[str, object]:
+        from datetime import datetime
+        from dcmget.profile_backup import create_profile_backup
+
+        output = profile.state_directory / "backups" / (
+            f"dcmget-profiles-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        )
+        result = create_profile_backup(output, config_root=profile.config_path.parents[2])
+        return {"ok": True, "message": "Profile 备份已生成", "path": str(result.path)}
+
+    def support_bundle(_payload: object = None) -> dict[str, object]:
+        from datetime import datetime
+        from dcmget.support_bundle import create_support_bundle
+
+        output = profile.state_directory / "support" / (
+            f"dcmget-support-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        )
+        result = create_support_bundle(
+            output,
+            current_config(),
+            project_root=PROJECT_ROOT,
+            diagnostic_directory=profile.log_directory,
+        )
+        return {"ok": True, "message": "脱敏支持包已生成", "path": str(result.path)}
+
+    profile_operations = ProfileWebOperations(
+        manager=ProfileManager(
+            config_root=profile.config_path.parents[2],
+            state_root=profile.state_directory.parents[1],
+        ),
+        project_root=PROJECT_ROOT,
+    )
+    return {
+        "open-destination": open_destination,
+        "open-log-directory": open_logs,
+        "open-data-directory": open_data,
+        "open-pdi": open_pdi,
+        "acceptance-report": acceptance_report,
+        "profile-backup": profile_backup,
+        "support-bundle": support_bundle,
+        **profile_operations.handlers(),
+    }
+
+
+def run_web_self_test(config_path: str) -> int:
     from tempfile import TemporaryDirectory
 
-    app = create_application()
-    with TemporaryDirectory(prefix="dcmget-ui-self-test-") as temporary:
-        temporary_root = Path(temporary)
-        profile = acquire_instance_profile(
-            state_root=temporary_root / "state",
-            config_root=temporary_root / "config",
-            template_config_path=config_path,
+    validate_web_resources(PROJECT_ROOT)
+    with TemporaryDirectory(prefix="dcmget-web-self-test-") as temporary:
+        root = Path(temporary)
+        config = load_config(config_path)
+        config.web_bind_address = "127.0.0.1"
+        config.web_port = _available_port("127.0.0.1", 18787)
+        config.dicom_destination_folder = str(root / "dicom")
+        saved_config = root / "config.json"
+        save_config(saved_config, config)
+        service = DcmGetAppService(
+            task_store=TaskCheckpointStore(root / "active-task.sqlite3"),
+            project_root=PROJECT_ROOT,
+            profile_name="自检",
+            fallback_log_directory=root / "logs",
+        )
+        server = DcmGetWebServer(
+            service,
+            state_directory=root / "web-state",
+            host=config.web_bind_address,
+            port=config.web_port,
+            trusted_hosts=("127.0.0.1", "localhost"),
+            static_root=PROJECT_ROOT / "dcmget" / "webui",
+            directory_roots={"self-test": root},
+            config_path=saved_config,
+            project_root=PROJECT_ROOT,
+            profile_metadata={"name": "自检", "number": 1},
+            session_ttl_seconds=300,
         )
         try:
-            app.aboutToQuit.connect(profile.close)
-            window = DcmGetWindow(
-                profile.config_path,
-                PROJECT_ROOT,
-                profile.task_state_path,
-                offer_task_resume=False,
-                enable_multi_task=False,
-                profile_number=profile.number,
-                instance_label=profile.label,
-                settings_name=profile.settings_name,
-                log_directory=profile.log_directory,
-                **(
-                    {"profile_lock": profile.slot_lock}
-                    if hasattr(profile, "slot_lock")
-                    else {}
-                ),
-            )
-            window.show()
-            app.processEvents()
-            if not window.isVisible() or window.centralWidget() is None:
-                raise RuntimeError("主窗口未能显示")
-            window.close()
-            app.processEvents()
+            url = server.start_background(timeout=10)
+            with urllib.request.urlopen(url, timeout=5) as response:
+                html = response.read().decode("utf-8")
+            if response.status != 200 or "DcmGet" not in html:
+                raise RuntimeError("Web 首页自检失败")
+            with urllib.request.urlopen(url + "api/bootstrap", timeout=5) as response:
+                bootstrap = json.loads(response.read().decode("utf-8"))
+            if not bootstrap.get("insecure_http", bootstrap.get("web", {}).get("insecure_http")):
+                raise RuntimeError("Web HTTP 安全提示自检失败")
         finally:
-            profile.close()
-    print(f"DcmGet {__version__} UI self-test OK")
+            server.stop(timeout=10)
+    print(f"DcmGet {__version__} Web self-test OK")
     return 0
 
 
-def resume_authorization_task_id(task_state_path: str | Path) -> str | None:
-    """Return only the unfinished task assigned to the selected instance."""
+def run_ui_self_test(config_path: str) -> int:
+    """Compatibility alias retained for existing deployment automation."""
 
-    try:
-        checkpoint = TaskCheckpointStore(task_state_path).load()
-    except TaskStateError:
-        return None
-    return checkpoint.task_id if checkpoint is not None else None
+    return run_web_self_test(config_path)
 
 
 def migrate_legacy_task_state(config_template_path: str | Path) -> None:
@@ -341,8 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     profile: InstanceProfile | None = None
     activation: SingleInstance | None = None
+    server: DcmGetWebServer | None = None
+    service: DcmGetAppService | None = None
     self_test_requested = any(
-        value in {"--self-test", "--ui-self-test"} for value in arguments
+        value in {"--self-test", "--web-self-test", "--ui-self-test"}
+        for value in arguments
     )
     try:
         ensure_supported_runtime()
@@ -352,10 +601,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.self_test_report:
                 return run_self_test(args.config, args.self_test_report)
             return run_self_test(args.config)
-        if args.ui_self_test:
-            return run_ui_self_test(args.config)
+        if args.web_self_test:
+            return run_web_self_test(args.config)
 
-        app = create_application()
         migrate_legacy_task_state(args.config)
         try:
             profile = acquire_instance_profile(
@@ -389,7 +637,64 @@ def main(argv: list[str] | None = None) -> int:
             activation.close()
             activation = None
             return 0
+        config = _profile_web_config(profile)
+        task_store = TaskCheckpointStore(profile.task_state_path)
+        service = DcmGetAppService(
+            task_store=task_store,
+            project_root=PROJECT_ROOT,
+            profile_name=profile.label,
+            fallback_log_directory=profile.log_directory,
+        )
+        resolver = DcmtkResolver(PROJECT_ROOT)
+
+        def tools_provider(selected: AppConfig):
+            return resolver.resolve(selected.dcmtk_bin_dir)
+
+        lan_url = _lan_url(config)
+        server = DcmGetWebServer(
+            service,
+            state_directory=profile.state_directory,
+            host=config.web_bind_address,
+            port=config.web_port,
+            trusted_hosts=_lan_hosts(),
+            static_root=validate_web_resources(PROJECT_ROOT),
+            directory_roots=_directory_roots(config),
+            config_path=profile.config_path,
+            project_root=PROJECT_ROOT,
+            profile_metadata={
+                "id": profile.number,
+                "number": profile.number,
+                "name": profile.label,
+                "data_dir": str(profile.state_directory),
+                "lan_url": lan_url,
+            },
+            session_ttl_seconds=config.web_session_timeout_minutes * 60,
+            tools_provider=tools_provider,
+            operation_handlers=_operation_handlers(profile, service),
+        )
+        activation.set_activation_handler(
+            lambda _payload: webbrowser.open(server.url, new=1)
+        )
+        checkpoint = task_store.load(include_archived_files=False)
+        if checkpoint is not None:
+            try:
+                service.resume_task(tools_provider(checkpoint.config))
+            except Exception as exc:
+                record_exception("未完成任务自动恢复失败", exc)
+
+        if config.web_open_browser:
+            opener = threading.Timer(
+                0.8,
+                lambda: webbrowser.open(server.url, new=1),
+            )
+            opener.daemon = True
+            opener.start()
     except Exception as exc:
+        if server is not None:
+            try:
+                server.stop(timeout=10)
+            except Exception as stop_error:
+                record_exception("Web 服务启动清理失败", stop_error)
         if activation is not None:
             activation.close()
         if profile is not None:
@@ -399,37 +704,24 @@ def main(argv: list[str] | None = None) -> int:
 
     assert profile is not None
     assert activation is not None
+    assert server is not None
     try:
-        resume_task_id = resume_authorization_task_id(profile.task_state_path)
-        if not authorize_gui(resume_task_id):
-            return 1
-        window = DcmGetWindow(
-            profile.config_path,
-            PROJECT_ROOT,
-            profile.task_state_path,
-            offer_task_resume=True,
-            enable_multi_task=False,
-            profile_number=profile.number,
-            instance_label=profile.label,
-            settings_name=profile.settings_name,
-            log_directory=profile.log_directory,
-            **(
-                {"profile_lock": profile.slot_lock}
-                if hasattr(profile, "slot_lock")
-                else {}
-            ),
+        LOGGER.info(
+            "DcmGet Web ready local=%s lan=%s profile=%s",
+            server.url,
+            _lan_url(load_config(profile.config_path)),
+            profile.number,
         )
-        activation.set_activation_handler(
-            window.external_activation_requested.emit
-        )
-        app.aboutToQuit.connect(activation.close)
-        app.aboutToQuit.connect(profile.close)
-        window.show()
-        return app.exec_()
+        server.run()
+        return 0
     except Exception as exc:
-        _report_startup_failure("DcmGet 主窗口启动失败", exc, False)
+        _report_startup_failure("DcmGet Web 服务启动失败", exc, False)
         return 1
     finally:
+        try:
+            server.stop(timeout=15)
+        except Exception as exc:
+            record_exception("DcmGet Web 服务停止失败", exc)
         activation.close()
         profile.close()
 
@@ -444,12 +736,17 @@ def _report_startup_failure(
     if self_test:
         print(message, file=sys.stderr)
         return
-    if QApplication.instance() is not None:
+    if sys.platform == "win32" and not self_test:
         try:
-            QMessageBox.critical(None, "DcmGet 启动失败", message)
+            ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+                None,
+                message,
+                "DcmGet 启动失败",
+                0x10,
+            )
             return
-        except Exception as dialog_error:
-            record_exception("无法显示启动失败提示", dialog_error)
+        except Exception as native_error:
+            record_exception("无法显示 Windows 启动失败提示", native_error)
     print(message, file=sys.stderr)
 
 

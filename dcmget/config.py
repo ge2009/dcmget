@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
 import uuid
@@ -70,7 +71,7 @@ def validate_ae_title(value: object, label: str = "AE Title") -> str:
 
 @dataclass(slots=True)
 class AppConfig:
-    config_version: int = 7
+    config_version: int = 8
     dcmtk_bin_dir: str = ""
     access_numbers_file_path: str = "access.txt"
     dicom_destination_folder: str = "Dicom"
@@ -81,6 +82,10 @@ class AppConfig:
     storage_ae_title: str = "DCMGET"
     storage_port: int = 6666
     max_concurrent_moves: int = 2
+    web_bind_address: str = "0.0.0.0"
+    web_port: int = 8787
+    web_open_browser: bool = True
+    web_session_timeout_minutes: int = 480
     directory_template: str = DEFAULT_DIRECTORY_TEMPLATE
     anonymization_enabled: bool = False
     anonymization_profile: str = DEFAULT_ANONYMIZATION_PROFILE
@@ -104,7 +109,7 @@ class AppConfig:
         if is_legacy:
             legacy_move_destination = data.get("calling_ae_title", "DCMGET")
             data = {
-                "config_version": 7,
+                "config_version": 8,
                 "dcmtk_bin_dir": _legacy_dcmtk_dir(data.get("movescu_executable_path", "")),
                 "access_numbers_file_path": data.get("access_numbers_file_path", "access.txt"),
                 "dicom_destination_folder": data.get("dicom_destination_folder", "Dicom"),
@@ -115,6 +120,10 @@ class AppConfig:
                 "storage_ae_title": legacy_move_destination,
                 "storage_port": data.get("network_port", 6666),
                 "max_concurrent_moves": 2,
+                "web_bind_address": "0.0.0.0",
+                "web_port": 8787,
+                "web_open_browser": True,
+                "web_session_timeout_minutes": 480,
                 "directory_template": DEFAULT_DIRECTORY_TEMPLATE,
                 "anonymization_enabled": False,
                 "anonymization_profile": DEFAULT_ANONYMIZATION_PROFILE,
@@ -141,11 +150,15 @@ class AppConfig:
             field: data.get(field, getattr(defaults, field))
             for field in asdict(defaults)
         }
-        values["config_version"] = 7
+        values["config_version"] = 8
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
         values["max_concurrent_moves"] = _as_int(
             values["max_concurrent_moves"], 2
+        )
+        values["web_port"] = _as_int(values["web_port"], 8787)
+        values["web_session_timeout_minutes"] = _as_int(
+            values["web_session_timeout_minutes"], 480
         )
         values["max_log_file_size_bytes"] = _as_int(
             values["max_log_file_size_bytes"], 104_857_600
@@ -177,6 +190,10 @@ class AppConfig:
         values["pdi_include_ohif_viewer"] = _as_bool(
             values["pdi_include_ohif_viewer"], True
         )
+        values["web_open_browser"] = _as_bool(values["web_open_browser"], True)
+        values["web_bind_address"] = str(
+            values["web_bind_address"] or "0.0.0.0"
+        ).strip()
         values["anonymization_profile"] = str(
             values["anonymization_profile"] or DEFAULT_ANONYMIZATION_PROFILE
         ).strip().lower()
@@ -206,6 +223,19 @@ class AppConfig:
             errors["storage_port"] = "端口必须在 1 到 65535 之间"
         if not 1 <= self.max_concurrent_moves <= 8:
             errors["max_concurrent_moves"] = "并发下载数必须在 1 到 8 之间"
+        try:
+            bind_address = ipaddress.ip_address(self.web_bind_address.strip())
+        except ValueError:
+            errors["web_bind_address"] = "Web 监听地址必须是有效的 IP 地址"
+        else:
+            if bind_address.version != 4:
+                errors["web_bind_address"] = "当前版本仅支持 IPv4 监听地址"
+        if not 1 <= self.web_port <= 65535:
+            errors["web_port"] = "Web 端口必须在 1 到 65535 之间"
+        elif self.web_port == self.storage_port:
+            errors["web_port"] = "Web 端口不能与 DICOM 接收端口相同"
+        if not 5 <= self.web_session_timeout_minutes <= 1440:
+            errors["web_session_timeout_minutes"] = "会话有效期必须在 5 到 1440 分钟之间"
         if self.max_log_file_size_bytes < 1024:
             errors["max_log_file_size_bytes"] = "日志大小至少为 1024 字节"
         if self.minimum_free_space_bytes < 0:

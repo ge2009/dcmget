@@ -59,7 +59,7 @@ def test_migrates_legacy_configuration(tmp_path):
 
     config = load_config(path)
 
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert Path(config.dcmtk_bin_dir) == Path("C:/dcmtk/bin")
     assert config.calling_ae_title == "CALLING"
     assert config.pacs_ae_title == "PACS"
@@ -70,6 +70,10 @@ def test_migrates_legacy_configuration(tmp_path):
     assert not config.pdi_export_enabled
     assert config.pdi_include_ohif_viewer
     assert config.max_concurrent_moves == 2
+    assert config.web_bind_address == "0.0.0.0"
+    assert config.web_port == 8787
+    assert config.web_open_browser
+    assert config.web_session_timeout_minutes == 480
 
 
 def test_accession_parser_ignores_blanks_and_deduplicates_in_order():
@@ -152,7 +156,7 @@ def test_version_two_configuration_keeps_existing_values_and_adds_current_defaul
         }
     )
 
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert config.pacs_server_ip == "10.1.2.3"
     assert config.storage_port == 16666
     assert config.directory_template == "{StudyInstanceUID}"
@@ -192,7 +196,7 @@ def test_version_four_configuration_migrates_to_ohif_without_overwriting_values(
         }
     )
 
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert config.pacs_server_ip == "10.1.2.3"
     assert config.pdi_export_enabled
     assert config.pdi_institution_name == "测试医院"
@@ -209,7 +213,7 @@ def test_version_five_configuration_parses_ohif_boolean():
     )
 
     assert not config.pdi_include_ohif_viewer
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert config.max_concurrent_moves == 2
 
 
@@ -221,7 +225,7 @@ def test_version_five_configuration_adds_default_concurrency_without_overwriting
         {"config_version": 6, "max_concurrent_moves": "4"}
     )
 
-    assert migrated.config_version == 7
+    assert migrated.config_version == 8
     assert migrated.max_concurrent_moves == 2
     assert migrated.pacs_server_ip == "10.1.2.3"
     assert configured.max_concurrent_moves == 4
@@ -244,7 +248,7 @@ def test_version_six_configuration_adds_delivery_safety_defaults_without_overwri
         }
     )
 
-    assert migrated.config_version == 7
+    assert migrated.config_version == 8
     assert migrated.minimum_free_space_bytes == 2 * 1024**3
     assert migrated.auto_retry_attempts == 2
     assert migrated.circuit_breaker_failures == 5
@@ -282,11 +286,13 @@ def test_version_four_viewer_options_merge_into_ohif(
 def test_example_configuration_matches_current_schema():
     config = load_config(Path(__file__).parents[1] / "config.example.json")
 
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert config.max_concurrent_moves == 2
     assert not config.anonymization_enabled
     assert config.anonymization_profile == DEFAULT_ANONYMIZATION_PROFILE
     assert config.pdi_include_ohif_viewer
+    assert config.web_bind_address == "0.0.0.0"
+    assert config.web_port == 8787
 
 
 def test_validation_reports_required_and_invalid_values():
@@ -296,6 +302,9 @@ def test_validation_reports_required_and_invalid_values():
         pacs_server_port=0,
         storage_port=70000,
         max_concurrent_moves=9,
+        web_bind_address="not-an-ip",
+        web_port=0,
+        web_session_timeout_minutes=2,
         minimum_free_space_bytes=-1,
         auto_retry_attempts=11,
         circuit_breaker_failures=1,
@@ -311,12 +320,40 @@ def test_validation_reports_required_and_invalid_values():
         "pacs_server_port",
         "storage_port",
         "max_concurrent_moves",
+        "web_bind_address",
+        "web_port",
+        "web_session_timeout_minutes",
         "minimum_free_space_bytes",
         "auto_retry_attempts",
         "circuit_breaker_failures",
         "pdi_volume_size_bytes",
         "max_log_file_size_bytes",
     }
+
+
+def test_web_configuration_round_trip_and_validation():
+    config = AppConfig.from_dict(
+        {
+            "config_version": 7,
+            "web_bind_address": "127.0.0.1",
+            "web_port": "9080",
+            "web_open_browser": "false",
+            "web_session_timeout_minutes": "30",
+        }
+    )
+
+    assert config.config_version == 8
+    assert config.web_bind_address == "127.0.0.1"
+    assert config.web_port == 9080
+    assert not config.web_open_browser
+    assert config.web_session_timeout_minutes == 30
+    assert config.validate() == {}
+
+
+def test_web_port_cannot_reuse_dicom_receiver_port():
+    config = AppConfig(storage_port=8787, web_port=8787)
+
+    assert "不能与 DICOM 接收端口相同" in config.validate()["web_port"]
 
 
 @pytest.mark.parametrize(

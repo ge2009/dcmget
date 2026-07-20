@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.11.0"
+  #define AppVersion "3.0.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -20,6 +20,7 @@
 #define AppName "DcmGet"
 #define AppExeName "DcmGet.exe"
 #define FirewallRule "DcmGet Receiver TCP"
+#define WebFirewallRule "DcmGet Web TCP"
 #define LegacyFirewallRule "DcmGet storescp TCP"
 #define LegacyPortFirewallRule "DcmGet storescp TCP 6666"
 
@@ -87,12 +88,15 @@ Name: "{autodesktop}\DcmGet"; Filename: "{app}\{#AppExeName}"; Tasks: desktopico
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "正在检查 Microsoft Visual C++ Runtime…"; Flags: runhidden waituntilterminated
 #endif
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#WebFirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\_internal\.runtime\dcmtk\windows-x86_64\dcmtk-3.7.0-win64-dynamic\bin\storescp.exe"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#WebFirewallRule}"" dir=in action=allow program=""{app}\{#AppExeName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExeName}"; Description: "启动 DcmGet"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#WebFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetWebFirewallRule"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyFirewallRule"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyPortFirewallRule"

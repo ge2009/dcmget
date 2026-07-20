@@ -1,7 +1,7 @@
-PyQt5>=5.15.10,<5.16
-PyQt5-Qt5==5.15.17; platform_system == "Darwin"
 cryptography>=44,<47
+fastapi>=0.139.2,<0.140
 filelock>=3.16,<4
 pydicom>=3.0,<4
 pynetdicom>=3.0,<4
 psutil>=6.1,<8
+uvicorn>=0.51,<0.52

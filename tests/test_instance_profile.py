@@ -4,8 +4,6 @@ import json
 import multiprocessing
 import os
 import sqlite3
-import subprocess
-import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -191,6 +189,7 @@ def test_profile_slots_keep_config_state_logs_and_settings_isolated(tmp_path):
         first_config = load_config(first.config_path)
         first_config.storage_ae_title = "FIRST"
         first_config.storage_port = 7001
+        first_config.web_port = 9000
         save_config(first.config_path, first_config)
 
         second = acquire_instance_profile(**kwargs)
@@ -202,13 +201,16 @@ def test_profile_slots_keep_config_state_logs_and_settings_isolated(tmp_path):
             assert second.log_directory != first.log_directory
             copied = load_config(second.config_path)
             assert copied.storage_ae_title == "FIRST"
-            assert copied.storage_port == 7001
+            assert copied.storage_port == 7002
+            assert copied.web_port == 9001
             with pytest.raises(InstanceProfileError, match="已在运行"):
                 acquire_instance_profile(2, **kwargs)
 
             third = acquire_instance_profile(**kwargs)
             try:
                 assert third.number == 3
+                assert load_config(third.config_path).storage_port == 7003
+                assert load_config(third.config_path).web_port == 9002
             finally:
                 third.close()
         finally:
@@ -306,46 +308,6 @@ def test_profile_close_supports_weak_method_on_python_310(tmp_path):
         assert not profile.lock_held
     finally:
         profile.close()
-
-
-def test_profile_close_connects_to_qt_about_to_quit(tmp_path):
-    script = """
-import sys
-from pathlib import Path
-
-from filelock import FileLock
-from PyQt5.QtCore import QCoreApplication, QTimer
-
-from dcmget.instance_profile import InstanceProfile
-
-root = Path(sys.argv[1])
-lock = FileLock(str(root / "instance.lock"))
-lock.acquire()
-profile = InstanceProfile(
-    number=1,
-    config_path=root / "config.json",
-    state_directory=root,
-    task_state_path=root / "active-task.sqlite3",
-    log_directory=root / "logs",
-    settings_name="DcmGet2-test",
-    label="test",
-    _slot_lock=lock,
-)
-app = QCoreApplication([])
-app.aboutToQuit.connect(profile.close)
-QTimer.singleShot(0, app.quit)
-exit_code = app.exec_()
-raise SystemExit(2 if profile.lock_held else exit_code)
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
 
 
 def test_auto_allocation_prefers_an_idle_profile_with_recovery_state(tmp_path):

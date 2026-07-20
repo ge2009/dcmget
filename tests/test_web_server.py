@@ -1,0 +1,468 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from dcmget.config import AppConfig, save_config
+from dcmget.core import ToolPaths
+from dcmget.web_security import bootstrap_web_security
+from dcmget.web_server import create_web_app
+
+
+PORT = 8787
+LOCAL_URL = f"http://127.0.0.1:{PORT}"
+LOCAL_ORIGIN = {"Origin": LOCAL_URL}
+
+
+class FakeService:
+    def __init__(self):
+        self.status = "idle"
+        self.task_id = ""
+        self.started_with: tuple[AppConfig, ToolPaths, list[str]] | None = None
+        self.calls: list[str] = []
+        self.stopped = False
+        self.events = [
+            {
+                "id": 1,
+                "type": "log",
+                "timestamp": "2026-07-20T00:00:00+00:00",
+                "payload": {"level": "error", "source": "test", "message": "failure"},
+            }
+        ]
+
+    def snapshot(self) -> dict[str, Any]:
+        active = self.status in {"starting_receiver", "downloading", "paused"}
+        return {
+            "event_id": 1,
+            "status": self.status,
+            "message": "",
+            "operation": "download" if active else "",
+            "task": {
+                "id": self.task_id,
+                "profile": "i1",
+                "total": 2 if self.task_id else 0,
+                "large_batch": False,
+                "accessions": ["A1", "A2"] if self.task_id else [],
+                "destination": "",
+            },
+            "progress": {
+                "processed": 0,
+                "total": 2 if self.task_id else 0,
+                "file_count": 0,
+                "speed_bytes_per_second": 0,
+            },
+            "results": [],
+            "pdi": None,
+            "verification": None,
+            "actions": {"can_start": not active, "can_cancel": active},
+            "authorization": {"registered": False, "trial_remaining": 30},
+            "error_logs": [],
+        }
+
+    def start_task(self, config: AppConfig, tools: ToolPaths, accessions: list[str]):
+        assert isinstance(config, AppConfig)
+        assert isinstance(tools, ToolPaths)
+        self.started_with = (config, tools, list(accessions))
+        self.task_id = "task-1"
+        self.status = "downloading"
+        return self.snapshot()
+
+    def resume_task(self, tools: ToolPaths):
+        self.calls.append("resume_task")
+        self.status = "downloading"
+        return self.snapshot()
+
+    def pause(self):
+        self.calls.append("pause")
+        self.status = "paused"
+        return self.snapshot()
+
+    def resume(self):
+        self.calls.append("resume")
+        self.status = "downloading"
+        return self.snapshot()
+
+    def cancel(self):
+        self.calls.append("cancel")
+        self.status = "cancelled"
+        return self.snapshot()
+
+    def retry_failed(self, tools: ToolPaths):
+        self.calls.append("retry_failed")
+        return self.snapshot()
+
+    def accept_partial(self):
+        self.calls.append("accept_partial")
+        return self.snapshot()
+
+    def retry_pdi(self, tools: ToolPaths):
+        self.calls.append("retry_pdi")
+        return self.snapshot()
+
+    def verify_pdi(self, root: str):
+        self.calls.append(f"verify:{root}")
+        return {"ok": True, "root": root}
+
+    def events_since(self, after_id: int = 0, *, limit: int = 200):
+        return [event for event in self.events if event["id"] > after_id][:limit]
+
+    def subscribe(self, callback):
+        return lambda: None
+
+    def shutdown(self):
+        self.stopped = True
+        return True
+
+
+@dataclass
+class WebFixture:
+    service: FakeService
+    client: TestClient
+    security: Any
+    config_path: Path
+    allowed_root: Path
+    tools: ToolPaths
+
+    def setup(self, password: str = "a-secure-admin-password") -> str:
+        response = self.client.post(
+            "/api/setup",
+            json={"password": password, "confirm_password": password},
+            headers=LOCAL_ORIGIN,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["csrf_token"]
+
+
+@pytest.fixture
+def web(tmp_path: Path) -> WebFixture:
+    state = tmp_path / "state"
+    config_path = tmp_path / "config.json"
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    config = AppConfig(
+        dicom_destination_folder=str(allowed),
+        pdi_output_folder=str(allowed / "PDI"),
+        pdi_institution_name="测试医院",
+        web_port=PORT,
+    )
+    save_config(config_path, config)
+    tools = ToolPaths(
+        movescu=tmp_path / "bin" / "movescu",
+        storescp=tmp_path / "bin" / "storescp",
+        bin_dir=tmp_path / "bin",
+        version="3.7.0",
+    )
+    service = FakeService()
+    security = bootstrap_web_security(state)
+    app = create_web_app(
+        service,
+        security=security,
+        server_port=PORT,
+        trusted_hosts=("127.0.0.1", "192.168.1.50"),
+        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+        directory_roots={"data": allowed},
+        config_path=config_path,
+        project_root=tmp_path,
+        profile_metadata={
+            "name": "i1",
+            "data_dir": str(state),
+            "lan_url": "http://192.168.1.50:8787/",
+        },
+        tools_provider=lambda _config: tools,
+        preflight_provider=lambda _config: {
+            "checks": [
+                ("DCMTK 工具", True, "3.7.0"),
+                ("保存目录", True, "可写"),
+                ("接收端口", True, "可用"),
+            ],
+            "errors": {},
+        },
+    )
+    client = TestClient(
+        app,
+        base_url=LOCAL_URL,
+        client=("127.0.0.1", 50123),
+    )
+    return WebFixture(service, client, security, config_path, allowed, tools)
+
+
+def test_first_password_setup_is_local_only_and_then_bootstraps_app(web: WebFixture):
+    initial = web.client.get("/api/bootstrap")
+    assert initial.status_code == 200
+    assert initial.json()["setup_required"] is True
+    assert initial.json()["can_setup_here"] is True
+    assert initial.json()["web"]["insecure_http"] is True
+    assert initial.json()["web"]["lan_url"] == "http://192.168.1.50:8787/"
+    assert initial.json()["web"]["local_session"] is True
+
+    remote = TestClient(
+        web.client.app,
+        base_url="http://192.168.1.50:8787",
+        client=("192.168.1.20", 50124),
+    )
+    denied = remote.post(
+        "/api/setup",
+        json={"password": "remote-must-not-win"},
+        headers={"Origin": "http://192.168.1.50:8787"},
+    )
+    assert denied.status_code == 403
+    remote_bootstrap = remote.get("/api/bootstrap").json()
+    assert remote_bootstrap["can_setup_here"] is False
+    assert remote_bootstrap["web"]["local_session"] is False
+
+    csrf = web.setup()
+    assert csrf
+    bootstrap = web.client.get("/api/bootstrap").json()
+    assert bootstrap["auth"] == {
+        "authenticated": True,
+        "setup_required": False,
+        "first_run": False,
+    }
+    assert bootstrap["config"]["web_port"] == PORT
+    assert bootstrap["profile"]["name"] == "i1"
+    assert bootstrap["task"]["status"] == "idle"
+    assert bootstrap["web"]["local_session"] is True
+    assert web.client.get("/").status_code == 200
+    assert web.client.get("/assets/app.js").status_code == 200
+
+
+def test_host_origin_session_and_csrf_are_enforced(web: WebFixture):
+    csrf = web.setup()
+
+    bad_host = web.client.get("/api/task", headers={"Host": "attacker.example:8787"})
+    assert bad_host.status_code == 421
+    no_csrf = web.client.post("/api/task/pause", headers=LOCAL_ORIGIN, json={})
+    assert no_csrf.status_code == 403
+    bad_origin = web.client.post(
+        "/api/task/pause",
+        headers={"Origin": "http://attacker.example:8787", "X-CSRF-Token": csrf},
+        json={},
+    )
+    assert bad_origin.status_code == 403
+    unauthorized = TestClient(
+        web.client.app,
+        base_url=LOCAL_URL,
+        client=("127.0.0.1", 50125),
+    ).get("/api/events/stream")
+    assert unauthorized.status_code == 401
+
+    response = web.client.get("/api/task")
+    assert response.status_code == 200
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_intentional_bare_http_is_reported_as_warning_not_failure(web: WebFixture):
+    csrf = web.setup()
+
+    response = web.client.post(
+        "/api/operations/health",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200
+    transport = next(
+        check for check in response.json()["checks"] if check["name"] == "Web 传输模式"
+    )
+    assert transport["ok"] is True
+    assert transport["severity"] == "warning"
+
+
+def test_task_routes_build_server_side_config_and_tools(web: WebFixture):
+    csrf = web.setup()
+    payload = {
+        "accessions": ["A1", "A2"],
+        "destination": str(web.allowed_root),
+        "pdi": {"enabled": True, "output_folder": str(web.allowed_root / "PDI")},
+        "tools": {"movescu": "C:/attacker.exe"},
+    }
+
+    preflight = web.client.post(
+        "/api/preflight",
+        json=payload,
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert preflight.status_code == 200
+    assert preflight.json()["ok"]
+    assert {item["key"] for item in preflight.json()["checks"]} >= {
+        "config",
+        "dcmtk",
+        "destination",
+        "receiver",
+    }
+
+    response = web.client.post(
+        "/api/task/start",
+        json=payload,
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200, response.text
+    config, tools, accessions = web.service.started_with or (None, None, None)
+    assert config.dicom_destination_folder == str(web.allowed_root)
+    assert config.pdi_export_enabled
+    assert tools is web.tools
+    assert accessions == ["A1", "A2"]
+    assert response.json()["task"]["status"] == "downloading"
+
+    pause = web.client.post(
+        "/api/task/pause",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert pause.status_code == 200
+    assert pause.json()["task"]["status"] == "paused"
+    resumed = web.client.post(
+        "/api/task/resume",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert resumed.status_code == 200
+    assert web.service.calls[-1] == "resume"
+
+    web.service.status = "interrupted"
+    recovered = web.client.post(
+        "/api/task/resume",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert recovered.status_code == 200
+    assert web.service.calls[-1] == "resume_task"
+    assert recovered.json()["task"]["status"] == "downloading"
+
+
+def test_config_update_is_validated_and_locked_during_active_task(web: WebFixture):
+    csrf = web.setup()
+    current = web.client.get("/api/config").json()["config"]
+    current["pacs_server_port"] = 11112
+    saved = web.client.put(
+        "/api/config",
+        json=current,
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["config"]["pacs_server_port"] == 11112
+
+    partial = web.client.put(
+        "/api/config",
+        json={"pacs_server_port": 11113},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert partial.status_code == 200
+    assert partial.json()["config"]["pacs_server_port"] == 11113
+    assert partial.json()["config"]["storage_port"] == current["storage_port"]
+    assert partial.json()["config"]["dicom_destination_folder"] == current["dicom_destination_folder"]
+
+    web.service.status = "downloading"
+    blocked = web.client.put(
+        "/api/config",
+        json=current,
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert blocked.status_code == 409
+
+
+def test_raw_accession_import_and_safe_directory_listing(web: WebFixture):
+    csrf = web.setup()
+    (web.allowed_root / "child").mkdir()
+    imported = web.client.post(
+        "/api/files/accessions",
+        content="A001\n\nA001\nA002\n".encode(),
+        headers={
+            **LOCAL_ORIGIN,
+            "X-CSRF-Token": csrf,
+            "X-File-Name": "access.txt",
+            "Content-Type": "text/plain",
+        },
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["accessions"] == ["A001", "A002"]
+    assert imported.json()["duplicate_count"] == 1
+
+    listing = web.client.get(
+        "/api/files/directories",
+        params={"path": str(web.allowed_root), "purpose": "destination"},
+    )
+    assert listing.status_code == 200
+    assert listing.json()["directories"] == [
+        {"name": "child", "path": str(web.allowed_root / "child")}
+    ]
+    escaped = web.client.get(
+        "/api/files/directories",
+        params={"path": str(web.allowed_root.parent), "purpose": "destination"},
+    )
+    assert escaped.status_code == 400
+
+
+def test_remote_authenticated_session_cannot_shutdown_server(web: WebFixture):
+    csrf = web.setup("another-secure-admin-password")
+    callback_calls: list[bool] = []
+    web.client.app.routes  # Keep fixture app alive for both clients.
+    # The fixture did not install a shutdown callback; local shutdown still
+    # exercises service cleanup, while the remote request must not reach it.
+    remote = TestClient(
+        web.client.app,
+        base_url="http://192.168.1.50:8787",
+        client=("192.168.1.20", 50124),
+    )
+    login = remote.post(
+        "/api/login",
+        json={"password": "another-secure-admin-password"},
+        headers={"Origin": "http://192.168.1.50:8787"},
+    )
+    assert login.status_code == 200
+    remote_csrf = login.json()["csrf_token"]
+    assert remote.get("/api/bootstrap").json()["web"]["local_session"] is False
+    denied = remote.post(
+        "/api/ops/shutdown",
+        json={},
+        headers={
+            "Origin": "http://192.168.1.50:8787",
+            "X-CSRF-Token": remote_csrf,
+        },
+    )
+    assert denied.status_code == 403
+    assert not web.service.stopped
+
+    local = web.client.post(
+        "/api/ops/shutdown",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert local.status_code == 200
+    assert web.service.stopped
+    assert callback_calls == []
+
+
+def test_login_rate_limit_returns_retry_after(web: WebFixture):
+    web.setup("correct-admin-password")
+    web.client.post("/api/logout", json={}, headers=LOCAL_ORIGIN)
+    for attempt in range(5):
+        response = web.client.post(
+            "/api/login",
+            json={"password": "wrong-password"},
+            headers=LOCAL_ORIGIN,
+        )
+    assert response.status_code == 429
+    assert int(response.headers["retry-after"]) > 0
+
+
+def test_license_status_exposes_machine_code_and_rejects_bad_token(web: WebFixture):
+    csrf = web.setup()
+
+    status = web.client.get("/api/license")
+    assert status.status_code == 200
+    assert status.json()["machine_code"]
+    assert "license" in status.json()
+
+    invalid = web.client.post(
+        "/api/license/activate",
+        json={"token": "not-a-license"},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+    assert invalid.status_code == 400

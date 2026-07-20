@@ -1,5 +1,5 @@
 -r requirements.txt
 pytest>=8.0,<9
-pytest-qt>=4.4,<5
+httpx>=0.28,<0.29
 pydicom>=3.0,<4
 pynetdicom>=3.0,<4

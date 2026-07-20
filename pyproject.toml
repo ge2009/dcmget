@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "2.11.0"
-description = "Cross-platform multi-instance DCMTK C-MOVE download workstation"
+version = "3.0.0"
+description = "Offline LAN Web workstation for DCMTK C-MOVE downloads"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "PyQt5>=5.15.10,<5.16",
-  "PyQt5-Qt5==5.15.17; platform_system == 'Darwin'",
   "cryptography>=44,<47",
+  "fastapi>=0.139.2,<0.140",
   "filelock>=3.16,<4",
   "pydicom>=3.0,<4",
   "pynetdicom>=3.0,<4",
   "psutil>=6.1,<8",
+  "uvicorn>=0.51,<0.52",
 ]
 
 [project.scripts]
@@ -27,7 +27,7 @@ packages = ["dcmget"]
 py-modules = ["DICOM_download_script", "DICOM_download_ui"]
 
 [tool.setuptools.package-data]
-dcmget = ["CHANGELOG.md"]
+dcmget = ["CHANGELOG.md", "webui/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
