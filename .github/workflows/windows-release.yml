@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.2.0
+        default: 3.3.0
 
 permissions:
   contents: read
@@ -673,6 +673,7 @@ jobs:
           $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
           $profile2Directory = Join-Path $configDir "instances\i2"
           $profile2ConfigPath = Join-Path $profile2Directory "config.json"
+          $runtimeStatePath = Join-Path $env:LOCALAPPDATA "DcmGet\management\profile-runtime.json"
 
           function Get-DcmGetProfileProcesses([int]$profileNumber) {
             @(
@@ -744,10 +745,22 @@ jobs:
             [IO.File]::Move($pendingPath, $profile2ConfigPath)
           }
 
+          function Set-DesiredProfiles([int[]]$profileNumbers) {
+            $directory = Split-Path -Parent $runtimeStatePath
+            New-Item -ItemType Directory -Force $directory | Out-Null
+            $pendingPath = Join-Path $directory ".profile-runtime.json.pending"
+            $payload = [ordered]@{
+              schema = "dcmget-profile-runtime"
+              version = 1
+              desired_running_profiles = @($profileNumbers | Sort-Object -Unique)
+            } | ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($pendingPath, "$payload`n", [Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $pendingPath -Destination $runtimeStatePath -Force
+          }
+
           function Start-AdoptAndRestartProfile([int]$webPort) {
-            $launched = Start-Process (Join-Path $installDir "DcmGet.exe") -ArgumentList @("--profile", "2", "--no-open-browser") -PassThru
+            Set-DesiredProfiles @(1, 2)
             $running = Wait-DcmGetProfile 2 $webPort
-            if ($running.ProcessId -ne $launched.Id) { throw "Explicit Profile 2 launch returned an unexpected process" }
             Start-Sleep -Seconds 4
             & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$running.ProcessId) /T /F | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Could not terminate adopted Profile 2 process" }
@@ -785,8 +798,11 @@ jobs:
           Wait-ProfileStopped 2 $profile2WebPort
 
           Write-ProfileConfigAtomically $profile2ConfigJson
-          Start-Sleep -Seconds 4
-          Assert-ProfileNotRunning 2 $profile2WebPort "Service host auto-started a restored Profile before explicit start"
+          $profile2Process = Wait-DcmGetProfile 2 $profile2WebPort
+          Set-DesiredProfiles @(1)
+          Wait-ProfileStopped 2 $profile2WebPort
+          Start-Sleep -Seconds 2
+          Assert-ProfileNotRunning 2 $profile2WebPort "Service host restarted a Profile after the operator stopped it"
           $profile2Process = Start-AdoptAndRestartProfile $profile2WebPort
           if (-not (Test-Path $profile2ConfigPath -PathType Leaf)) { throw "Dynamic Profile test lost Profile 2 config" }
 
@@ -883,7 +899,7 @@ jobs:
                 )
                 if ($listeners.Count -eq 1) {
                   try {
-                    $response = Invoke-WebRequest "http://127.0.0.1:$managementPort/?page=operations" -UseBasicParsing -TimeoutSec 2
+                    $response = Invoke-WebRequest "http://127.0.0.1:$managementPort/" -UseBasicParsing -TimeoutSec 2
                     if ($response.StatusCode -eq 200) { return $process[0] }
                   } catch {}
                 }
@@ -941,6 +957,10 @@ jobs:
           if ($configuredEnvironment.APPDATA -ne $env:APPDATA) { throw "Service APPDATA does not belong to the installing user" }
           if ($configuredEnvironment.LOCALAPPDATA -ne $env:LOCALAPPDATA) { throw "Service LOCALAPPDATA does not belong to the installing user" }
           if ($configuredEnvironment.USERPROFILE -ne $env:USERPROFILE) { throw "Service USERPROFILE does not belong to the installing user" }
+          $serviceState = Get-ItemProperty "HKLM:\Software\DcmGet\WindowsService" -ErrorAction Stop
+          if ($serviceState.AppDataRoot -ne $env:APPDATA) { throw "Stable service APPDATA was not registered" }
+          if ($serviceState.LocalAppDataRoot -ne $env:LOCALAPPDATA) { throw "Stable service LOCALAPPDATA was not registered" }
+          if ($serviceState.UserProfileRoot -ne $env:USERPROFILE) { throw "Stable service USERPROFILE was not registered" }
 
           Wait-DcmGetServiceStatus "Running" | Out-Null
           $serviceRecord = Get-CimInstance Win32_Service -Filter "Name = '$serviceName'"
@@ -1030,6 +1050,28 @@ jobs:
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Stopped-service upgrade changed the existing user configuration" }
           if ((Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash -ne $profile1Hash) { throw "Stopped-service upgrade changed Profile 1 configuration" }
           if ((Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash -ne $profile2Hash) { throw "Stopped-service upgrade changed Profile 2 configuration" }
+
+          # A missing wrapper from an interrupted update must be repairable.  The
+          # installer verifies the registered SCM ImagePath instead of requiring
+          # the old file itself and still preserves the intentionally stopped state.
+          Remove-Item -LiteralPath $serviceWrapper -Force
+          $missingWrapperRepairLog = Join-Path $env:RUNNER_TEMP "dcmget-missing-wrapper-repair.log"
+          $missingWrapperRepair = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$missingWrapperRepairLog") -Wait -PassThru
+          if ($missingWrapperRepair.ExitCode -ne 0) {
+            Get-Content -LiteralPath $missingWrapperRepairLog -Tail 240 -ErrorAction SilentlyContinue | Write-Host
+            throw "Missing-wrapper repair failed with code $($missingWrapperRepair.ExitCode)"
+          }
+          if (-not (Test-Path -LiteralPath $serviceWrapper -PathType Leaf)) { throw "Missing-wrapper repair did not restore WinSW" }
+          if ((Get-FileHash $serviceWrapper -Algorithm SHA256).Hash.ToLowerInvariant() -ne "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da") {
+            throw "Missing-wrapper repair restored the wrong WinSW payload"
+          }
+          if ((Get-Service -Name $serviceName -ErrorAction Stop).Status -ne "Stopped") { throw "Missing-wrapper repair unexpectedly restarted the service" }
+          $serviceStateAfterRepair = Get-ItemProperty "HKLM:\Software\DcmGet\WindowsService" -ErrorAction Stop
+          if ($serviceStateAfterRepair.AppDataRoot -ne $serviceState.AppDataRoot -or
+              $serviceStateAfterRepair.LocalAppDataRoot -ne $serviceState.LocalAppDataRoot -or
+              $serviceStateAfterRepair.UserProfileRoot -ne $serviceState.UserProfileRoot) {
+            throw "Missing-wrapper repair changed the stable service user directories"
+          }
           & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not restart service after stopped-state upgrade test" }
           Wait-DcmGetServiceStatus "Running" | Out-Null
@@ -1041,7 +1083,7 @@ jobs:
             (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"),
             (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs")
           )
-          foreach ($shortcutName in @("DcmGet.url", "DcmGet 启动全部.lnk", "DcmGet 停止全部.lnk")) {
+          foreach ($shortcutName in @("DcmGet.url", "DcmGet 启动后台服务.lnk", "DcmGet 停止后台服务.lnk")) {
             if (-not ($startMenuRoots | Where-Object { Test-Path (Join-Path $_ $shortcutName) -PathType Leaf })) {
               throw "Installed shortcut is missing: $shortcutName"
             }
@@ -1054,7 +1096,7 @@ jobs:
           $desktopShortcut = $desktopRoots | ForEach-Object { Join-Path $_ "DcmGet.url" } | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $desktopShortcut) { throw "Installed DcmGet desktop shortcut is missing" }
           foreach ($shortcut in @($webShortcut, $desktopShortcut)) {
-            if (-not (Select-String -LiteralPath $shortcut -Pattern '^URL=http://127\.0\.0\.1:8786/\?page=operations$' -Quiet)) {
+            if (-not (Select-String -LiteralPath $shortcut -Pattern '^URL=http://127\.0\.0\.1:8786/$' -Quiet)) {
               throw "Installed DcmGet shortcut does not open the management operations page: $shortcut"
             }
           }
@@ -1072,6 +1114,7 @@ jobs:
           $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
           $serviceName = "kayisoft-dcmget"
           $managementPort = 8786
+          $serviceWrapper = Join-Path $installDir "kayisoft-dcmget.exe"
           $serviceHost = Join-Path $installDir "kayisoft-dcmget-host.ps1"
           $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
           $profile2ConfigPath = Join-Path $configDir "instances\i2\config.json"
@@ -1128,7 +1171,7 @@ jobs:
               )
               if ($process.Count -eq 1) {
                 try {
-                  $response = Invoke-WebRequest "http://127.0.0.1:$managementPort/?page=operations" -UseBasicParsing -TimeoutSec 2
+                  $response = Invoke-WebRequest "http://127.0.0.1:$managementPort/" -UseBasicParsing -TimeoutSec 2
                   if ($response.StatusCode -eq 200) { return $process[0] }
                 } catch {}
               }
@@ -1279,9 +1322,18 @@ jobs:
               Where-Object { $_.Length -gt 0 }
           )
           if ($diagnosticLogs.Count -lt 1) { throw "Installed self-test did not write a process-specific diagnostic log" }
+
+          # Exercise the uninstaller's sc.exe fallback for an interrupted install
+          # where the registered service remains but the WinSW file is missing.
+          & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not stop service before missing-wrapper uninstall test" }
+          Wait-DcmGetServiceStatus "Stopped" | Out-Null
+          Assert-NoDcmGetServiceApplications
+          Remove-Item -LiteralPath $serviceWrapper -Force
           $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "Uninstall left kayisoft-dcmget service behind" }
+          if (Test-Path "HKLM:\Software\DcmGet\WindowsService") { throw "Uninstall left stable service state behind" }
           $serviceSurvivors = @(
             Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
               Where-Object {

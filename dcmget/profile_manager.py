@@ -190,6 +190,61 @@ class ProfileManager:
                 return candidate
         raise ProfileManagerError("没有可用的接收端口")
 
+    def create_profile(
+        self,
+        *,
+        display_name: str | None = None,
+    ) -> ProfileInfo:
+        """Create one stopped Profile with non-conflicting default ports."""
+
+        allocation_lock = self._acquire_allocation_lock()
+        target_lock: FileLock | None = None
+        target_number: int | None = None
+        completed = False
+        try:
+            target_number = self._next_profile_number()
+            target_lock = self._acquire_profile_lock(target_number)
+            storage_port = self.recommend_available_port(6666)
+            web_port = self.recommend_available_port(
+                8787,
+                excluded_ports=(storage_port,),
+            )
+            config = replace(
+                AppConfig(),
+                storage_port=storage_port,
+                web_port=web_port,
+            )
+            name = _display_name(
+                display_name if display_name is not None else f"实例 {target_number}"
+            )
+            target_config = self._config_path(target_number)
+            target_metadata = self._metadata_path(target_number)
+            if target_config.exists() or target_metadata.exists():
+                raise ProfileManagerError(
+                    f"实例 {target_number} 的配置已存在，无法创建"
+                )
+            target_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._validate_directory(target_config.parent, self.config_root)
+            save_config(target_config, config)
+            _make_private(target_config)
+            self._write_metadata(target_number, name)
+            completed = True
+        except Exception as exc:
+            if target_number is not None:
+                self._remove_failed_clone(target_number)
+            if isinstance(exc, ProfileManagerError):
+                raise
+            raise ProfileManagerError(f"创建 Profile 失败：{exc}") from exc
+        finally:
+            if target_lock is not None and target_lock.is_locked:
+                target_lock.release()
+            if target_number is not None and not completed and target_lock is not None:
+                self._remove_unused_lock_file(target_number)
+            allocation_lock.release()
+
+        assert target_number is not None
+        return self.get_profile(target_number)
+
     def clone_profile(
         self,
         source_profile_number: int | str,

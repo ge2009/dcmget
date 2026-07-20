@@ -82,6 +82,26 @@ def test_list_profiles_exposes_identity_endpoint_and_status(tmp_path):
     assert profile.has_recovery
 
 
+def test_create_profile_allocates_safe_defaults_without_starting(tmp_path):
+    checked: list[int] = []
+
+    def probe(_host: str, port: int) -> bool:
+        checked.append(port)
+        return port not in {6666, 8787}
+
+    manager = _manager(tmp_path, port_probe=probe)
+
+    profile = manager.create_profile(display_name="CT 工作站")
+
+    assert profile.number == 1
+    assert profile.display_name == "CT 工作站"
+    assert profile.storage_port == 6667
+    assert profile.web_port == 8788
+    assert not profile.is_running
+    assert profile.config_path.is_file()
+    assert checked == [6666, 6667, 8787, 8788]
+
+
 def test_rename_profile_persists_utf8_metadata_atomically(tmp_path):
     _write_profile(tmp_path, 1)
     manager = _manager(tmp_path)

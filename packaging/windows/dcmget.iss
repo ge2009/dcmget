@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.2.0"
+  #define AppVersion "3.3.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -36,7 +36,8 @@
 #define ServiceConfigName "kayisoft-dcmget.xml"
 #define ServiceTemplateName "kayisoft-dcmget.xml.template"
 #define ServiceHostName "kayisoft-dcmget-host.ps1"
-#define ManagementUrl "http://127.0.0.1:8786/?page=operations"
+#define ServiceStateRegistryKey "Software\DcmGet\WindowsService"
+#define ManagementUrl "http://127.0.0.1:8786/"
 #define FirewallRule "DcmGet Receiver TCP"
 #define WebFirewallRule "DcmGet Web TCP"
 #define LegacyFirewallRule "DcmGet storescp TCP"
@@ -102,6 +103,8 @@ Type: files; Name: "{autoprograms}\DcmGet.lnk"
 Type: files; Name: "{autodesktop}\DcmGet.lnk"
 Type: files; Name: "{autoprograms}\DcmGet.url"
 Type: files; Name: "{autodesktop}\DcmGet.url"
+Type: files; Name: "{autoprograms}\DcmGet 启动全部.lnk"
+Type: files; Name: "{autoprograms}\DcmGet 停止全部.lnk"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -115,8 +118,8 @@ Source: "{#VCRedistPath}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flag
 
 [Icons]
 Name: "{autoprograms}\DcmGet 诊断日志"; Filename: "{localappdata}\DcmGet\logs"
-Name: "{autoprograms}\DcmGet 启动全部"; Filename: "{sys}\sc.exe"; Parameters: "start {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
-Name: "{autoprograms}\DcmGet 停止全部"; Filename: "{sys}\sc.exe"; Parameters: "stop {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
+Name: "{autoprograms}\DcmGet 启动后台服务"; Filename: "{sys}\sc.exe"; Parameters: "start {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
+Name: "{autoprograms}\DcmGet 停止后台服务"; Filename: "{sys}\sc.exe"; Parameters: "stop {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
 
 [INI]
 Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"
@@ -125,6 +128,11 @@ Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIn
 Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"; Tasks: desktopicon
 Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconFile"; String: "{app}\{#AppExeName}"; Tasks: desktopicon
 Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIndex"; String: "0"; Tasks: desktopicon
+
+[Registry]
+Root: HKLM; Subkey: "{#ServiceStateRegistryKey}"; ValueType: string; ValueName: "AppDataRoot"; ValueData: "{code:GetServiceAppDataRoot}"; Flags: createvalueifdoesntexist uninsdeletevalue
+Root: HKLM; Subkey: "{#ServiceStateRegistryKey}"; ValueType: string; ValueName: "LocalAppDataRoot"; ValueData: "{code:GetServiceLocalAppDataRoot}"; Flags: createvalueifdoesntexist uninsdeletevalue
+Root: HKLM; Subkey: "{#ServiceStateRegistryKey}"; ValueType: string; ValueName: "UserProfileRoot"; ValueData: "{code:GetServiceUserProfileRoot}"; Flags: createvalueifdoesntexist uninsdeletevalue uninsdeletekeyifempty
 
 [Run]
 #ifdef VCRedistPath
@@ -139,8 +147,6 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{
 Filename: "{app}\{#ServiceWrapperName}"; Parameters: "start"; StatusMsg: "正在启动 DcmGet Windows 服务…"; Flags: runhidden waituntilterminated; Check: ShouldStartDcmGetService
 
 [UninstallRun]
-Filename: "{app}\{#ServiceWrapperName}"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopDcmGetService"
-Filename: "{app}\{#ServiceWrapperName}"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstallDcmGetService"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetFirewallRule"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#WebFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetWebFirewallRule"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyFirewallRule"
@@ -154,16 +160,73 @@ Type: files; Name: "{app}\{#ServiceWrapperName}"
 Type: files; Name: "{app}\LICENSE-WINSW.txt"
 Type: files; Name: "{autoprograms}\DcmGet.url"
 Type: files; Name: "{autodesktop}\DcmGet.url"
+Type: files; Name: "{autoprograms}\DcmGet 启动全部.lnk"
+Type: files; Name: "{autoprograms}\DcmGet 停止全部.lnk"
 
 [Code]
 var
   ServiceWasInstalled: Boolean;
   ServiceExistedBeforeInstall: Boolean;
   ServiceWasActiveBeforeInstall: Boolean;
+  ServiceAppDataRoot: String;
+  ServiceLocalAppDataRoot: String;
+  ServiceUserProfileRoot: String;
 
 function ServiceWrapperPath(): String;
 begin
   Result := ExpandConstant('{app}\{#ServiceWrapperName}');
+end;
+
+function ExecutableFromCommandLine(CommandLine: String): String;
+var
+  Tail: String;
+  DelimiterPosition: Integer;
+begin
+  Result := '';
+  CommandLine := Trim(CommandLine);
+  if CommandLine = '' then
+    Exit;
+  if CommandLine[1] = '"' then
+  begin
+    Tail := Copy(CommandLine, 2, Length(CommandLine));
+    DelimiterPosition := Pos('"', Tail);
+    if DelimiterPosition = 0 then
+      Exit;
+    Result := Copy(Tail, 1, DelimiterPosition - 1);
+  end
+  else
+  begin
+    DelimiterPosition := Pos(' ', CommandLine);
+    if DelimiterPosition = 0 then
+      Result := CommandLine
+    else
+      Result := Copy(CommandLine, 1, DelimiterPosition - 1);
+  end;
+  if Result <> '' then
+    Result := ExpandFileName(Result);
+end;
+
+function RegisteredServiceWrapperPath(): String;
+var
+  ImagePath: String;
+begin
+  Result := '';
+  if RegQueryStringValue(
+    HKLM,
+    'SYSTEM\CurrentControlSet\Services\{#ServiceName}',
+    'ImagePath',
+    ImagePath
+  ) then
+    Result := ExecutableFromCommandLine(ImagePath);
+end;
+
+function DcmGetServiceBelongsToApp(): Boolean;
+var
+  RegisteredPath: String;
+begin
+  RegisteredPath := RegisteredServiceWrapperPath();
+  Result := (RegisteredPath <> '') and
+    (CompareText(RegisteredPath, ExpandFileName(ServiceWrapperPath())) = 0);
 end;
 
 function DcmGetServiceExists(): Boolean;
@@ -256,7 +319,7 @@ begin
     'if ($null -ne $service -and $service.Status -ne ''Stopped'') {' + #13#10 +
     '  throw ''kayisoft-dcmget service did not stop''' + #13#10 +
     '}' + #13#10 +
-    '$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'')' + #13#10 +
+    '$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'', ''{#ServiceWrapperName}'')' + #13#10 +
     'function Get-DcmGetInstalledProcess {' + #13#10 +
     '  @(Get-CimInstance Win32_Process | Where-Object {' + #13#10 +
     '    $path = [string]$_.ExecutablePath' + #13#10 +
@@ -303,6 +366,95 @@ begin
   Result := True;
 end;
 
+function XmlUnescape(Value: String): String;
+begin
+  Result := Value;
+  StringChangeEx(Result, '&quot;', '"', True);
+  StringChangeEx(Result, '&apos;', '''', True);
+  StringChangeEx(Result, '&gt;', '>', True);
+  StringChangeEx(Result, '&lt;', '<', True);
+  StringChangeEx(Result, '&amp;', '&', True);
+end;
+
+function ServiceEnvironmentValue(Line: String; Name: String): String;
+var
+  Marker: String;
+  Tail: String;
+  EndPosition: Integer;
+begin
+  Result := '';
+  Marker := '<env name="' + Name + '" value="';
+  EndPosition := Pos(Marker, Line);
+  if EndPosition = 0 then
+    Exit;
+  Tail := Copy(
+    Line,
+    EndPosition + Length(Marker),
+    Length(Line)
+  );
+  EndPosition := Pos('"', Tail);
+  if EndPosition = 0 then
+    Exit;
+  Result := XmlUnescape(Copy(Tail, 1, EndPosition - 1));
+end;
+
+procedure LoadPreservedServiceEnvironment();
+var
+  Lines: TArrayOfString;
+  Index: Integer;
+  Value: String;
+begin
+  RegQueryStringValue(
+    HKLM,
+    '{#ServiceStateRegistryKey}',
+    'AppDataRoot',
+    ServiceAppDataRoot
+  );
+  RegQueryStringValue(
+    HKLM,
+    '{#ServiceStateRegistryKey}',
+    'LocalAppDataRoot',
+    ServiceLocalAppDataRoot
+  );
+  RegQueryStringValue(
+    HKLM,
+    '{#ServiceStateRegistryKey}',
+    'UserProfileRoot',
+    ServiceUserProfileRoot
+  );
+  if (ServiceAppDataRoot <> '') and
+    (ServiceLocalAppDataRoot <> '') and
+    (ServiceUserProfileRoot <> '') then
+    Exit;
+
+  if not LoadStringsFromFile(
+    ExpandConstant('{app}\{#ServiceConfigName}'),
+    Lines
+  ) then
+    Exit;
+  for Index := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    if ServiceAppDataRoot = '' then
+    begin
+      Value := ServiceEnvironmentValue(Lines[Index], 'APPDATA');
+      if Value <> '' then
+        ServiceAppDataRoot := Value;
+    end;
+    if ServiceLocalAppDataRoot = '' then
+    begin
+      Value := ServiceEnvironmentValue(Lines[Index], 'LOCALAPPDATA');
+      if Value <> '' then
+        ServiceLocalAppDataRoot := Value;
+    end;
+    if ServiceUserProfileRoot = '' then
+    begin
+      Value := ServiceEnvironmentValue(Lines[Index], 'USERPROFILE');
+      if Value <> '' then
+        ServiceUserProfileRoot := Value;
+    end;
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   AppDir: String;
@@ -314,14 +466,53 @@ begin
   ServiceWasInstalled := DcmGetServiceExists();
   ServiceExistedBeforeInstall := ServiceWasInstalled;
   ServiceWasActiveBeforeInstall := ServiceWasInstalled and DcmGetServiceIsActive();
-  if ServiceWasInstalled and not FileExists(ServiceWrapperPath()) then
+  if ServiceWasInstalled and not DcmGetServiceBelongsToApp() then
   begin
     Result := 'Windows 中已存在同名 kayisoft-dcmget 服务，但它不属于当前安装目录。请联系管理员处理服务名称冲突。';
     Exit;
   end;
+  if ServiceWasInstalled then
+    LoadPreservedServiceEnvironment();
   RequestExistingServiceStop();
   if not RunManagedProcessCleanup(AppDir, FailureMessage) then
     Result := FailureMessage;
+end;
+
+procedure RemoveDcmGetServiceForUninstall();
+var
+  ResultCode: Integer;
+  Attempt: Integer;
+begin
+  if not DcmGetServiceExists() then
+    Exit;
+  if not DcmGetServiceBelongsToApp() then
+    RaiseException('无法卸载 kayisoft-dcmget：同名 Windows 服务不属于当前安装目录。');
+
+  if FileExists(ServiceWrapperPath()) then
+    Exec(
+      ServiceWrapperPath(),
+      'uninstall',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+  if DcmGetServiceExists() then
+    Exec(
+      ExpandConstant('{sys}\sc.exe'),
+      'delete "{#ServiceName}"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+  for Attempt := 0 to 99 do
+  begin
+    if not DcmGetServiceExists() then
+      Exit;
+    Sleep(100);
+  end;
+  RaiseException('无法删除 kayisoft-dcmget Windows 服务，请关闭服务管理器后重试。');
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -332,6 +523,7 @@ begin
     Exit;
   if not RunManagedProcessCleanup(ExpandConstant('{app}'), FailureMessage) then
     RaiseException(FailureMessage);
+  RemoveDcmGetServiceForUninstall();
 end;
 
 function XmlEscape(Value: String): String;
@@ -357,6 +549,27 @@ begin
   end;
 end;
 
+function GetServiceAppDataRoot(Param: String): String;
+begin
+  Result := ServiceAppDataRoot;
+  if Result = '' then
+    Result := ExpandConstant('{userappdata}');
+end;
+
+function GetServiceLocalAppDataRoot(Param: String): String;
+begin
+  Result := ServiceLocalAppDataRoot;
+  if Result = '' then
+    Result := ExpandConstant('{localappdata}');
+end;
+
+function GetServiceUserProfileRoot(Param: String): String;
+begin
+  Result := ServiceUserProfileRoot;
+  if Result = '' then
+    Result := InstallingUserProfile();
+end;
+
 procedure WriteDcmGetServiceConfig();
 var
   Lines: TArrayOfString;
@@ -370,9 +583,9 @@ begin
     RaiseException('无法读取 DcmGet Windows 服务配置模板。');
   for Index := 0 to GetArrayLength(Lines) - 1 do
   begin
-    StringChangeEx(Lines[Index], '@APPDATA@', XmlEscape(ExpandConstant('{userappdata}')), True);
-    StringChangeEx(Lines[Index], '@LOCALAPPDATA@', XmlEscape(ExpandConstant('{localappdata}')), True);
-    StringChangeEx(Lines[Index], '@USERPROFILE@', XmlEscape(InstallingUserProfile()), True);
+    StringChangeEx(Lines[Index], '@APPDATA@', XmlEscape(GetServiceAppDataRoot('')), True);
+    StringChangeEx(Lines[Index], '@LOCALAPPDATA@', XmlEscape(GetServiceLocalAppDataRoot('')), True);
+    StringChangeEx(Lines[Index], '@USERPROFILE@', XmlEscape(GetServiceUserProfileRoot('')), True);
   end;
   if not SaveStringsToUTF8File(ConfigPath, Lines, False) then
     RaiseException('无法写入 DcmGet Windows 服务配置。');

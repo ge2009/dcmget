@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import dcmget.profile_web_operations as operations_module
 from dcmget.config import AppConfig, save_config
 from dcmget.profile_manager import ProfileManager
 from dcmget.profile_web_operations import ProfileWebOperations
+from dcmget.profile_runtime_state import ProfileRuntimeState
 
 
 def _manager(tmp_path: Path, **kwargs: object) -> ProfileManager:
@@ -79,6 +81,17 @@ def test_list_profiles_returns_json_safe_profiles(tmp_path):
     assert isinstance(profile["config_path"], str)
     assert profile["storage_ae_title"] == "AE01"
     assert profile["issues"] == []
+    assert profile["desired_running"] is False
+
+
+def test_create_profile_is_stopped_by_default(tmp_path):
+    operations = _operations(tmp_path)
+
+    result = operations.create_profile({"display_name": "新建工作站"})
+
+    assert result["profile"]["display_name"] == "新建工作站"
+    assert result["profile"]["desired_running"] is False
+    assert operations.runtime_state.desired_profiles() == ()
 
 
 def test_list_profiles_surfaces_port_conflicts_without_hiding_other_profiles(tmp_path):
@@ -176,6 +189,59 @@ def test_launch_profile_uses_subprocess_popen_without_shell(tmp_path, monkeypatc
     assert kwargs["shell"] is False
     assert str(kwargs["cwd"]).endswith(str(tmp_path))
     assert result["url"] == "http://127.0.0.1:8787/"
+    assert operations.runtime_state.desired_profiles() == (3,)
+
+
+def test_launch_profile_does_not_recheck_ports_after_process_starts(tmp_path):
+    _write_profile(tmp_path, 1)
+    spawned = False
+
+    class _FakeProcess:
+        pid = 43210
+
+    def port_probe(_host: str, _port: int) -> bool:
+        return not spawned
+
+    def fake_popen(_command: list[str], **_kwargs: object) -> _FakeProcess:
+        nonlocal spawned
+        spawned = True
+        return _FakeProcess()
+
+    result = _operations(
+        tmp_path,
+        port_probe=port_probe,
+        popen=fake_popen,
+    ).launch_profile({"profile_number": 1})
+
+    assert result["ok"] is True
+    assert result["pid"] == 43210
+
+
+def test_stop_profile_persists_stopped_state_before_requesting_shutdown(tmp_path):
+    _write_profile(tmp_path, 1)
+    runtime = ProfileRuntimeState(tmp_path / "state" / "management" / "profile-runtime.json")
+    runtime.set_desired(1, True)
+    lock_path = tmp_path / "state" / "instances" / "i1.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(lock_path))
+    lock.acquire(timeout=0)
+    calls: list[int] = []
+    try:
+        operations = _operations(
+            tmp_path,
+            runtime_state=runtime,
+            shutdown_profile=lambda profile: calls.append(profile.number),
+        )
+
+        result = operations.stop_profile({"profile_number": 1})
+    finally:
+        lock.release()
+
+    assert result["ok"]
+    assert result["stopping"]
+    assert result["profile"]["desired_running"] is False
+    assert calls == [1]
+    assert runtime.desired_profiles() == ()
 
 
 def test_launch_all_starts_idle_profiles_and_skips_running_profile(
@@ -222,6 +288,91 @@ def test_launch_all_returns_per_profile_port_errors(tmp_path):
     assert result["started_count"] == 0
     assert result["error_count"] == 1
     assert "Web 端口 8787 已被其他程序占用" in result["errors"][0]["error"]
+
+
+def test_launch_and_delete_same_profile_are_serialized(tmp_path):
+    config_path = _write_profile(tmp_path, 1)
+    popen_entered = threading.Event()
+    release_popen = threading.Event()
+    delete_done = threading.Event()
+    results: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = 43210
+
+    def fake_popen(_command: list[str], **_kwargs: object) -> _FakeProcess:
+        popen_entered.set()
+        assert release_popen.wait(2)
+        return _FakeProcess()
+
+    operations = _operations(tmp_path, popen=fake_popen)
+
+    def launch() -> None:
+        results["launch"] = operations.launch_profile({"profile_number": 1})
+
+    def delete() -> None:
+        try:
+            operations.delete_profile({"profile_number": 1})
+        except Exception as exc:
+            results["delete_error"] = exc
+        finally:
+            delete_done.set()
+
+    launch_thread = threading.Thread(target=launch)
+    delete_thread = threading.Thread(target=delete)
+    launch_thread.start()
+    assert popen_entered.wait(2)
+    delete_thread.start()
+    assert not delete_done.wait(0.1)
+    release_popen.set()
+    launch_thread.join(2)
+    delete_thread.join(2)
+
+    assert not launch_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert isinstance(results["delete_error"], RuntimeError)
+    assert "先停止后再删除" in str(results["delete_error"])
+    assert config_path.is_file()
+    assert operations.runtime_state.desired_profiles() == (1,)
+
+
+def test_launch_all_terminates_spawned_process_when_runtime_state_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    _write_profile(tmp_path, 1)
+    terminated = threading.Event()
+    waited = threading.Event()
+
+    class _FakeProcess:
+        pid = 43210
+
+        def terminate(self) -> None:
+            terminated.set()
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 5
+            waited.set()
+            return 0
+
+    operations = _operations(
+        tmp_path,
+        popen=lambda *_args, **_kwargs: _FakeProcess(),
+    )
+
+    def fail_write(_profile_number: int, _desired: bool) -> None:
+        raise OSError("runtime state write failed")
+
+    monkeypatch.setattr(operations.runtime_state, "set_desired", fail_write)
+
+    result = operations.launch_all_profiles()
+
+    assert result["ok"] is False
+    assert result["started_count"] == 0
+    assert result["error_count"] == 1
+    assert "runtime state write failed" in result["errors"][0]["error"]
+    assert terminated.is_set()
+    assert waited.is_set()
 
 
 def test_create_shortcut_defaults_to_desktop_and_profile_based_name(

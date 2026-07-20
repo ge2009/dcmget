@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +21,7 @@ from .profile_manager import (
     ProfileManager,
     ProfileManagerError,
 )
+from .profile_runtime_state import PROFILE_RUNTIME_FILE_NAME, ProfileRuntimeState
 from .runtime import is_frozen, resource_root
 
 
@@ -37,6 +40,8 @@ class ProfileWebOperations:
         frozen: bool | None = None,
         desktop_directory: str | Path | None = None,
         popen: Callable[..., subprocess.Popen[Any]] | None = None,
+        runtime_state: ProfileRuntimeState | None = None,
+        shutdown_profile: Callable[[ProfileInfo], object] | None = None,
     ) -> None:
         self.manager = manager or ProfileManager()
         self.project_root = (
@@ -56,22 +61,42 @@ class ProfileWebOperations:
             else _default_desktop_directory()
         )
         self._popen = popen or subprocess.Popen
+        self.runtime_state = runtime_state or ProfileRuntimeState(
+            self.manager.state_root / "management" / PROFILE_RUNTIME_FILE_NAME
+        )
+        self._shutdown_profile = shutdown_profile
+        self._lifecycle_locks_guard = threading.Lock()
+        self._lifecycle_locks: dict[int, threading.RLock] = {}
 
-    def handlers(self) -> dict[str, Callable[[object], JsonDict]]:
+    def handlers(self) -> dict[str, Callable[[object], object]]:
         return {
             "profile-list": self.list_profiles,
+            "profile-create": self.create_profile,
             "profile-clone": self.clone_profile,
             "profile-update": self.update_profile,
             "profile-rename": self.rename_profile,
             "profile-delete": self.delete_profile,
             "profile-launch": self.launch_profile,
+            "profile-stop": self._stop_profile_handler,
             "profile-launch-all": self.launch_all_profiles,
             "profile-shortcut": self.create_shortcut,
         }
 
     def list_profiles(self, _payload: object = None) -> JsonDict:
-        profiles = [self._serialize_profile(item) for item in self.manager.list_profiles()]
+        desired = frozenset(self.runtime_state.desired_profiles())
+        profiles = [
+            self._serialize_profile(item, desired_profiles=desired)
+            for item in self.manager.list_profiles()
+        ]
         return {"profiles": profiles, "count": len(profiles)}
+
+    def create_profile(self, payload: object = None) -> JsonDict:
+        body = {} if payload is None else _require_mapping(payload)
+        display_name = _optional_display_name(body, "display_name")
+        profile = self.manager.create_profile(display_name=display_name)
+        # Absence from the desired set is the stopped-by-default contract.
+        self.runtime_state.remove(profile.number)
+        return {"ok": True, "profile": self._serialize_profile(profile)}
 
     def clone_profile(self, payload: object) -> JsonDict:
         body = _require_mapping(payload)
@@ -112,7 +137,8 @@ class ProfileWebOperations:
         for field_name in port_fields:
             if field_name in body:
                 changes[field_name] = _require_port(body[field_name], field_name)
-        profile = self.manager.update_profile(profile_number, **changes)
+        with self._lifecycle_lock(profile_number):
+            profile = self.manager.update_profile(profile_number, **changes)
         return {
             "ok": True,
             "profile": self._serialize_profile(profile),
@@ -123,80 +149,109 @@ class ProfileWebOperations:
     def delete_profile(self, payload: object) -> JsonDict:
         body = _require_mapping(payload)
         profile_number = _require_profile_number(body, "profile_number")
-        self.manager.delete_profile(profile_number)
+        with self._lifecycle_lock(profile_number):
+            if self.runtime_state.is_desired(profile_number):
+                raise RuntimeError(
+                    f"实例 {profile_number} 已设置为运行，请先停止后再删除"
+                )
+            self.manager.delete_profile(profile_number)
+            self.runtime_state.remove(profile_number)
         return {"ok": True, "deleted_profile_number": profile_number}
 
     def launch_profile(self, payload: object) -> JsonDict:
         body = _require_mapping(payload)
         profile_number = _require_profile_number(body, "profile_number")
-        profile = self.manager.get_profile(profile_number)
-        if not profile.is_running:
+        with self._lifecycle_lock(profile_number):
+            profile = self.manager.get_profile(profile_number)
+            if profile.is_running:
+                self.runtime_state.set_desired(profile.number, True)
+                return {
+                    "ok": True,
+                    "already_running": True,
+                    "profile": self._serialize_profile(profile),
+                    "pid": None,
+                    "url": _profile_url(profile),
+                }
             self.manager.validate_profile_ports(
                 profile.number,
                 check_system_ports=True,
             )
-        launch = build_instance_launch_command(
-            profile.number,
-            project_root=self.project_root,
-            executable=self.executable,
-            frozen=self.frozen,
-            no_open_browser=True,
-        )
-        process = self._popen(
-            [str(launch.target), *launch.arguments],
-            cwd=str(launch.working_directory),
-            shell=False,
-            close_fds=(os.name != "nt"),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return {
-            "ok": True,
-            "profile": self._serialize_profile(profile),
-            "pid": int(process.pid),
-            "url": _profile_url(profile),
-            "launch": self._serialize_launch(launch),
-        }
+            launch = build_instance_launch_command(
+                profile.number,
+                project_root=self.project_root,
+                executable=self.executable,
+                frozen=self.frozen,
+                no_open_browser=True,
+            )
+            process = self._popen(
+                [str(launch.target), *launch.arguments],
+                cwd=str(launch.working_directory),
+                shell=False,
+                close_fds=(os.name != "nt"),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            try:
+                self.runtime_state.set_desired(profile.number, True)
+            except Exception:
+                _terminate_spawned_process(process)
+                raise
+            return {
+                "ok": True,
+                "profile": self._serialize_profile(
+                    profile,
+                    check_system_ports=False,
+                ),
+                "pid": int(process.pid),
+                "url": _profile_url(profile),
+                "launch": self._serialize_launch(launch),
+            }
+
+    def stop_profile(self, payload: object) -> JsonDict:
+        body = _require_mapping(payload)
+        profile_number = _require_profile_number(body, "profile_number")
+        with self._lifecycle_lock(profile_number):
+            profile = self.manager.get_profile(profile_number)
+            self.runtime_state.set_desired(profile.number, False)
+            if not profile.is_running:
+                return {
+                    "ok": True,
+                    "already_stopped": True,
+                    "profile": self._serialize_profile(profile),
+                }
+            if self._shutdown_profile is None:
+                raise RuntimeError(
+                    "已保存停止状态，等待 Windows 服务停止该 Profile"
+                )
+            self._shutdown_profile(profile)
+            return {
+                "ok": True,
+                "stopping": True,
+                "profile": self._serialize_profile(
+                    profile,
+                    desired_profiles=frozenset(),
+                ),
+            }
+
+    async def _stop_profile_handler(self, payload: object) -> JsonDict:
+        return await asyncio.to_thread(self.stop_profile, payload)
 
     def launch_all_profiles(self, _payload: object = None) -> JsonDict:
         started: list[JsonDict] = []
         skipped: list[JsonDict] = []
         errors: list[JsonDict] = []
         for profile in self.manager.list_profiles():
-            if profile.is_running:
-                skipped.append(
-                    {
-                        "profile_number": profile.number,
-                        "reason": "实例已在运行",
-                        "url": _profile_url(profile),
-                    }
-                )
-                continue
             try:
-                self.manager.validate_profile_ports(
-                    profile.number,
-                    check_system_ports=True,
-                )
-                launch = build_instance_launch_command(
-                    profile.number,
-                    project_root=self.project_root,
-                    executable=self.executable,
-                    frozen=self.frozen,
-                    no_open_browser=True,
-                )
-                process = self._popen(
-                    [str(launch.target), *launch.arguments],
-                    cwd=str(launch.working_directory),
-                    shell=False,
-                    close_fds=(os.name != "nt"),
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                started.append(
-                    {
-                        "profile_number": profile.number,
-                        "pid": int(process.pid),
-                        "url": _profile_url(profile),
-                    }
-                )
+                result = self.launch_profile({"profile_number": profile.number})
+                item = {
+                    "profile_number": profile.number,
+                    "url": str(result["url"]),
+                }
+                if result.get("already_running"):
+                    item["reason"] = "实例已在运行"
+                    skipped.append(item)
+                else:
+                    item["pid"] = int(result["pid"])
+                    started.append(item)
             except Exception as exc:
                 errors.append(
                     {
@@ -213,6 +268,13 @@ class ProfileWebOperations:
             "skipped_count": len(skipped),
             "error_count": len(errors),
         }
+
+    def _lifecycle_lock(self, profile_number: int) -> threading.RLock:
+        with self._lifecycle_locks_guard:
+            return self._lifecycle_locks.setdefault(
+                profile_number,
+                threading.RLock(),
+            )
 
     def create_shortcut(self, payload: object) -> JsonDict:
         body = _require_mapping(payload)
@@ -255,15 +317,29 @@ class ProfileWebOperations:
             },
         }
 
-    def _serialize_profile(self, profile: ProfileInfo) -> JsonDict:
+    def _serialize_profile(
+        self,
+        profile: ProfileInfo,
+        *,
+        desired_profiles: frozenset[int] | None = None,
+        check_system_ports: bool | None = None,
+    ) -> JsonDict:
         issues: list[str] = []
         try:
             self.manager.validate_profile_ports(
                 profile.number,
-                check_system_ports=not profile.is_running,
+                check_system_ports=(
+                    not profile.is_running
+                    if check_system_ports is None
+                    else check_system_ports
+                ),
             )
         except ProfileManagerError as exc:
             issues.append(str(exc))
+        if desired_profiles is None:
+            desired_running = self.runtime_state.is_desired(profile.number)
+        else:
+            desired_running = profile.number in desired_profiles
         return {
             "number": profile.number,
             "display_name": profile.display_name,
@@ -278,6 +354,7 @@ class ProfileWebOperations:
             "destination_directory": profile.destination_directory,
             "dicom_destination_folder": profile.destination_directory,
             "is_running": profile.is_running,
+            "desired_running": desired_running,
             "has_recovery": profile.has_recovery,
             "issues": issues,
         }
@@ -299,6 +376,31 @@ class ProfileWebOperations:
             "working_directory": str(launch.working_directory),
             "icon": str(launch.icon),
         }
+
+
+def _terminate_spawned_process(process: subprocess.Popen[Any]) -> None:
+    terminate = getattr(process, "terminate", None)
+    if not callable(terminate):
+        return
+    try:
+        terminate()
+    except OSError:
+        return
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            try:
+                kill()
+                wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    except OSError:
+        pass
 
 
 def _require_mapping(value: object) -> Mapping[str, object]:

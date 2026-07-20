@@ -44,6 +44,7 @@ const TERMINAL_STATUSES = new Set([
 
 const state = {
   bootstrap: {},
+  profileBootstrap: {},
   config: {},
   task: null,
   parsedAccessions: [],
@@ -52,6 +53,8 @@ const state = {
   preflightSignature: "",
   csrfToken: "",
   eventSource: null,
+  eventPollTimer: 0,
+  eventCursor: "",
   logs: [],
   showDetailedLogs: false,
   directoryPurpose: "destination",
@@ -70,6 +73,14 @@ const state = {
   localSession: true,
   managerMode: false,
   profiles: [],
+  profileGeneration: 0,
+  profileAbortController: null,
+  profileListRequestId: 0,
+  activeProfileNumber: null,
+  activeProfile: null,
+  activeProfileRunning: false,
+  openDrawer: "",
+  lastFocusedBeforeDrawer: null,
   windowsService: null,
 };
 
@@ -82,6 +93,13 @@ class ApiError extends Error {
     this.name = "ApiError";
     this.status = status;
     this.details = details;
+  }
+}
+
+class StaleProfileResponseError extends Error {
+  constructor() {
+    super("Profile 上下文已经切换");
+    this.name = "StaleProfileResponseError";
   }
 }
 
@@ -107,6 +125,7 @@ async function api(path, options = {}) {
     method,
     headers,
     body,
+    signal: options.signal,
     credentials: "same-origin",
     cache: "no-store",
   });
@@ -134,6 +153,120 @@ async function api(path, options = {}) {
     throw new ApiError(String(message), response.status, payload);
   }
   return payload ?? {};
+}
+
+function profileNumberOf(profile) {
+  const value = profile?.number ?? profile?.profile_number ?? profile?.id;
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) ? number : null;
+}
+
+function profileDisplayName(profile) {
+  const number = profileNumberOf(profile);
+  return profile?.display_name || profile?.name || profile?.id || (number != null ? `Profile ${number}` : "当前 Profile");
+}
+
+function currentProfile() {
+  return state.activeProfile || state.profileBootstrap.profile || state.bootstrap.profile || {};
+}
+
+function currentProfileNumber() {
+  if (state.managerMode) return state.activeProfileNumber;
+  return state.activeProfileNumber ?? profileNumberOf(currentProfile());
+}
+
+function currentProfileIssues(profile = currentProfile()) {
+  const raw = profile?.issues || profile?.validation_errors || profile?.errors || [];
+  if (Array.isArray(raw)) return raw.map((item) => String(item?.message || item)).filter(Boolean);
+  if (raw && typeof raw === "object") return Object.values(raw).map((item) => String(item?.message || item)).filter(Boolean);
+  if (profile?.validation_error) return [String(profile.validation_error)];
+  if (profile?.last_error) return [String(profile.last_error)];
+  return [];
+}
+
+function currentProfileCanRun() {
+  return !currentProfileIssues().length;
+}
+
+function profileDesiredRunning(profile = currentProfile()) {
+  return Boolean(profile?.is_running || profile?.desired_running);
+}
+
+function profileLifecycleState(profile = currentProfile()) {
+  if (profile?.is_running) return "running";
+  if (profile?.desired_running) return "starting";
+  return "stopped";
+}
+
+function isManagedSelection() {
+  return state.managerMode && currentProfileNumber() != null;
+}
+
+function managementProfilePath(profileNumber, suffix) {
+  return `/api/management/profiles/${profileNumber}${suffix}`;
+}
+
+function isStaleProfileResponse(error) {
+  return error?.name === "AbortError" || error instanceof StaleProfileResponseError;
+}
+
+function advanceProfileContext(profileNumber) {
+  if (state.profileAbortController) state.profileAbortController.abort();
+  state.profileGeneration += 1;
+  state.profileAbortController = profileNumber == null ? null : new AbortController();
+  state.eventCursor = "";
+  window.clearTimeout(state.refreshTimer);
+  window.clearTimeout(state.preflightTimer);
+  window.clearTimeout(state.accessionInputTimer);
+  state.preflightRequestId += 1;
+  state.directoryRequestId += 1;
+  state.preflightOk = false;
+  state.preflightSignature = "";
+  const preflightButton = $("#run-preflight-button");
+  if (preflightButton) {
+    preflightButton.disabled = false;
+    setButtonLabel(preflightButton, "重新检查");
+  }
+  resetPreflightChecks();
+  updateStartAvailability();
+}
+
+async function profileRequest(path, options = {}) {
+  if (!state.managerMode) return api(path, options);
+  if (!isManagedSelection()) throw new ApiError("请先选择一个 Profile。", 409);
+  const profileNumber = currentProfileNumber();
+  const generation = state.profileGeneration;
+  const signal = state.profileAbortController?.signal;
+  const apiPath = String(path || "").replace(/^\/?api\/?/, "").replace(/^\/+/, "");
+  try {
+    const result = await api(managementProfilePath(profileNumber, `/${apiPath}`), {
+      ...options,
+      signal: options.signal || signal,
+    });
+    if (generation !== state.profileGeneration || profileNumber !== currentProfileNumber()) {
+      throw new StaleProfileResponseError();
+    }
+    return result;
+  } catch (error) {
+    if (
+      isStaleProfileResponse(error)
+      || generation !== state.profileGeneration
+      || profileNumber !== currentProfileNumber()
+    ) {
+      throw new StaleProfileResponseError();
+    }
+    throw error;
+  }
+}
+
+async function loadManagedProfileBootstrap(profileNumber) {
+  if (profileNumber !== currentProfileNumber()) throw new StaleProfileResponseError();
+  return profileRequest("/api/bootstrap");
+}
+
+async function loadManagedProfileSnapshot(profileNumber) {
+  if (profileNumber !== currentProfileNumber()) throw new StaleProfileResponseError();
+  return profileRequest("/api/snapshot");
 }
 
 function setText(selector, value) {
@@ -267,7 +400,10 @@ function taskDraft() {
 }
 
 function draftSignature() {
-  return JSON.stringify(taskDraft());
+  return JSON.stringify({
+    profile_number: state.managerMode ? currentProfileNumber() : null,
+    task: taskDraft(),
+  });
 }
 
 function invalidatePreflight(schedule = true) {
@@ -365,7 +501,7 @@ async function runPreflight({ requireAccessions = true, silent = false } = {}) {
   button.disabled = true;
   setButtonLabel(button, "检查中…");
   try {
-    const result = await api("/api/preflight", { method: "POST", body: taskDraft() });
+    const result = await profileRequest("/api/preflight", { method: "POST", body: taskDraft() });
     if (requestId !== state.preflightRequestId || signature !== draftSignature()) return false;
     renderPreflight(result, signature);
     if (!state.preflightOk && !silent) showAlert(result.message || "部分检查未通过，请根据红色项目修复后重试。", "预检未通过");
@@ -391,14 +527,14 @@ async function startTask() {
     if (!ok) return;
   }
   const draft = taskDraft();
-  const signature = JSON.stringify(draft);
+  const signature = draftSignature();
   if (!state.preflightOk || state.preflightSignature !== signature) {
     showAlert("任务内容已经改变，请重新完成预检。", "无法开始下载");
     return;
   }
-  const profile = state.bootstrap.profile || {};
+  const profile = currentProfile();
   const config = state.config || {};
-  const profileName = profile.name || profile.id || state.bootstrap.profile_name || "default";
+  const profileName = profileDisplayName(profile);
   const pacs = `${config.pacs_server_ip || "—"}:${config.pacs_server_port || "—"} / ${config.pacs_ae_title || "—"}`;
   const pdi = draft.pdi.enabled ? `开启${draft.pdi.output_folder ? `（${draft.pdi.output_folder}）` : ""}` : "关闭";
   await confirmAction(
@@ -421,7 +557,7 @@ async function submitStartTask(draft, signature) {
   button.disabled = true;
   setButtonLabel(button, "正在创建…");
   try {
-    const result = await api("/api/task/start", {
+    const result = await profileRequest("/api/task/start", {
       method: "POST",
       body: draft,
     });
@@ -430,6 +566,7 @@ async function submitStartTask(draft, signature) {
     renderTask(state.task);
     showToast("任务已交给后台执行，关闭浏览器不会停止下载。");
   } catch (error) {
+    if (isStaleProfileResponse(error)) return;
     showAlert(error.message, "任务启动失败");
     updateStartAvailability();
   } finally {
@@ -464,6 +601,7 @@ function renderTask(task) {
   }
 
   state.task = task;
+  showTaskWorkspace();
   const status = normalizeStatus(task.status);
   const total = taskCount(task, "total", "total_count", "accession_count") || taskItems(task).length;
   const processed = taskCount(task, "processed", "processed_count", "finished_count");
@@ -523,6 +661,7 @@ function renderPdiState(pdi) {
 
 function showTaskEditor() {
   state.task = null;
+  showTaskWorkspace();
   $("#task-editor").hidden = false;
   $("#task-runtime").hidden = true;
   setTaskEditorCollapsed(false);
@@ -594,10 +733,11 @@ async function taskAction(action, body = {}) {
   $("#task-runtime").setAttribute("aria-busy", "true");
   controls.forEach((button) => { button.disabled = true; });
   try {
-    const result = await api(`/api/task/${action}`, { method: "POST", body });
+    const result = await profileRequest(`/api/task/${action}`, { method: "POST", body });
     state.task = result.task || result;
     renderTask(state.task);
   } catch (error) {
+    if (isStaleProfileResponse(error)) return;
     showAlert(error.message, "任务操作失败");
   } finally {
     state.taskActionPending = false;
@@ -691,67 +831,173 @@ function requestedPage(fallback = "home") {
   return ["home", "settings", "operations"].includes(requested) ? requested : fallback;
 }
 
+function openDrawer(name) {
+  const key = name === "settings" ? "settings" : "operations";
+  const drawer = key === "settings" ? $("#settings-drawer") : $("#operations-drawer");
+  if (!drawer) return;
+  if (!state.openDrawer) state.lastFocusedBeforeDrawer = document.activeElement;
+  state.openDrawer = key;
+  $("#drawer-scrim").hidden = false;
+  $("#settings-drawer").hidden = key !== "settings";
+  $("#operations-drawer").hidden = key !== "operations";
+  $("#app-shell").inert = true;
+  document.body.classList.add("drawer-open");
+  const target = key === "settings" ? $("#close-settings-drawer") : $("#close-operations-drawer");
+  if (target) target.focus();
+}
+
+function closeDrawers() {
+  state.openDrawer = "";
+  $("#drawer-scrim").hidden = true;
+  $("#settings-drawer").hidden = true;
+  $("#operations-drawer").hidden = true;
+  $("#app-shell").inert = false;
+  document.body.classList.remove("drawer-open");
+  if (state.lastFocusedBeforeDrawer instanceof HTMLElement) state.lastFocusedBeforeDrawer.focus();
+  state.lastFocusedBeforeDrawer = null;
+}
+
 function showPage(pageName, { syncUrl = true } = {}) {
-  const allowedPage = state.managerMode ? "operations" : pageName;
-  $$("[data-page-panel]").forEach((panel) => {
-    const active = panel.dataset.pagePanel === allowedPage;
-    panel.hidden = !active;
-    panel.classList.toggle("is-active", active);
-  });
-  $$(".nav-item[data-page]").forEach((button) => {
-    const active = button.dataset.page === allowedPage;
-    button.classList.toggle("is-active", active);
-    if (active) button.setAttribute("aria-current", "page");
-    else button.removeAttribute("aria-current");
-  });
+  const allowedPage = ["settings", "operations"].includes(pageName) ? pageName : "home";
+  if (allowedPage === "settings") openDrawer("settings");
+  else if (allowedPage === "operations") {
+    openDrawer("operations");
+    refreshOperations();
+  } else {
+    closeDrawers();
+  }
   if (syncUrl) {
     const url = new URL(window.location.href);
     url.searchParams.set("page", allowedPage);
     window.history.replaceState({}, "", url);
   }
-  $("#main-content").focus({ preventScroll: true });
-  if (allowedPage === "operations") refreshOperations();
+  if (allowedPage === "home") $("#main-content").focus({ preventScroll: true });
+}
+
+function trapDrawerFocus(event) {
+  const drawer = state.openDrawer === "settings" ? $("#settings-drawer") : $("#operations-drawer");
+  if (!drawer) return;
+  const focusable = $$([
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(","), drawer).filter((element) => element.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && (document.activeElement === first || !drawer.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !drawer.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function showApplication() {
   $("#app-shell").hidden = false;
 }
 
-function applyBootstrap(payload) {
-  state.bootstrap = payload || {};
-  state.csrfToken = payload.csrf_token || payload.csrfToken || state.csrfToken;
-  state.managerMode = payload.profile?.mode === "manager";
-  document.body.classList.toggle("manager-mode", state.managerMode);
-  showApplication();
+function setWorkspaceTaskVisibility(visible) {
+  $("#workspace-task-stack").hidden = !visible;
+  $("#profile-idle-state").hidden = visible;
+}
+
+function showIdleState(profile = currentProfile()) {
+  setWorkspaceTaskVisibility(false);
+  const issues = currentProfileIssues(profile);
+  const name = profileDisplayName(profile);
+  const starting = profileLifecycleState(profile) === "starting";
+  setText("#profile-idle-title", starting ? `${name} 正在启动` : `${name} 当前未启动`);
+  setText(
+    "#profile-idle-message",
+    issues.length
+      ? `该 Profile 存在待修复配置：${issues[0]}`
+      : starting
+        ? "已记录运行选择，正在等待后台服务启动或恢复当前 Profile。"
+      : "先启动当前 Profile，再在右侧提交下载任务、查看进度与处理错误。",
+  );
+  $("#idle-start-button").hidden = currentProfileNumber() == null || starting;
+  $("#idle-configure-button").hidden = currentProfileNumber() == null;
+}
+
+function showProfileLoadingState(profile) {
+  setWorkspaceTaskVisibility(false);
+  setText("#profile-idle-title", `${profileDisplayName(profile)} 正在载入`);
+  setText("#profile-idle-message", "正在同步该 Profile 的配置、任务和实时日志。");
+  $("#idle-start-button").hidden = true;
+  $("#idle-configure-button").hidden = true;
+}
+
+function showTaskWorkspace() {
+  setWorkspaceTaskVisibility(true);
+}
+
+function applyProfileBootstrap(payload, { connectStream = true } = {}) {
+  const nextBootstrap = payload || {};
+  const profile = nextBootstrap.profile || currentProfile();
+  const profileNumber = profileNumberOf(profile);
+  if (state.managerMode && profileNumber !== state.activeProfileNumber) return;
+  state.profileBootstrap = nextBootstrap;
+  state.csrfToken = nextBootstrap.csrf_token || nextBootstrap.csrfToken || state.csrfToken;
+  state.activeProfile = { ...state.activeProfile, ...profile };
+  state.activeProfileNumber = profileNumber ?? state.activeProfileNumber;
+  state.activeProfileRunning = profile.is_running !== false;
   state.config = payload.config || {};
   populateSettings(state.config);
   $("#destination-input").value = state.config.dicom_destination_folder || "";
   renderEnvironment(payload);
   renderLicense(payload.license || {});
-  if (state.managerMode) {
-    document.title = "DcmGet · 管理中心";
-    $("#manager-overview").hidden = false;
-    setText("#operations-eyebrow", "Windows 服务工作台");
-    setText("#operations-title", "DcmGet 管理中心");
-    setText("#operations-description", "统一管理这台 Windows 主机上的 Profile，并通过独立链接进入各自任务页面。");
-    setConnectionState("connected", "管理中心已连接");
-    state.initialized = true;
-    showPage("operations", { syncUrl: false });
-    return;
-  }
   const task = payload.task || payload.active_task;
   if (task) renderTask(task);
   else showTaskEditor();
-  connectEvents();
-  state.initialized = true;
-  showPage(requestedPage("home"), { syncUrl: false });
+  if (connectStream) connectEvents();
   if (!state.task && $("#destination-input").value.trim()) schedulePreflight(0);
+}
+
+function applyManagerBootstrap(payload) {
+  state.profileBootstrap = {};
+  state.activeProfile = null;
+  state.activeProfileNumber = null;
+  state.activeProfileRunning = false;
+  advanceProfileContext(null);
+  renderEnvironment(payload);
+  renderLicense(payload.license || {});
+  $("#manager-overview").hidden = false;
+  setText("#operations-eyebrow", "Windows 服务工作台");
+  setText("#operations-title", "DcmGet 管理中心");
+  setText("#operations-description", "统一管理这台 Windows 主机上的 Profile，并在同一工作台内切换当前上下文。");
+  setConnectionState("connected", "管理中心已连接");
+  showIdleState({ display_name: "请选择 Profile" });
 }
 
 async function loadBootstrap() {
   try {
     const payload = await api("/api/bootstrap");
-    applyBootstrap(payload);
+    state.bootstrap = payload || {};
+    state.csrfToken = payload.csrf_token || payload.csrfToken || state.csrfToken;
+    state.managerMode = payload.profile?.mode === "manager";
+    document.body.classList.toggle("manager-mode", state.managerMode);
+    showApplication();
+    if (state.managerMode) {
+      document.title = "DcmGet · 8786 工作台";
+      applyManagerBootstrap(payload);
+      state.initialized = true;
+      await refreshOperations();
+      showPage(requestedPage("home"), { syncUrl: false });
+      return;
+    }
+    state.activeProfile = payload.profile || {};
+    state.activeProfileNumber = profileNumberOf(state.activeProfile);
+    applyProfileBootstrap(payload);
+    state.initialized = true;
+    showPage(requestedPage("home"), { syncUrl: false });
   } catch (error) {
     showApplication();
     setConnectionState("disconnected", "后台连接失败");
@@ -760,45 +1006,95 @@ async function loadBootstrap() {
 }
 
 function renderEnvironment(payload) {
-  const profile = payload.profile || {};
-  const config = payload.config || {};
+  const profile = payload.profile || currentProfile();
+  const baseConfig = payload.config || state.config || {};
+  const config = state.managerMode && profileNumberOf(profile) != null
+    ? {
+        ...baseConfig,
+        pacs_server_ip: profile.pacs_server_ip,
+        pacs_server_port: profile.pacs_server_port,
+        calling_ae_title: profile.calling_ae_title,
+        pacs_ae_title: profile.pacs_ae_title,
+        storage_ae_title: profile.storage_ae_title,
+        storage_port: profile.storage_port,
+        web_port: profile.web_port,
+        dicom_destination_folder: profile.destination_directory,
+      }
+    : baseConfig;
   const receiver = payload.receiver || {};
   const web = payload.web || {};
   state.localSession = web.local_session !== false;
-  if (state.managerMode) {
-    setText("#header-profile", "Windows 管理中心");
-    setText("#header-pacs", "kayisoft-dcmget");
+  const running = state.managerMode ? state.activeProfileRunning : profile.is_running !== false;
+  const starting = state.managerMode && !running && profileDesiredRunning(profile);
+  const issues = currentProfileIssues(profile);
+  const displayName = profileDisplayName(profile);
+  const version = payload.version || payload.app_version;
+  const dcmtkVersion = payload.dcmtk?.version || payload.dcmtk_version || receiver.dcmtk_version;
+  if (state.managerMode && !state.activeProfileNumber) {
+    setText("#header-profile", "8786 管理工作台");
+    setText("#header-pacs", "统一调度所有 Profile");
     setText("#header-receiver", `管理端口 ${profile.manager_port || window.location.port || "8786"}`);
   } else {
-    setText("#header-profile", `Profile ${profile.name || profile.id || payload.profile_name || "default"}`);
+    setText("#header-profile", displayName);
     setText("#header-pacs", `PACS ${config.pacs_server_ip || "—"}:${config.pacs_server_port || "—"} · ${config.pacs_ae_title || "—"}`);
     setText("#header-receiver", `接收 ${config.storage_ae_title || "—"}:${config.storage_port || "—"}`);
   }
-  setText("#operation-profile", profile.name || profile.id || payload.profile_name || "default");
-  setText("#operation-data-dir", profile.data_dir || payload.data_dir);
-  setText("#operation-version", payload.version || payload.app_version);
-  setText("#operation-dcmtk-version", payload.dcmtk?.version || payload.dcmtk_version || receiver.dcmtk_version);
+  setText("#workspace-profile-title", state.managerMode && !state.activeProfileNumber ? "请选择左侧 Profile" : displayName);
+  setText(
+    "#workspace-profile-subtitle",
+    state.managerMode && !state.activeProfileNumber
+      ? "先在左侧选中一个 Profile，任务、设置、PDI 和错误日志都会切换到当前上下文。"
+      : running
+        ? "当前 Profile 已就绪；任务、进度、PDI 与日志都在本页完成。"
+        : starting
+          ? "已记录运行选择，正在等待后台服务启动或恢复当前 Profile。"
+        : "当前 Profile 默认不启动；先启动或修复配置，再开始下载任务。",
+  );
+  setStatusBadge(
+    $("#workspace-profile-status"),
+    running ? "completed" : starting ? "working" : issues.length ? "failed" : "stopped",
+    running ? "已启动" : starting ? "启动中" : issues.length ? "待修复" : "未启动",
+  );
+  setText("#operation-profile", displayName);
+  setText("#operation-data-dir", profile.data_dir || profile.destination_directory || payload.data_dir || config.dicom_destination_folder);
+  setText("#operation-version", version);
+  setText("#operation-version-copy", version);
+  setText("#operation-dcmtk-version", dcmtkVersion);
+  setText("#operation-dcmtk-version-copy", dcmtkVersion);
 
   const url = web.lan_url || web.url || payload.lan_url || window.location.origin;
+  setText("#workspace-directory", profile.destination_directory || config.dicom_destination_folder);
+  setText("#workspace-web-url", url);
   setText("#operation-web-url", url);
   setText("#lan-url", url);
   $("#lan-notice").hidden = !(web.lan_enabled ?? config.web_lan_enabled ?? payload.lan_enabled);
-  $("#profile-management-card").hidden = !(state.localSession || state.managerMode);
+  $("#workspace-sidebar").hidden = !state.managerMode;
+  $("#current-profile-start-button").hidden = !state.managerMode || currentProfileNumber() == null || running || starting;
+  $("#current-profile-stop-button").hidden = !state.managerMode || currentProfileNumber() == null || (!running && !starting);
+  $("#workspace-config-button").disabled = state.managerMode && currentProfileNumber() == null;
+  $("#workspace-operations-button").disabled = false;
+  $("#open-destination-button").disabled = state.managerMode && currentProfileNumber() == null;
+  $("#open-log-directory-button").disabled = state.managerMode && currentProfileNumber() == null;
+  $$('[data-operation]').forEach((control) => {
+    control.disabled = state.managerMode && currentProfileNumber() == null;
+  });
   [
     "#open-destination-button",
     "#open-log-directory-button",
     '[data-operation="open-data-directory"]',
     '[data-operation="open-log-directory"]',
     '[data-operation="acceptance-report"]',
-    "#shutdown-service-button",
   ].forEach((selector) => {
     const control = $(selector);
-    if (control) control.hidden = !state.localSession;
+    if (control) control.hidden = !(state.localSession || state.managerMode);
   });
+  const shutdownButton = $("#shutdown-service-button");
+  if (shutdownButton) shutdownButton.hidden = state.managerMode || !state.localSession;
   if (!$("#destination-input").value) $("#destination-input").value = config.dicom_destination_folder || "";
   $("#quick-pdi-enabled").checked = Boolean(config.pdi_export_enabled);
   $("#quick-pdi-folder").value = config.pdi_output_folder || "";
   $("#quick-pdi-folder-row").hidden = !$("#quick-pdi-enabled").checked;
+  if (state.managerMode && currentProfileNumber() != null && !running) showIdleState(profile);
   updateStartAvailability();
 }
 
@@ -874,13 +1170,19 @@ async function saveSettings(event) {
   buttons.forEach((button) => { button.disabled = true; });
   setText("#settings-status", "正在保存…");
   try {
-    const result = await api("/api/config", { method: "PUT", body: settingsPayload() });
+    const result = await profileRequest("/api/config", { method: "PUT", body: settingsPayload() });
     state.config = result.config || result;
     populateSettings(state.config);
-    renderEnvironment({ ...state.bootstrap, config: state.config, web: result.web || state.bootstrap.web });
+    renderEnvironment({
+      ...state.profileBootstrap,
+      config: state.config,
+      web: result.web || state.profileBootstrap.web || state.bootstrap.web,
+      profile: currentProfile(),
+    });
     setText("#settings-status", `${result.message || "设置已保存"}。正在运行的任务继续使用原配置快照。`);
     showToast("设置已保存");
   } catch (error) {
+    if (isStaleProfileResponse(error)) return;
     setText("#settings-status", error.message);
     showAlert(error.message, "设置保存失败");
   } finally {
@@ -889,11 +1191,34 @@ async function saveSettings(event) {
 }
 
 async function refreshTask() {
+  if (state.managerMode && currentProfileNumber() == null) return;
   try {
+    if (isManagedSelection()) {
+      const snapshot = await loadManagedProfileSnapshot(currentProfileNumber());
+      if (snapshot.config) {
+        state.config = snapshot.config;
+        populateSettings(state.config);
+      }
+      if (snapshot.profile || snapshot.web || snapshot.receiver || snapshot.license || snapshot.version) {
+        renderEnvironment({
+          ...state.profileBootstrap,
+          ...snapshot,
+          profile: { ...currentProfile(), ...(snapshot.profile || {}) },
+        });
+      }
+      if (snapshot.license) renderLicense(snapshot.license);
+      if (snapshot.health) renderHealth(snapshot.health);
+      const task = snapshot.task || snapshot.active_task || (snapshot.id ? snapshot : null);
+      if (task) renderTask(task);
+      else showTaskEditor();
+      return;
+    }
     const result = await api("/api/task");
     const task = result.task || result.active_task || (result.id ? result : null);
     if (task) renderTask(task);
+    else showTaskEditor();
   } catch (error) {
+    if (isStaleProfileResponse(error)) return;
     if (error.status !== 404) console.warn("Task refresh failed", error);
   }
 }
@@ -904,9 +1229,64 @@ function setConnectionState(status, label) {
   setText(element.lastElementChild, label);
 }
 
+function consumeServerPayload(type, data) {
+  if ([
+    "task", "task_started", "state", "progress", "task_state", "task_progress",
+    "pdi_progress", "pdi_finished", "verification_progress",
+  ].includes(type)) {
+    if (data.task?.id || data.task?.status) renderTask(data.task);
+    else scheduleTaskRefresh();
+  }
+  else if (type === "log") addLog(data);
+  else if (type === "license") renderLicense(data);
+  else if (type === "config") {
+    state.config = data.config || data;
+    populateSettings(state.config);
+    renderEnvironment({ ...state.profileBootstrap, config: state.config });
+  } else if (type === "health") renderHealth(data);
+  else if (type === "receiver" && data.message) addLog({ ...data, source: data.source || "storescp" });
+}
+
+function scheduleManagedEventPoll(delay = 1500) {
+  window.clearTimeout(state.eventPollTimer);
+  state.eventPollTimer = window.setTimeout(pollManagedEvents, delay);
+}
+
+async function pollManagedEvents() {
+  if (!isManagedSelection() || !state.activeProfileRunning) return;
+  const query = new URLSearchParams();
+  if (state.eventCursor) query.set("after_id", state.eventCursor);
+  try {
+    const result = await profileRequest(`/api/events${query.toString() ? `?${query.toString()}` : ""}`);
+    const events = result.events || result.items || result.records || [];
+    events.forEach((entry) => {
+      const type = entry.type || entry.event_type || entry.name || "message";
+      const data = entry.payload ?? entry.data ?? entry;
+      if (entry.id != null) state.eventCursor = String(entry.id);
+      consumeServerPayload(type, data);
+    });
+    if (result.last_id != null) state.eventCursor = String(result.last_id);
+    setConnectionState("connected", "当前 Profile 已同步");
+    scheduleManagedEventPoll(events.length ? 350 : 1500);
+  } catch (error) {
+    if (isStaleProfileResponse(error)) return;
+    setConnectionState("disconnected", "同步中断，自动重试");
+    scheduleManagedEventPoll(2500);
+  }
+}
+
 function connectEvents() {
   closeEvents();
+  if (state.managerMode && (!state.activeProfileRunning || currentProfileNumber() == null)) {
+    setConnectionState("connected", "等待选择已启动的 Profile");
+    return;
+  }
   setConnectionState("connecting", "正在连接");
+  if (isManagedSelection()) {
+    state.eventCursor = "";
+    scheduleManagedEventPoll(0);
+    return;
+  }
   const source = new EventSource("/api/events/stream", { withCredentials: true });
   state.eventSource = source;
   source.onopen = () => setConnectionState("connected", "后台已连接");
@@ -923,6 +1303,8 @@ function connectEvents() {
 function closeEvents() {
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
+  window.clearTimeout(state.eventPollTimer);
+  state.eventPollTimer = 0;
 }
 
 function handleServerEvent(event) {
@@ -935,20 +1317,7 @@ function handleServerEvent(event) {
   }
   const type = payload.type || event.type;
   const data = payload.payload ?? payload.data ?? payload;
-  if ([
-    "task", "task_started", "state", "progress", "task_state", "task_progress",
-    "pdi_progress", "pdi_finished", "verification_progress",
-  ].includes(type)) {
-    if (data.task?.id || data.task?.status) renderTask(data.task);
-    else scheduleTaskRefresh();
-  }
-  else if (type === "log") addLog(data);
-  else if (type === "license") renderLicense(data);
-  else if (type === "config") {
-    state.config = data.config || data;
-    populateSettings(state.config);
-  } else if (type === "health") renderHealth(data);
-  else if (type === "receiver" && data.message) addLog({ ...data, source: data.source || "storescp" });
+  consumeServerPayload(type, data);
 }
 
 function scheduleTaskRefresh() {
@@ -983,7 +1352,7 @@ async function loadDirectories(path = "") {
   const query = new URLSearchParams({ purpose: state.directoryPurpose });
   if (path) query.set("path", path);
   try {
-    const result = await api(`/api/files/directories?${query.toString()}`);
+    const result = await profileRequest(`/api/files/directories?${query.toString()}`);
     if (requestId !== state.directoryRequestId) return;
     state.currentDirectory = result.path || result.current || path || "";
     $("#directory-current-path").value = state.currentDirectory;
@@ -1047,7 +1416,7 @@ async function importAccessions(file) {
   const extension = file.name.split(".").pop().toLowerCase();
   if (extension === "xlsx") {
     try {
-      const result = await api("/api/files/accessions", {
+      const result = await profileRequest("/api/files/accessions", {
         method: "POST",
         headers: {
           "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1060,6 +1429,7 @@ async function importAccessions(file) {
       parseAccessions($("#accession-input").value);
       showToast(`已从 ${file.name} 导入 ${values.length} 个检查号`);
     } catch (error) {
+      if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "XLSX 导入失败");
     }
     return;
@@ -1086,6 +1456,19 @@ async function runOperation(name, body = {}) {
   }
 }
 
+async function runScopedOperation(name, body = {}) {
+  try {
+    const result = await profileRequest(`/api/operations/${name}`, { method: "POST", body });
+    showToast(result.message || "操作已完成");
+    if (result.download_url) window.location.assign(result.download_url);
+    return result;
+  } catch (error) {
+    if (isStaleProfileResponse(error)) return null;
+    showAlert(error.message, "当前 Profile 操作失败");
+    return null;
+  }
+}
+
 async function shutdownService() {
   const button = $("#shutdown-service-button");
   button.disabled = true;
@@ -1107,15 +1490,15 @@ async function shutdownService() {
 
 async function refreshOperations() {
   if (state.managerMode) {
-    await Promise.allSettled([refreshProfiles(), refreshWindowsServiceStatus(), refreshReleaseNotes()]);
+    await Promise.allSettled([refreshProfiles(), refreshHealth(), refreshLicense(), refreshWindowsServiceStatus(), refreshReleaseNotes()]);
     return;
   }
   const refreshes = [refreshHealth(), refreshLicense(), refreshReleaseNotes(), refreshWindowsServiceStatus()];
-  if (state.localSession || state.managerMode) refreshes.push(refreshProfiles());
   await Promise.allSettled(refreshes);
 }
 
 async function profileOperation(name, body = {}) {
+  if (state.managerMode && name === "list") return api("/api/management/profiles");
   return api(`/api/operations/profile-${name}`, { method: "POST", body });
 }
 
@@ -1130,43 +1513,7 @@ function profileActionButton(label, action, profile, disabled = false) {
 }
 
 function profileIssues(profile) {
-  const raw = profile.issues || profile.validation_errors || profile.errors || [];
-  if (Array.isArray(raw)) return raw.map((item) => String(item?.message || item)).filter(Boolean);
-  if (raw && typeof raw === "object") return Object.values(raw).map((item) => String(item?.message || item)).filter(Boolean);
-  if (profile.validation_error) return [String(profile.validation_error)];
-  if (profile.last_error) return [String(profile.last_error)];
-  return [];
-}
-
-function profilePageUrl(profile, page = "home") {
-  const url = new URL(window.location.href);
-  url.port = String(profile.web_port);
-  url.pathname = "/";
-  url.search = "";
-  url.searchParams.set("page", page);
-  url.hash = "";
-  return url.toString();
-}
-
-function openProfilePage(profile, page = "home") {
-  window.open(profilePageUrl(profile, page), `_dcmget_profile_${profile.number}_${page}`, "noopener");
-}
-
-function profilePageButton(label, page, profile, primary = false) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = `button ${primary ? "button--primary" : "button--secondary"} button--small`;
-  const icon = document.createElement("svg");
-  icon.setAttribute("class", "icon");
-  icon.setAttribute("aria-hidden", "true");
-  const use = document.createElement("use");
-  use.setAttribute("href", "#icon-external");
-  icon.append(use);
-  const text = document.createElement("span");
-  text.textContent = label;
-  button.append(icon, text);
-  button.addEventListener("click", () => openProfilePage(profile, page));
-  return button;
+  return currentProfileIssues(profile);
 }
 
 function profileFact(label, value) {
@@ -1189,6 +1536,122 @@ function updateManagerOverview(profiles) {
   setText("#manager-issue-count", issues);
 }
 
+async function selectManagedProfile(profile, { preserveLogs = false } = {}) {
+  if (!profile) return;
+  const profileNumber = profileNumberOf(profile);
+  if (profileNumber == null) return;
+  if (state.openDrawer) closeDrawers();
+  state.activeProfile = profile;
+  state.activeProfileNumber = profileNumber;
+  state.activeProfileRunning = Boolean(profile.is_running);
+  state.task = null;
+  advanceProfileContext(profileNumber);
+  renderProfiles(state.profiles);
+  clearAlert();
+  if (!preserveLogs) {
+    state.logs = [];
+    renderLogs();
+  }
+  closeEvents();
+  if (!state.activeProfileRunning) {
+    state.profileBootstrap = { profile };
+    state.task = null;
+    renderEnvironment({ ...state.bootstrap, profile, web: {} });
+    setConnectionState(
+      "connected",
+      profileDesiredRunning(profile) ? "Profile 正在启动" : "Profile 未启动",
+    );
+    showIdleState(profile);
+    return;
+  }
+  showProfileLoadingState(profile);
+  try {
+    const payload = await loadManagedProfileBootstrap(profileNumber);
+    applyProfileBootstrap({
+      ...payload,
+      profile: { ...profile, ...(payload.profile || {}) },
+    });
+  } catch (error) {
+    if (isStaleProfileResponse(error)) return;
+    state.activeProfileRunning = false;
+    renderEnvironment({ ...state.bootstrap, profile, web: {} });
+    setConnectionState("disconnected", "Profile 载入失败");
+    showIdleState(profile);
+    showAlert(error.message, "Profile 加载失败");
+  }
+}
+
+function clearManagedProfileSelection() {
+  closeEvents();
+  state.activeProfile = null;
+  state.activeProfileNumber = null;
+  state.activeProfileRunning = false;
+  state.profileBootstrap = {};
+  state.config = {};
+  state.task = null;
+  state.startedAt = 0;
+  state.logs = [];
+  advanceProfileContext(null);
+  renderLogs();
+  $("#accession-input").value = "";
+  $("#destination-input").value = "";
+  $("#quick-pdi-enabled").checked = false;
+  $("#quick-pdi-folder").value = "";
+  $("#quick-pdi-folder-row").hidden = true;
+  parseAccessions("", { schedule: false });
+  ["#directory-dialog", "#confirm-dialog", "#profile-config-dialog"].forEach((selector) => {
+    const dialog = $(selector);
+    if (dialog.open) dialog.close("cancel");
+  });
+  if (state.openDrawer) closeDrawers();
+  renderEnvironment({ ...state.bootstrap, profile: state.bootstrap.profile || {}, web: state.bootstrap.web || {} });
+  showIdleState({ display_name: "尚无可用 Profile" });
+  setConnectionState("connected", "等待创建 Profile");
+}
+
+async function startManagedProfile(profile = currentProfile()) {
+  const profileNumber = profileNumberOf(profile);
+  if (profileNumber == null) return;
+  if (profileIssues(profile).length) {
+    openProfileConfig(profile, true);
+    return;
+  }
+  try {
+    profile.desired_running = true;
+    if (profileNumber === state.activeProfileNumber) state.activeProfile = profile;
+    renderProfiles(state.profiles);
+    renderEnvironment({ ...state.bootstrap, profile, web: {} });
+    const result = await api(managementProfilePath(profileNumber, "/start"), { method: "POST", body: {} });
+    showToast(result.message || `${profileDisplayName(profile)} 启动命令已提交`);
+    await refreshProfiles();
+    window.setTimeout(() => refreshProfiles(), 900);
+  } catch (error) {
+    await refreshProfiles();
+    showAlert(error.message, "启动 Profile 失败");
+  }
+}
+
+async function stopManagedProfile(profile = currentProfile()) {
+  const profileNumber = profileNumberOf(profile);
+  if (profileNumber == null) return;
+  await confirmAction(
+    "停止当前 Profile",
+    `将停止 ${profileDisplayName(profile)} 的接收端、下载进程与 PDI 子任务，但保留已下载文件和恢复点。确认停止吗？`,
+    async () => {
+      try {
+        profile.desired_running = false;
+        if (profileNumber === state.activeProfileNumber) state.activeProfile = profile;
+        const result = await api(managementProfilePath(profileNumber, "/stop"), { method: "POST", body: {} });
+        showToast(result.message || `${profileDisplayName(profile)} 正在停止`);
+        await refreshProfiles();
+      } catch (error) {
+        await refreshProfiles();
+        showAlert(error.message, "停止 Profile 失败");
+      }
+    },
+  );
+}
+
 function renderProfiles(profiles) {
   state.profiles = Array.isArray(profiles) ? profiles : [];
   const grid = $("#profile-grid");
@@ -1203,9 +1666,12 @@ function renderProfiles(profiles) {
   }
   state.profiles.forEach((profile) => {
     const issues = profileIssues(profile);
+    const lifecycle = profileLifecycleState(profile);
+    const selected = profileNumberOf(profile) === state.activeProfileNumber;
     const card = document.createElement("article");
     card.className = "profile-card";
-    card.dataset.state = issues.length ? "issue" : (profile.is_running ? "running" : "idle");
+    card.dataset.state = issues.length ? "issue" : lifecycle;
+    card.classList.toggle("is-selected", selected);
 
     const header = document.createElement("div");
     header.className = "profile-card__header";
@@ -1216,10 +1682,18 @@ function renderProfiles(profiles) {
     const number = document.createElement("p");
     number.textContent = `Profile ${profile.number}`;
     identity.append(name, number);
-    const status = document.createElement("span");
-    const tone = issues.length ? "error" : (profile.is_running ? "success" : "neutral");
-    status.className = `status-badge status-badge--${tone}`;
-    status.textContent = issues.length ? "需要处理" : (profile.is_running ? "运行中" : "未启动");
+    const status = document.createElement("button");
+    const tone = issues.length ? "error" : lifecycle === "running" ? "success" : lifecycle === "starting" ? "working" : "neutral";
+    status.type = "button";
+    status.className = `status-badge status-badge--${tone} profile-card__switch`;
+    status.textContent = selected
+      ? "当前上下文"
+      : lifecycle === "running"
+        ? "切换到此"
+        : lifecycle === "starting"
+          ? "启动中"
+          : "未启动";
+    status.addEventListener("click", () => selectManagedProfile(profile, { preserveLogs: selected }));
     header.append(identity, status);
 
     const facts = document.createElement("dl");
@@ -1242,14 +1716,22 @@ function renderProfiles(profiles) {
 
     const actions = document.createElement("div");
     actions.className = "profile-card__actions";
-    if (profile.is_running) {
+    if (lifecycle === "running") {
       actions.append(
-        profilePageButton("任务", "home", profile, true),
-        profilePageButton("设置", "settings", profile),
-        profilePageButton("运维", "operations", profile),
+        profileActionButton(selected ? "当前 Profile" : "切换", selectManagedProfile, profile, selected),
+        profileActionButton("停止", stopManagedProfile, profile),
+        profileActionButton("配置", configureProfile, profile),
+      );
+    } else if (lifecycle === "starting") {
+      actions.append(
+        profileActionButton(selected ? "当前 Profile" : "切换", selectManagedProfile, profile, selected),
+        profileActionButton("取消启动", stopManagedProfile, profile),
       );
     } else {
-      actions.append(profileActionButton(issues.length ? "修复配置" : "配置并启动", launchProfile, profile));
+      actions.append(
+        profileActionButton(issues.length ? "修复配置" : "启动", launchProfile, profile),
+        profileActionButton("配置", configureProfile, profile),
+      );
     }
     card.append(actions);
 
@@ -1266,10 +1748,10 @@ function renderProfiles(profiles) {
     const menu = document.createElement("div");
     menu.className = "profile-more__menu";
     menu.append(
-      profileActionButton("配置", configureProfile, profile, profile.is_running),
+      profileActionButton("配置", configureProfile, profile, profileDesiredRunning(profile)),
       profileActionButton("复制", cloneProfile, profile),
       profileActionButton("创建快捷方式", createProfileShortcut, profile),
-      profileActionButton("删除", deleteProfile, profile, profile.is_running || profile.has_recovery),
+      profileActionButton("删除", deleteProfile, profile, profileDesiredRunning(profile) || profile.has_recovery),
     );
     more.append(summary, menu);
     footer.append(path, more);
@@ -1279,15 +1761,64 @@ function renderProfiles(profiles) {
 }
 
 async function refreshProfiles() {
+  if (!state.managerMode) return;
+  const requestId = ++state.profileListRequestId;
   try {
     const result = await profileOperation("list");
-    renderProfiles(result.profiles || []);
-    setText("#profile-management-hint", state.managerMode
-      ? "页面链接自动使用当前 Windows 主机地址；修复配置后，kayisoft-dcmget 会重新尝试启动对应 Profile。"
-      : "启动前可修改 PACS、AE、目录和端口；保存时会检查当前 Profile、其他 Profile及本机端口占用。");
+    if (requestId !== state.profileListRequestId) return;
+    const profiles = result.profiles || result.items || result;
+    renderProfiles(profiles || []);
+    setText("#profile-management-hint", "工作台保持 8786 单入口；切换左侧 Profile 后，右侧任务、设置与维护会同步切换。");
+    if (!state.profiles.length) {
+      clearManagedProfileSelection();
+      return;
+    }
+    const nextProfile = state.profiles.find((profile) => profileNumberOf(profile) === state.activeProfileNumber)
+      || state.profiles.find((profile) => profile.is_running)
+      || state.profiles.find((profile) => profile.desired_running)
+      || state.profiles[0];
+    if (!state.activeProfileNumber || profileNumberOf(nextProfile) !== state.activeProfileNumber) {
+      await selectManagedProfile(nextProfile);
+      return;
+    }
+    const wasRunning = state.activeProfileRunning;
+    state.activeProfile = nextProfile;
+    state.activeProfileRunning = Boolean(nextProfile.is_running);
+    if (wasRunning !== state.activeProfileRunning) {
+      await selectManagedProfile(nextProfile, { preserveLogs: true });
+      return;
+    }
+    renderProfiles(state.profiles);
+    if (!state.activeProfileRunning) {
+      renderEnvironment({ ...state.bootstrap, profile: nextProfile, web: {} });
+      showIdleState(nextProfile);
+    }
   } catch (error) {
-    renderProfiles([]);
-    setText("#profile-management-hint", error.message);
+    if (requestId !== state.profileListRequestId) return;
+    if (!state.profiles.length) {
+      const errorState = document.createElement("div");
+      errorState.className = "profile-empty profile-empty--error";
+      errorState.textContent = `Profile 列表读取失败：${error.message}`;
+      $("#profile-grid").replaceChildren(errorState);
+    }
+    setText("#profile-management-hint", `刷新失败，已保留上次状态：${error.message}`);
+  }
+}
+
+async function createProfile() {
+  if (!state.managerMode) return;
+  try {
+    const result = await api("/api/management/profiles", { method: "POST", body: {} });
+    await refreshProfiles();
+    if (result.profile) {
+      showToast(`已创建 ${profileDisplayName(result.profile)}；当前默认处于停止状态。`);
+      await selectManagedProfile(result.profile);
+      openProfileConfig(result.profile, false);
+    } else {
+      showToast("新 Profile 已创建；请补充配置后再启动。");
+    }
+  } catch (error) {
+    showAlert(error.message, "新建 Profile 失败");
   }
 }
 
@@ -1336,15 +1867,15 @@ async function deleteProfile(profile) {
 }
 
 async function launchProfile(profile) {
+  if (state.managerMode) {
+    await startManagedProfile(profile);
+    return;
+  }
   openProfileConfig(profile, true);
 }
 
 function configureProfile(profile) {
   openProfileConfig(profile, false);
-}
-
-function openProfileWeb(profile) {
-  openProfilePage(profile, "home");
 }
 
 function openProfileConfig(profile, launchAfterSave) {
@@ -1535,8 +2066,9 @@ function renderHealth(payload) {
 }
 
 async function refreshLicense() {
+  if (state.managerMode && !state.activeProfileRunning) return;
   try {
-    const result = await api("/api/license");
+    const result = await profileRequest("/api/license");
     renderLicense({
       ...(result.license || result),
       machine_code: result.machine_code || result.license?.machine_code,
@@ -1555,7 +2087,10 @@ async function activateLicense() {
   const button = $("#activate-license-button");
   button.disabled = true;
   try {
-    const result = await api("/api/license/activate", {
+    if (state.managerMode && !state.activeProfileRunning) {
+      throw new Error("请先启动一个 Profile，再进行软件授权。");
+    }
+    const result = await profileRequest("/api/license/activate", {
       method: "POST",
       body: { token },
     });
@@ -1564,6 +2099,7 @@ async function activateLicense() {
     await refreshLicense();
     showToast("软件授权已激活");
   } catch (error) {
+    if (isStaleProfileResponse(error)) return;
     showAlert(error.message, "授权激活失败");
   } finally {
     button.disabled = false;
@@ -1607,7 +2143,23 @@ function renderReleaseNotes(releases) {
 
 function bindEvents() {
   $("#dismiss-alert").addEventListener("click", clearAlert);
-  $$(".nav-item[data-page]").forEach((button) => button.addEventListener("click", () => showPage(button.dataset.page)));
+  $("#workspace-config-button").addEventListener("click", () => {
+    if (state.managerMode && currentProfileNumber() == null) return;
+    if (state.managerMode && !state.activeProfileRunning) {
+      configureProfile(currentProfile());
+      return;
+    }
+    showPage("settings");
+  });
+  $("#workspace-operations-button").addEventListener("click", () => showPage("operations"));
+  $("#close-settings-drawer").addEventListener("click", closeDrawers);
+  $("#close-operations-drawer").addEventListener("click", closeDrawers);
+  $("#drawer-scrim").addEventListener("click", closeDrawers);
+  $("#current-profile-start-button").addEventListener("click", () => startManagedProfile());
+  $("#current-profile-stop-button").addEventListener("click", () => stopManagedProfile());
+  $("#idle-start-button").addEventListener("click", () => startManagedProfile());
+  $("#idle-configure-button").addEventListener("click", () => configureProfile(currentProfile()));
+  $("#create-profile-button").addEventListener("click", createProfile);
 
   $("#accession-input").addEventListener("input", () => {
     window.clearTimeout(state.accessionInputTimer);
@@ -1660,27 +2212,30 @@ function bindEvents() {
   });
   $("#open-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
-      const result = await api("/api/pdi/open", { method: "POST", body: { task_id: state.task?.id } });
+      const result = await profileRequest("/api/pdi/open", { method: "POST", body: { task_id: state.task?.id } });
       showToast(result.message || "已在 DcmGet 主机打开 PDI 目录");
     } catch (error) {
+      if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "无法打开 PDI");
     }
   }));
   $("#verify-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
-      const result = await api("/api/pdi/verify", { method: "POST", body: { task_id: state.task?.id } });
+      const result = await profileRequest("/api/pdi/verify", { method: "POST", body: { task_id: state.task?.id } });
       showToast(result.message || (result.ok ? "PDI 校验通过" : "PDI 校验未通过"));
       if (!result.ok) showAlert(result.message || "PDI 校验未通过，请查看任务日志。", "PDI 校验异常");
     } catch (error) {
+      if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "PDI 校验失败");
     }
   }));
   $("#retry-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
-      const result = await api("/api/pdi/retry", { method: "POST", body: { task_id: state.task?.id } });
+      const result = await profileRequest("/api/pdi/retry", { method: "POST", body: { task_id: state.task?.id } });
       renderTask(result.task || result);
       showToast("已重新加入 PDI 导出队列");
     } catch (error) {
+      if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "PDI 重试失败");
     }
   }));
@@ -1746,15 +2301,36 @@ function bindEvents() {
       showAlert("浏览器拒绝了剪贴板权限。", "无法复制");
     }
   });
-  $("#shutdown-service-button").addEventListener("click", () => confirmAction(
-    "关闭 DcmGet 后台",
-    "后台关闭后，当前浏览器将无法继续操作；正在运行的下载会安全停止并保留恢复点。",
-    shutdownService,
-    { confirmLabel: "确认关闭", tone: "danger" },
-  ));
-  $$('[data-operation]').forEach((button) => button.addEventListener("click", () => runOperation(button.dataset.operation)));
-  $("#open-destination-button").addEventListener("click", () => runOperation("open-destination"));
-  $("#open-log-directory-button").addEventListener("click", () => runOperation("open-log-directory"));
+  $("#shutdown-service-button").addEventListener("click", () => {
+    if (state.managerMode) {
+      stopManagedProfile();
+      return;
+    }
+    confirmAction(
+      "关闭 DcmGet 后台",
+      "后台关闭后，当前浏览器将无法继续操作；正在运行的下载会安全停止并保留恢复点。",
+      shutdownService,
+      { confirmLabel: "确认关闭", tone: "danger" },
+    );
+  });
+  $$('[data-operation]').forEach((button) => button.addEventListener("click", () => {
+    const operation = state.managerMode ? runScopedOperation : runOperation;
+    operation(button.dataset.operation);
+  }));
+  $("#open-destination-button").addEventListener("click", () => {
+    if (state.managerMode) {
+      if (currentProfileNumber() != null) runScopedOperation("open-destination");
+      return;
+    }
+    runOperation("open-destination");
+  });
+  $("#open-log-directory-button").addEventListener("click", () => {
+    if (state.managerMode) {
+      if (currentProfileNumber() != null) runScopedOperation("open-log-directory");
+      return;
+    }
+    runOperation("open-log-directory");
+  });
   $("#buy-license-button").addEventListener("click", async () => {
     await refreshLicense();
     showPage("operations");
@@ -1775,11 +2351,16 @@ function bindEvents() {
       else refreshTask();
     }
   });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.openDrawer) closeDrawers();
+    else if (event.key === "Tab" && state.openDrawer) trapDrawerFocus(event);
+  });
   window.setInterval(() => {
     if (document.hidden) return;
     if (state.managerMode) {
       refreshProfiles();
       refreshWindowsServiceStatus();
+      if (state.activeProfileRunning) refreshTask();
     } else if (state.task && !TERMINAL_STATUSES.has(normalizeStatus(state.task.status))) {
       refreshTask();
     }

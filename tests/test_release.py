@@ -354,7 +354,10 @@ def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
     assert "$path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)" in installer
     for name in ("DcmGet.exe", "DcmGetPdiServer.exe", "storescp.exe", "movescu.exe"):
         assert name in installer
-    assert "$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'')" in installer
+    assert (
+        "$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', "
+        "''movescu.exe'', ''{#ServiceWrapperName}'')" in installer
+    )
     assert "$attempt -lt 140" in installer
     assert installer.index("kayisoft-dcmget service did not stop") < installer.index(
         "$names = @(''DcmGet.exe''"
@@ -402,7 +405,12 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "function Test-CompleteProfileConfig" in host
     assert "ConvertFrom-Json -InputObject $content -ErrorAction Stop" in host
     assert "Get-ConfiguredProfileNumbers" in host
-    assert "$startupProfileNumbers = @(Get-ConfiguredProfileNumbers)" in host
+    assert '$runtimeStatePath = Join-Path $env:LOCALAPPDATA "DcmGet\\management\\profile-runtime.json"' in host
+    assert "function Get-DesiredProfileNumbers" in host
+    assert '$parsed.schema -ne "dcmget-profile-runtime"' in host
+    assert "desired_running_profiles" in host
+    assert "$startupProfileNumbers = @(Get-ConfiguredProfileNumbers)" not in host
+    assert "$defaultProfilePending" not in host
     assert "$managedProfiles = @{}" in host
     assert "function Get-InstalledProfileProcesses" in host
     assert "function Update-ManagedProfiles" in host
@@ -411,8 +419,17 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Adopted running DcmGet profile $number" in host
     assert 'Stop-DcmGetProcess $script:processes[[int]$number] "deleted DcmGet profile $number"' in host
     assert "Stopped supervising deleted DcmGet profile $number" in host
+    assert "Stopped supervising disabled DcmGet profile $number" in host
+    assert "return $true" in host
+    assert "return $false" in host
+    assert "Will retry stopping disabled DcmGet profile $number" in host
+    assert "Will retry stopping deleted DcmGet profile $number" in host
+    assert host.index("if (-not (Stop-DcmGetProcess") < host.index(
+        "Stopped supervising disabled DcmGet profile $number"
+    )
     assert "[DateTime]::UtcNow.AddSeconds(4)" in host
-    assert "$managedProfileNumbers = @(Update-ManagedProfiles $defaultProfilePending)" in host
+    assert "$lastDesiredProfileNumbers = @(Get-DesiredProfileNumbers)" in host
+    assert "$managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)" in host
     assert "foreach ($number in $managedProfileNumbers)" in host
     assert "$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)" not in host
     assert "profile ${number}:" in host
@@ -420,7 +437,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "while ($true)" in host
     assert "Start-Sleep -Seconds 2" in host
     assert host.index("if (-not (Test-RunningProcess $managementProcess))") < host.index(
-        "$managedProfileNumbers = @(Update-ManagedProfiles $defaultProfilePending)"
+        "$managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)"
     ) < host.index("foreach ($number in $managedProfileNumbers)")
     assert "function Stop-DcmGetProcesses" in host
     assert 'Stop-DcmGetProcess $script:managementProcess "DcmGet management hub"' in host
@@ -437,24 +454,48 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     )
     assert "procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);" in installer
     assert "if not RunManagedProcessCleanup(ExpandConstant('{app}'), FailureMessage) then" in installer
-    assert 'Parameters: "stop"' in installer
-    assert 'Parameters: "uninstall"' in installer
+    assert "procedure RemoveDcmGetServiceForUninstall();" in installer
+    assert "RemoveDcmGetServiceForUninstall();" in installer
+    assert "DcmGetServiceBelongsToApp" in installer
+    assert "RegisteredServiceWrapperPath" in installer
+    assert "RegQueryStringValue(" in installer
+    assert "'ImagePath'" in installer
+    assert "ServiceWasInstalled and not FileExists(ServiceWrapperPath())" not in installer
+    assert "ServiceWasInstalled and not DcmGetServiceBelongsToApp()" in installer
+    assert "'delete \"{#ServiceName}\"'" in installer
+    assert "''{#ServiceWrapperName}''" in installer
     assert 'Parameters: "start"' in installer
     assert "Check: ShouldStartDcmGetService" in installer
     assert "ServiceExistedBeforeInstall" in installer
     assert "ServiceWasActiveBeforeInstall" in installer
     assert "$service.Status -ne ''Stopped''" in installer
-    assert 'Name: "{autoprograms}\\DcmGet 启动全部"' in installer
-    assert 'Name: "{autoprograms}\\DcmGet 停止全部"' in installer
+    assert 'Name: "{autoprograms}\\DcmGet 启动后台服务"' in installer
+    assert 'Name: "{autoprograms}\\DcmGet 停止后台服务"' in installer
+    assert installer.count(
+        'Type: files; Name: "{autoprograms}\\DcmGet 启动全部.lnk"'
+    ) == 2
+    assert installer.count(
+        'Type: files; Name: "{autoprograms}\\DcmGet 停止全部.lnk"'
+    ) == 2
     assert 'Filename: "{sys}\\sc.exe"' in installer
     assert 'Filename: "{autoprograms}\\DcmGet.url"' in installer
-    assert '#define ManagementUrl "http://127.0.0.1:8786/?page=operations"' in installer
+    assert '#define ManagementUrl "http://127.0.0.1:8786/"' in installer
     assert installer.count('Key: "URL"; String: "{#ManagementUrl}"') == 2
     assert 'Type: files; Name: "{autoprograms}\\DcmGet.url"' in installer
     assert 'Type: files; Name: "{autodesktop}\\DcmGet.url"' in installer
     assert "GetPrimaryWebUrl" not in installer
     assert "ReadConfiguredWebPort" not in installer
     assert "GetEnv('HOMEDRIVE') + GetEnv('HOMEPATH')" in installer
+    assert '#define ServiceStateRegistryKey "Software\\DcmGet\\WindowsService"' in installer
+    assert "procedure LoadPreservedServiceEnvironment();" in installer
+    assert "ServiceEnvironmentValue" in installer
+    assert "GetServiceAppDataRoot" in installer
+    assert "GetServiceLocalAppDataRoot" in installer
+    assert "GetServiceUserProfileRoot" in installer
+    assert installer.count("Flags: createvalueifdoesntexist uninsdeletevalue") == 3
+    assert "XmlEscape(GetServiceAppDataRoot(''))" in installer
+    assert "XmlEscape(GetServiceLocalAppDataRoot(''))" in installer
+    assert "XmlEscape(GetServiceUserProfileRoot(''))" in installer
 
     assert "Verify pinned WinSW service wrapper" in workflow
     assert "Verify Windows PowerShell service host syntax" in workflow
@@ -480,13 +521,15 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Service host adopted Profile 2 before config.json was complete" in workflow
     assert "Service host auto-started a cloned Profile before explicit start" in workflow
     assert "Start-AdoptAndRestartProfile" in workflow
-    assert 'Start-Process (Join-Path $installDir "DcmGet.exe")' in workflow
+    assert "function Set-DesiredProfiles" in workflow
+    assert 'schema = "dcmget-profile-runtime"' in workflow
+    assert "desired_running_profiles" in workflow
     assert "Service host did not restart adopted Profile 2" in workflow
     assert "Deleted Profile $profileNumber remained running" in workflow
-    assert "Service host auto-started a restored Profile before explicit start" in workflow
+    assert "Service host restarted a Profile after the operator stopped it" in workflow
     assert "Service host adopted a newly cloned Profile before explicit startup configuration" not in workflow
     assert "function Wait-DcmGetManagement" in workflow
-    assert 'http://127.0.0.1:$managementPort/?page=operations' in workflow
+    assert 'http://127.0.0.1:$managementPort/' in workflow
     assert '$_.LocalAddress -eq "0.0.0.0"' in workflow
     assert "DcmGet management hub did not become ready on 0.0.0.0:$managementPort" in workflow
     assert "Service-aware upgrade left old manager/profile process running" in workflow
@@ -498,10 +541,16 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Installed management application is not AMD64" in workflow
     assert '"/TASKS=desktopicon"' in workflow
     assert "Installed DcmGet desktop shortcut is missing" in workflow
-    assert "^URL=http://127\\.0\\.0\\.1:8786/\\?page=operations$" in workflow
+    assert "^URL=http://127\\.0\\.0\\.1:8786/$" in workflow
     assert "Uninstall removed or changed downloaded DICOM data" in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
+    assert "Stable service APPDATA was not registered" in workflow
+    assert "Missing-wrapper repair failed" in workflow
+    assert "Missing-wrapper repair unexpectedly restarted the service" in workflow
+    assert "Missing-wrapper repair changed the stable service user directories" in workflow
+    assert "missing-wrapper uninstall test" in workflow
     assert "Uninstall left kayisoft-dcmget service behind" in workflow
+    assert "Uninstall left stable service state behind" in workflow
 
     workflow_lines = workflow.splitlines(keepends=True)
     run_block_lengths: list[int] = []

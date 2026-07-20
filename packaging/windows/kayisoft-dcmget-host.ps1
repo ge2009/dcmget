@@ -19,12 +19,14 @@ if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
 }
 
 $profileRoot = Join-Path $env:APPDATA "DcmGet\instances"
+$runtimeStatePath = Join-Path $env:LOCALAPPDATA "DcmGet\management\profile-runtime.json"
 $managementProcess = $null
 $managementRetryAfter = $null
 $processes = @{}
 $retryAfter = @{}
 $managedProfiles = @{}
 $profileMissingAfter = @{}
+$lastDesiredProfileNumbers = @()
 
 function Test-CompleteProfileConfig([string]$Path) {
     try {
@@ -58,6 +60,37 @@ function Get-ConfiguredProfileNumbers {
             Sort-Object -Unique
     )
     return $numbers
+}
+
+function Get-DesiredProfileNumbers {
+    if (-not (Test-Path -LiteralPath $runtimeStatePath -PathType Leaf)) {
+        return @()
+    }
+    $item = Get-Item -LiteralPath $runtimeStatePath -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Profile runtime state is a reparse point: $runtimeStatePath"
+    }
+    if ($item.Length -gt 65536) {
+        throw "Profile runtime state is too large: $runtimeStatePath"
+    }
+    $content = Get-Content -LiteralPath $runtimeStatePath -Raw -Encoding UTF8 -ErrorAction Stop
+    $parsed = ConvertFrom-Json -InputObject $content -ErrorAction Stop
+    if (
+        $null -eq $parsed -or
+        $parsed.schema -ne "dcmget-profile-runtime" -or
+        [int]$parsed.version -ne 1
+    ) {
+        throw "Profile runtime state schema is invalid: $runtimeStatePath"
+    }
+    $numbers = @()
+    foreach ($rawNumber in @($parsed.desired_running_profiles)) {
+        $number = 0
+        if (-not [int]::TryParse([string]$rawNumber, [ref]$number) -or $number -lt 1 -or $number -gt 9999) {
+            throw "Profile runtime state contains an invalid Profile number: $rawNumber"
+        }
+        $numbers += $number
+    }
+    return @($numbers | Sort-Object -Unique)
 }
 
 function Test-RunningProcess([object]$Process) {
@@ -132,44 +165,62 @@ function Get-InstalledProfileProcesses {
 
 function Stop-DcmGetProcess([object]$Process, [string]$Description) {
     if (-not (Test-RunningProcess $Process)) {
-        return
+        return $true
     }
     try {
         & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$Process.Id) /T /F 2>$null | Out-Null
         $taskkillExitCode = $LASTEXITCODE
         [void]$Process.WaitForExit(5000)
-        if ($taskkillExitCode -ne 0 -or (Test-RunningProcess $Process)) {
-            Write-Warning "$Description process $($Process.Id) survived taskkill (exit code $taskkillExitCode)."
+        if (-not (Test-RunningProcess $Process)) {
+            return $true
         }
+        Write-Warning "$Description process $($Process.Id) survived taskkill (exit code $taskkillExitCode)."
+        return $false
     } catch {
         Write-Warning "Could not stop $Description process $($Process.Id): $($_.Exception.Message)"
+        return -not (Test-RunningProcess $Process)
     }
 }
 
 function Stop-DcmGetProcesses {
     if ($null -ne $script:managementProcess) {
-        Stop-DcmGetProcess $script:managementProcess "DcmGet management hub"
+        [void](Stop-DcmGetProcess $script:managementProcess "DcmGet management hub")
     }
     foreach ($number in @($script:processes.Keys)) {
         $process = $script:processes[$number]
         if ($null -eq $process) {
             continue
         }
-        Stop-DcmGetProcess $process "DcmGet profile $number"
+        [void](Stop-DcmGetProcess $process "DcmGet profile $number")
     }
 }
 
-function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
+function Update-ManagedProfiles([int[]]$DesiredProfileNumbers) {
     $configuredNumbers = @(Get-ConfiguredProfileNumbers)
     $configured = @{}
     foreach ($number in $configuredNumbers) {
         $configured[[int]$number] = $true
     }
-    if ($KeepDefaultProfile -and -not $configured.ContainsKey(1)) {
-        $configured[1] = $true
+    $desired = @{}
+    foreach ($number in @($DesiredProfileNumbers)) {
+        $desired[[int]$number] = $true
     }
 
     foreach ($number in @($script:managedProfiles.Keys)) {
+        if (-not $desired.ContainsKey([int]$number)) {
+            if ($script:processes.ContainsKey([int]$number)) {
+                if (-not (Stop-DcmGetProcess $script:processes[[int]$number] "stopped DcmGet profile $number")) {
+                    Write-Warning "Will retry stopping disabled DcmGet profile $number."
+                    continue
+                }
+            }
+            [void]$script:managedProfiles.Remove([int]$number)
+            [void]$script:processes.Remove([int]$number)
+            [void]$script:retryAfter.Remove([int]$number)
+            [void]$script:profileMissingAfter.Remove([int]$number)
+            Write-Output "Stopped supervising disabled DcmGet profile $number."
+            continue
+        }
         if ($configured.ContainsKey([int]$number)) {
             [void]$script:profileMissingAfter.Remove([int]$number)
             continue
@@ -183,7 +234,10 @@ function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
             continue
         }
         if ($script:processes.ContainsKey([int]$number)) {
-            Stop-DcmGetProcess $script:processes[[int]$number] "deleted DcmGet profile $number"
+            if (-not (Stop-DcmGetProcess $script:processes[[int]$number] "deleted DcmGet profile $number")) {
+                Write-Warning "Will retry stopping deleted DcmGet profile $number."
+                continue
+            }
         }
         [void]$script:managedProfiles.Remove([int]$number)
         [void]$script:processes.Remove([int]$number)
@@ -194,7 +248,7 @@ function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
 
     foreach ($record in @(Get-InstalledProfileProcesses)) {
         $number = [int]$record.Number
-        if (-not $configured.ContainsKey($number)) {
+        if (-not $configured.ContainsKey($number) -or -not $desired.ContainsKey($number)) {
             continue
         }
         $tracked = $script:processes[$number]
@@ -208,7 +262,7 @@ function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
     }
 
     return @(
-        $script:managedProfiles.Keys |
+        $DesiredProfileNumbers |
             Where-Object { $configured.ContainsKey([int]$_) } |
             ForEach-Object { [int]$_ } |
             Sort-Object -Unique
@@ -216,15 +270,13 @@ function Update-ManagedProfiles([bool]$KeepDefaultProfile) {
 }
 
 Write-Output "DcmGet service host started; APPDATA=$env:APPDATA; LOCALAPPDATA=$env:LOCALAPPDATA"
-$startupProfileNumbers = @(Get-ConfiguredProfileNumbers)
-$defaultProfilePending = $startupProfileNumbers.Count -eq 0
-if ($defaultProfilePending) {
-    $startupProfileNumbers = @(1)
+try {
+    $lastDesiredProfileNumbers = @(Get-DesiredProfileNumbers)
+} catch {
+    Write-Warning "Could not read Profile runtime state at startup: $($_.Exception.Message)"
+    $lastDesiredProfileNumbers = @()
 }
-foreach ($number in $startupProfileNumbers) {
-    $managedProfiles[[int]$number] = $true
-}
-Write-Output "Managing startup profile snapshot: $($startupProfileNumbers -join ', ')"
+Write-Output "Desired startup Profiles: $($lastDesiredProfileNumbers -join ', ')"
 try {
     while ($true) {
         if (-not (Test-RunningProcess $managementProcess)) {
@@ -237,10 +289,15 @@ try {
                 }
             }
         }
-        if ($defaultProfilePending -and (Get-ConfiguredProfileNumbers) -contains 1) {
-            $defaultProfilePending = $false
+        try {
+            $lastDesiredProfileNumbers = @(Get-DesiredProfileNumbers)
+        } catch {
+            Write-Warning "Could not refresh Profile runtime state; keeping the last valid selection: $($_.Exception.Message)"
         }
-        $managedProfileNumbers = @(Update-ManagedProfiles $defaultProfilePending)
+        $managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)
+        foreach ($number in $managedProfileNumbers) {
+            $managedProfiles[[int]$number] = $true
+        }
         foreach ($number in $managedProfileNumbers) {
             if (Test-RunningProcess $processes[$number]) {
                 continue

@@ -44,6 +44,7 @@ LOGGER = logging.getLogger(__name__)
 SESSION_COOKIE = "dcmget_session"
 LEGACY_SESSION_COOKIE_PORT = 8787
 MAX_JSON_BODY_BYTES = 4 * 1024 * 1024
+MAX_PROFILE_PROXY_BODY_BYTES = 16 * 1024 * 1024
 MAX_ACCESSIONS = 100_000
 MAX_ACCESSION_LENGTH = 256
 SSE_POLL_SECONDS = 0.5
@@ -59,11 +60,13 @@ _IPV6_ULA_NETWORK = ipaddress.ip_network("fc00::/7")
 _MANAGEMENT_OPERATIONS = frozenset(
     {
         "profile-list",
+        "profile-create",
         "profile-clone",
         "profile-update",
         "profile-rename",
         "profile-delete",
         "profile-launch",
+        "profile-stop",
         "profile-launch-all",
         "profile-shortcut",
         "windows-service-status",
@@ -376,6 +379,7 @@ def create_web_app(
     tools_provider: Callable[[AppConfig], ToolPaths] | None = None,
     preflight_provider: Callable[[AppConfig], object] | None = None,
     operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
+    profile_api_proxy: Callable[..., object] | None = None,
     management_mode: bool = False,
 ) -> FastAPI:
     """Create the offline, LAN-capable DcmGet HTTP application.
@@ -463,6 +467,7 @@ def create_web_app(
     app.state.directory_browser = browser
     app.state.profile_metadata = metadata
     app.state.session_cookie_name = session_cookie
+    app.state.profile_api_proxy = profile_api_proxy
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next):
@@ -1213,6 +1218,137 @@ def create_web_app(
     async def diagnostics(_session: WebSession = Depends(require_session)) -> Any:
         return await _invoke(service, "diagnostics")
 
+    def require_management_peer(request: Request) -> None:
+        if not management_mode or not is_management_peer_address(_client_ip(request)):
+            raise HTTPException(
+                status_code=403,
+                detail="管理操作只允许来自服务器本机或可信私有网络",
+            )
+
+    def management_handler(name: str) -> Callable[[dict[str, Any]], object]:
+        handler = handlers.get(name)
+        if handler is None:
+            raise HTTPException(status_code=501, detail=f"管理操作未配置：{name}")
+        return handler
+
+    @app.get("/api/management/profiles")
+    async def management_profiles(
+        request: Request,
+        _session: WebSession = Depends(require_session),
+    ) -> Any:
+        require_management_peer(request)
+        return await _call_handler(management_handler("profile-list"), {})
+
+    @app.post("/api/management/profiles")
+    async def management_create_profile(
+        request: Request,
+        _session: WebSession = Depends(require_csrf),
+    ) -> Any:
+        require_management_peer(request)
+        payload = await _json_body(request)
+        return await _call_handler(management_handler("profile-create"), payload)
+
+    @app.post("/api/management/profiles/{profile_number}/start")
+    async def management_start_profile(
+        profile_number: int,
+        request: Request,
+        _session: WebSession = Depends(require_csrf),
+    ) -> Any:
+        require_management_peer(request)
+        await _json_body(request)
+        return await _call_handler(
+            management_handler("profile-launch"),
+            {"profile_number": profile_number},
+        )
+
+    @app.post("/api/management/profiles/{profile_number}/stop")
+    async def management_stop_profile(
+        profile_number: int,
+        request: Request,
+        _session: WebSession = Depends(require_csrf),
+    ) -> Any:
+        require_management_peer(request)
+        await _json_body(request)
+        return await _call_handler(
+            management_handler("profile-stop"),
+            {"profile_number": profile_number},
+        )
+
+    @app.api_route(
+        "/api/management/profiles/{profile_number}/{api_path:path}",
+        methods=["GET", "POST", "PUT"],
+    )
+    async def management_profile_api(
+        profile_number: int,
+        api_path: str,
+        request: Request,
+        session: WebSession = Depends(require_session),
+    ) -> Response:
+        """Same-origin JSON bridge from the manager to one loopback Profile.
+
+        The bridge callable owns the upstream route allowlist.  Browser cookies,
+        Profile ports and upstream CSRF tokens never cross the management
+        boundary; mutations still require the manager session's CSRF token.
+        """
+
+        if not management_mode or profile_api_proxy is None:
+            raise HTTPException(status_code=404, detail="Profile 代理未启用")
+        require_management_peer(request)
+        if not 1 <= profile_number <= 9999:
+            raise HTTPException(status_code=400, detail="Profile 编号无效")
+        method = request.method.upper()
+        if method in _MUTATING_HTTP_METHODS:
+            candidate = request.headers.get("x-csrf-token", "")
+            if not hmac_compare(candidate, session.csrf_token):
+                raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_PROFILE_PROXY_BODY_BYTES:
+                    raise HTTPException(status_code=413, detail="Profile 请求体过大")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Content-Length 无效") from exc
+        body = await request.body()
+        if len(body) > MAX_PROFILE_PROXY_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Profile 请求体过大")
+        try:
+            result = profile_api_proxy(
+                profile_number=profile_number,
+                method=method,
+                api_path=api_path,
+                query=request.url.query,
+                body=body,
+                content_type=request.headers.get("content-type", ""),
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=str(exc) or "Profile 服务暂不可用",
+            ) from exc
+        if not isinstance(result, Mapping):
+            raise HTTPException(status_code=502, detail="Profile 代理响应无效")
+        try:
+            status_code = int(result.get("status_code", 200))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail="Profile 代理状态码无效") from exc
+        payload = result.get("payload", {})
+        if api_path.strip("/") == "bootstrap" and isinstance(payload, Mapping):
+            manager_url = str(request.base_url)
+            upstream_web = payload.get("web")
+            web = dict(upstream_web) if isinstance(upstream_web, Mapping) else {}
+            web.update({"url": manager_url, "lan_url": manager_url})
+            payload = {
+                **payload,
+                "csrf_token": session.csrf_token,
+                "web": web,
+            }
+        return JSONResponse(
+            status_code=status_code,
+            content=jsonable_encoder(payload),
+        )
+
     @app.post("/api/ops/shutdown")
     async def shutdown(
         request: Request,
@@ -1344,6 +1480,7 @@ class DcmGetWebServer:
         tools_provider: Callable[[AppConfig], ToolPaths] | None = None,
         preflight_provider: Callable[[AppConfig], object] | None = None,
         operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
+        profile_api_proxy: Callable[..., object] | None = None,
         management_mode: bool = False,
         log_level: str = "info",
     ):
@@ -1385,6 +1522,7 @@ class DcmGetWebServer:
             tools_provider=tools_provider,
             preflight_provider=preflight_provider,
             operation_handlers=operation_handlers,
+            profile_api_proxy=profile_api_proxy,
             management_mode=self.management_mode,
         )
 

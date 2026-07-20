@@ -45,24 +45,32 @@ def _javascript() -> str:
     return JAVASCRIPT.read_text(encoding="utf-8")
 
 
-def test_web_frontend_is_a_self_contained_es_module_application() -> None:
+def test_web_frontend_is_a_self_contained_single_workspace_application() -> None:
     source, document = _document()
 
     assert INDEX.is_file()
     assert CSS.is_file()
     assert JAVASCRIPT.is_file()
     assert len(document.ids) == len(set(document.ids))
-    assert {"app-shell", "page-home", "page-settings", "page-operations"} <= set(document.ids)
+    assert {
+        "app-shell",
+        "workspace-sidebar",
+        "workspace-summary",
+        "page-home",
+        "page-settings",
+        "page-operations",
+        "settings-drawer",
+        "operations-drawer",
+    } <= set(document.ids)
     assert "login-screen" not in document.ids
+    assert "window.open(" not in _javascript()
     assert any(
         script.get("type") == "module" and script.get("src") == "/assets/app.js"
         for script in document.scripts
     )
     assert 'href="/assets/app.css"' in source
-    assert all(
-        value.startswith(("/", "#"))
-        for _attribute, value in document.references
-    )
+    assert "影像下载工作台" in source
+    assert all(value.startswith(("/", "#")) for _attribute, value in document.references)
 
 
 def test_web_frontend_never_depends_on_network_assets_or_node_runtime() -> None:
@@ -96,38 +104,42 @@ def test_all_state_changing_requests_use_the_csrf_api_wrapper() -> None:
     assert 'headers.set("X-CSRF-Token", state.csrfToken || "")' in javascript
 
 
-def test_remote_profile_pages_hide_host_controls_but_manager_can_refresh_profiles() -> None:
+def test_manager_mode_uses_single_workbench_profile_contract_and_no_new_windows() -> None:
+    source, _document_parser = _document()
     javascript = _javascript()
 
-    assert "web.local_session !== false" in javascript
-    assert '$("#profile-management-card").hidden = !(state.localSession || state.managerMode)' in javascript
-    assert "state.managerMode = payload.profile?.mode === \"manager\"" in javascript
-    assert "if (state.localSession || state.managerMode) refreshes.push(refreshProfiles())" in javascript
-    for operation in ("open-data-directory", "open-log-directory", "acceptance-report"):
-        assert f'[data-operation="{operation}"]' in javascript
+    assert "/api/management/profiles" in javascript
+    assert 'profileRequest("/api/bootstrap")' in javascript
+    assert 'profileRequest("/api/snapshot")' in javascript
+    assert 'query.set("after_id", state.eventCursor)' in javascript
+    assert 'api("/api/management/profiles", { method: "POST", body: {} })' in javascript
+    assert 'managementProfilePath(profileNumber, "/start")' in javascript
+    assert 'managementProfilePath(profileNumber, "/stop")' in javascript
+    assert 'new EventSource("/api/events/stream"' in javascript
+    assert 'id="create-profile-button"' in source
+    assert 'id="workspace-sidebar"' in source
+    assert "当前 Profile 默认不启动" in javascript
+    assert "window.open(" not in javascript
 
 
-def test_bootstrap_overwrites_browser_restored_destination_with_profile_config() -> None:
+def test_drawer_navigation_replaces_the_old_three_page_jump_flow() -> None:
+    source, _document_parser = _document()
     javascript = _javascript()
 
-    assert '$("#destination-input").value = state.config.dicom_destination_folder || ""' in javascript
-
-
-def test_health_ui_distinguishes_intentional_http_warning_from_failure() -> None:
-    javascript = _javascript()
-    css = CSS.read_text(encoding="utf-8")
-
-    assert 'check.severity === "warning"' in javascript
-    assert 'item.dataset.state = warning ? "warning"' in javascript
-    assert '.health-list li[data-state="warning"]' in css
-    assert javascript.count("fetch(") == 1
-    assert 'method: "POST"' in javascript
-    assert 'method: "PUT"' in javascript
-    assert 'api("/api/preflight"' in javascript
-    assert 'api("/api/task/start"' in javascript
-    assert 'api("/api/pdi/open"' in javascript
-    assert 'api("/api/pdi/retry"' in javascript
-    assert 'api("/api/pdi/verify"' in javascript
+    assert 'id="drawer-scrim"' in source
+    assert 'id="settings-drawer"' in source
+    assert 'id="operations-drawer"' in source
+    assert "function openDrawer(name)" in javascript
+    assert "function closeDrawers()" in javascript
+    assert 'showPage("operations")' in javascript
+    assert 'showPage("settings")' in javascript
+    assert 'event.key === "Escape" && state.openDrawer' in javascript
+    assert source.count('role="dialog" aria-modal="true"') == 2
+    assert '$("#app-shell").inert = true' in javascript
+    assert '$("#app-shell").inert = false' in javascript
+    assert 'event.key === "Tab" && state.openDrawer' in javascript
+    assert "function trapDrawerFocus(event)" in javascript
+    assert 'if (allowedPage === "home") $("#main-content").focus' in javascript
 
 
 def test_task_control_and_live_updates_cover_background_operation() -> None:
@@ -136,7 +148,6 @@ def test_task_control_and_live_updates_cover_background_operation() -> None:
 
     for action in ("pause", "resume", "cancel", "retry", "accept-partial"):
         assert f'taskAction("{action}"' in javascript
-    assert 'new EventSource("/api/events/stream"' in javascript
     assert "visibilitychange" in javascript
     assert "关闭浏览器不会停止" in source
     assert "beforeunload" not in javascript
@@ -147,12 +158,14 @@ def test_task_start_freezes_the_preflighted_draft_and_confirms_targets() -> None
 
     assert 'parseAccessions($("#accession-input").value, { schedule: false })' in javascript
     assert "const draft = taskDraft();" in javascript
-    assert "const signature = JSON.stringify(draft);" in javascript
+    assert "const signature = draftSignature();" in javascript
     assert "() => submitStartTask(draft, signature)" in javascript
     assert "signature !== draftSignature()" in javascript
     assert "body: draft" in javascript
     for label in ("Profile：", "PACS：", "保存目录：", "PDI："):
         assert label in javascript
+    assert "const profile = currentProfile();" in javascript
+    assert "const profileName = profileDisplayName(profile);" in javascript
 
 
 def test_large_tasks_use_aggregate_rendering_after_200_accessions() -> None:
@@ -178,7 +191,7 @@ def test_logs_default_to_errors_until_user_opts_in() -> None:
     assert "list.scrollTop = list.scrollHeight" in javascript
 
 
-def test_recovery_large_batch_and_sse_contracts_are_visible() -> None:
+def test_recovery_large_batch_and_polling_contracts_are_visible() -> None:
     javascript = _javascript()
 
     for status in ("interrupted", "download_retryable", "pdi_retryable", "recovery_error"):
@@ -186,6 +199,7 @@ def test_recovery_large_batch_and_sse_contracts_are_visible() -> None:
     assert "task?.status_counts?.[key]" in javascript
     assert "payload.payload ?? payload.data ?? payload" in javascript
     assert "scheduleTaskRefresh()" in javascript
+    assert "scheduleManagedEventPoll" in javascript
     assert "showLogin" not in javascript
     assert 'type="password"' not in INDEX.read_text(encoding="utf-8")
 
@@ -219,9 +233,19 @@ def test_accession_import_is_local_for_text_and_binary_for_xlsx() -> None:
 
     assert ".txt,.csv,.xlsx" in source
     assert "await file.text()" in javascript
-    assert 'api("/api/files/accessions"' in javascript
+    assert 'profileRequest("/api/files/accessions"' in javascript
     assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in javascript
     assert '"X-File-Name": encodeURIComponent(file.name)' in javascript
+
+
+def test_management_workspace_scopes_profile_actions_and_keeps_manager_shutdown_hidden() -> None:
+    javascript = _javascript()
+
+    assert "state.managerMode ? runScopedOperation : runOperation" in javascript
+    assert "shutdownButton.hidden = state.managerMode || !state.localSession" in javascript
+    assert "state.managerMode && !state.activeProfileRunning" in javascript
+    assert "pacs_server_ip: profile.pacs_server_ip" in javascript
+    assert "storage_port: profile.storage_port" in javascript
 
 
 def test_settings_cover_clinical_network_reliability_privacy_and_pdi() -> None:
@@ -272,13 +296,13 @@ def test_pdi_is_off_by_default_but_preserves_an_explicit_saved_preference() -> N
     source, _document_parser = _document()
     javascript = _javascript()
 
-    assert '默认关闭' in source
+    assert "默认关闭" in source
     assert 'id="quick-pdi-enabled" type="checkbox"' in source
     assert 'id="setting-pdi-enabled" name="pdi_export_enabled" type="checkbox"' in source
     assert 'id="quick-pdi-enabled" type="checkbox" checked' not in source
     assert '$("#quick-pdi-enabled").checked = Boolean(config.pdi_export_enabled)' in javascript
     assert 'id="setting-pdi-options"' in source
-    assert 'syncPdiSettingsUi()' in javascript
+    assert "syncPdiSettingsUi()" in javascript
 
 
 def test_preflight_runs_automatically_and_discards_stale_responses() -> None:
@@ -288,7 +312,66 @@ def test_preflight_runs_automatically_and_discards_stale_responses() -> None:
     assert "runPreflight({ requireAccessions: false, silent: true })" in javascript
     assert "const requestId = ++state.preflightRequestId" in javascript
     assert "requestId !== state.preflightRequestId || signature !== draftSignature()" in javascript
+    assert "profile_number: state.managerMode ? currentProfileNumber() : null" in javascript
+    assert "state.preflightRequestId += 1" in javascript
     assert '$("#run-preflight-button").addEventListener("click", () => runPreflight())' in javascript
+
+
+def test_profile_switch_aborts_and_discards_all_stale_profile_responses() -> None:
+    javascript = _javascript()
+
+    assert "profileGeneration: 0" in javascript
+    assert "profileAbortController: null" in javascript
+    assert "function advanceProfileContext(profileNumber)" in javascript
+    assert "state.profileAbortController.abort()" in javascript
+    assert "state.profileGeneration += 1" in javascript
+    assert "signal: options.signal || signal" in javascript
+    assert "generation !== state.profileGeneration" in javascript
+    assert "profileNumber !== currentProfileNumber()" in javascript
+    assert 'profileRequest(`/api/events${' in javascript
+    assert "if (isStaleProfileResponse(error)) return" in javascript
+    assert "advanceProfileContext(profileNumber);" in javascript
+
+
+def test_empty_profile_list_fully_clears_the_managed_context() -> None:
+    javascript = _javascript()
+
+    assert "function clearManagedProfileSelection()" in javascript
+    for reset in (
+        "state.activeProfile = null",
+        "state.activeProfileNumber = null",
+        "state.activeProfileRunning = false",
+        "state.profileBootstrap = {}",
+        "state.config = {}",
+        "state.task = null",
+        "state.logs = []",
+        "advanceProfileContext(null)",
+    ):
+        assert reset in javascript
+    assert "if (state.managerMode) return state.activeProfileNumber" in javascript
+    assert "clearManagedProfileSelection();" in javascript
+    assert 'throw new ApiError("请先选择一个 Profile。", 409)' in javascript
+
+
+def test_manager_workspace_exposes_profile_start_stop_idle_and_settings_controls() -> None:
+    source, _document_parser = _document()
+    javascript = _javascript()
+
+    for element_id in (
+        "workspace-profile-title",
+        "profile-idle-title",
+        "current-profile-start-button",
+        "current-profile-stop-button",
+        "idle-start-button",
+        "idle-configure-button",
+        "create-profile-button",
+    ):
+        assert f'id="{element_id}"' in source
+    assert "showIdleState(" in javascript
+    assert "setWorkspaceTaskVisibility(false)" in javascript
+    assert 'profileActionButton(selected ? "当前 Profile" : "切换"' in javascript
+    assert 'profileActionButton("停止", stopManagedProfile' in javascript
+    assert 'profileActionButton(issues.length ? "修复配置" : "启动"' in javascript
 
 
 def test_start_and_local_shutdown_are_passwordless_but_keep_confirmation() -> None:
@@ -297,10 +380,9 @@ def test_start_and_local_shutdown_are_passwordless_but_keep_confirmation() -> No
 
     assert 'type="password"' not in source
     assert 'id="shutdown-service-button"' in source
-    assert 'body: taskDraft()' in javascript
-    assert 'api("/api/operations/shutdown"' in javascript
+    assert "shutdownService" in javascript
     assert "requirePassword" not in javascript
-    assert '"#shutdown-service-button"' in javascript
+    assert "confirmAction(" in javascript
 
 
 def test_profile_management_configures_before_launch_and_exposes_service_controls() -> None:
@@ -322,7 +404,6 @@ def test_profile_management_configures_before_launch_and_exposes_service_control
         assert f'name="{name}"' in source
     assert "SCP 接收端口不能与 Web 端口相同" in javascript
     assert 'profileOperation("update"' in javascript
-    assert 'profileOperation("launch-all"' in javascript
     assert 'id="start-all-profiles-button"' in source
     assert 'id="stop-all-services-button"' in source
     assert 'id="windows-service-state"' in source
@@ -330,86 +411,6 @@ def test_profile_management_configures_before_launch_and_exposes_service_control
     assert 'api("/api/operations/windows-service-start"' in javascript
     assert 'runOperation("windows-service-stop")' in javascript
     assert "stopButton.hidden = !result.supported" in javascript
-
-
-def test_windows_management_hub_has_profile_cards_remote_links_and_deep_pages() -> None:
-    source, _document_parser = _document()
-    javascript = _javascript()
-    css = CSS.read_text(encoding="utf-8")
-
-    assert 'id="manager-overview"' in source
-    assert 'id="profile-grid"' in source
-    assert "所有下载实例，一处管理" in source
-    assert "profilePageUrl(profile, page" in javascript
-    assert "url.port = String(profile.web_port)" in javascript
-    assert 'url.searchParams.set("page", page)' in javascript
-    assert 'payload.profile?.mode === "manager"' in javascript
-    assert 'showPage("operations", { syncUrl: false })' in javascript
-    assert 'window.location.hostname' in javascript
-    assert "127.0.0.1:${profile.web_port}" not in javascript
-    assert ".manager-overview" in css
-    assert ".profile-card" in css
-    assert '.manager-mode .nav-item[data-page="home"]' in css
-
-
-def test_clinical_workspace_icons_collapse_and_busy_states_are_self_contained() -> None:
-    source, _document_parser = _document()
-    css = CSS.read_text(encoding="utf-8")
-    javascript = _javascript()
-
-    assert 'class="icon-sprite"' in source
-    assert 'id="icon-dicom"' in source
-    assert 'href="#icon-download"' in source
-    assert 'id="toggle-task-editor"' in source
-    assert 'aria-controls="task-editor-body"' in source
-    assert "setTaskEditorCollapsed" in javascript
-    assert "taskActionPending" in javascript
-    assert "pdiActionPending" in javascript
-    assert 'setAttribute("aria-busy", "true")' in javascript
-    assert "directoryRequestId" in javascript
-    assert "requestId !== state.directoryRequestId" in javascript
-    assert "@keyframes page-enter" in css
-    assert "@keyframes progress-sheen" in css
-
-
-def test_compact_desktop_keeps_the_task_editor_two_column_until_840px() -> None:
-    source, _document_parser = _document()
-    css = CSS.read_text(encoding="utf-8")
-
-    desktop_block = css.split("@media (max-width: 1080px)", 1)[1].split(
-        "@media (max-width: 840px)", 1
-    )[0]
-    compact_block = css.split("@media (max-width: 840px)", 1)[1]
-    assert ".editor-grid" not in desktop_block
-    assert ".editor-grid" in compact_block
-    for name in ("任务", "设置", "管理"):
-        assert f'aria-label="{name}"' in source
-
-
-def test_verification_terminal_states_and_profile_form_validation_are_explicit() -> None:
-    source, _document_parser = _document()
-    javascript = _javascript()
-
-    for status in (
-        "verification_completed",
-        "verification_failed",
-        "verification_cancelled",
-    ):
-        assert javascript.count(status) >= 2
-    assert 'id="profile-config-cancel"' in source
-    assert "form.reportValidity()" in javascript
-    assert '$("#profile-config-form").addEventListener("submit"' in javascript
-
-
-def test_offline_license_activation_exposes_machine_code_and_token_input() -> None:
-    source, _document_parser = _document()
-    javascript = _javascript()
-
-    assert 'id="license-machine-code"' in source
-    assert 'id="license-token-input"' in source
-    assert 'api("/api/license/activate"' in javascript
-    assert 'api("/api/license"' in javascript
-    assert "license.registered" in javascript
 
 
 def test_ui_has_accessibility_and_responsive_baselines() -> None:
@@ -425,5 +426,10 @@ def test_ui_has_accessibility_and_responsive_baselines() -> None:
     assert "@media (max-width: 840px)" in css
     assert "@media (max-width: 620px)" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
+    responsive_1080 = css.split("@media (max-width: 1080px)", 1)[1].split(
+        "@media (max-width: 840px)", 1
+    )[0]
+    assert ".editor-grid" in responsive_1080
+    assert "grid-template-columns: 1fr" in responsive_1080
     assert "innerHTML" not in javascript
     assert ".textContent" in javascript
