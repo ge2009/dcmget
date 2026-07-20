@@ -108,13 +108,24 @@ def _request(
     *,
     method: str = "GET",
 ):
-    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
-    connection.request(method, path, headers=headers or {})
-    response = connection.getresponse()
-    body = response.read()
-    result = response.status, dict(response.getheaders()), body
-    connection.close()
-    return result
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", server.server_address[1], timeout=3
+    )
+    try:
+        connection.request(method, path, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        return response.status, dict(response.getheaders()), body
+    finally:
+        connection.close()
+
+
+def _expire_idle_server(server: PdiHttpServer) -> None:
+    with server._idle_condition:
+        server._last_activity = (
+            time.monotonic() - server.idle_timeout_seconds - 1
+        )
+        server._idle_condition.notify_all()
 
 
 def test_main_rejects_unsupported_runtime_before_starting_server(
@@ -533,21 +544,30 @@ def test_server_exits_when_idle_and_requests_renew_timeout(tmp_path: Path) -> No
         "127.0.0.1",
         0,
         quiet=True,
-        idle_timeout_seconds=0.4,
+        idle_timeout_seconds=60,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        time.sleep(0.25)
         status, _headers, _body = _request(
             server,
             f"/ready/{server.session_token}",
             method="HEAD",
         )
         assert status == 200
-        time.sleep(0.25)
+        with server._idle_condition:
+            first_activity = server._last_activity
+        status, _headers, _body = _request(
+            server,
+            f"/ready/{server.session_token}",
+            method="HEAD",
+        )
+        assert status == 200
+        with server._idle_condition:
+            assert server._last_activity > first_activity
         assert thread.is_alive(), "已认证的就绪探测未续期空闲超时"
-        thread.join(timeout=1.5)
+        _expire_idle_server(server)
+        thread.join(timeout=3)
         assert not thread.is_alive()
         assert server.idle_expired
     finally:
@@ -567,17 +587,26 @@ def test_unauthorized_requests_do_not_renew_idle_timeout(tmp_path: Path) -> None
         "127.0.0.1",
         0,
         quiet=True,
-        idle_timeout_seconds=0.4,
+        idle_timeout_seconds=60,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        time.sleep(0.25)
+        status, _headers, _body = _request(
+            server,
+            f"/ready/{server.session_token}",
+            method="HEAD",
+        )
+        assert status == 200
+        with server._idle_condition:
+            activity_before_unauthorized_request = server._last_activity
         status, _headers, _body = _request(server, "/api/studies")
         assert status == 403
-        time.sleep(0.25)
+        with server._idle_condition:
+            assert server._last_activity == activity_before_unauthorized_request
+        _expire_idle_server(server)
+        thread.join(timeout=3)
         assert server.idle_expired, "未授权请求不应续期空闲超时"
-        thread.join(timeout=1)
         assert not thread.is_alive()
     finally:
         if thread.is_alive():
