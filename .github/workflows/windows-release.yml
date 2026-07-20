@@ -446,6 +446,8 @@ jobs:
           $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.6.1-Setup-x64.exe").Path
           $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
+          $upgradeDicomDir = Join-Path $env:RUNNER_TEMP "DcmGetUpgradeDicom"
+          $downloadSentinelPath = Join-Path $upgradeDicomDir "keep-download.dcm"
           $configDir = Join-Path $env:APPDATA "DcmGet"
           $configPath = Join-Path $configDir "config.json"
           $licensePath = Join-Path $configDir "license.lic"
@@ -504,6 +506,7 @@ jobs:
           }
 
           Remove-Item $configDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $upgradeDicomDir -Recurse -Force -ErrorAction SilentlyContinue
 
           $install = Start-Process $baseline -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Baseline installer failed with exit code $($install.ExitCode)" }
@@ -512,8 +515,17 @@ jobs:
           if ($baselineRecords[0].DisplayVersion -ne "2.6.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.6.1" }
           if ($baselineRecords[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Baseline installation directory is incorrect" }
           New-Item -ItemType Directory -Force $configDir | Out-Null
+          New-Item -ItemType Directory -Force $upgradeDicomDir | Out-Null
           $upgradeWebPort = Get-FreeTcpPort
-          [IO.File]::WriteAllText($configPath, "{`"config_version`":2,`"pacs_server_ip`":`"upgrade-preserve.invalid`",`"storage_port`":16666,`"web_port`":$upgradeWebPort}", [Text.UTF8Encoding]::new($false))
+          $upgradeConfig = [ordered]@{
+            config_version = 2
+            pacs_server_ip = "upgrade-preserve.invalid"
+            storage_port = 16666
+            web_port = $upgradeWebPort
+            dicom_destination_folder = $upgradeDicomDir
+          }
+          [IO.File]::WriteAllText($configPath, ($upgradeConfig | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText($downloadSentinelPath, "download-result-sentinel", [Text.UTF8Encoding]::new($false))
           Set-Content $licensePath "upgrade-license-sentinel"
           python -c "from dcmget.licensing import consume_trial; consume_trial()"
           if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
@@ -869,6 +881,8 @@ jobs:
         shell: pwsh
         run: |
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
+          $upgradeDicomDir = Join-Path $env:RUNNER_TEMP "DcmGetUpgradeDicom"
+          $downloadSentinelPath = Join-Path $upgradeDicomDir "keep-download.dcm"
           $configDir = Join-Path $env:APPDATA "DcmGet"
           $configPath = Join-Path $configDir "config.json"
           $licensePath = Join-Path $configDir "license.lic"
@@ -887,6 +901,7 @@ jobs:
           $licenseHash = (Get-FileHash $licensePath -Algorithm SHA256).Hash
           $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
           $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
+          $downloadSentinelHash = (Get-FileHash $downloadSentinelPath -Algorithm SHA256).Hash
 
           function Wait-DcmGetServiceStatus([string]$expected, [int]$timeoutSeconds = 30) {
             $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
@@ -1076,12 +1091,14 @@ jobs:
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Uninstall removed or changed the license" }
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Uninstall removed or changed the trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Uninstall removed or changed the machine trial anchor" }
+          if ((Get-FileHash $downloadSentinelPath -Algorithm SHA256).Hash -ne $downloadSentinelHash) { throw "Uninstall removed or changed downloaded DICOM data" }
           if (-not ($diagnosticLogs | Where-Object { Test-Path $_.FullName })) { throw "Uninstall removed the diagnostic log" }
           if (Get-NetFirewallRule -DisplayName "DcmGet Receiver TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the receiver firewall rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet Web TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the Web firewall rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy storescp rule behind" }
           if (Get-NetFirewallRule -DisplayName "DcmGet storescp TCP 6666" -ErrorAction SilentlyContinue) { throw "Uninstall left the legacy firewall rule behind" }
           Remove-Item $configDir -Recurse -Force
+          Remove-Item $upgradeDicomDir -Recurse -Force
 
       - name: Enforce Windows x64 gate, verify signatures, and finalize manifest
         shell: pwsh

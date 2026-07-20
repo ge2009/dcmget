@@ -447,6 +447,8 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert '$opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)' in workflow
     assert '$attempt -lt 120 -and (Test-Path $installDir)' in workflow
     assert "--- Remaining installation directory contents ---" in workflow
+    assert 'dicom_destination_folder = $upgradeDicomDir' in workflow
+    assert "Uninstall removed or changed downloaded DICOM data" in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
     assert "Uninstall left kayisoft-dcmget service behind" in workflow
 
@@ -496,7 +498,7 @@ def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
     assert 'Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb' in workflow
     assert '$rules.Count -ne 1' in workflow
     assert '$portFilters[0].LocalPort.ToString() -ne "Any"' in workflow
-    assert '`"storage_port`":16666' in workflow
+    assert "storage_port = 16666" in workflow
     assert "Upgrade left the legacy storescp program rule behind" in workflow
     assert "Upgrade left the legacy TCP 6666 firewall rule behind" in workflow
     assert '$applicationFilters.Count -ne 1' in workflow
