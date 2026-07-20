@@ -438,7 +438,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Windows service lifecycle, upgrade-state and uninstall test" in workflow
     assert "Windows service controls, process-tree and uninstall test" in workflow
     assert "Could not stop fixture process" in workflow
-    assert "[System.Management.ManagementDateTimeConverter]::ToDateTime($treeProcess.CreationDate)" in workflow
+    assert "CreationTicks = ([DateTime]$treeProcess.CreationDate)" in workflow
     assert "$serviceTreeIdentities" in workflow
     assert "Service tree process survived stop" in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
