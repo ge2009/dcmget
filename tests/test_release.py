@@ -424,9 +424,27 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Verify pinned WinSW service wrapper" in workflow
     assert "WinSW checksum mismatch" in workflow
     assert "kayisoft-dcmget" in workflow
+    assert "Windows service lifecycle, upgrade-state and uninstall test" in workflow
+    assert "Windows service controls, process-tree and uninstall test" in workflow
     assert "Service tree process survived stop" in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
     assert "Uninstall left kayisoft-dcmget service behind" in workflow
+
+    workflow_lines = workflow.splitlines(keepends=True)
+    run_block_lengths: list[int] = []
+    for index, line in enumerate(workflow_lines):
+        if line.strip() != "run: |":
+            continue
+        indentation = len(line) - len(line.lstrip())
+        body: list[str] = []
+        for candidate in workflow_lines[index + 1 :]:
+            candidate_indentation = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and candidate_indentation <= indentation:
+                break
+            body.append(candidate)
+        run_block_lengths.append(len("".join(body)))
+    assert run_block_lengths
+    assert max(run_block_lengths) < 21_000
 
 
 def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():

@@ -633,6 +633,72 @@ jobs:
           Assert-DcmGetFirewallRule "DcmGet Receiver TCP" $expectedReceiver
           Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb
 
+      - name: Windows service lifecycle, upgrade-state and uninstall test
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
+          $configDir = Join-Path $env:APPDATA "DcmGet"
+          $configPath = Join-Path $configDir "config.json"
+          $licensePath = Join-Path $configDir "license.lic"
+          $trialPath = Join-Path $configDir "trial.json"
+          $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
+          $serviceName = "kayisoft-dcmget"
+          $upgradeWebPort = [int]((Get-Content $configPath -Raw | ConvertFrom-Json).web_port)
+          $configHash = (Get-FileHash $configPath -Algorithm SHA256).Hash
+          $licenseHash = (Get-FileHash $licensePath -Algorithm SHA256).Hash
+          $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
+          $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
+
+          function Wait-DcmGetServiceStatus([string]$expected, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              if ($null -ne $service -and $service.Status.ToString() -eq $expected) { return $service }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $actual = if ($null -eq $service) { "missing" } else { $service.Status.ToString() }
+            throw "Service $serviceName status is $actual, expected $expected"
+          }
+
+          function Wait-DcmGetProfile([int]$profileNumber, [int]$webPort, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $process = @(
+                Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { ([string]$_.CommandLine) -match "--profile\s+$profileNumber(?:\s|$)" }
+              )
+              if ($process.Count -eq 1) {
+                try {
+                  $client = [Net.Sockets.TcpClient]::new()
+                  $client.Connect("127.0.0.1", $webPort)
+                  $client.Dispose()
+                  return $process[0]
+                } catch {
+                  if ($null -ne $client) { $client.Dispose() }
+                }
+              }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "Profile $profileNumber did not become ready on Web port $webPort"
+          }
+
+          function Get-FreeTcpPort {
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            try { return ([Net.IPEndPoint]$listener.LocalEndpoint).Port }
+            finally { $listener.Stop() }
+          }
+
+          function Test-TcpPortOpen([int]$port) {
+            $client = [Net.Sockets.TcpClient]::new()
+            try {
+              $pending = $client.ConnectAsync("127.0.0.1", $port)
+              return $pending.Wait(500) -and $client.Connected
+            } catch { return $false }
+            finally { $client.Dispose() }
+          }
+
           $serviceWrapper = Join-Path $installDir "kayisoft-dcmget.exe"
           $serviceConfig = Join-Path $installDir "kayisoft-dcmget.xml"
           $serviceHost = Join-Path $installDir "kayisoft-dcmget-host.ps1"
@@ -747,6 +813,62 @@ jobs:
           $webShortcut = $startMenuRoots | ForEach-Object { Join-Path $_ "DcmGet.url" } | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not (Select-String -LiteralPath $webShortcut -Pattern "^URL=http://127\.0\.0\.1:$upgradeWebPort/$" -Quiet)) {
             throw "Installed DcmGet shortcut does not open the Web page"
+          }
+
+      - name: Windows service controls, process-tree and uninstall test
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
+          $configDir = Join-Path $env:APPDATA "DcmGet"
+          $configPath = Join-Path $configDir "config.json"
+          $licensePath = Join-Path $configDir "license.lic"
+          $trialPath = Join-Path $configDir "trial.json"
+          $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
+          $serviceName = "kayisoft-dcmget"
+          $serviceHost = Join-Path $installDir "kayisoft-dcmget-host.ps1"
+          $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
+          $profile2ConfigPath = Join-Path $configDir "instances\i2\config.json"
+          $profile1Config = Get-Content $profile1ConfigPath -Raw | ConvertFrom-Json
+          $profile2Config = Get-Content $profile2ConfigPath -Raw | ConvertFrom-Json
+          $profile2WebPort = [int]$profile2Config.web_port
+          $configHash = (Get-FileHash $configPath -Algorithm SHA256).Hash
+          $profile1Hash = (Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash
+          $profile2Hash = (Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash
+          $licenseHash = (Get-FileHash $licensePath -Algorithm SHA256).Hash
+          $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
+          $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
+
+          function Wait-DcmGetServiceStatus([string]$expected, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              if ($null -ne $service -and $service.Status.ToString() -eq $expected) { return $service }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $actual = if ($null -eq $service) { "missing" } else { $service.Status.ToString() }
+            throw "Service $serviceName status is $actual, expected $expected"
+          }
+
+          function Wait-DcmGetProfile([int]$profileNumber, [int]$webPort, [int]$timeoutSeconds = 30) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+            do {
+              $process = @(
+                Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { ([string]$_.CommandLine) -match "--profile\s+$profileNumber(?:\s|$)" }
+              )
+              if ($process.Count -eq 1) {
+                try {
+                  $client = [Net.Sockets.TcpClient]::new()
+                  $client.Connect("127.0.0.1", $webPort)
+                  $client.Dispose()
+                  return $process[0]
+                } catch {
+                  if ($null -ne $client) { $client.Dispose() }
+                }
+              }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "Profile $profileNumber did not become ready on Web port $webPort"
           }
 
           # Replace only the service host with a deterministic child-tree fixture.
