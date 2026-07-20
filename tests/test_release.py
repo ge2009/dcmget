@@ -441,6 +441,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "CreationTicks = ([DateTime]$treeProcess.CreationDate)" in workflow
     assert "$serviceTreeIdentities" in workflow
     assert "Service tree process survived stop" in workflow
+    assert '$opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)' in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
     assert "Uninstall left kayisoft-dcmget service behind" in workflow
 

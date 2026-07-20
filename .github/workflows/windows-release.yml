@@ -1014,7 +1014,7 @@ jobs:
           # Builtin Users receive only query/start/stop rights.  Running sc.exe
           # under a fresh ordinary account proves daily operations need no UAC.
           $opsUser = "DcmGetOpsCI"
-          $opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N")
+          $opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)
           & "$env:SystemRoot\System32\net.exe" user $opsUser $opsPasswordText /add | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not create ordinary service-control test user" }
           try {
