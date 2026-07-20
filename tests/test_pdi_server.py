@@ -556,6 +556,7 @@ def test_server_exits_when_idle_and_requests_renew_timeout(tmp_path: Path) -> No
         )
         assert status == 200
         with server._idle_condition:
+            server._last_activity -= 1
             first_activity = server._last_activity
         status, _headers, _body = _request(
             server,
