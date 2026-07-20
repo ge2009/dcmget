@@ -69,24 +69,46 @@ function Start-DcmGetProfile([int]$Number) {
     Write-Output "Started DcmGet profile $Number (PID $($process.Id))."
 }
 
-Write-Output "DcmGet service host started; APPDATA=$env:APPDATA; LOCALAPPDATA=$env:LOCALAPPDATA"
-$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)
-Write-Output "Managing startup profile snapshot: $($managedProfileNumbers -join ', ')"
-while ($true) {
-    foreach ($number in $managedProfileNumbers) {
-        if (Test-RunningProcess $processes[$number]) {
-            continue
-        }
-        $notBefore = $retryAfter[$number]
-        if ($null -ne $notBefore -and [DateTime]::UtcNow -lt $notBefore) {
+function Stop-DcmGetProfiles {
+    foreach ($process in @($script:processes.Values)) {
+        if (-not (Test-RunningProcess $process)) {
             continue
         }
         try {
-            Start-DcmGetProfile $number
+            & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$process.Id) /T /F 2>$null | Out-Null
+            $taskkillExitCode = $LASTEXITCODE
+            [void]$process.WaitForExit(5000)
+            if ($taskkillExitCode -ne 0 -or (Test-RunningProcess $process)) {
+                Write-Warning "DcmGet profile process $($process.Id) survived taskkill (exit code $taskkillExitCode)."
+            }
         } catch {
-            $retryAfter[$number] = [DateTime]::UtcNow.AddSeconds(10)
-            Write-Warning "Could not start DcmGet profile ${number}: $($_.Exception.Message)"
+            Write-Warning "Could not stop DcmGet profile process $($process.Id): $($_.Exception.Message)"
         }
     }
-    Start-Sleep -Seconds 2
+}
+
+Write-Output "DcmGet service host started; APPDATA=$env:APPDATA; LOCALAPPDATA=$env:LOCALAPPDATA"
+$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)
+Write-Output "Managing startup profile snapshot: $($managedProfileNumbers -join ', ')"
+try {
+    while ($true) {
+        foreach ($number in $managedProfileNumbers) {
+            if (Test-RunningProcess $processes[$number]) {
+                continue
+            }
+            $notBefore = $retryAfter[$number]
+            if ($null -ne $notBefore -and [DateTime]::UtcNow -lt $notBefore) {
+                continue
+            }
+            try {
+                Start-DcmGetProfile $number
+            } catch {
+                $retryAfter[$number] = [DateTime]::UtcNow.AddSeconds(10)
+                Write-Warning "Could not start DcmGet profile ${number}: $($_.Exception.Message)"
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+} finally {
+    Stop-DcmGetProfiles
 }

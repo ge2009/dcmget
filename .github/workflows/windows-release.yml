@@ -673,6 +673,14 @@ jobs:
               Write-Host "### $($_.FullName)"
               Get-Content $_.FullName -Tail 120 -ErrorAction SilentlyContinue | Write-Host
             }
+            Write-Host "--- installed DcmGet process trees ---"
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object {
+                ([string]$_.ExecutablePath).StartsWith($installDir, [StringComparison]::OrdinalIgnoreCase) -or
+                ([string]$_.CommandLine).IndexOf((Join-Path $installDir "kayisoft-dcmget-host.ps1"), [StringComparison]::OrdinalIgnoreCase) -ge 0
+              } |
+              Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine |
+              Format-List | Out-String | Write-Host
             Write-Host "--- recent Service Control Manager events ---"
             Get-WinEvent -FilterHashtable @{
               LogName = "System"

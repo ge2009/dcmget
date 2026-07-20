@@ -404,6 +404,9 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "profile $number:" not in host
     assert "while ($true)" in host
     assert "Start-Sleep -Seconds 2" in host
+    assert "function Stop-DcmGetProfiles" in host
+    assert 'taskkill.exe" /PID ([string]$process.Id) /T /F' in host
+    assert "} finally {\n    Stop-DcmGetProfiles\n}" in host
 
     assert 'DestName: "{#ServiceWrapperName}"' in installer
     assert "ConfigureAndInstallDcmGetService" in installer
