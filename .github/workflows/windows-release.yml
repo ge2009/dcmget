@@ -1058,7 +1058,17 @@ jobs:
               }
           )
           if ($serviceSurvivors.Count -ne 0) { throw "Uninstall left DcmGet service processes behind: $($serviceSurvivors.ProcessId -join ', ')" }
-          if (Test-Path $installDir) { throw "Installation directory remains after uninstall" }
+          # Inno Setup documents that its temporary uninstall clone can still be
+          # deleting the original executable after the parent returns an exit code.
+          for ($attempt = 0; $attempt -lt 120 -and (Test-Path $installDir); $attempt++) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (Test-Path $installDir) {
+            Get-ChildItem $installDir -Force -Recurse -ErrorAction SilentlyContinue |
+              Select-Object FullName, Length, LastWriteTime |
+              Format-Table -AutoSize | Out-String | Write-Host
+            throw "Installation directory remains after uninstall"
+          }
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Uninstall removed or changed the user configuration" }
           if ((Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash -ne $profile1Hash) { throw "Uninstall removed or changed Profile 1 configuration" }
           if ((Get-FileHash $profile2ConfigPath -Algorithm SHA256).Hash -ne $profile2Hash) { throw "Uninstall removed or changed Profile 2 configuration" }
