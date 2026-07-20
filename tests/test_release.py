@@ -463,6 +463,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "if not RunManagedProcessCleanup(ExpandConstant('{app}'), FailureMessage) then" in installer
     assert "procedure RemoveDcmGetServiceForUninstall();" in installer
     assert "RemoveDcmGetServiceForUninstall();" in installer
+    assert 'Type: dirifempty; Name: "{app}\\Dicom"' in installer
     assert "DcmGetServiceBelongsToApp" in installer
     assert "RegisteredServiceWrapperPath" in installer
     assert "RegQueryStringValue(" in installer

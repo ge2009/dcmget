@@ -153,6 +153,7 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#LegacyPortFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGetLegacyPortFirewallRule"
 
 [UninstallDelete]
+Type: dirifempty; Name: "{app}\Dicom"
 Type: files; Name: "{app}\{#ServiceConfigName}"
 Type: files; Name: "{app}\{#ServiceTemplateName}"
 Type: files; Name: "{app}\{#ServiceHostName}"
