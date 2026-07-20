@@ -278,7 +278,12 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Unpacked self-test failed with code $($process.ExitCode)" }
           $config = Join-Path $env:RUNNER_TEMP "dcmget-unpacked-web-self-test.json"
           $web = Start-Process $exe -ArgumentList @("--web-self-test", "--config", $config) -Wait -PassThru
-          if ($web.ExitCode -ne 0) { throw "Unpacked Web self-test failed with code $($web.ExitCode)" }
+          if ($web.ExitCode -ne 0) {
+            $diagnostic = Get-ChildItem (Join-Path $env:LOCALAPPDATA "DcmGet\logs") -Filter "dcmget-diagnostics-*.log" -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1
+            if ($diagnostic) { Get-Content $diagnostic.FullName -Raw }
+            throw "Unpacked Web self-test failed with code $($web.ExitCode)"
+          }
 
       - name: Smoke test portable application
         shell: pwsh
@@ -340,7 +345,12 @@ jobs:
 
           $config = Join-Path $env:RUNNER_TEMP "dcmget-portable-web-self-test.json"
           $web = Start-Process $portable -ArgumentList @("--web-self-test", "--config", $config) -Wait -PassThru
-          if ($web.ExitCode -ne 0) { throw "Portable Web self-test failed with code $($web.ExitCode)" }
+          if ($web.ExitCode -ne 0) {
+            $diagnostic = Get-ChildItem (Join-Path $env:LOCALAPPDATA "DcmGet\logs") -Filter "dcmget-diagnostics-*.log" -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1
+            if ($diagnostic) { Get-Content $diagnostic.FullName -Raw }
+            throw "Portable Web self-test failed with code $($web.ExitCode)"
+          }
 
       - name: Install Inno Setup
         shell: pwsh
