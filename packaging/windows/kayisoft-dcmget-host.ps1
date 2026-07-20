@@ -85,7 +85,7 @@ while ($true) {
             Start-DcmGetProfile $number
         } catch {
             $retryAfter[$number] = [DateTime]::UtcNow.AddSeconds(10)
-            Write-Warning "Could not start DcmGet profile $number: $($_.Exception.Message)"
+            Write-Warning "Could not start DcmGet profile ${number}: $($_.Exception.Message)"
         }
     }
     Start-Sleep -Seconds 2

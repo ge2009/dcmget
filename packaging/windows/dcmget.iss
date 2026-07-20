@@ -424,10 +424,8 @@ procedure ConfigureAndInstallDcmGetService();
 begin
   WriteDcmGetServiceConfig();
   if ServiceWasInstalled then
-  begin
-    RunServiceCommand('uninstall');
-    ServiceWasInstalled := False;
-  end;
-  RunServiceCommand('install');
+    RunServiceCommand('refresh')
+  else
+    RunServiceCommand('install');
   ServiceWasInstalled := True;
 end;

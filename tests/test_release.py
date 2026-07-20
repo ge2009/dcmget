@@ -395,6 +395,8 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)" in host
     assert "foreach ($number in $managedProfileNumbers)" in host
     assert "foreach ($number in @(Get-ConfiguredProfileNumbers))" not in host
+    assert "profile ${number}:" in host
+    assert "profile $number:" not in host
     assert "while ($true)" in host
     assert "Start-Sleep -Seconds 2" in host
 
@@ -422,6 +424,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "GetEnv('HOMEDRIVE') + GetEnv('HOMEPATH')" in installer
 
     assert "Verify pinned WinSW service wrapper" in workflow
+    assert "Verify Windows PowerShell service host syntax" in workflow
     assert "WinSW checksum mismatch" in workflow
     assert "kayisoft-dcmget" in workflow
     assert "Windows service lifecycle, upgrade-state and uninstall test" in workflow

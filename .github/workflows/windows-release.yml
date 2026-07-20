@@ -98,6 +98,18 @@ jobs:
           $expected = "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
           if ($actual -ne $expected) { throw "WinSW checksum mismatch: $actual" }
 
+      - name: Verify Windows PowerShell service host syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "packaging/windows/kayisoft-dcmget-host.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+
       - name: Verify minimal DCMTK runtime and tools
         shell: pwsh
         run: |
