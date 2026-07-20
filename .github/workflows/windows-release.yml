@@ -701,6 +701,18 @@ jobs:
               }
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $deadline)
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in @("DcmGet.exe", "powershell.exe", "kayisoft-dcmget.exe") } |
+              Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine |
+              Format-List | Out-String | Write-Host
+            $serviceLogDirectory = Join-Path $env:LOCALAPPDATA "DcmGet\logs\service"
+            Get-ChildItem -LiteralPath $serviceLogDirectory -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime |
+              Select-Object -Last 4 |
+              ForEach-Object {
+                Write-Host "--- service log: $($_.FullName) ---"
+                Get-Content -LiteralPath $_.FullName -Tail 240 -ErrorAction SilentlyContinue | Write-Host
+              }
             throw "Profile $profileNumber did not become ready on Web port $webPort"
           }
 

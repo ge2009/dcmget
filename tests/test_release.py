@@ -430,6 +430,13 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "[DateTime]::UtcNow.AddSeconds(4)" in host
     assert "$lastDesiredProfileNumbers = @(Get-DesiredProfileNumbers)" in host
     assert "$managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)" in host
+    update_managed_body = host.split(
+        "function Update-ManagedProfiles", 1
+    )[1].split(
+        'Write-Output "DcmGet service host started', 1
+    )[0]
+    assert "Write-Output" not in update_managed_body
+    assert update_managed_body.count("Write-Host") == 3
     assert "foreach ($number in $managedProfileNumbers)" in host
     assert "$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)" not in host
     assert "profile ${number}:" in host

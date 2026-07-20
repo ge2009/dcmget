@@ -218,7 +218,7 @@ function Update-ManagedProfiles([int[]]$DesiredProfileNumbers) {
             [void]$script:processes.Remove([int]$number)
             [void]$script:retryAfter.Remove([int]$number)
             [void]$script:profileMissingAfter.Remove([int]$number)
-            Write-Output "Stopped supervising disabled DcmGet profile $number."
+            Write-Host "Stopped supervising disabled DcmGet profile $number."
             continue
         }
         if ($configured.ContainsKey([int]$number)) {
@@ -243,7 +243,7 @@ function Update-ManagedProfiles([int[]]$DesiredProfileNumbers) {
         [void]$script:processes.Remove([int]$number)
         [void]$script:retryAfter.Remove([int]$number)
         [void]$script:profileMissingAfter.Remove([int]$number)
-        Write-Output "Stopped supervising deleted DcmGet profile $number."
+        Write-Host "Stopped supervising deleted DcmGet profile $number."
     }
 
     foreach ($record in @(Get-InstalledProfileProcesses)) {
@@ -258,7 +258,7 @@ function Update-ManagedProfiles([int[]]$DesiredProfileNumbers) {
         $script:managedProfiles[$number] = $true
         $script:processes[$number] = $record.Process
         $script:retryAfter[$number] = [DateTime]::UtcNow.AddSeconds(10)
-        Write-Output "Adopted running DcmGet profile $number (PID $($record.Process.Id))."
+        Write-Host "Adopted running DcmGet profile $number (PID $($record.Process.Id))."
     }
 
     return @(
