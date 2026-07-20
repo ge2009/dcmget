@@ -347,17 +347,13 @@ def is_loopback_address(value: str) -> bool:
 
 def discover_local_hosts() -> frozenset[str]:
     hosts = {"localhost", "127.0.0.1", "::1"}
-    for candidate in (socket.gethostname(), socket.getfqdn()):
-        candidate = candidate.strip().lower().rstrip(".")
-        if candidate:
-            hosts.add(candidate)
-        try:
-            for result in socket.getaddrinfo(candidate, None):
-                address = str(result[4][0]).split("%", 1)[0]
-                if address:
-                    hosts.add(address.lower())
-        except OSError:
-            pass
+    # Host discovery runs on the startup path.  DNS and mDNS resolution can
+    # block for minutes on isolated hospital networks, so never call
+    # getfqdn/getaddrinfo here.  The launcher supplies every interface address
+    # separately; this fallback only needs the kernel hostname and primary IP.
+    hostname = socket.gethostname().strip().lower().rstrip(".")
+    if hostname:
+        hosts.add(hostname)
     # Discover the primary LAN address without sending any traffic.
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

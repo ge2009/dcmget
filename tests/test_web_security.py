@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from dcmget.web_security import (
     SessionStore,
     UnsafePathError,
     WebSecurityError,
+    discover_local_hosts,
 )
 
 
@@ -116,6 +118,24 @@ def test_host_policy_is_exact_and_rejects_dns_rebinding():
     assert not policy.allows_origin("null")
     with pytest.raises(ValueError, match="通配符"):
         HostPolicy(8787, ["*"])
+
+
+def test_local_host_discovery_never_waits_for_dns(monkeypatch):
+    monkeypatch.setattr(socket, "gethostname", lambda: "DCMGET-01")
+    monkeypatch.setattr(
+        socket,
+        "getfqdn",
+        lambda: pytest.fail("本机 Host 白名单不应执行 FQDN 查询"),
+    )
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: pytest.fail("本机 Host 白名单不应执行 DNS 查询"),
+    )
+
+    hosts = discover_local_hosts()
+
+    assert {"localhost", "127.0.0.1", "::1", "dcmget-01"} <= hosts
 
 
 def test_safe_directory_browser_blocks_escape_and_symlinks(tmp_path: Path):
