@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.3.0
+        default: 3.4.0
 
 permissions:
   contents: read
@@ -159,10 +159,17 @@ jobs:
           $content = Get-Content $link -Raw
           if ($content -notmatch '(?m)^URL=http://127\.0\.0\.1:8787/$') { throw "Profile URL shortcut target is incorrect: $content" }
 
-      - name: Verify embedded Web, OHIF and PDI resources
+      - name: Verify embedded NiceGUI, Web fallback, OHIF and PDI resources
         shell: pwsh
         run: |
           function Assert-WebResources([string]$resourceRoot) {
+            $nicegui = Join-Path $resourceRoot "nicegui"
+            @("static", "templates") | ForEach-Object {
+              $asset = Join-Path $nicegui $_
+              if (-not (Test-Path $asset -PathType Container)) {
+                throw "Missing offline NiceGUI resource directory: $asset"
+              }
+            }
             $webui = Join-Path $resourceRoot "dcmget\webui"
             @("index.html", "app.css", "app.js") | ForEach-Object {
               $asset = Join-Path $webui $_
@@ -221,6 +228,9 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.css" -Quiet)) { throw "Portable EXE is missing DcmGet Web styles" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.js" -Quiet)) { throw "Portable EXE is missing DcmGet Web application" }
           if (-not (Select-String -Path $archiveListing -Pattern "fastapi" -Quiet)) { throw "Portable EXE is missing FastAPI" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*nicegui_ui" -Quiet)) { throw "Portable EXE is missing DcmGet NiceGUI workspace" }
+          if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*templates.*index\.html" -Quiet)) { throw "Portable EXE is missing NiceGUI templates" }
+          if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*static" -Quiet)) { throw "Portable EXE is missing NiceGUI static assets" }
           if (-not (Select-String -Path $archiveListing -Pattern "uvicorn" -Quiet)) { throw "Portable EXE is missing Uvicorn" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
           if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom compatibility modules" }
@@ -611,6 +621,9 @@ jobs:
             throw "Installed DCMTK bin allowlist mismatch: $($installedDcmtkDifference | Out-String)"
           }
           $resourceRoot = Join-Path $installDir "_internal"
+          @("static", "templates") | ForEach-Object {
+            if (-not (Test-Path (Join-Path "$resourceRoot/nicegui" $_) -PathType Container)) { throw "Installed NiceGUI resource is missing: $_" }
+          }
           $webui = Join-Path $resourceRoot "dcmget\webui"
           @("index.html", "app.css", "app.js") | ForEach-Object {
             if (-not (Test-Path (Join-Path $webui $_) -PathType Leaf)) { throw "Installed DcmGet Web resource is missing: $_" }

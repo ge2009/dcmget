@@ -375,6 +375,7 @@ def create_windows_management_server(
     state_directory: str | Path | None = None,
     trusted_hosts: Iterable[str] = (),
     static_root: str | Path | None = None,
+    nicegui_enabled: bool = False,
     log_level: str = "info",
 ) -> DcmGetWebServer:
     """Build the fixed management hub without claiming or validating a Profile."""
@@ -426,6 +427,7 @@ def create_windows_management_server(
         operation_handlers=handlers,
         profile_api_proxy=profile_proxy.request,
         management_mode=True,
+        nicegui_enabled=nicegui_enabled,
         log_level=log_level,
     )
 
@@ -447,6 +449,7 @@ def run_windows_management_server(
         state_directory=state_directory,
         trusted_hosts=trusted_hosts,
         static_root=static_root,
+        nicegui_enabled=True,
         log_level=log_level,
     )
     try:

@@ -126,6 +126,7 @@ def test_source_deploy_contains_transitive_requirement_files():
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
     assert "dcmget/architecture.py" in bundled
+    assert "dcmget/nicegui_ui.py" in bundled
     assert "dcmget/storage_scp.py" in bundled
 
 
@@ -243,11 +244,15 @@ def test_offline_web_runtime_and_static_frontend_are_packaged():
     readme = (root / "README.md").read_text(encoding="utf-8")
 
     assert "fastapi>=0.139.2,<0.140" in requirements
+    assert "nicegui>=3.14,<3.15" in requirements
     assert "uvicorn>=0.51,<0.52" in requirements
     assert '"fastapi>=0.139.2,<0.140"' in project
+    assert '"nicegui>=3.14,<3.15"' in project
     assert '"uvicorn>=0.51,<0.52"' in project
     assert "f\"{ROOT / 'dcmget' / 'webui'}:dcmget/webui\"" in build
     assert '"--collect-submodules",\n        "uvicorn"' in build
+    assert '"--collect-all",\n        "nicegui"' in build
+    assert '"--hidden-import",\n        "dcmget.nicegui_ui"' in build
     assert "Assert-WebResources $unpackedResourceRoot" in workflow
     assert "Portable EXE is missing DcmGet Web index" in workflow
     assert "Portable EXE is missing FastAPI" in workflow

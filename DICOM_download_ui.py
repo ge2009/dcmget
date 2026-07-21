@@ -635,6 +635,7 @@ def run_web_self_test(config_path: str) -> int:
             project_root=PROJECT_ROOT,
             profile_metadata={"name": "自检", "number": 1},
             session_ttl_seconds=300,
+            nicegui_enabled=True,
         )
         try:
             url = server.start_background(timeout=10)
@@ -783,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             session_ttl_seconds=config.web_session_timeout_minutes * 60,
             tools_provider=tools_provider,
             operation_handlers=_operation_handlers(profile, service),
+            nicegui_enabled=True,
         )
         activation.set_activation_handler(
             lambda payload: (

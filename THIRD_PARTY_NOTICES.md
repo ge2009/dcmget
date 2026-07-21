@@ -5,6 +5,7 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [DCMTK](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)：Copyright OFFIS e.V.，遵循 DCMTK 自带许可。
 - [cryptography](https://github.com/pyca/cryptography)：Apache License 2.0 / BSD 3-Clause 双许可。
 - [FastAPI](https://github.com/fastapi/fastapi)：MIT License。
+- [NiceGUI](https://github.com/zauberzeug/nicegui)：MIT License。DcmGet 使用其离线内置的 Vue、Quasar 与 Socket.IO Web 资源构建本地操作工作台，不加载 CDN。
 - [Starlette](https://github.com/Kludex/starlette)：BSD 3-Clause License。
 - [Uvicorn](https://github.com/Kludex/uvicorn)：BSD 3-Clause License。
 - [Pydantic](https://github.com/pydantic/pydantic)：MIT License。

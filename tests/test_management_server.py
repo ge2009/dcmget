@@ -300,7 +300,11 @@ def test_management_hub_exposes_same_origin_profile_proxy(
     assert response.json() == {
         "csrf_token": csrf,
         "status": "idle",
-        "web": {"url": f"{MANAGER_URL}/", "lan_url": f"{MANAGER_URL}/"},
+        "web": {
+            "url": f"{MANAGER_URL}/",
+            "lan_url": f"{MANAGER_URL}/",
+            "local_session": False,
+        },
     }
     assert calls[0]["profile_number"] == 2
     assert calls[0]["method"] == "GET"

@@ -1,6 +1,7 @@
 cryptography>=44,<47
 fastapi>=0.139.2,<0.140
 filelock>=3.16,<4
+nicegui>=3.14,<3.15
 pydicom>=3.0,<4
 pynetdicom>=3.0,<4
 psutil>=6.1,<8

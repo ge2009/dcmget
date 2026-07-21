@@ -1,5 +1,14 @@
 # DcmGet 版本说明
 
+## 3.4.0（2026-07-21）
+
+- Web 工作台改用 NiceGUI 重构，保留现有 FastAPI API、DCMTK 下载核心、Profile 进程隔离、任务恢复、授权与 PDI 流程；不引入 Node.js、CDN 或外部网络资源。
+- Profile 主页收敛为“检查号 → 目标目录/PDI → 自动预检 → 开始/进度”主路径；运行中原位显示当前检查号、文件数、速度和可用操作，结果与错误就近展示。
+- 超过 200 个检查号后仅保留聚合摘要，不渲染明细列表；日志默认只显示错误，用户主动开启后才显示详细日志。
+- 设置按 PACS 服务端、本地 DICOM 接收端、存储/PDI 与高级选项分组；端口继续使用纯文本输入，避免滚轮误改。Windows 管理中心使用紧凑 Profile 卡片完成创建、启动和停止，并在管理端口内原位进入工作台、返回管理页或快速切换 Profile。
+- NiceGUI 挂载在 `/workspace/`，所有业务变更仍通过原有同源 API 与 CSRF 边界；Socket.IO 通道新增 Host、Origin、IP 绑定会话与管理端私网来源校验，NiceGUI 所需内联 CSP 仅在工作台路径放行。
+- Windows x64 构建开始收集 NiceGUI 的 Python 模块与离线 Vue/Quasar/Socket.IO 资源；安装版、便携版与 ZIP 仍只支持 x64 Windows，并允许 Windows ARM64 通过 x64 兼容层运行。
+
 ## 3.3.0（2026-07-20）
 
 - Windows 管理中心升级为固定使用 `8786` 的统一单页工作台：左侧快速切换 Profile，右侧原位显示当前 Profile 的下载任务、进度、PDI、错误日志与运行摘要，不再跳转到不同端口或打开多个窗口。

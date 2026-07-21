@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "3.3.0"
+version = "3.4.0"
 description = "Offline LAN Web workstation for DCMTK C-MOVE downloads"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = [
   "cryptography>=44,<47",
   "fastapi>=0.139.2,<0.140",
   "filelock>=3.16,<4",
+  "nicegui>=3.14,<3.15",
   "pydicom>=3.0,<4",
   "pynetdicom>=3.0,<4",
   "psutil>=6.1,<8",
