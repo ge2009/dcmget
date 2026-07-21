@@ -74,6 +74,12 @@ STATUS_LABELS = {
 
 CSS = r"""
 :root {
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular",
+    Menlo, "Liberation Mono", monospace;
   --ink: #1b2a33;
   --panel: #ffffff;
   --panel-hi: #f8fbfc;
@@ -86,14 +92,29 @@ CSS = r"""
   --bad: #c54848;
   --cyan: #4d8f98;
 }
-html, body, #q-app { background: var(--paper); color: var(--ink); }
+html, body, #q-app {
+  background: var(--paper); color: var(--ink); font-family: var(--font-ui);
+  line-height: 1.55; text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+}
+html { font-size:16px; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    "Microsoft YaHei", sans-serif;
+  font-size:14px;
   background-image:
     radial-gradient(circle at 88% 0%, rgba(20, 125, 166, .09), transparent 32rem),
     linear-gradient(180deg, #f7fafb 0, #f1f5f7 100%);
 }
+button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog {
+  font-family: var(--font-ui) !important;
+}
+.q-btn__content { font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+.q-field__native, .q-field__input { font-size: 14px; line-height: 1.5; }
+.q-field__label { font-size: 13px; }
+.font-mono { font-family: var(--font-mono) !important; }
+.text-xs { font-size: 12px !important; line-height: 1.55; }
+.text-sm { font-size: 13px !important; line-height: 1.55; }
+.text-lg { font-size: 17px !important; line-height: 1.4; font-weight: 600; }
+.text-xl { font-size: 20px !important; line-height: 1.35; font-weight: 600; }
 .q-page { min-height: 100vh !important; }
 .workspace { width: min(1480px, 100%); margin: 0 auto; padding: 20px 24px 48px; }
 .topbar {
@@ -109,19 +130,19 @@ body {
 .brand-mark::before, .brand-mark::after { content: ""; position:absolute; background: var(--signal); opacity:.55; }
 .brand-mark::before { width: 16px; height: 1px; }
 .brand-mark::after { width: 1px; height: 16px; }
-.brand-title { font-size: 20px; font-weight: 750; letter-spacing: .06em; }
-.brand-sub { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, monospace; letter-spacing: .18em; }
-.connection { font: 12px ui-monospace, SFMono-Regular, monospace; color: var(--good); display:flex; align-items:center; gap:8px; }
+.brand-title { font-family:var(--font-display); font-size:20px; font-weight:700; letter-spacing:.055em; }
+.brand-sub { color:var(--muted); font:11px var(--font-mono); letter-spacing:.16em; }
+.connection { font:500 12px var(--font-ui); font-variant-numeric:tabular-nums; color:var(--good); display:flex; align-items:center; gap:8px; }
 .connection::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 12px currentColor; }
 .hero { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(310px, .65fr); gap:22px; }
-.eyebrow { color: var(--signal); font: 600 11px ui-monospace, SFMono-Regular, monospace; letter-spacing:.2em; text-transform:uppercase; }
-.headline { font-size:clamp(30px, 3vw, 44px); font-weight:750; line-height:1.15; letter-spacing:-.025em; margin:8px 0 12px; }
-.lede { color:var(--muted); max-width:680px; line-height:1.75; font-size:14px; }
+.eyebrow { color:var(--signal); font:600 11px var(--font-mono); letter-spacing:.18em; text-transform:uppercase; }
+.headline { font-family:var(--font-display); font-size:clamp(28px,2.3vw,36px); font-weight:700; line-height:1.25; letter-spacing:-.015em; margin:8px 0 12px; }
+.lede { color:var(--muted); max-width:680px; line-height:1.72; font-size:15px; }
 .hero-facts { display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.82); box-shadow:0 12px 35px rgba(37,64,78,.06); overflow:hidden; }
 .hero-fact { padding:17px; border-right:1px solid var(--line); min-width:0; }
 .hero-fact:last-child { border:0; }
-.hero-fact span { display:block; color:var(--muted); font-size:11px; margin-bottom:7px; }
-.hero-fact strong { display:block; font:600 13px ui-monospace,SFMono-Regular,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hero-fact span { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
+.hero-fact strong { display:block; font:600 13px var(--font-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .grid-main { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(330px,.5fr); gap:22px; margin-top:25px; align-items:start; }
 .stack { display:grid; gap:18px; }
 .surface { border:1px solid var(--line); border-radius:15px; background:var(--panel); box-shadow:0 12px 34px rgba(37,64,78,.07); overflow:hidden; }
@@ -129,14 +150,14 @@ body {
 .surface-head h2 { font-size:20px; margin:0; }
 .surface-head p { color:var(--muted); font-size:12px; margin:3px 0 0; }
 .surface-body { padding:20px; }
-.step-index { color:var(--signal); font:12px ui-monospace,SFMono-Regular,monospace; }
+.step-index { color:var(--signal); font:600 12px var(--font-ui); font-variant-numeric:tabular-nums; letter-spacing:.03em; }
 .q-field--outlined .q-field__control:before { border-color:var(--line) !important; }
 .q-field--outlined .q-field__control:hover:before { border-color:rgba(255,179,71,.45) !important; }
 .q-field__native, .q-field__input, .q-field__label { color:var(--ink) !important; }
 .q-field__bottom { color:var(--muted); }
-.accession-input textarea { min-height:170px !important; font:13px/1.62 ui-monospace,SFMono-Regular,monospace !important; }
+.accession-input textarea { min-height:170px !important; font:13px/1.62 var(--font-mono) !important; }
 .inline-stats { display:flex; flex-wrap:wrap; gap:8px; margin-top:11px; }
-.stat-pill { border:1px solid var(--line); padding:5px 9px; color:var(--muted); font:11px ui-monospace,SFMono-Regular,monospace; }
+.stat-pill { border:1px solid var(--line); padding:5px 9px; color:var(--muted); font:12px var(--font-ui); font-variant-numeric:tabular-nums; }
 .stat-pill strong { color:var(--ink); }
 .quick-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
 .button-primary { background:var(--signal) !important; color:#fff !important; font-weight:700; letter-spacing:.02em; }
@@ -148,31 +169,32 @@ body {
 .check-dot { width:20px;height:20px;border-radius:50%;display:grid;place-items:center;background:#edf2f4;color:var(--muted);font-size:11px; }
 .check-dot.ok { color:var(--good); background:rgba(113,214,160,.12); }
 .check-dot.bad { color:var(--bad); background:rgba(255,122,115,.12); }
-.check-copy strong { display:block;font-size:13px; }.check-copy small{color:var(--muted);font-size:11px;}
+.check-copy strong { display:block;font-size:13px; }.check-copy small{color:var(--muted);font-size:12px;}
 .progress-rail { height:9px; background:#eaf0f3; border:1px solid var(--line); border-radius:999px; overflow:hidden; }
 .progress-fill { height:100%; width:0; background:linear-gradient(90deg,var(--signal),var(--signal-2)); transition:width .4s ease; }
-.progress-label { color:var(--signal); font:600 12px ui-monospace,SFMono-Regular,monospace; }
+.progress-label { color:var(--signal); font:600 12px var(--font-mono); }
 .metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:18px; }
-.metric { background:var(--panel-hi); padding:15px; min-width:0; }.metric span{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em}.metric strong{display:block;margin-top:8px;font:600 15px ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.metric { background:var(--panel-hi); padding:15px; min-width:0; }.metric span{display:block;color:var(--muted);font-size:12px;letter-spacing:.05em}.metric strong{display:block;margin-top:8px;font:600 15px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .action-row { display:flex;flex-wrap:wrap;gap:9px;margin-top:18px; }
 .error-block { border-left:3px solid var(--bad); background:#fff4f3; padding:14px; margin-bottom:14px; }
 .error-block strong { color:var(--bad); }.error-block p{color:#8c4a48;margin:5px 0 0;font-size:12px;}
 .result-table { width:100%; }
 .result-table .q-table { background:transparent; color:var(--ink); }
-.result-table th { color:var(--muted); font-size:11px; letter-spacing:.06em; }
+.result-table th { color:var(--muted); font-size:12px; letter-spacing:.05em; }
 .large-summary { border:1px solid rgba(20,125,166,.22); border-radius:10px; background:#f1f8fb; padding:16px; color:#3a687a; line-height:1.65; }
-.log-line { display:grid;grid-template-columns:68px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid rgba(176,212,205,.08);font:11px/1.5 ui-monospace,SFMono-Regular,monospace; }
+.log-line { display:grid;grid-template-columns:70px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid rgba(176,212,205,.08);font:12px/1.55 var(--font-mono); }
 .log-time { color:var(--muted); }.log-error{color:var(--bad)}.log-info{color:#b8c9c5}
 .profile-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px;margin-top:22px; }
 .profile-card { border:1px solid var(--line); border-radius:15px; background:#fff;padding:19px;position:relative;overflow:hidden;box-shadow:0 10px 28px rgba(37,64,78,.06); }
 .profile-card::after { content:"";position:absolute;width:80px;height:80px;border:1px solid rgba(124,206,208,.08);border-radius:50%;right:-30px;top:-30px; }
 .profile-card.running { border-color:rgba(113,214,160,.32); }.profile-card.issue{border-color:rgba(255,122,115,.35)}
-.profile-name { font-size:20px;font-weight:700; }.profile-no{color:var(--signal);font:11px ui-monospace,SFMono-Regular,monospace;}
-.profile-facts { display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0; }.profile-fact span{display:block;color:var(--muted);font-size:10px}.profile-fact strong{font:12px ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:4px}
-.profile-status { position:absolute;right:15px;top:15px;font:11px ui-monospace,SFMono-Regular,monospace;color:var(--muted); }.profile-status.on{color:var(--good)}
-.manager-summary { display:flex;gap:25px;margin-top:16px; }.manager-summary strong{font-size:30px;font-weight:750}.manager-summary span{display:block;color:var(--muted);font-size:11px}
+.profile-name { font-family:var(--font-display);font-size:20px;font-weight:700; }.profile-no{color:var(--signal);font:11px var(--font-mono);}
+.profile-facts { display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0; }.profile-fact span{display:block;color:var(--muted);font-size:12px}.profile-fact strong{font:12px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:4px}
+.profile-status { position:absolute;right:15px;top:15px;font:500 12px var(--font-ui);color:var(--muted); }.profile-status.on{color:var(--good)}
+.manager-summary { display:flex;gap:25px;margin-top:16px; }.manager-summary strong{font-family:var(--font-display);font-size:30px;font-weight:700}.manager-summary span{display:block;color:var(--muted);font-size:12px}
 .settings-dialog { width:min(850px,94vw);max-width:850px;background:#fff !important;color:var(--ink);border:1px solid var(--line); }
-.settings-grid { display:grid;grid-template-columns:1fr 1fr;gap:13px; }.settings-section{padding:4px 0 12px}.settings-section-title{color:var(--signal);font:11px ui-monospace,SFMono-Regular,monospace;letter-spacing:.15em;margin-bottom:12px}
+.settings-grid { display:grid;grid-template-columns:1fr 1fr;gap:13px; }.settings-section{padding:4px 0 12px}.settings-section-title{color:var(--signal);font:600 12px var(--font-ui);letter-spacing:.05em;margin-bottom:12px}
+.dialog-host { display:contents; }
 .q-expansion-item { border-bottom:1px solid var(--line); }.q-expansion-item__container > .q-item{color:var(--ink)}
 .directory-dialog { width:min(720px,94vw);background:#fff !important;color:var(--ink);border:1px solid var(--line); }
 .directory-row { width:100%;justify-content:flex-start;color:var(--ink)!important;border-bottom:1px solid var(--line); }
@@ -343,6 +365,8 @@ def _notify_error(exc: Exception, prefix: str = "操作失败") -> None:
 async def _build_manager(bootstrap: dict[str, Any]) -> None:
     profiles: list[dict[str, Any]] = []
     grid: Any = None
+    dialog_host: Any = None
+    active_profile_dialog: Any = None
     count_label: Any = None
     running_label: Any = None
 
@@ -373,64 +397,79 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
         ui.navigate.to(f"./?profile={number}")
 
     def edit_profile(profile: Mapping[str, Any]) -> None:
-        with ui.dialog() as dialog, ui.card().classes("settings-dialog p-0"):
-            with ui.element("div").classes("surface-head"):
-                with ui.element("div"):
-                    ui.label(f"配置 Profile {profile.get('number', '')}").classes("text-xl")
-                    ui.label("保存后再启动；接收端口和 Web 端口不能重复")
-                ui.button(icon="close", on_click=dialog.close).props("flat round")
-            fields: dict[str, Any] = {}
-            with ui.element("div").classes("surface-body"):
-                with ui.element("div").classes("settings-grid"):
-                    fields["display_name"] = ui.input(
-                        "显示名称", value=profile.get("display_name", "")
-                    ).props("outlined dense")
-                    fields["pacs_server_ip"] = ui.input(
-                        "PACS 地址", value=profile.get("pacs_server_ip", "")
-                    ).props("outlined dense")
-                    for key, label in (
-                        ("pacs_server_port", "PACS 端口"),
-                        ("storage_port", "DICOM 接收端口"),
-                        ("web_port", "Web 端口"),
-                    ):
-                        fields[key] = ui.input(label, value=str(profile.get(key, ""))).props(
-                            "outlined dense inputmode=numeric pattern=[0-9]*"
-                        )
-                    fields["calling_ae_title"] = ui.input(
-                        "本机调用 AE", value=profile.get("calling_ae_title", "")
-                    ).props("outlined dense")
-                    fields["pacs_ae_title"] = ui.input(
-                        "PACS AE", value=profile.get("pacs_ae_title", "")
-                    ).props("outlined dense")
-                    fields["storage_ae_title"] = ui.input(
-                        "接收 AE", value=profile.get("storage_ae_title", "")
-                    ).props("outlined dense")
-                    fields["dicom_destination_folder"] = ui.input(
-                        "保存目录", value=profile.get("dicom_destination_folder", "")
-                    ).props("outlined dense")
+        nonlocal active_profile_dialog
+        if dialog_host is None:
+            ui.notify("配置面板尚未就绪，请稍后重试", type="warning")
+            return
+        if active_profile_dialog is not None:
+            active_profile_dialog.delete()
+        # Profile cards are replaced by the four-second status refresh. Keep
+        # dialogs in a stable sibling so clearing the card grid cannot close one.
+        with dialog_host:
+            with ui.dialog() as dialog, ui.card().classes("settings-dialog p-0"):
+                with ui.element("div").classes("surface-head"):
+                    with ui.element("div"):
+                        ui.label(f"配置 Profile {profile.get('number', '')}").classes("text-xl")
+                        ui.label("保存后再启动；接收端口和 Web 端口不能重复")
+                    ui.button(icon="close", on_click=dialog.close).props("flat round")
+                fields: dict[str, Any] = {}
+                with ui.element("div").classes("surface-body"):
+                    with ui.element("div").classes("settings-grid"):
+                        fields["display_name"] = ui.input(
+                            "显示名称", value=profile.get("display_name", "")
+                        ).props("outlined dense")
+                        fields["pacs_server_ip"] = ui.input(
+                            "PACS 地址", value=profile.get("pacs_server_ip", "")
+                        ).props("outlined dense")
+                        for key, label in (
+                            ("pacs_server_port", "PACS 端口"),
+                            ("storage_port", "DICOM 接收端口"),
+                            ("web_port", "Web 端口"),
+                        ):
+                            fields[key] = ui.input(
+                                label, value=str(profile.get(key, ""))
+                            ).props("outlined dense inputmode=numeric pattern=[0-9]*")
+                        fields["calling_ae_title"] = ui.input(
+                            "本机调用 AE", value=profile.get("calling_ae_title", "")
+                        ).props("outlined dense")
+                        fields["pacs_ae_title"] = ui.input(
+                            "PACS AE", value=profile.get("pacs_ae_title", "")
+                        ).props("outlined dense")
+                        fields["storage_ae_title"] = ui.input(
+                            "接收 AE", value=profile.get("storage_ae_title", "")
+                        ).props("outlined dense")
+                        fields["dicom_destination_folder"] = ui.input(
+                            "保存目录", value=profile.get("dicom_destination_folder", "")
+                        ).props("outlined dense")
 
-                async def save_profile() -> None:
-                    body: dict[str, Any] = {"profile_number": int(profile.get("number", 0))}
-                    try:
-                        for key, control in fields.items():
-                            value = control.value
-                            body[key] = int(value) if key.endswith("_port") else value
-                        result = await _browser_api(
-                            "/api/operations/profile-update", method="POST", body=body
-                        )
-                        dialog.close()
-                        ui.notify(str(result.get("message") or "Profile 配置已保存"), type="positive")
-                        await refresh_profiles()
-                    except (TypeError, ValueError) as exc:
-                        _notify_error(exc, "端口必须是 1 到 65535 的整数")
-                    except Exception as exc:
-                        _notify_error(exc, "保存失败")
+                    async def save_profile() -> None:
+                        body: dict[str, Any] = {
+                            "profile_number": int(profile.get("number", 0))
+                        }
+                        try:
+                            for key, control in fields.items():
+                                value = control.value
+                                body[key] = int(value) if key.endswith("_port") else value
+                            result = await _browser_api(
+                                "/api/operations/profile-update", method="POST", body=body
+                            )
+                            dialog.close()
+                            ui.notify(
+                                str(result.get("message") or "Profile 配置已保存"),
+                                type="positive",
+                            )
+                            await refresh_profiles()
+                        except (TypeError, ValueError) as exc:
+                            _notify_error(exc, "端口必须是 1 到 65535 的整数")
+                        except Exception as exc:
+                            _notify_error(exc, "保存失败")
 
-                with ui.row().classes("justify-end w-full pt-5"):
-                    ui.button("取消", on_click=dialog.close).props("flat")
-                    ui.button("保存配置", icon="save", on_click=save_profile).props(
-                        "unelevated"
-                    ).classes("button-primary")
+                    with ui.row().classes("justify-end w-full pt-5"):
+                        ui.button("取消", on_click=dialog.close).props("flat")
+                        ui.button("保存配置", icon="save", on_click=save_profile).props(
+                            "unelevated"
+                        ).classes("button-primary")
+        active_profile_dialog = dialog
         dialog.open()
 
     def render_profiles() -> None:
@@ -496,6 +535,7 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
                         ui.label("正在运行")
                 ui.button("新建 Profile", icon="add", on_click=create_profile).props("unelevated").classes("button-primary mt-5")
         grid = ui.element("section").classes("profile-grid")
+        dialog_host = ui.element("div").classes("dialog-host")
     await refresh_profiles()
     ui.timer(4.0, refresh_profiles)
 

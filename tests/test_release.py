@@ -261,6 +261,33 @@ def test_offline_web_runtime_and_static_frontend_are_packaged():
     assert "HTTP 未加密" in readme
 
 
+def test_nicegui_manager_dialog_survives_profile_grid_refresh():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+    manager = source[
+        source.index("async def _build_manager") : source.index("def _topbar")
+    ]
+
+    assert 'dialog_host = ui.element("div").classes("dialog-host")' in manager
+    assert "with dialog_host:" in manager
+    grid_position = manager.index('grid = ui.element("section")')
+    host_position = manager.index('dialog_host = ui.element("div")')
+    initial_refresh_position = manager.index("await refresh_profiles()", host_position)
+    assert grid_position < host_position < initial_refresh_position
+
+
+def test_nicegui_typography_uses_offline_platform_fonts_and_readable_sizes():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+
+    assert '"Segoe UI Variable Text"' in source
+    assert '"Microsoft YaHei UI"' in source
+    assert '"PingFang SC"' in source
+    assert '"Cascadia Mono"' in source
+    assert "body {\n  font-size:14px;" in source
+    assert "font-size:clamp(28px,2.3vw,36px)" in source
+
+
 def test_windows_release_packages_only_the_required_dcmtk_runtime():
     root = Path(__file__).resolve().parents[1]
     build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
