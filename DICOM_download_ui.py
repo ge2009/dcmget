@@ -323,7 +323,10 @@ def validate_frozen_pdi_resources(root: str | Path) -> None:
 
 def validate_web_resources(root: str | Path = PROJECT_ROOT) -> Path:
     static_root = Path(root) / "dcmget" / "webui"
-    required = tuple(static_root / name for name in ("index.html", "app.css", "app.js"))
+    required = tuple(
+        static_root / name
+        for name in ("index.html", "app.css", "app.js", "theme.js")
+    )
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Web 离线资源缺失：{'、'.join(missing)}")

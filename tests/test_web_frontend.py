@@ -10,6 +10,7 @@ WEB_ROOT = ROOT / "dcmget" / "webui"
 INDEX = WEB_ROOT / "index.html"
 CSS = WEB_ROOT / "app.css"
 JAVASCRIPT = WEB_ROOT / "app.js"
+THEME_BOOTSTRAP = WEB_ROOT / "theme.js"
 
 
 class _DocumentParser(HTMLParser):
@@ -51,6 +52,7 @@ def test_web_frontend_is_a_self_contained_single_workspace_application() -> None
     assert INDEX.is_file()
     assert CSS.is_file()
     assert JAVASCRIPT.is_file()
+    assert THEME_BOOTSTRAP.is_file()
     assert len(document.ids) == len(set(document.ids))
     assert {
         "app-shell",
@@ -68,6 +70,11 @@ def test_web_frontend_is_a_self_contained_single_workspace_application() -> None
         script.get("type") == "module" and script.get("src") == "/assets/app.js"
         for script in document.scripts
     )
+    assert any(
+        script.get("src") == "/assets/theme.js"
+        for script in document.scripts
+    )
+    assert all(script.get("src") for script in document.scripts)
     assert 'href="/assets/app.css"' in source
     assert "影像下载工作台" in source
     assert all(value.startswith(("/", "#")) for _attribute, value in document.references)
@@ -75,7 +82,8 @@ def test_web_frontend_is_a_self_contained_single_workspace_application() -> None
 
 def test_web_frontend_never_depends_on_network_assets_or_node_runtime() -> None:
     combined = "\n".join(
-        path.read_text(encoding="utf-8") for path in (INDEX, CSS, JAVASCRIPT)
+        path.read_text(encoding="utf-8")
+        for path in (INDEX, CSS, JAVASCRIPT, THEME_BOOTSTRAP)
     ).lower()
 
     assert "https://" not in combined
@@ -85,6 +93,24 @@ def test_web_frontend_never_depends_on_network_assets_or_node_runtime() -> None:
     assert "unpkg" not in combined
     assert "jsdelivr" not in combined
     assert "googleapis" not in combined
+
+
+def test_theme_and_feedback_polish_stay_offline_and_accessible() -> None:
+    source, document = _document()
+    css = CSS.read_text(encoding="utf-8")
+    javascript = _javascript()
+    bootstrap = THEME_BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "theme-toggle" in document.ids
+    assert "app-loading" in document.ids
+    assert 'localStorage.getItem("dcmget-theme")' in bootstrap
+    assert "prefers-color-scheme: dark" in bootstrap
+    assert 'localStorage.setItem(THEME_STORAGE_KEY, next)' in javascript
+    assert ':root[data-theme="dark"]' in css
+    assert "@media (forced-colors: active)" in css
+    for kind in ("success", "error", "warning", "info"):
+        assert f".toast--{kind}" in css
+    assert '<script>' not in source
 
 
 def test_every_static_javascript_id_selector_exists_in_html() -> None:

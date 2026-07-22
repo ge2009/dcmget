@@ -280,12 +280,77 @@ function setButtonLabel(button, value) {
   else button.textContent = String(value);
 }
 
-function showToast(message, duration = 3200) {
+const TOAST_ICONS = { success: "✓", error: "✕", warning: "!", info: "i" };
+
+// options may be a type string ("success"|"error"|"warning"|"info"),
+// a duration number, or an object { type, duration }.
+function showToast(message, options = {}) {
+  let opts = options;
+  if (typeof options === "string") opts = { type: options };
+  else if (typeof options === "number") opts = { duration: options };
+  const type = TOAST_ICONS[opts.type] ? opts.type : "info";
+  const duration = opts.duration ?? (type === "error" ? 5200 : 3200);
   const toast = document.createElement("div");
-  toast.className = "toast";
-  toast.textContent = String(message);
+  toast.className = `toast toast--${type}`;
+  toast.setAttribute("role", type === "error" ? "alert" : "status");
+  const icon = document.createElement("span");
+  icon.className = "toast__icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = TOAST_ICONS[type];
+  const body = document.createElement("span");
+  body.className = "toast__body";
+  body.textContent = String(message);
+  toast.append(icon, body);
   $("#toast-region").append(toast);
   window.setTimeout(() => toast.remove(), duration);
+}
+
+const THEME_STORAGE_KEY = "dcmget-theme";
+const THEME_COLORS = { light: "#087481", dark: "#0e1518" };
+
+function applyTheme(theme) {
+  const resolved = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = resolved;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", THEME_COLORS[resolved]);
+  const toggle = document.getElementById("theme-toggle");
+  if (toggle) {
+    const next = resolved === "dark" ? "浅色" : "深色";
+    toggle.setAttribute("aria-label", `切换到${next}主题`);
+    toggle.setAttribute("title", `切换到${next}主题`);
+    toggle.setAttribute("aria-pressed", String(resolved === "dark"));
+  }
+}
+
+function initTheme() {
+  const bootstrap = document.documentElement.dataset.theme;
+  applyTheme(bootstrap === "dark" ? "dark" : "light");
+  const media = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+  if (media) {
+    const onChange = (event) => {
+      try {
+        const forced = window.localStorage.getItem(THEME_STORAGE_KEY);
+        if (forced === "light" || forced === "dark") return;
+      } catch {
+        // If localStorage is unavailable, continue to follow OS theme.
+      }
+      applyTheme(event.matches ? "dark" : "light");
+    };
+    if (media.addEventListener) media.addEventListener("change", onChange);
+    else if (media.addListener) media.addListener(onChange);
+  }
+  const toggle = document.getElementById("theme-toggle");
+  if (toggle) {
+    toggle.addEventListener("click", () => {
+      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      applyTheme(next);
+      try {
+        window.localStorage.setItem(THEME_STORAGE_KEY, next);
+      } catch {
+        /* storage unavailable — theme still applies for this session */
+      }
+    });
+  }
 }
 
 function showAlert(message, title = "操作失败") {
@@ -564,7 +629,7 @@ async function submitStartTask(draft, signature) {
     state.task = result.task || result;
     state.startedAt = Date.now();
     renderTask(state.task);
-    showToast("任务已交给后台执行，关闭浏览器不会停止下载。");
+    showToast("任务已交给后台执行，关闭浏览器不会停止下载。", "success");
   } catch (error) {
     if (isStaleProfileResponse(error)) return;
     showAlert(error.message, "任务启动失败");
@@ -902,6 +967,8 @@ function trapDrawerFocus(event) {
 
 function showApplication() {
   $("#app-shell").hidden = false;
+  const loading = document.getElementById("app-loading");
+  if (loading) loading.hidden = true;
 }
 
 function setWorkspaceTaskVisibility(visible) {
@@ -1180,7 +1247,7 @@ async function saveSettings(event) {
       profile: currentProfile(),
     });
     setText("#settings-status", `${result.message || "设置已保存"}。正在运行的任务继续使用原配置快照。`);
-    showToast("设置已保存");
+    showToast("设置已保存", "success");
   } catch (error) {
     if (isStaleProfileResponse(error)) return;
     setText("#settings-status", error.message);
@@ -1427,7 +1494,7 @@ async function importAccessions(file) {
       const values = result.accessions || result.values || [];
       $("#accession-input").value = values.join("\n");
       parseAccessions($("#accession-input").value);
-      showToast(`已从 ${file.name} 导入 ${values.length} 个检查号`);
+      showToast(`已从 ${file.name} 导入 ${values.length} 个检查号`, "success");
     } catch (error) {
       if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "XLSX 导入失败");
@@ -1447,7 +1514,7 @@ async function importAccessions(file) {
 async function runOperation(name, body = {}) {
   try {
     const result = await api(`/api/operations/${name}`, { method: "POST", body });
-    showToast(result.message || "操作已完成");
+    showToast(result.message || "操作已完成", "success");
     if (result.download_url) window.location.assign(result.download_url);
     return result;
   } catch (error) {
@@ -1459,7 +1526,7 @@ async function runOperation(name, body = {}) {
 async function runScopedOperation(name, body = {}) {
   try {
     const result = await profileRequest(`/api/operations/${name}`, { method: "POST", body });
-    showToast(result.message || "操作已完成");
+    showToast(result.message || "操作已完成", "success");
     if (result.download_url) window.location.assign(result.download_url);
     return result;
   } catch (error) {
@@ -1481,7 +1548,7 @@ async function shutdownService() {
     window.clearTimeout(state.preflightTimer);
     closeEvents();
     setConnectionState("disconnected", "后台已关闭");
-    showToast(result.message || "DcmGet 后台已安全关闭，可以关闭浏览器页面。", 6000);
+    showToast(result.message || "DcmGet 后台已安全关闭，可以关闭浏览器页面。", { type: "success", duration: 6000 });
   } catch (error) {
     button.disabled = false;
     showAlert(error.message, "关闭后台失败");
@@ -1622,7 +1689,7 @@ async function startManagedProfile(profile = currentProfile()) {
     renderProfiles(state.profiles);
     renderEnvironment({ ...state.bootstrap, profile, web: {} });
     const result = await api(managementProfilePath(profileNumber, "/start"), { method: "POST", body: {} });
-    showToast(result.message || `${profileDisplayName(profile)} 启动命令已提交`);
+    showToast(result.message || `${profileDisplayName(profile)} 启动命令已提交`, "success");
     await refreshProfiles();
     window.setTimeout(() => refreshProfiles(), 900);
   } catch (error) {
@@ -1650,7 +1717,7 @@ async function stopManagedProfile(profile = currentProfile()) {
     async () => {
       try {
         const result = await stopManagedProfileNow(profile);
-        showToast(result?.message || `${profileDisplayName(profile)} 已停止`);
+        showToast(result?.message || `${profileDisplayName(profile)} 已停止`, "success");
       } catch (error) {
         await refreshProfiles();
         showAlert(error.message, "停止 Profile 失败");
@@ -1818,11 +1885,11 @@ async function createProfile() {
     const result = await api("/api/management/profiles", { method: "POST", body: {} });
     await refreshProfiles();
     if (result.profile) {
-      showToast(`已创建 ${profileDisplayName(result.profile)}；当前默认处于停止状态。`);
+      showToast(`已创建 ${profileDisplayName(result.profile)}；当前默认处于停止状态。`, "success");
       await selectManagedProfile(result.profile);
       openProfileConfig(result.profile, false);
     } else {
-      showToast("新 Profile 已创建；请补充配置后再启动。");
+      showToast("新 Profile 已创建；请补充配置后再启动。", "success");
     }
   } catch (error) {
     showAlert(error.message, "新建 Profile 失败");
@@ -1838,7 +1905,7 @@ async function cloneProfile(profile) {
       display_name: name,
     });
     await refreshProfiles();
-    showToast(`已创建 Profile ${result.profile.number}；请确认参数后启动。`);
+    showToast(`已创建 Profile ${result.profile.number}；请确认参数后启动。`, "success");
     openProfileConfig(result.profile, true);
   } catch (error) {
     showAlert(error.message, "复制 Profile 失败");
@@ -1851,7 +1918,7 @@ async function renameProfile(profile) {
   try {
     await profileOperation("rename", { profile_number: profile.number, display_name: name });
     await refreshProfiles();
-    showToast("Profile 已重命名");
+    showToast("Profile 已重命名", "success");
   } catch (error) {
     showAlert(error.message, "重命名 Profile 失败");
   }
@@ -1865,7 +1932,7 @@ async function deleteProfile(profile) {
       try {
         await profileOperation("delete", { profile_number: profile.number });
         await refreshProfiles();
-        showToast("Profile 配置已删除");
+        showToast("Profile 配置已删除", "success");
       } catch (error) {
         showAlert(error.message, "删除 Profile 失败");
       }
@@ -1900,7 +1967,7 @@ async function requestManagedProfileConfiguration(profile = currentProfile()) {
         const latest = state.profiles.find(
           (item) => profileNumberOf(item) === profileNumber,
         ) || profile;
-        showToast(result?.message || `${profileDisplayName(profile)} 已停止`);
+        showToast(result?.message || `${profileDisplayName(profile)} 已停止`, "success");
         configureProfile(latest);
       } catch (error) {
         await refreshProfiles();
@@ -1971,9 +2038,9 @@ async function saveProfileConfiguration(launchAfterSave) {
     const result = await profileOperation("update", payload);
     if (launchAfterSave) {
       await profileOperation("launch", { profile_number: payload.profile_number });
-      showToast(`Profile ${payload.profile_number} 已保存并启动`);
+      showToast(`Profile ${payload.profile_number} 已保存并启动`, "success");
     } else {
-      showToast(`Profile ${payload.profile_number} 配置已保存`);
+      showToast(`Profile ${payload.profile_number} 配置已保存`, "success");
     }
     $("#profile-config-dialog").close();
     await refreshProfiles();
@@ -1992,7 +2059,7 @@ async function createProfileShortcut(profile) {
       profile_number: profile.number,
       overwrite: false,
     });
-    showToast(`Web 页面快捷方式已创建：${result.shortcut.path}`);
+    showToast(`Web 页面快捷方式已创建：${result.shortcut.path}`, "success");
   } catch (error) {
     showAlert(error.message, "创建快捷方式失败");
   }
@@ -2006,14 +2073,14 @@ async function startAllProfiles() {
     if (service?.supported && !["running", "starting"].includes(service.status)) {
       const startedService = await api("/api/operations/windows-service-start", { method: "POST", body: {} });
       state.windowsService = startedService;
-      showToast("kayisoft-dcmget 服务启动命令已提交，将自动启动全部 Profile");
+      showToast("kayisoft-dcmget 服务启动命令已提交，将自动启动全部 Profile", "success");
       window.setTimeout(refreshWindowsServiceStatus, 1000);
       return;
     }
     const result = await profileOperation("launch-all");
     const started = Number(result.started_count ?? result.started?.length ?? 0);
     const skipped = Number(result.skipped_count ?? result.skipped?.length ?? 0);
-    showToast(`已启动 ${started} 个 Profile${skipped ? `，跳过 ${skipped} 个` : ""}`);
+    showToast(`已启动 ${started} 个 Profile${skipped ? `，跳过 ${skipped} 个` : ""}`, "success");
     window.setTimeout(refreshProfiles, 900);
   } catch (error) {
     showAlert(error.message, "启动全部 Profile 失败");
@@ -2130,7 +2197,7 @@ async function activateLicense() {
     $("#license-token-input").value = "";
     renderLicense({ ...(result.license || {}), machine_code: result.machine_code });
     await refreshLicense();
-    showToast("软件授权已激活");
+    showToast("软件授权已激活", "success");
   } catch (error) {
     if (isStaleProfileResponse(error)) return;
     showAlert(error.message, "授权激活失败");
@@ -2246,7 +2313,7 @@ function bindEvents() {
   $("#open-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
       const result = await profileRequest("/api/pdi/open", { method: "POST", body: { task_id: state.task?.id } });
-      showToast(result.message || "已在 DcmGet 主机打开 PDI 目录");
+      showToast(result.message || "已在 DcmGet 主机打开 PDI 目录", "success");
     } catch (error) {
       if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "无法打开 PDI");
@@ -2255,7 +2322,7 @@ function bindEvents() {
   $("#verify-pdi-button").addEventListener("click", () => runPdiAction(async () => {
     try {
       const result = await profileRequest("/api/pdi/verify", { method: "POST", body: { task_id: state.task?.id } });
-      showToast(result.message || (result.ok ? "PDI 校验通过" : "PDI 校验未通过"));
+      showToast(result.message || (result.ok ? "PDI 校验通过" : "PDI 校验未通过"), result.ok ? "success" : "warning");
       if (!result.ok) showAlert(result.message || "PDI 校验未通过，请查看任务日志。", "PDI 校验异常");
     } catch (error) {
       if (isStaleProfileResponse(error)) return;
@@ -2266,7 +2333,7 @@ function bindEvents() {
     try {
       const result = await profileRequest("/api/pdi/retry", { method: "POST", body: { task_id: state.task?.id } });
       renderTask(result.task || result);
-      showToast("已重新加入 PDI 导出队列");
+      showToast("已重新加入 PDI 导出队列", "success");
     } catch (error) {
       if (isStaleProfileResponse(error)) return;
       showAlert(error.message, "PDI 重试失败");
@@ -2287,7 +2354,7 @@ function bindEvents() {
     if (!text) return showToast("当前没有可复制的日志");
     try {
       await navigator.clipboard.writeText(text);
-      showToast("日志已复制");
+      showToast("日志已复制", "success");
     } catch (_) {
       showAlert("浏览器拒绝了剪贴板权限，请从主机日志目录复制。", "无法复制");
     }
@@ -2326,10 +2393,10 @@ function bindEvents() {
   $("#activate-license-button").addEventListener("click", activateLicense);
   $("#copy-machine-code-button").addEventListener("click", async () => {
     const code = $("#license-machine-code").textContent.trim();
-    if (!code || code === "—") return showToast("机器码尚未加载");
+    if (!code || code === "—") return showToast("机器码尚未加载", "warning");
     try {
       await navigator.clipboard.writeText(code);
-      showToast("机器码已复制");
+      showToast("机器码已复制", "success");
     } catch (_) {
       showAlert("浏览器拒绝了剪贴板权限。", "无法复制");
     }
@@ -2367,12 +2434,12 @@ function bindEvents() {
   $("#buy-license-button").addEventListener("click", async () => {
     await refreshLicense();
     showPage("operations");
-    showToast("授权状态已刷新；离线激活请使用产品授权文件。");
+    showToast("授权状态已刷新；离线激活请使用产品授权文件。", "success");
   });
   $("#copy-lan-url").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("#lan-url").textContent);
-      showToast("局域网地址已复制");
+      showToast("局域网地址已复制", "success");
     } catch (_) {
       showAlert("浏览器拒绝了剪贴板权限。", "无法复制");
     }
@@ -2400,6 +2467,7 @@ function bindEvents() {
   }, 15000);
 }
 
+initTheme();
 bindEvents();
 resetPreflightChecks();
 parseAccessions("");

@@ -291,6 +291,23 @@ def test_nicegui_typography_uses_offline_platform_fonts_and_readable_sizes():
     assert "font-size:clamp(28px,2.3vw,36px)" in source
 
 
+def test_nicegui_workspace_has_persistent_theme_and_accessibility_fallbacks():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+
+    assert "THEME_BOOTSTRAP" in source
+    assert "THEME_TOGGLE_HANDLER" in source
+    assert "data-dcmget-theme-bootstrap" in source
+    assert "window.localStorage.getItem(key)" in source
+    assert "window.localStorage.setItem('dcmget-theme', next)" in source
+    assert ':root[data-theme="dark"]' in source
+    assert "@media(prefers-reduced-motion:reduce)" in source
+    assert "@media(forced-colors:active)" in source
+    assert 'ui.add_head_html(THEME_BOOTSTRAP)' in source
+    assert 'js_handler=THEME_TOGGLE_HANDLER' in source
+    assert 'aria-label="切换浅色或深色主题"' in source
+
+
 def test_nicegui_primary_action_is_high_and_runtime_buttons_remain_legible():
     root = Path(__file__).resolve().parents[1]
     source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
@@ -505,6 +522,14 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
 
     assert 'DestName: "{#ServiceWrapperName}"' in installer
     assert "ConfigureAndInstallDcmGetService" in installer
+    configure_service = installer.split(
+        "procedure ConfigureAndInstallDcmGetService();", 1
+    )[1].split("\nend;", 1)[0]
+    assert "RunServiceCommand('refresh')" not in installer
+    assert "RemoveDcmGetServiceForUninstall();" in configure_service
+    assert configure_service.index("RemoveDcmGetServiceForUninstall();") < configure_service.index(
+        "RunServiceCommand('install')"
+    )
     assert "  RequestExistingServiceStop();" in installer
     assert "function RunManagedProcessCleanup(AppDir: String; var FailureMessage: String): Boolean;" in installer
     assert installer.index("  RequestExistingServiceStop();") < installer.index(

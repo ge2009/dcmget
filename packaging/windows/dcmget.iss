@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.5.0"
+  #define AppVersion "3.5.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -609,8 +609,12 @@ procedure ConfigureAndInstallDcmGetService();
 begin
   WriteDcmGetServiceConfig();
   if ServiceWasInstalled then
-    RunServiceCommand('refresh')
-  else
-    RunServiceCommand('install');
+  begin
+    { WinSW 2.12.0 does not support the newer refresh command.  Re-registering
+      the stopped, app-owned service keeps repair/upgrade installs idempotent. }
+    RemoveDcmGetServiceForUninstall();
+    ServiceWasInstalled := False;
+  end;
+  RunServiceCommand('install');
   ServiceWasInstalled := True;
 end;

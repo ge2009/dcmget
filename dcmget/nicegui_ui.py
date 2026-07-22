@@ -85,6 +85,50 @@ STATUS_MESSAGES = {
 }
 
 
+THEME_BOOTSTRAP = r"""
+<meta name="color-scheme" content="light dark">
+<script data-dcmget-theme-bootstrap>
+(() => {
+  const key = 'dcmget-theme';
+  const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+  const apply = (theme) => {
+    const resolved = theme === 'dark' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = resolved;
+    document.documentElement.style.colorScheme = resolved;
+    document.querySelector('meta[name="theme-color"]')
+      ?.setAttribute('content', resolved === 'dark' ? '#0e1518' : '#147da6');
+  };
+  const preferred = () => {
+    try {
+      const stored = window.localStorage.getItem(key);
+      if (stored === 'light' || stored === 'dark') return stored;
+    } catch (_) {}
+    return media?.matches ? 'dark' : 'light';
+  };
+  apply(preferred());
+  media?.addEventListener?.('change', () => {
+    try {
+      if (window.localStorage.getItem(key)) return;
+    } catch (_) {}
+    apply(preferred());
+  });
+})();
+</script>
+"""
+
+THEME_TOGGLE_HANDLER = r"""
+() => {
+  const root = document.documentElement;
+  const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+  root.dataset.theme = next;
+  root.style.colorScheme = next;
+  try { window.localStorage.setItem('dcmget-theme', next); } catch (_) {}
+  document.querySelector('meta[name="theme-color"]')
+    ?.setAttribute('content', next === 'dark' ? '#0e1518' : '#147da6');
+}
+"""
+
+
 CSS = r"""
 :root {
   --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
@@ -104,6 +148,45 @@ CSS = r"""
   --good: #248663;
   --bad: #c54848;
   --cyan: #4d8f98;
+  --on-signal: #ffffff;
+  --panel-glass: rgba(255,255,255,.86);
+  --page-top: #f7fafb;
+  --page-bottom: #f1f5f7;
+  --quiet-bg: #ffffff;
+  --neutral-soft: #edf2f4;
+  --progress-bg: #eaf0f3;
+  --error-soft: #fff4f3;
+  --error-copy: #8c4a48;
+  --summary-soft: #f1f8fb;
+  --summary-copy: #3a687a;
+  --log-info: #49636f;
+  --shadow: 0 12px 34px rgba(37,64,78,.07);
+}
+:root[data-theme="dark"] {
+  --ink: #e7eef1;
+  --panel: #17242a;
+  --panel-hi: #1b2b32;
+  --line: #2c3e46;
+  --muted: #a2b4bc;
+  --paper: #0e1518;
+  --signal: #45bdce;
+  --signal-2: #6ccddd;
+  --good: #55c58f;
+  --bad: #f07b82;
+  --cyan: #74b9c1;
+  --on-signal: #05262c;
+  --panel-glass: rgba(23,36,42,.90);
+  --page-top: #111b20;
+  --page-bottom: #0e1518;
+  --quiet-bg: #1b2b32;
+  --neutral-soft: #233239;
+  --progress-bg: #23343c;
+  --error-soft: #2c171a;
+  --error-copy: #f0a2a6;
+  --summary-soft: #142a33;
+  --summary-copy: #a9d5e3;
+  --log-info: #a8bac2;
+  --shadow: 0 14px 38px rgba(0,0,0,.34);
 }
 html, body, #q-app {
   background: var(--paper); color: var(--ink); font-family: var(--font-ui);
@@ -114,8 +197,8 @@ html { font-size:16px; }
 body {
   font-size:14px;
   background-image:
-    radial-gradient(circle at 88% 0%, rgba(20, 125, 166, .09), transparent 32rem),
-    linear-gradient(180deg, #f7fafb 0, #f1f5f7 100%);
+    radial-gradient(circle at 88% 0%, color-mix(in srgb,var(--signal) 9%,transparent), transparent 32rem),
+    linear-gradient(180deg, var(--page-top) 0, var(--page-bottom) 100%);
 }
 button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog {
   font-family: var(--font-ui) !important;
@@ -134,33 +217,61 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
   display: flex; align-items: center; justify-content: space-between; gap: 20px;
   padding: 8px 2px 18px; border-bottom: 1px solid var(--line); margin-bottom: 22px;
 }
+.topbar-stack { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
 .brand-lockup { display: flex; align-items: center; gap: 13px; }
 .brand-mark {
-  width: 38px; height: 38px; border: 1px solid rgba(20,125,166,.35);
+  width: 38px; height: 38px; border: 1px solid color-mix(in srgb,var(--signal) 35%,transparent);
   display: grid; place-items: center; color: var(--signal); position: relative;
-  border-radius: 10px; background: rgba(20,125,166,.07);
+  border-radius: 10px; background: color-mix(in srgb,var(--signal) 8%,transparent);
 }
 .brand-mark::before, .brand-mark::after { content: ""; position:absolute; background: var(--signal); opacity:.55; }
 .brand-mark::before { width: 16px; height: 1px; }
 .brand-mark::after { width: 1px; height: 16px; }
 .brand-title { font-family:var(--font-display); font-size:20px; font-weight:700; letter-spacing:.055em; }
 .brand-sub { color:var(--muted); font:11px var(--font-mono); letter-spacing:.16em; }
-.connection { font:500 12px var(--font-ui); font-variant-numeric:tabular-nums; color:var(--good); display:flex; align-items:center; gap:8px; }
+.topbar-chip {
+  display:flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
+  border:1px solid color-mix(in srgb,var(--signal) 14%,var(--line));
+  background:color-mix(in srgb,var(--panel) 84%,transparent);
+  color:var(--muted); font:600 12px var(--font-ui);
+}
+.connection {
+  font:600 12px var(--font-ui); font-variant-numeric:tabular-nums; color:var(--good);
+  display:flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
+  border:1px solid color-mix(in srgb,var(--good) 18%,var(--line));
+  background:color-mix(in srgb,var(--good) 10%,transparent);
+}
+.connection.is-pending { color:var(--signal); }
+.connection.is-error { color:var(--bad); }
 .connection::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 12px currentColor; }
 .hero { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(310px, .65fr); gap:22px; }
 .eyebrow { color:var(--signal); font:600 11px var(--font-mono); letter-spacing:.18em; text-transform:uppercase; }
 .headline { font-family:var(--font-display); font-size:clamp(28px,2.3vw,36px); font-weight:700; line-height:1.25; letter-spacing:-.015em; margin:8px 0 12px; }
 .lede { color:var(--muted); max-width:680px; line-height:1.72; font-size:15px; }
-.hero-facts { display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.82); box-shadow:0 12px 35px rgba(37,64,78,.06); overflow:hidden; }
-.hero-fact { padding:17px; border-right:1px solid var(--line); min-width:0; }
-.hero-fact:last-child { border:0; }
+.hero-panel { display:grid; gap:14px; }
+.summary-card { padding:20px; background:linear-gradient(180deg, color-mix(in srgb,var(--panel) 98%,transparent), color-mix(in srgb,var(--summary-soft) 78%,var(--panel))); }
+.summary-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.summary-copy { display:grid; gap:4px; }
+.summary-copy p { margin:0; color:var(--muted); font-size:13px; line-height:1.6; }
+.summary-badge {
+  display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
+  border:1px solid color-mix(in srgb,var(--signal) 20%,var(--line));
+  background:color-mix(in srgb,var(--signal) 10%,transparent);
+  color:var(--signal); font:600 12px var(--font-ui); white-space:nowrap;
+}
+.hero-facts { display:grid; grid-template-columns:repeat(2,1fr); border:1px solid var(--line); border-radius:14px; background:var(--panel-glass); box-shadow:var(--shadow); overflow:hidden; }
+.hero-fact { padding:17px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); min-width:0; }
+.hero-fact:nth-child(2n) { border-right:0; }
+.hero-fact:nth-last-child(-n+2) { border-bottom:0; }
 .fact-label { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
 .fact-value { display:block; font:600 13px var(--font-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hero-actions { display:flex; flex-wrap:wrap; gap:10px; }
+.hero-actions .q-btn { min-width:0; }
 .launch-bar {
   display:flex; align-items:center; justify-content:space-between; gap:18px;
-  margin-top:20px; padding:15px 18px; border:1px solid rgba(20,125,166,.24);
-  border-radius:15px; background:rgba(255,255,255,.94);
-  box-shadow:0 12px 34px rgba(37,64,78,.08); position:sticky; top:10px; z-index:20;
+  margin-top:20px; padding:15px 18px; border:1px solid color-mix(in srgb,var(--signal) 24%,var(--line));
+  border-radius:15px; background:var(--panel-glass);
+  box-shadow:var(--shadow); position:sticky; top:10px; z-index:20;
 }
 .launch-copy { min-width:0; }
 .launch-title { display:block; font-size:16px; font-weight:700; }
@@ -168,68 +279,80 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .launch-actions { display:flex; align-items:center; gap:9px; flex:0 0 auto; }
 .grid-main { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(330px,.5fr); gap:22px; margin-top:25px; align-items:start; }
 .stack { display:grid; gap:18px; }
-.surface { border:1px solid var(--line); border-radius:15px; background:var(--panel); box-shadow:0 12px 34px rgba(37,64,78,.07); overflow:hidden; }
+.surface { border:1px solid var(--line); border-radius:15px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden; }
 .surface-head { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 20px; border-bottom:1px solid var(--line); }
 .surface-head h2 { font-size:20px; margin:0; }
 .surface-head p { color:var(--muted); font-size:12px; margin:3px 0 0; }
 .surface-body { padding:20px; }
 .step-index { color:var(--signal); font:600 12px var(--font-ui); font-variant-numeric:tabular-nums; letter-spacing:.03em; }
+.section-copy { display:grid; gap:2px; }
+.section-note { color:var(--muted); font-size:12px; line-height:1.55; }
 .q-field--outlined .q-field__control:before { border-color:var(--line) !important; }
-.q-field--outlined .q-field__control:hover:before { border-color:rgba(255,179,71,.45) !important; }
+.q-field--outlined .q-field__control:hover:before { border-color:color-mix(in srgb,var(--signal) 55%,var(--line)) !important; }
 .q-field__native, .q-field__input, .q-field__label { color:var(--ink) !important; }
 .q-field__bottom { color:var(--muted); }
+.q-field__control, .q-menu, .q-card { background:var(--panel); color:var(--ink); }
 .accession-input textarea { min-height:170px !important; font:13px/1.62 var(--font-mono) !important; }
 .inline-stats { display:flex; flex-wrap:wrap; gap:8px; margin-top:11px; }
 .stat-pill { border:1px solid var(--line); padding:5px 9px; color:var(--muted); font:12px var(--font-ui); font-variant-numeric:tabular-nums; }
 .stat-pill strong { color:var(--ink); }
 .quick-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
-.button-primary { background:var(--signal) !important; color:#fff !important; font-weight:700; letter-spacing:.02em; }
-.button-primary .q-btn__content, .button-primary .q-icon { color:#fff !important; opacity:1 !important; }
+.button-primary { background:var(--signal) !important; color:var(--on-signal) !important; font-weight:700; letter-spacing:.02em; }
+.button-primary .q-btn__content, .button-primary .q-icon { color:var(--on-signal) !important; opacity:1 !important; }
 .button-primary.q-btn--disabled { opacity:.52 !important; }
-.button-danger { color:var(--bad) !important; border-color:rgba(255,122,115,.35) !important; }
-.button-quiet { color:var(--ink) !important; border:1px solid var(--line); background:#fff !important; }
+.button-danger { color:var(--bad) !important; border-color:color-mix(in srgb,var(--bad) 35%,transparent) !important; }
+.button-quiet { color:var(--ink) !important; border:1px solid var(--line); background:var(--quiet-bg) !important; }
 html body .q-btn.button-danger { color:var(--bad) !important; }
 html body .q-btn.button-quiet { color:var(--ink) !important; }
 .button-danger .q-btn__content, .button-danger .q-icon { color:var(--bad) !important; }
 .button-quiet .q-btn__content, .button-quiet .q-icon { color:var(--ink) !important; }
-.drop-upload { width:100%; border:1px dashed rgba(124,206,208,.42); background:rgba(124,206,208,.035); }
+.drop-upload { width:100%; border:1px dashed color-mix(in srgb,var(--cyan) 42%,transparent); background:color-mix(in srgb,var(--cyan) 4%,transparent); }
 .preflight-list { display:grid; gap:10px; }
-.check-row { display:grid; grid-template-columns:24px 1fr; gap:10px; align-items:start; padding:9px 0; border-bottom:1px solid rgba(176,212,205,.08); }
-.check-dot { width:20px;height:20px;border-radius:50%;display:grid;place-items:center;background:#edf2f4;color:var(--muted);font-size:11px; }
-.check-dot.ok { color:var(--good); background:rgba(113,214,160,.12); }
-.check-dot.bad { color:var(--bad); background:rgba(255,122,115,.12); }
+.check-row { display:grid; grid-template-columns:24px 1fr; gap:10px; align-items:start; padding:9px 0; border-bottom:1px solid var(--line); }
+.check-dot { width:20px;height:20px;border-radius:50%;display:grid;place-items:center;background:var(--neutral-soft);color:var(--muted);font-size:11px; }
+.check-dot.ok { color:var(--good); background:color-mix(in srgb,var(--good) 12%,transparent); }
+.check-dot.bad { color:var(--bad); background:color-mix(in srgb,var(--bad) 12%,transparent); }
 .check-copy strong { display:block;font-size:13px; }.check-copy small{color:var(--muted);font-size:12px;}
-.progress-rail { height:9px; background:#eaf0f3; border:1px solid var(--line); border-radius:999px; overflow:hidden; }
+.progress-rail { height:9px; background:var(--progress-bg); border:1px solid var(--line); border-radius:999px; overflow:hidden; }
 .progress-fill { height:100%; width:0; background:linear-gradient(90deg,var(--signal),var(--signal-2)); transition:width .4s ease; }
 .progress-label { color:var(--signal); font:600 12px var(--font-mono); }
 .metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:18px; }
 .metric { background:var(--panel-hi); padding:15px; min-width:0; }.metric span{display:block;color:var(--muted);font-size:12px;letter-spacing:.05em}.metric strong{display:block;margin-top:8px;font:600 15px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .action-row { display:flex;flex-wrap:wrap;gap:9px;margin-top:18px; }
-.error-block { border-left:3px solid var(--bad); background:#fff4f3; padding:14px; margin-bottom:14px; }
-.error-block strong { color:var(--bad); }.error-block p{color:#8c4a48;margin:5px 0 0;font-size:12px;}
+.error-block { border-left:3px solid var(--bad); background:var(--error-soft); padding:14px; margin-bottom:14px; }
+.error-block strong { color:var(--bad); }.error-block p{color:var(--error-copy);margin:5px 0 0;font-size:12px;}
 .result-table { width:100%; }
 .result-table .q-table { background:transparent; color:var(--ink); }
 .result-table th { color:var(--muted); font-size:12px; letter-spacing:.05em; }
-.large-summary { border:1px solid rgba(20,125,166,.22); border-radius:10px; background:#f1f8fb; padding:16px; color:#3a687a; line-height:1.65; }
-.log-line { display:grid;grid-template-columns:70px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid rgba(176,212,205,.08);font:12px/1.55 var(--font-mono); }
-.log-time { color:var(--muted); }.log-error{color:var(--bad)}.log-info{color:#b8c9c5}
+.large-summary { border:1px solid color-mix(in srgb,var(--signal) 22%,var(--line)); border-radius:10px; background:var(--summary-soft); padding:16px; color:var(--summary-copy); line-height:1.65; }
+.log-line { display:grid;grid-template-columns:70px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font:12px/1.55 var(--font-mono); }
+.log-time { color:var(--muted); }.log-error{color:var(--bad)}.log-info{color:var(--log-info)}
 .profile-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px;margin-top:22px; }
-.profile-card { border:1px solid var(--line); border-radius:15px; background:#fff;padding:19px;position:relative;overflow:hidden;box-shadow:0 10px 28px rgba(37,64,78,.06); }
-.profile-card::after { content:"";position:absolute;width:80px;height:80px;border:1px solid rgba(124,206,208,.08);border-radius:50%;right:-30px;top:-30px; }
-.profile-card.running { border-color:rgba(113,214,160,.32); }.profile-card.issue{border-color:rgba(255,122,115,.35)}
+.profile-card { border:1px solid var(--line); border-radius:15px; background:var(--panel);padding:19px;position:relative;overflow:hidden;box-shadow:var(--shadow); }
+.profile-card::after { content:"";position:absolute;width:80px;height:80px;border:1px solid color-mix(in srgb,var(--cyan) 8%,transparent);border-radius:50%;right:-30px;top:-30px; }
+.profile-card.running { border-color:color-mix(in srgb,var(--good) 32%,var(--line)); }.profile-card.issue{border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
 .profile-name { font-family:var(--font-display);font-size:20px;font-weight:700; }.profile-no{color:var(--signal);font:11px var(--font-mono);}
 .profile-facts { display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0; }.profile-fact span{display:block;color:var(--muted);font-size:12px}.profile-fact strong{font:12px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:4px}
 .profile-status { position:absolute;right:15px;top:15px;font:500 12px var(--font-ui);color:var(--muted); }.profile-status.on{color:var(--good)}
 .manager-summary { display:flex;gap:25px;margin-top:16px; }.manager-summary strong{font-family:var(--font-display);font-size:30px;font-weight:700}.manager-summary span{display:block;color:var(--muted);font-size:12px}
-.settings-dialog { width:min(850px,94vw);max-width:850px;background:#fff !important;color:var(--ink);border:1px solid var(--line); }
+.manager-cta { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+.settings-dialog { width:min(850px,94vw);max-width:850px;background:var(--panel) !important;color:var(--ink);border:1px solid var(--line); }
 .settings-grid { display:grid;grid-template-columns:1fr 1fr;gap:13px; }.settings-section{padding:4px 0 12px}.settings-section-title{color:var(--signal);font:600 12px var(--font-ui);letter-spacing:.05em;margin-bottom:12px}
 .dialog-host { display:contents; }
 .q-expansion-item { border-bottom:1px solid var(--line); }.q-expansion-item__container > .q-item{color:var(--ink)}
-.directory-dialog { width:min(720px,94vw);background:#fff !important;color:var(--ink);border:1px solid var(--line); }
+.directory-dialog { width:min(720px,94vw);background:var(--panel) !important;color:var(--ink);border:1px solid var(--line); }
 .directory-row { width:100%;justify-content:flex-start;color:var(--ink)!important;border-bottom:1px solid var(--line); }
 .loading-card { min-height:220px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:var(--muted); }
-@media(max-width:900px){.hero,.grid-main{grid-template-columns:1fr}.hero-facts{margin-top:4px}.metric-grid{grid-template-columns:1fr 1fr}.workspace{padding:14px 14px 36px}.settings-grid{grid-template-columns:1fr}.launch-bar{top:6px}}
-@media(max-width:520px){.headline{font-size:34px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0;border-bottom:1px solid var(--line)}.metric-grid{grid-template-columns:1fr}.topbar{align-items:flex-start}.connection{display:none}.launch-bar{align-items:stretch;flex-direction:column}.launch-actions{display:grid;grid-template-columns:1fr 1.25fr}.launch-actions .q-btn{width:100%}}
+.theme-toggle { color:var(--ink) !important; border:1px solid var(--line); background:var(--quiet-bg) !important; }
+.text-slate-400, .text-slate-500 { color:var(--muted) !important; }
+.q-notification { border:1px solid color-mix(in srgb,currentColor 20%,transparent); box-shadow:var(--shadow); }
+.surface, .profile-card, .launch-bar { transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.profile-card:hover { border-color:color-mix(in srgb,var(--signal) 38%,var(--line)); transform:translateY(-1px); }
+.q-btn:active { transform:translateY(1px); }
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}}
+@media(forced-colors:active){.surface,.profile-card,.launch-bar,.q-btn,.q-field__control{border:1px solid ButtonBorder!important}.button-primary{border-color:ButtonText!important}.connection::before{forced-color-adjust:none}}
+@media(max-width:900px){.hero,.grid-main{grid-template-columns:1fr}.hero-facts{margin-top:4px}.metric-grid{grid-template-columns:1fr 1fr}.workspace{padding:14px 14px 36px}.settings-grid{grid-template-columns:1fr}.launch-bar{top:6px}.topbar{align-items:flex-start;flex-direction:column}.topbar-stack{justify-content:flex-start}}
+@media(max-width:520px){.headline{font-size:34px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0!important;border-bottom:1px solid var(--line)}.hero-fact:last-child{border-bottom:0}.metric-grid{grid-template-columns:1fr}.connection{display:none}.topbar-chip{width:100%;justify-content:center}.launch-bar{align-items:stretch;flex-direction:column}.launch-actions{display:grid;grid-template-columns:1fr 1.25fr}.launch-actions .q-btn{width:100%}}
 """
 
 
@@ -635,8 +758,12 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
                 ui.label("PROFILE ORCHESTRATION / 8786").classes("eyebrow")
                 ui.label("让每一条影像链路，清楚地运行。 ").classes("headline")
                 ui.label("统一查看、启动和停止独立 Profile。每个 Profile 保持自己的 PACS、接收端口、保存目录与任务状态。").classes("lede")
-            with ui.element("div").classes("surface surface-body"):
-                ui.label("工作台概况").classes("eyebrow")
+            with ui.element("div").classes("surface surface-body summary-card"):
+                with ui.element("div").classes("summary-head"):
+                    with ui.element("div").classes("summary-copy"):
+                        ui.label("工作台概况").classes("eyebrow")
+                        ui.label("统一入口，按需启动；不再把细碎配置堆在首屏。").classes("text-sm")
+                    ui.label("当前 Profile 默认不启动").classes("summary-badge")
                 with ui.element("div").classes("manager-summary"):
                     with ui.element("div"):
                         count_label = ui.label("0")
@@ -644,21 +771,40 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
                     with ui.element("div"):
                         running_label = ui.label("0")
                         ui.label("正在运行")
-                ui.button("新建 Profile", icon="add", on_click=create_profile).props("unelevated").classes("button-primary mt-5")
+                with ui.element("div").classes("manager-cta"):
+                    ui.button("新建 Profile", icon="add", on_click=create_profile).props("unelevated").classes("button-primary")
         grid = ui.element("section").classes("profile-grid")
         dialog_host = ui.element("div").classes("dialog-host")
     await refresh_profiles()
     ui.timer(4.0, refresh_profiles)
 
 
-def _topbar(context: str) -> None:
+def _topbar(context: str, *, connection_state: str = "connected") -> None:
     with ui.element("header").classes("topbar"):
         with ui.element("div").classes("brand-lockup"):
             ui.element("div").classes("brand-mark")
             with ui.element("div"):
                 ui.label("DCMGET").classes("brand-title")
                 ui.label(context.upper()).classes("brand-sub")
-        ui.label("API 已连接 · 浏览器安全会话").classes("connection")
+        with ui.element("div").classes("topbar-stack"):
+            ui.label("浏览器安全会话").classes("topbar-chip")
+            theme_button = ui.button(icon="contrast").props(
+                'flat round dense aria-label="切换浅色或深色主题"'
+            ).classes("theme-toggle")
+            theme_button.on("click", js_handler=THEME_TOGGLE_HANDLER)
+            theme_button.tooltip("切换浅色 / 深色主题")
+            connection_labels = {
+                "connected": "API 已连接",
+                "connecting": "正在连接",
+                "error": "连接失败",
+            }
+            connection_classes = {
+                "connecting": " is-pending",
+                "error": " is-error",
+            }
+            ui.label(connection_labels.get(connection_state, "API 已连接")).classes(
+                "connection" + connection_classes.get(connection_state, "")
+            )
 
 
 async def _build_profile(
@@ -703,6 +849,22 @@ async def _build_profile(
         state.preflight_signature = ""
         refs["start"].disable()
         refs["readiness"].set_text("内容有变化，请重新预检")
+
+    def can_start_new_task() -> bool:
+        actions = state.task.get("actions")
+        if isinstance(actions, Mapping) and "can_start" in actions:
+            return bool(actions.get("can_start"))
+        return _normal_status(state.task.get("status")) in TERMINAL_STATUSES | {"idle"}
+
+    def task_block_message() -> str:
+        status = _normal_status(state.task.get("status"))
+        operation = str(state.task.get("operation") or "").strip().lower()
+        port = state.config.get("storage_port", "—")
+        if operation == "download" and status in {
+            "starting_receiver", "downloading", "pause_pending", "paused", "stopping"
+        }:
+            return f"当前任务正在使用接收端口 {port}；请先继续或结束当前任务"
+        return "当前 Profile 存在未完成任务；请先继续、重试或结束当前任务"
 
     def update_accessions(values: list[str], stats: dict[str, int]) -> bool:
         if values == state.accessions and stats == state.import_stats:
@@ -856,6 +1018,18 @@ async def _build_profile(
         await load(current)
 
     async def run_preflight(*, silent: bool = False) -> bool:
+        if not can_start_new_task():
+            message = task_block_message()
+            state.preflight_ok = False
+            state.preflight_signature = ""
+            render_checks(
+                [{"key": "task", "name": "当前任务", "ok": False, "message": message}]
+            )
+            refs["readiness"].set_text(message)
+            refs["start"].disable()
+            if not silent:
+                ui.notify(message, type="warning")
+            return False
         if not state.large_import:
             parse_pasted()
         payload = draft()
@@ -919,6 +1093,9 @@ async def _build_profile(
         try:
             result = await _browser_api(api("/api/tasks/start"), method="POST", body=draft(), timeout=45)
             state.task = dict(result.get("task") or result)
+            state.preflight_ok = False
+            state.preflight_signature = ""
+            state.last_preflight_attempt = ""
             render_task()
             ui.notify("任务已交给后台执行；关闭浏览器不会停止下载", type="positive")
         except Exception as exc:
@@ -985,6 +1162,9 @@ async def _build_profile(
         summary = refs.get("license_summary")
         if summary is not None:
             summary.set_text(license_label(value))
+        badge = refs.get("license_badge")
+        if badge is not None:
+            badge.set_text(license_label(value))
 
     def open_license_dialog() -> None:
         with ui.dialog() as dialog, ui.card().classes("settings-dialog p-0"):
@@ -1111,6 +1291,13 @@ async def _build_profile(
         refs["speed"].set_text(_format_speed(task.get("speed_bytes_per_second", task.get("speed_bps", 0))))
         refs["failed"].set_text(f"{_task_count(task, 'failed', 'failed_count', '失败'):,}")
         actions = task.get("actions") if isinstance(task.get("actions"), Mapping) else {}
+        if bool(actions.get("can_start", status in TERMINAL_STATUSES | {"idle"})):
+            refs["start"].set_enabled(state.preflight_ok)
+        else:
+            state.preflight_ok = False
+            state.preflight_signature = ""
+            refs["start"].disable()
+            refs["readiness"].set_text(task_block_message())
         refs["pause"].set_visibility(bool(actions.get("can_pause", status in ACTIVE_STATUSES)))
         refs["resume"].set_visibility(bool(actions.get("can_resume", status in RESUMABLE_STATUSES)))
         refs["cancel"].set_visibility(bool(actions.get("can_cancel", status not in TERMINAL_STATUSES | {"idle"})))
@@ -1372,10 +1559,25 @@ async def _build_profile(
                 ui.label("DICOM RETRIEVAL WORKSPACE").classes("eyebrow")
                 ui.label("把影像取回这件事，变得简单而确定。 ").classes("headline")
                 ui.label("粘贴检查号，确认保存位置，然后开始。预检、接收、下载、失败重试与 PDI 导出均由后台持续执行。").classes("lede")
-            with ui.element("div").classes("hero-facts"):
-                _fact("当前 PROFILE", profile_name)
-                _fact("PACS", f"{config.get('pacs_server_ip', '—')}:{config.get('pacs_server_port', '—')}")
-                _fact("接收端", f"{config.get('storage_ae_title', '—')}:{config.get('storage_port', '—')}")
+            with ui.element("div").classes("hero-panel"):
+                with ui.element("div").classes("surface summary-card"):
+                    with ui.element("div").classes("summary-head"):
+                        with ui.element("div").classes("summary-copy"):
+                            ui.label("当前工作上下文").classes("eyebrow")
+                            ui.label("主流程只保留任务输入、预检与下载控制。").classes("text-sm")
+                        refs["license_badge"] = ui.label(
+                            license_label(license_data)
+                        ).classes("summary-badge")
+                    with ui.element("div").classes("hero-facts"):
+                        _fact("当前 PROFILE", profile_name)
+                        _fact("PACS", f"{config.get('pacs_server_ip', '—')}:{config.get('pacs_server_port', '—')}")
+                        _fact("接收端", f"{config.get('storage_ae_title', '—')}:{config.get('storage_port', '—')}")
+                        _fact("WEB", str(web.get("lan_url") or web.get("url") or "—"))
+                with ui.element("div").classes("hero-actions"):
+                    ui.button("当前设置", icon="settings", on_click=open_settings).props("flat no-caps").classes("button-quiet")
+                    ui.button("版本说明", icon="history", on_click=open_release_notes).props("flat no-caps").classes("button-quiet")
+                    if local_session:
+                        ui.button("打开保存目录", icon="folder_open", on_click=lambda: operation("open-destination")).props("flat no-caps").classes("button-quiet")
 
         with ui.element("section").classes("launch-bar"):
             with ui.element("div").classes("launch-copy"):
@@ -1400,9 +1602,10 @@ async def _build_profile(
             with ui.element("div").classes("stack"):
                 with ui.element("article").classes("surface"):
                     with ui.element("div").classes("surface-head"):
-                        with ui.element("div"):
+                        with ui.element("div").classes("section-copy"):
                             ui.label("01 / 输入检查号").classes("step-index")
                             ui.label("新建下载任务").classes("text-xl")
+                            ui.label("支持粘贴和导入文件；大批量任务会自动切换为聚合视图。").classes("section-note")
                         with ui.row().classes("items-center gap-2"):
                             ui.button("清空", icon="delete_sweep", on_click=clear_accessions).props("flat").classes("button-quiet")
                             ui.upload(
@@ -1426,9 +1629,10 @@ async def _build_profile(
 
                 with ui.element("article").classes("surface"):
                     with ui.element("div").classes("surface-head"):
-                        with ui.element("div"):
+                        with ui.element("div").classes("section-copy"):
                             ui.label("02 / 保存与交付").classes("step-index")
                             ui.label("快速选项").classes("text-xl")
+                            ui.label("常用参数留在当前页，低频参数进入完整设置。").classes("section-note")
                         ui.button("完整设置", icon="settings", on_click=open_settings).props("flat").classes("button-quiet")
                     with ui.element("div").classes("surface-body stack"):
                         with ui.element("div").classes("quick-grid"):
@@ -1447,9 +1651,10 @@ async def _build_profile(
 
                 with ui.element("article").classes("surface"):
                     with ui.element("div").classes("surface-head"):
-                        with ui.element("div"):
+                        with ui.element("div").classes("section-copy"):
                             ui.label("03 / 启动前确认").classes("step-index")
                             ui.label("自动预检").classes("text-xl")
+                            ui.label("会检查配置、DCMTK、保存目录以及当前任务是否仍占用接收端口。").classes("section-note")
                     with ui.element("div").classes("surface-body"):
                         refs["checks"] = ui.element("div").classes("preflight-list")
                         render_checks([])
@@ -1577,6 +1782,7 @@ def install_nicegui(app: Any, mount_path: str = "/workspace") -> None:
 
     @ui.page("/")
     async def dcmget_workspace(request: Request) -> None:
+        ui.add_head_html(THEME_BOOTSTRAP)
         ui.add_css(CSS)
         ui.colors(
             primary="#147da6",
@@ -1587,7 +1793,7 @@ def install_nicegui(app: Any, mount_path: str = "/workspace") -> None:
         root = ui.element("div").classes("w-full")
         with root:
             with ui.element("main").classes("workspace"):
-                _topbar("正在连接")
+                _topbar("正在连接", connection_state="connecting")
                 with ui.element("div").classes("surface surface-body loading-card"):
                     ui.spinner("dots", size="2.5rem", color="primary")
                     ui.label("正在读取 Profile 与任务状态…")
@@ -1599,7 +1805,7 @@ def install_nicegui(app: Any, mount_path: str = "/workspace") -> None:
                 root.clear()
                 with root:
                     with ui.element("main").classes("workspace"):
-                        _topbar("连接失败")
+                        _topbar("连接失败", connection_state="error")
                         with ui.element("div").classes("error-block mt-8"):
                             ui.label("无法连接 DcmGet API").classes("font-semibold")
                             ui.label(_payload_error(exc))

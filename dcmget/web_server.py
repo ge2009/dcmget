@@ -291,6 +291,30 @@ def _preflight_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "check"
 
 
+def _task_preflight_blocker(
+    snapshot: Mapping[str, Any], storage_port: int
+) -> str:
+    """Explain why this Profile cannot accept another task before probing ports."""
+
+    actions = snapshot.get("actions")
+    if not isinstance(actions, Mapping) or actions.get("can_start") is not False:
+        return ""
+    status = str(snapshot.get("status") or "").strip().lower().replace("-", "_")
+    operation = str(snapshot.get("operation") or "").strip().lower()
+    if operation == "download" and status in {
+        "starting_receiver",
+        "downloading",
+        "pause_pending",
+        "paused",
+        "stopping",
+    }:
+        return (
+            f"当前 Profile 已有下载任务，接收端口 {int(storage_port)} "
+            "正由该任务使用；请先继续或结束当前任务，不能同时新建任务"
+        )
+    return "当前 Profile 存在未完成或可恢复任务，请先继续、重试或结束当前任务"
+
+
 def _validated_accessions(value: object) -> list[str]:
     if not isinstance(value, list) or len(value) > MAX_ACCESSIONS:
         raise HTTPException(status_code=400, detail="检查号列表无效或超过上限")
@@ -1010,6 +1034,23 @@ def create_web_app(
         config = _task_config(current_config(), payload)
         if preflight_provider is None:
             raise HTTPException(status_code=503, detail="预检服务尚未配置")
+        current = await _invoke(service, "snapshot")
+        if isinstance(current, dict):
+            task_blocker = _task_preflight_blocker(current, config.storage_port)
+            if task_blocker:
+                return {
+                    "ok": False,
+                    "checks": [
+                        {
+                            "key": "task",
+                            "name": "当前任务",
+                            "ok": False,
+                            "message": task_blocker,
+                        }
+                    ],
+                    "errors": {"task_state": task_blocker},
+                    "raw": {"status": current.get("status", "")},
+                }
         try:
             result = preflight_provider(config)
             if inspect.isawaitable(result):

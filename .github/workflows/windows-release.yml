@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.5.0
+        default: 3.5.1
 
 permissions:
   contents: read
@@ -1041,7 +1041,7 @@ jobs:
           )
 
           # Reinstall the same release while the service is active.  This proves
-          # service-aware upgrade stop/refresh/start behavior and config retention.
+          # service-aware upgrade stop/re-register/start behavior and config retention.
           $serviceUpgradeLog = Join-Path $env:RUNNER_TEMP "dcmget-service-active-upgrade.log"
           $serviceUpgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$serviceUpgradeLog") -Wait -PassThru
           if ($serviceUpgrade.ExitCode -ne 0) {

@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from dcmget import web_server as web_server_module
 from dcmget.config import AppConfig, save_config
 from dcmget.core import ToolPaths
 from dcmget.web_security import bootstrap_web_security
@@ -222,6 +223,7 @@ def test_anonymous_bootstrap_creates_ip_bound_session_and_loads_app(web: WebFixt
     assert web.client.get("/").status_code == 200
     assert web.client.get("/favicon.ico").status_code == 204
     assert web.client.get("/assets/app.js").status_code == 200
+    assert web.client.get("/assets/theme.js").status_code == 200
 
 
 def test_nicegui_workspace_uses_scoped_csp_and_secures_websocket_session(
@@ -334,6 +336,7 @@ with TestClient(
     page = client.get('/workspace/')
     assert page.status_code == 200
     assert 'DcmGet 影像下载工作台' in page.text
+    assert 'data-dcmget-theme-bootstrap' in page.text
     assert '/workspace/_nicegui/' in page.text
     assert client.get('/workspace/favicon.ico').status_code == 200
 """
@@ -471,6 +474,109 @@ def test_task_routes_build_server_side_config_and_tools(web: WebFixture):
     assert recovered.status_code == 200
     assert web.service.calls[-1] == "resume_task"
     assert recovered.json()["task"]["status"] == "downloading"
+
+
+def test_preflight_reports_current_task_before_its_receiver_port_as_conflict(
+    web: WebFixture,
+):
+    csrf = web.setup()
+    web.service.task_id = "active-task"
+    web.service.status = "downloading"
+
+    response = web.client.post(
+        "/api/preflight",
+        json={
+            "accessions": ["A1"],
+            "destination": str(web.allowed_root),
+        },
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert set(payload["errors"]) == {"task_state"}
+    assert payload["checks"] == [
+        {
+            "key": "task",
+            "name": "当前任务",
+            "ok": False,
+            "message": (
+                "当前 Profile 已有下载任务，接收端口 6666 "
+                "正由该任务使用；请先继续或结束当前任务，不能同时新建任务"
+            ),
+        }
+    ]
+
+
+def test_default_web_preflight_still_reports_external_receiver_port_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    state = tmp_path / "state"
+    config_path = tmp_path / "config.json"
+    destination = tmp_path / "dicom"
+    destination.mkdir()
+    save_config(
+        config_path,
+        AppConfig(
+            dicom_destination_folder=str(destination),
+            storage_port=6663,
+            web_port=PORT,
+        ),
+    )
+    tools = ToolPaths(
+        movescu=tmp_path / "bin" / "movescu",
+        storescp=tmp_path / "bin" / "storescp",
+        bin_dir=tmp_path / "bin",
+        version="3.7.0",
+    )
+    observed: list[bool] = []
+
+    def fake_preflight(config, _resolver, *, check_port=True):
+        observed.append(bool(check_port))
+        return {
+            "checks": [
+                (
+                    "接收端口",
+                    False,
+                    "端口 6663 已被其他程序占用",
+                )
+            ],
+            "errors": {"storage_port": "端口 6663 已被其他程序占用"},
+        }
+
+    monkeypatch.setattr(web_server_module, "run_core_preflight", fake_preflight)
+    security = bootstrap_web_security(state)
+    app = create_web_app(
+        FakeService(),
+        security=security,
+        server_port=PORT,
+        trusted_hosts=("127.0.0.1",),
+        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+        directory_roots={"data": destination},
+        config_path=config_path,
+        project_root=tmp_path,
+        tools_provider=lambda _config: tools,
+    )
+    with TestClient(
+        app,
+        base_url=LOCAL_URL,
+        client=("127.0.0.1", 50123),
+    ) as client:
+        csrf = client.get("/api/bootstrap").json()["csrf_token"]
+        response = client.post(
+            "/api/preflight",
+            json={"accessions": ["A1"], "destination": str(destination)},
+            headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert observed == [True]
+    receiver = next(
+        item for item in response.json()["checks"] if item["key"] == "receiver"
+    )
+    assert receiver["message"] == "端口 6663 已被其他程序占用"
 
 
 def test_config_update_is_validated_and_locked_during_active_task(web: WebFixture):
