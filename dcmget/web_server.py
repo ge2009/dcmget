@@ -1300,6 +1300,11 @@ def create_web_app(
 
     async def shutdown_application() -> dict[str, Any]:
         result = await _invoke(service, "shutdown")
+        if result is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="后台任务或 DCMTK 进程未能在限定时间内停止",
+            )
         if shutdown_callback is not None:
             # Let this response leave the socket before stopping uvicorn.
             threading.Timer(0.15, shutdown_callback).start()
@@ -1755,13 +1760,11 @@ class DcmGetWebServer:
 
     def stop(self, timeout: float = 10.0) -> None:
         with self._stop_lock:
-            try:
-                shutdown = getattr(self.service, "shutdown", None)
-                if callable(shutdown):
-                    shutdown()
-            finally:
-                self.security.sessions.revoke_all()
-                self.request_shutdown()
+            shutdown = getattr(self.service, "shutdown", None)
+            if callable(shutdown) and shutdown() is not True:
+                raise RuntimeError("DcmGet 后台进程未能在超时内停止")
+            self.security.sessions.revoke_all()
+            self.request_shutdown()
             thread = self._thread
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=max(0.0, timeout))

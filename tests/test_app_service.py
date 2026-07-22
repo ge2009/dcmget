@@ -146,8 +146,10 @@ def test_pause_resume_cancel_are_forwarded_and_shutdown_drains_worker(tmp_path):
     service = _service(tmp_path, runner_factory=Runner)
     service.start_task(AppConfig(), _tools(tmp_path), ["A001"])
     assert started.wait(2)
-    service.pause()
+    paused = service.pause()
     assert Runner.instances[-1].paused
+    assert paused["status"] == "pause_pending"
+    assert paused["message"] == "当前检查号完成后暂停"
     service.resume()
     assert not Runner.instances[-1].paused
     service.shutdown(timeout=2)

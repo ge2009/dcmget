@@ -36,9 +36,13 @@ ACTIVE_STATUSES = {
     "starting_receiver",
     "running",
     "downloading",
-    "pause_pending",
 }
-RESUMABLE_STATUSES = {"paused", "interrupted", "download_retryable"}
+RESUMABLE_STATUSES = {
+    "pause_pending",
+    "paused",
+    "interrupted",
+    "download_retryable",
+}
 TERMINAL_STATUSES = {
     "completed",
     "failed",
@@ -69,6 +73,15 @@ STATUS_LABELS = {
     "pdi_running": "PDI 生成中",
     "pdi_retryable": "PDI 可重试",
     "pdi_completed": "PDI 已完成",
+}
+
+STATUS_MESSAGES = {
+    "starting_receiver": "正在启动 DICOM 接收器",
+    "downloading": "正在接收影像",
+    "pause_pending": "当前检查号完成后暂停",
+    "paused": "下载已暂停，可以随时继续",
+    "interrupted": "下载已安全中断，可以继续",
+    "download_retryable": "部分检查号未完成，可以重试失败项",
 }
 
 
@@ -141,8 +154,18 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .hero-facts { display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.82); box-shadow:0 12px 35px rgba(37,64,78,.06); overflow:hidden; }
 .hero-fact { padding:17px; border-right:1px solid var(--line); min-width:0; }
 .hero-fact:last-child { border:0; }
-.hero-fact span { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
-.hero-fact strong { display:block; font:600 13px var(--font-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.fact-label { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
+.fact-value { display:block; font:600 13px var(--font-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.launch-bar {
+  display:flex; align-items:center; justify-content:space-between; gap:18px;
+  margin-top:20px; padding:15px 18px; border:1px solid rgba(20,125,166,.24);
+  border-radius:15px; background:rgba(255,255,255,.94);
+  box-shadow:0 12px 34px rgba(37,64,78,.08); position:sticky; top:10px; z-index:20;
+}
+.launch-copy { min-width:0; }
+.launch-title { display:block; font-size:16px; font-weight:700; }
+.launch-state { display:block; color:var(--muted); font-size:13px; margin-top:2px; }
+.launch-actions { display:flex; align-items:center; gap:9px; flex:0 0 auto; }
 .grid-main { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(330px,.5fr); gap:22px; margin-top:25px; align-items:start; }
 .stack { display:grid; gap:18px; }
 .surface { border:1px solid var(--line); border-radius:15px; background:var(--panel); box-shadow:0 12px 34px rgba(37,64,78,.07); overflow:hidden; }
@@ -161,8 +184,14 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .stat-pill strong { color:var(--ink); }
 .quick-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
 .button-primary { background:var(--signal) !important; color:#fff !important; font-weight:700; letter-spacing:.02em; }
+.button-primary .q-btn__content, .button-primary .q-icon { color:#fff !important; opacity:1 !important; }
+.button-primary.q-btn--disabled { opacity:.52 !important; }
 .button-danger { color:var(--bad) !important; border-color:rgba(255,122,115,.35) !important; }
 .button-quiet { color:var(--ink) !important; border:1px solid var(--line); background:#fff !important; }
+html body .q-btn.button-danger { color:var(--bad) !important; }
+html body .q-btn.button-quiet { color:var(--ink) !important; }
+.button-danger .q-btn__content, .button-danger .q-icon { color:var(--bad) !important; }
+.button-quiet .q-btn__content, .button-quiet .q-icon { color:var(--ink) !important; }
 .drop-upload { width:100%; border:1px dashed rgba(124,206,208,.42); background:rgba(124,206,208,.035); }
 .preflight-list { display:grid; gap:10px; }
 .check-row { display:grid; grid-template-columns:24px 1fr; gap:10px; align-items:start; padding:9px 0; border-bottom:1px solid rgba(176,212,205,.08); }
@@ -199,8 +228,8 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .directory-dialog { width:min(720px,94vw);background:#fff !important;color:var(--ink);border:1px solid var(--line); }
 .directory-row { width:100%;justify-content:flex-start;color:var(--ink)!important;border-bottom:1px solid var(--line); }
 .loading-card { min-height:220px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:var(--muted); }
-@media(max-width:900px){.hero,.grid-main{grid-template-columns:1fr}.hero-facts{margin-top:4px}.metric-grid{grid-template-columns:1fr 1fr}.workspace{padding:14px 14px 36px}.settings-grid{grid-template-columns:1fr}}
-@media(max-width:520px){.headline{font-size:34px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0;border-bottom:1px solid var(--line)}.metric-grid{grid-template-columns:1fr}.topbar{align-items:flex-start}.connection{display:none}}
+@media(max-width:900px){.hero,.grid-main{grid-template-columns:1fr}.hero-facts{margin-top:4px}.metric-grid{grid-template-columns:1fr 1fr}.workspace{padding:14px 14px 36px}.settings-grid{grid-template-columns:1fr}.launch-bar{top:6px}}
+@media(max-width:520px){.headline{font-size:34px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0;border-bottom:1px solid var(--line)}.metric-grid{grid-template-columns:1fr}.topbar{align-items:flex-start}.connection{display:none}.launch-bar{align-items:stretch;flex-direction:column}.launch-actions{display:grid;grid-template-columns:1fr 1.25fr}.launch-actions .q-btn{width:100%}}
 """
 
 
@@ -354,8 +383,8 @@ class _WorkspaceState:
 
 def _fact(label: str, value: str) -> None:
     with ui.element("div").classes("hero-fact"):
-        ui.label(label)
-        ui.label(value or "—").classes("font-semibold")
+        ui.label(label).classes("fact-label")
+        ui.label(value or "—").classes("fact-value")
 
 
 def _notify_error(exc: Exception, prefix: str = "操作失败") -> None:
@@ -370,16 +399,33 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
     count_label: Any = None
     running_label: Any = None
 
-    async def profile_action(profile: Mapping[str, Any], action: str) -> None:
+    async def profile_action(
+        profile: Mapping[str, Any],
+        action: str,
+        *,
+        notify: bool = True,
+        refresh: bool = True,
+        raise_errors: bool = False,
+    ) -> Mapping[str, Any] | None:
         number = int(profile.get("number", 0))
         try:
-            await _browser_api(
-                f"/api/management/profiles/{number}/{action}", method="POST", body={}
+            result = await _browser_api(
+                f"/api/management/profiles/{number}/{action}",
+                method="POST",
+                body={},
+                timeout=90 if action == "stop" else 30,
             )
-            ui.notify("启动命令已提交" if action == "start" else "停止命令已提交", type="positive")
-            await refresh_profiles()
+            if notify:
+                default = "启动命令已提交" if action == "start" else "Profile 已停止"
+                ui.notify(str(result.get("message") or default), type="positive")
+            if refresh:
+                await refresh_profiles()
+            return result
         except Exception as exc:  # browser errors are user-facing
+            if raise_errors:
+                raise
             _notify_error(exc)
+            return None
 
     async def create_profile() -> None:
         try:
@@ -472,6 +518,62 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
         active_profile_dialog = dialog
         dialog.open()
 
+    async def request_edit_profile(profile: Mapping[str, Any]) -> None:
+        if not bool(profile.get("is_running")):
+            edit_profile(profile)
+            return
+        if dialog_host is None:
+            ui.notify("配置面板尚未就绪，请稍后重试", type="warning")
+            return
+        with dialog_host:
+            with ui.dialog() as confirm, ui.card().classes("settings-dialog p-0"):
+                with ui.element("div").classes("surface-head"):
+                    with ui.element("div"):
+                        ui.label("需要先停止 Profile").classes("text-xl")
+                        ui.label("修改 AE、端口或保存目录前，需要释放当前接收服务")
+                with ui.element("div").classes("surface-body"):
+                    ui.label(
+                        "未完成任务会保留恢复点。确认后将等待后台进程退出，"
+                        "并确认 Web 与 DICOM 接收端口均已释放，再打开配置。"
+                    ).classes("text-sm")
+
+                    async def stop_then_edit() -> None:
+                        stop_button.disable()
+                        stop_button.set_text("正在停止并检查端口…")
+                        try:
+                            result = await profile_action(
+                                profile,
+                                "stop",
+                                notify=False,
+                                refresh=False,
+                                raise_errors=True,
+                            )
+                            confirm.close()
+                            await refresh_profiles()
+                            number = int(profile.get("number", 0))
+                            latest = next(
+                                (item for item in profiles if int(item.get("number", 0)) == number),
+                                profile,
+                            )
+                            ui.notify(
+                                str((result or {}).get("message") or "Profile 已停止"),
+                                type="positive",
+                            )
+                            edit_profile(latest)
+                        except Exception as exc:
+                            stop_button.enable()
+                            stop_button.set_text("停止并修改")
+                            _notify_error(exc, "停止失败")
+
+                    with ui.row().classes("justify-end w-full pt-5"):
+                        ui.button("取消", on_click=confirm.close).props("flat")
+                        stop_button = ui.button(
+                            "停止并修改",
+                            icon="stop_circle",
+                            on_click=stop_then_edit,
+                        ).props("unelevated no-caps").classes("button-primary")
+        confirm.open()
+
     def render_profiles() -> None:
         grid.clear()
         count_label.set_text(str(len(profiles)))
@@ -501,11 +603,20 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
                     with ui.row().classes("action-row"):
                         if running:
                             ui.button("进入工作台", icon="arrow_forward", on_click=lambda p=profile: open_profile(p)).props("unelevated").classes("button-primary")
-                            ui.button("配置", icon="settings", on_click=lambda p=profile: edit_profile(p)).props("flat").classes("button-quiet")
+                            ui.button("配置", icon="settings", on_click=lambda p=profile: request_edit_profile(p)).props("flat").classes("button-quiet")
                             ui.button("停止", icon="stop", on_click=lambda p=profile: profile_action(p, "stop")).props("flat").classes("button-danger")
                         else:
                             ui.button("启动", icon="play_arrow", on_click=lambda p=profile: profile_action(p, "start")).props("unelevated").classes("button-primary")
-                            ui.button("配置", icon="settings", on_click=lambda p=profile: edit_profile(p)).props("flat").classes("button-quiet")
+                            ui.button("配置", icon="settings", on_click=lambda p=profile: request_edit_profile(p)).props("flat").classes("button-quiet")
+                            if any(
+                                "已被其他程序占用" in str(message)
+                                for message in profile.get("issues", [])
+                            ):
+                                ui.button(
+                                    "检查并清理占用",
+                                    icon="cleaning_services",
+                                    on_click=lambda p=profile: profile_action(p, "stop"),
+                                ).props("flat").classes("button-danger")
 
     async def refresh_profiles() -> None:
         nonlocal profiles
@@ -987,7 +1098,12 @@ async def _build_profile(
         percent = min(100, round(processed / total * 100)) if total else 0
         refs["runtime"].set_visibility(bool(task.get("id")) or status != "idle")
         refs["runtime_status"].set_text(STATUS_LABELS.get(status, status or "未知状态"))
-        refs["runtime_message"].set_text(str(task.get("message") or "后台任务状态会自动同步。"))
+        runtime_message = str(task.get("message") or "").strip()
+        if _normal_status(runtime_message) == status and status in STATUS_LABELS:
+            runtime_message = STATUS_MESSAGES.get(status, STATUS_LABELS[status])
+        refs["runtime_message"].set_text(
+            runtime_message or "后台任务状态会自动同步。"
+        )
         refs["progress_text"].set_text(f"{processed:,} / {total:,} · {percent}%")
         refs["progress_fill"].style(f"width:{percent}%")
         refs["current"].set_text(str(task.get("current_accession") or "—"))
@@ -1261,6 +1377,25 @@ async def _build_profile(
                 _fact("PACS", f"{config.get('pacs_server_ip', '—')}:{config.get('pacs_server_port', '—')}")
                 _fact("接收端", f"{config.get('storage_ae_title', '—')}:{config.get('storage_port', '—')}")
 
+        with ui.element("section").classes("launch-bar"):
+            with ui.element("div").classes("launch-copy"):
+                ui.label("准备好后即可开始").classes("launch-title")
+                refs["readiness"] = ui.label(
+                    "输入检查号和保存目录后将自动预检"
+                ).classes("launch-state")
+            with ui.element("div").classes("launch-actions"):
+                refs["preflight"] = ui.button(
+                    "立即预检",
+                    icon="fact_check",
+                    on_click=run_preflight,
+                ).props("flat no-caps").classes("button-quiet")
+                refs["start"] = ui.button(
+                    "开始下载",
+                    icon="play_arrow",
+                    on_click=start_task,
+                ).props("unelevated size=lg no-caps").classes("button-primary")
+                refs["start"].disable()
+
         with ui.element("section").classes("grid-main"):
             with ui.element("div").classes("stack"):
                 with ui.element("article").classes("surface"):
@@ -1315,13 +1450,9 @@ async def _build_profile(
                         with ui.element("div"):
                             ui.label("03 / 启动前确认").classes("step-index")
                             ui.label("自动预检").classes("text-xl")
-                        refs["preflight"] = ui.button("立即预检", icon="fact_check", on_click=run_preflight).props("flat").classes("button-quiet")
                     with ui.element("div").classes("surface-body"):
                         refs["checks"] = ui.element("div").classes("preflight-list")
                         render_checks([])
-                        refs["readiness"] = ui.label("输入任务后运行预检").classes("text-sm text-slate-400 mt-4")
-                        refs["start"] = ui.button("开始下载", icon="play_arrow", on_click=start_task).props("unelevated size=lg").classes("button-primary w-full mt-4")
-                        refs["start"].disable()
 
                 refs["runtime"] = ui.element("article").classes("surface")
                 with refs["runtime"]:
@@ -1341,7 +1472,7 @@ async def _build_profile(
                                     refs[key] = ui.label("—" if key == "current" else "0")
                         with ui.element("div").classes("action-row"):
                             refs["pause"] = ui.button("暂停", icon="pause", on_click=lambda: task_action("pause")).props("flat").classes("button-quiet")
-                            refs["resume"] = ui.button("继续", icon="play_arrow", on_click=lambda: task_action("resume")).props("flat").classes("button-primary")
+                            refs["resume"] = ui.button("继续", icon="play_arrow", on_click=lambda: task_action("resume")).props("unelevated no-caps").classes("button-primary")
                             refs["cancel"] = ui.button("取消任务", icon="close", on_click=lambda: task_action("cancel")).props("flat").classes("button-danger")
                             refs["retry"] = ui.button("重试失败项", icon="refresh", on_click=lambda: task_action("retry-failed")).props("flat").classes("button-quiet")
                             refs["accept"] = ui.button("接受已有文件", icon="done_all", on_click=lambda: task_action("accept-partial")).props("flat").classes("button-quiet")

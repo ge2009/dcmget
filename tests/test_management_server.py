@@ -331,6 +331,42 @@ def test_profile_proxy_allowlist_blocks_shutdown_and_arbitrary_paths():
     assert not _profile_proxy_route_allowed("GET", "http://attacker.invalid")
 
 
+def test_profile_proxy_requires_confirmed_backend_cleanup(tmp_path: Path):
+    profile = ProfileInfo(
+        number=2,
+        display_name="实例 2",
+        config_path=tmp_path / "config.json",
+        pacs_server_ip="127.0.0.1",
+        pacs_server_port=104,
+        calling_ae_title="DCMGET",
+        pacs_ae_title="PACS",
+        storage_ae_title="DCMGET",
+        storage_port=6667,
+        web_port=8899,
+        destination_directory=str(tmp_path / "dicom"),
+        is_running=True,
+        has_recovery=False,
+    )
+
+    class Manager:
+        pass
+
+    proxy = ProfileApiProxy(Manager())  # type: ignore[arg-type]
+    proxy._perform = lambda *_args: {  # type: ignore[method-assign]
+        "status_code": 200,
+        "payload": {"ok": True, "result": False},
+    }
+
+    with pytest.raises(RuntimeError, match="后台进程未能"):
+        proxy.shutdown_profile(profile)
+
+    proxy._perform = lambda *_args: {  # type: ignore[method-assign]
+        "status_code": 200,
+        "payload": {"ok": True, "result": True},
+    }
+    assert proxy.shutdown_profile(profile) is None
+
+
 def test_profile_proxy_uses_loopback_configured_port_and_internal_csrf(tmp_path: Path):
     profile = ProfileInfo(
         number=2,
@@ -512,7 +548,7 @@ def test_profile_proxy_slow_profile_does_not_block_other_profiles(tmp_path: Path
             self.profile_number = profile_number
 
         def open(self, _request: object, timeout: float) -> Response:
-            assert timeout == 30.0
+            assert timeout == 40.0
             if self.profile_number == 1:
                 first_started.set()
                 assert release_first.wait(2)

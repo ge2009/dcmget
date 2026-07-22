@@ -333,6 +333,18 @@ def test_profile_switch_aborts_and_discards_all_stale_profile_responses() -> Non
     assert "advanceProfileContext(profileNumber);" in javascript
 
 
+def test_legacy_manager_requires_verified_stop_before_profile_configuration() -> None:
+    javascript = _javascript()
+
+    assert "async function stopManagedProfileNow" in javascript
+    assert "async function requestManagedProfileConfiguration" in javascript
+    assert 'confirmLabel: "停止并修改"' in javascript
+    assert "await stopManagedProfileNow(profile)" in javascript
+    assert "requestManagedProfileConfiguration(currentProfile())" in javascript
+    assert 'profileActionButton("配置", configureProfile' not in javascript
+    assert 'profileActionButton("配置", requestManagedProfileConfiguration' in javascript
+
+
 def test_empty_profile_list_fully_clears_the_managed_context() -> None:
     javascript = _javascript()
 

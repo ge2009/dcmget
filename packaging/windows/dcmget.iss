@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.4.1"
+  #define AppVersion "3.5.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -117,17 +117,11 @@ Source: "{#VCRedistPath}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flag
 #endif
 
 [Icons]
+Name: "{autoprograms}\DcmGet"; Filename: "{app}\{#AppExeName}"; Parameters: "--native-shell-url ""{#ManagementUrl}"""; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\DcmGet"; Filename: "{app}\{#AppExeName}"; Parameters: "--native-shell-url ""{#ManagementUrl}"""; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 Name: "{autoprograms}\DcmGet 诊断日志"; Filename: "{localappdata}\DcmGet\logs"
 Name: "{autoprograms}\DcmGet 启动后台服务"; Filename: "{sys}\sc.exe"; Parameters: "start {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
 Name: "{autoprograms}\DcmGet 停止后台服务"; Filename: "{sys}\sc.exe"; Parameters: "stop {#ServiceName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Flags: runminimized
-
-[INI]
-Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"
-Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconFile"; String: "{app}\{#AppExeName}"
-Filename: "{autoprograms}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIndex"; String: "0"
-Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#ManagementUrl}"; Tasks: desktopicon
-Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconFile"; String: "{app}\{#AppExeName}"; Tasks: desktopicon
-Filename: "{autodesktop}\DcmGet.url"; Section: "InternetShortcut"; Key: "IconIndex"; String: "0"; Tasks: desktopicon
 
 [Registry]
 Root: HKLM; Subkey: "{#ServiceStateRegistryKey}"; ValueType: string; ValueName: "AppDataRoot"; ValueData: "{code:GetServiceAppDataRoot}"; Flags: createvalueifdoesntexist uninsdeletevalue
@@ -159,6 +153,8 @@ Type: files; Name: "{app}\{#ServiceTemplateName}"
 Type: files; Name: "{app}\{#ServiceHostName}"
 Type: files; Name: "{app}\{#ServiceWrapperName}"
 Type: files; Name: "{app}\LICENSE-WINSW.txt"
+Type: files; Name: "{autoprograms}\DcmGet.lnk"
+Type: files; Name: "{autodesktop}\DcmGet.lnk"
 Type: files; Name: "{autoprograms}\DcmGet.url"
 Type: files; Name: "{autodesktop}\DcmGet.url"
 Type: files; Name: "{autoprograms}\DcmGet 启动全部.lnk"

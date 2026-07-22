@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -452,6 +453,44 @@ class ProfileManager:
             )
         finally:
             allocation_lock.release()
+
+    def profile_stop_blockers(self, profile_number: int | str) -> tuple[str, ...]:
+        """Return processes or ports that prove a Profile is not fully stopped."""
+
+        profile = self.get_profile(profile_number)
+        blockers: list[str] = []
+        if profile.is_running:
+            blockers.append("Profile 后台进程")
+        for label, port in (
+            ("DICOM 接收端口", profile.storage_port),
+            ("Web 端口", profile.web_port),
+        ):
+            try:
+                available = bool(self._port_probe(self.bind_host, port))
+            except OSError:
+                available = False
+            if not available:
+                blockers.append(f"{label} {port}")
+        return tuple(blockers)
+
+    def wait_for_profile_stopped(
+        self,
+        profile_number: int | str,
+        *,
+        timeout: float = 45.0,
+        poll_interval: float = 0.1,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Wait until the Profile lock and both local listening ports are free."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        blockers: tuple[str, ...] = ()
+        while True:
+            blockers = self.profile_stop_blockers(profile_number)
+            if not blockers:
+                return True, ()
+            if time.monotonic() >= deadline:
+                return False, blockers
+            time.sleep(min(max(0.0, poll_interval), max(0.0, deadline - time.monotonic())))
 
     def delete_profile(self, profile_number: int | str) -> None:
         number = _profile_number(profile_number)

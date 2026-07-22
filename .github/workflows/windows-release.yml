@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.4.1
+        default: 3.5.0
 
 permissions:
   contents: read
@@ -159,7 +159,7 @@ jobs:
           $content = Get-Content $link -Raw
           if ($content -notmatch '(?m)^URL=http://127\.0\.0\.1:8787/$') { throw "Profile URL shortcut target is incorrect: $content" }
 
-      - name: Verify embedded NiceGUI, Web fallback, OHIF and PDI resources
+      - name: Verify embedded NiceGUI, WebView, OHIF and PDI resources
         shell: pwsh
         run: |
           function Assert-WebResources([string]$resourceRoot) {
@@ -169,6 +169,9 @@ jobs:
               if (-not (Test-Path $asset -PathType Container)) {
                 throw "Missing offline NiceGUI resource directory: $asset"
               }
+            }
+            if (-not (Test-Path (Join-Path $resourceRoot "webview") -PathType Container)) {
+              throw "Missing embedded pywebview modules"
             }
             $webui = Join-Path $resourceRoot "dcmget\webui"
             @("index.html", "app.css", "app.js") | ForEach-Object {
@@ -231,6 +234,7 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*nicegui_ui" -Quiet)) { throw "Portable EXE is missing DcmGet NiceGUI workspace" }
           if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*templates.*index\.html" -Quiet)) { throw "Portable EXE is missing NiceGUI templates" }
           if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*static" -Quiet)) { throw "Portable EXE is missing NiceGUI static assets" }
+          if (-not (Select-String -Path $archiveListing -Pattern "webview" -Quiet)) { throw "Portable EXE is missing pywebview" }
           if (-not (Select-String -Path $archiveListing -Pattern "uvicorn" -Quiet)) { throw "Portable EXE is missing Uvicorn" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
           if (-not (Select-String -Path $archiveListing -Pattern "pynetdicom" -Quiet)) { throw "Portable EXE is missing pynetdicom compatibility modules" }
@@ -1108,21 +1112,26 @@ jobs:
             (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"),
             (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs")
           )
-          foreach ($shortcutName in @("DcmGet.url", "DcmGet 启动后台服务.lnk", "DcmGet 停止后台服务.lnk")) {
+          foreach ($shortcutName in @("DcmGet.lnk", "DcmGet 启动后台服务.lnk", "DcmGet 停止后台服务.lnk")) {
             if (-not ($startMenuRoots | Where-Object { Test-Path (Join-Path $_ $shortcutName) -PathType Leaf })) {
               throw "Installed shortcut is missing: $shortcutName"
             }
           }
-          $webShortcut = $startMenuRoots | ForEach-Object { Join-Path $_ "DcmGet.url" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $webShortcut = $startMenuRoots | ForEach-Object { Join-Path $_ "DcmGet.lnk" } | Where-Object { Test-Path $_ } | Select-Object -First 1
           $desktopRoots = @(
             (Join-Path $env:PUBLIC "Desktop"),
             (Join-Path $env:USERPROFILE "Desktop")
           )
-          $desktopShortcut = $desktopRoots | ForEach-Object { Join-Path $_ "DcmGet.url" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $desktopShortcut = $desktopRoots | ForEach-Object { Join-Path $_ "DcmGet.lnk" } | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $desktopShortcut) { throw "Installed DcmGet desktop shortcut is missing" }
+          $shell = New-Object -ComObject WScript.Shell
           foreach ($shortcut in @($webShortcut, $desktopShortcut)) {
-            if (-not (Select-String -LiteralPath $shortcut -Pattern '^URL=http://127\.0\.0\.1:8786/$' -Quiet)) {
-              throw "Installed DcmGet shortcut does not open the management operations page: $shortcut"
+            $link = $shell.CreateShortcut($shortcut)
+            if (-not [string]::Equals($link.TargetPath, (Join-Path $installDir "DcmGet.exe"), [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Installed DcmGet shortcut target is incorrect: $shortcut"
+            }
+            if ($link.Arguments -ne '--native-shell-url "http://127.0.0.1:8786/"') {
+              throw "Installed DcmGet shortcut does not open the native management shell: $shortcut"
             }
           }
 

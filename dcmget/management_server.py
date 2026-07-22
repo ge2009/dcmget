@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -30,7 +30,7 @@ from .web_server import DcmGetWebServer
 
 LOGGER = logging.getLogger(__name__)
 WINDOWS_MANAGEMENT_HOST = "0.0.0.0"
-PROFILE_PROXY_TIMEOUT_SECONDS = 30.0
+PROFILE_PROXY_TIMEOUT_SECONDS = 40.0
 _PROFILE_TOPOLOGY_FIELDS = (
     "calling_ae_title",
     "pacs_ae_title",
@@ -135,9 +135,16 @@ class ProfileApiProxy:
             b"{}",
             "application/json",
         )
+        payload = result.get("payload")
         if int(result["status_code"]) >= 400:
-            payload = result.get("payload")
-            raise RuntimeError(f"停止实例 {profile.number} 失败：{payload}")
+            detail = payload.get("detail") if isinstance(payload, Mapping) else payload
+            raise RuntimeError(f"停止实例 {profile.number} 失败：{detail}")
+        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+            raise RuntimeError(f"停止实例 {profile.number} 失败：响应无效")
+        if payload.get("result") is not True:
+            raise RuntimeError(
+                f"停止实例 {profile.number} 失败：后台进程未能在限定时间内退出"
+            )
         with self._sessions_lock:
             self._sessions.pop(profile.number, None)
 

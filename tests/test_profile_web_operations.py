@@ -217,7 +217,7 @@ def test_launch_profile_does_not_recheck_ports_after_process_starts(tmp_path):
     assert result["pid"] == 43210
 
 
-def test_stop_profile_persists_stopped_state_before_requesting_shutdown(tmp_path):
+def test_stop_profile_waits_for_lock_and_ports_before_reporting_success(tmp_path):
     _write_profile(tmp_path, 1)
     runtime = ProfileRuntimeState(tmp_path / "state" / "management" / "profile-runtime.json")
     runtime.set_desired(1, True)
@@ -226,22 +226,74 @@ def test_stop_profile_persists_stopped_state_before_requesting_shutdown(tmp_path
     lock = FileLock(str(lock_path))
     lock.acquire(timeout=0)
     calls: list[int] = []
+    desired_during_shutdown: list[bool] = []
+
+    def shutdown(profile):
+        calls.append(profile.number)
+        desired_during_shutdown.append(runtime.is_desired(profile.number))
+        lock.release()
+
     try:
         operations = _operations(
             tmp_path,
             runtime_state=runtime,
-            shutdown_profile=lambda profile: calls.append(profile.number),
+            shutdown_profile=shutdown,
+            stop_timeout_seconds=0.2,
         )
 
         result = operations.stop_profile({"profile_number": 1})
     finally:
-        lock.release()
+        if lock.is_locked:
+            lock.release()
 
     assert result["ok"]
-    assert result["stopping"]
+    assert result["stopped"]
+    assert result["message"] == "Profile 已停止，Web 与 DICOM 接收端口均已释放"
     assert result["profile"]["desired_running"] is False
     assert calls == [1]
+    assert desired_during_shutdown == [True]
     assert runtime.desired_profiles() == ()
+
+
+def test_running_profile_without_shutdown_transport_fails_immediately(tmp_path):
+    _write_profile(tmp_path, 1)
+    lock = FileLock(str(tmp_path / "state" / "instances" / "i1.lock"))
+    lock.acquire(timeout=0)
+    try:
+        operations = _operations(tmp_path, stop_timeout_seconds=0)
+
+        with pytest.raises(RuntimeError, match="统一管理中心"):
+            operations.stop_profile({"profile_number": 1})
+    finally:
+        lock.release()
+
+
+def test_stop_profile_refuses_to_report_stopped_while_receiver_port_is_occupied(
+    tmp_path,
+):
+    _write_profile(tmp_path, 1)
+    operations = _operations(
+        tmp_path,
+        port_probe=lambda _host, port: port != 6666,
+        stop_timeout_seconds=0,
+    )
+
+    with pytest.raises(RuntimeError, match="DICOM 接收端口 6666"):
+        operations.stop_profile({"profile_number": 1})
+
+
+def test_profile_manager_stop_blockers_require_lock_and_both_ports_free(tmp_path):
+    _write_profile(tmp_path, 1)
+    occupied = {6666, 8787}
+    manager = _manager(
+        tmp_path,
+        port_probe=lambda _host, port: port not in occupied,
+    )
+
+    stopped, blockers = manager.wait_for_profile_stopped(1, timeout=0)
+
+    assert not stopped
+    assert blockers == ("DICOM 接收端口 6666", "Web 端口 8787")
 
 
 def test_launch_all_starts_idle_profiles_and_skips_running_profile(

@@ -245,13 +245,16 @@ def test_offline_web_runtime_and_static_frontend_are_packaged():
 
     assert "fastapi>=0.139.2,<0.140" in requirements
     assert "nicegui>=3.14,<3.15" in requirements
+    assert 'pywebview>=6.2.1,<6.3; sys_platform == "win32"' in requirements
     assert "uvicorn>=0.51,<0.52" in requirements
     assert '"fastapi>=0.139.2,<0.140"' in project
     assert '"nicegui>=3.14,<3.15"' in project
+    assert '"pywebview>=6.2.1,<6.3; sys_platform == \'win32\'"' in project
     assert '"uvicorn>=0.51,<0.52"' in project
     assert "f\"{ROOT / 'dcmget' / 'webui'}:dcmget/webui\"" in build
     assert '"--collect-submodules",\n        "uvicorn"' in build
     assert '"--collect-all",\n        "nicegui"' in build
+    assert '"--collect-all",\n        "webview"' in build
     assert '"--hidden-import",\n        "dcmget.nicegui_ui"' in build
     assert "Assert-WebResources $unpackedResourceRoot" in workflow
     assert "Portable EXE is missing DcmGet Web index" in workflow
@@ -288,6 +291,22 @@ def test_nicegui_typography_uses_offline_platform_fonts_and_readable_sizes():
     assert "font-size:clamp(28px,2.3vw,36px)" in source
 
 
+def test_nicegui_primary_action_is_high_and_runtime_buttons_remain_legible():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+    workspace = source[source.index('with ui.element("section").classes("hero")') :]
+
+    assert workspace.index('classes("launch-bar")') < workspace.index(
+        'classes("grid-main")'
+    )
+    assert 'refs["start"] = ui.button(' in workspace
+    assert 'refs["resume"] = ui.button("继续"' in workspace
+    resume = workspace[workspace.index('refs["resume"] = ui.button("继续"') :]
+    assert '.props("unelevated no-caps").classes("button-primary")' in resume[:300]
+    assert "async def request_edit_profile" in source
+    assert "停止并修改" in source
+
+
 def test_windows_release_packages_only_the_required_dcmtk_runtime():
     root = Path(__file__).resolve().parents[1]
     build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
@@ -321,7 +340,7 @@ def test_windows_release_validates_real_profile_shortcut_properties():
     assert "web_port=8787" in workflow
     assert '"dcmget-6666-DCMGET.url"' in workflow
     assert "URL=http://127\\.0\\.0\\.1:8787/" in workflow
-    assert "WScript.Shell" not in workflow
+    assert "WScript.Shell" in workflow
     assert "Portable EXE is missing profile shortcut support" in workflow
 
 
@@ -518,11 +537,12 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
         'Type: files; Name: "{autoprograms}\\DcmGet 停止全部.lnk"'
     ) == 2
     assert 'Filename: "{sys}\\sc.exe"' in installer
-    assert 'Filename: "{autoprograms}\\DcmGet.url"' in installer
+    assert 'Name: "{autoprograms}\\DcmGet"; Filename: "{app}\\{#AppExeName}"' in installer
     assert '#define ManagementUrl "http://127.0.0.1:8786/"' in installer
-    assert installer.count('Key: "URL"; String: "{#ManagementUrl}"') == 2
+    assert installer.count('Parameters: "--native-shell-url ""{#ManagementUrl}"""') == 2
     assert 'Type: files; Name: "{autoprograms}\\DcmGet.url"' in installer
     assert 'Type: files; Name: "{autodesktop}\\DcmGet.url"' in installer
+    assert '[INI]' not in installer
     assert "GetPrimaryWebUrl" not in installer
     assert "ReadConfiguredWebPort" not in installer
     assert "GetEnv('HOMEDRIVE') + GetEnv('HOMEPATH')" in installer
@@ -581,7 +601,7 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Installed management application is not AMD64" in workflow
     assert '"/TASKS=desktopicon"' in workflow
     assert "Installed DcmGet desktop shortcut is missing" in workflow
-    assert "^URL=http://127\\.0\\.0\\.1:8786/$" in workflow
+    assert '--native-shell-url \"http://127.0.0.1:8786/\"' in workflow
     assert "Uninstall removed or changed downloaded DICOM data" in workflow
     assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
     assert "Stable service APPDATA was not registered" in workflow

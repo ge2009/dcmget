@@ -51,6 +51,10 @@ jobs:
       - name: Verify retained pynetdicom compatibility dependency
         run: python -c "import pynetdicom; assert pynetdicom.__version__.split('.')[0] == '3'"
 
+      - name: Verify Windows WebView dependency
+        if: runner.os == 'Windows'
+        run: python -c "import clr, webview; assert clr and webview"
+
       - name: Cache DCMTK 3.7.0
         uses: actions/cache@v4
         with:

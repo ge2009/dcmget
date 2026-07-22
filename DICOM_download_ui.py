@@ -58,6 +58,7 @@ from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
 from dcmget.windows_service_control import windows_service_operation_handlers
 from dcmget.web_security import DirectoryRoot, discover_local_hosts
 from dcmget.web_server import DcmGetWebServer
+from dcmget.webview_shell import run_webview_shell, spawn_webview_shell
 
 
 PROJECT_ROOT = resource_root()
@@ -91,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--native-shell-url", help=argparse.SUPPRESS)
     parser.add_argument("--profile-name", help="启动前保存 Profile 显示名")
     parser.add_argument("--pacs-server-ip", help="启动前保存 PACS 地址")
     parser.add_argument("--pacs-server-port", type=int, help="启动前保存 PACS 端口")
@@ -378,7 +380,7 @@ def _profile_web_config(profile: InstanceProfile) -> AppConfig:
     return config
 
 
-def _open_browser_when_ready(
+def _open_ui_when_ready(
     url: str,
     *,
     timeout: float = 15.0,
@@ -386,9 +388,13 @@ def _open_browser_when_ready(
     opener=None,
     urlopen=None,
 ) -> bool:
-    """Open the browser only after the profile Web service answers HTTP."""
+    """Open the local UI only after the profile Web service answers HTTP."""
 
-    open_url = opener or webbrowser.open
+    open_url = opener or (
+        spawn_webview_shell
+        if sys.platform == "win32"
+        else lambda target: webbrowser.open(target, new=1)
+    )
     probe = urlopen or urllib.request.urlopen
     deadline = time.monotonic() + max(0.0, float(timeout))
     while time.monotonic() <= deadline:
@@ -406,25 +412,26 @@ def _open_browser_when_ready(
             time.sleep(max(0.0, poll_interval))
             continue
         try:
-            return bool(open_url(url, new=1))
+            result = open_url(url)
+            return bool(result is None or result)
         except Exception as exc:
-            record_exception("无法打开 DcmGet Web 页面", exc)
+            record_exception("无法打开 DcmGet 工作台", exc)
             return False
-    LOGGER.error("Web service did not become ready before browser open: %s", url)
+    LOGGER.error("Web service did not become ready before UI open: %s", url)
     return False
 
 
-def _schedule_browser_open(url: str) -> None:
+def _schedule_ui_open(url: str) -> None:
     opener = threading.Thread(
-        target=_open_browser_when_ready,
+        target=_open_ui_when_ready,
         args=(url,),
-        name="dcmget-web-opener",
+        name="dcmget-ui-opener",
         daemon=True,
     )
     opener.start()
 
 
-def _activation_requests_browser(payload: dict[str, object]) -> bool:
+def _activation_requests_ui(payload: dict[str, object]) -> bool:
     return str(payload.get("action", "activate")) != "ensure-running"
 
 
@@ -690,6 +697,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ensure_supported_runtime()
         args = build_parser().parse_args(arguments)
+        if args.native_shell_url:
+            return run_webview_shell(args.native_shell_url)
         if args.windows_management:
             return run_windows_management_server(
                 project_root=PROJECT_ROOT,
@@ -788,8 +797,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         activation.set_activation_handler(
             lambda payload: (
-                _schedule_browser_open(server.url)
-                if _activation_requests_browser(payload)
+                _schedule_ui_open(server.url)
+                if _activation_requests_ui(payload)
                 else None
             )
         )
@@ -803,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.no_open_browser and (
             args.open_profile_web or config.web_open_browser
         ):
-            _schedule_browser_open(server.url)
+            _schedule_ui_open(server.url)
     except Exception as exc:
         if server is not None:
             try:

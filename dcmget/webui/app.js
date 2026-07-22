@@ -1631,6 +1631,16 @@ async function startManagedProfile(profile = currentProfile()) {
   }
 }
 
+async function stopManagedProfileNow(profile = currentProfile()) {
+  const profileNumber = profileNumberOf(profile);
+  if (profileNumber == null) return null;
+  profile.desired_running = false;
+  if (profileNumber === state.activeProfileNumber) state.activeProfile = profile;
+  const result = await api(managementProfilePath(profileNumber, "/stop"), { method: "POST", body: {} });
+  await refreshProfiles();
+  return result;
+}
+
 async function stopManagedProfile(profile = currentProfile()) {
   const profileNumber = profileNumberOf(profile);
   if (profileNumber == null) return;
@@ -1639,11 +1649,8 @@ async function stopManagedProfile(profile = currentProfile()) {
     `将停止 ${profileDisplayName(profile)} 的接收端、下载进程与 PDI 子任务，但保留已下载文件和恢复点。确认停止吗？`,
     async () => {
       try {
-        profile.desired_running = false;
-        if (profileNumber === state.activeProfileNumber) state.activeProfile = profile;
-        const result = await api(managementProfilePath(profileNumber, "/stop"), { method: "POST", body: {} });
-        showToast(result.message || `${profileDisplayName(profile)} 正在停止`);
-        await refreshProfiles();
+        const result = await stopManagedProfileNow(profile);
+        showToast(result?.message || `${profileDisplayName(profile)} 已停止`);
       } catch (error) {
         await refreshProfiles();
         showAlert(error.message, "停止 Profile 失败");
@@ -1720,7 +1727,7 @@ function renderProfiles(profiles) {
       actions.append(
         profileActionButton(selected ? "当前 Profile" : "切换", selectManagedProfile, profile, selected),
         profileActionButton("停止", stopManagedProfile, profile),
-        profileActionButton("配置", configureProfile, profile),
+        profileActionButton("配置", requestManagedProfileConfiguration, profile),
       );
     } else if (lifecycle === "starting") {
       actions.append(
@@ -1730,7 +1737,7 @@ function renderProfiles(profiles) {
     } else {
       actions.append(
         profileActionButton(issues.length ? "修复配置" : "启动", launchProfile, profile),
-        profileActionButton("配置", configureProfile, profile),
+        profileActionButton("配置", requestManagedProfileConfiguration, profile),
       );
     }
     card.append(actions);
@@ -1748,7 +1755,7 @@ function renderProfiles(profiles) {
     const menu = document.createElement("div");
     menu.className = "profile-more__menu";
     menu.append(
-      profileActionButton("配置", configureProfile, profile, profileDesiredRunning(profile)),
+      profileActionButton("配置", requestManagedProfileConfiguration, profile),
       profileActionButton("复制", cloneProfile, profile),
       profileActionButton("创建快捷方式", createProfileShortcut, profile),
       profileActionButton("删除", deleteProfile, profile, profileDesiredRunning(profile) || profile.has_recovery),
@@ -1876,6 +1883,32 @@ async function launchProfile(profile) {
 
 function configureProfile(profile) {
   openProfileConfig(profile, false);
+}
+
+async function requestManagedProfileConfiguration(profile = currentProfile()) {
+  if (!state.managerMode || !profileDesiredRunning(profile)) {
+    configureProfile(profile);
+    return;
+  }
+  await confirmAction(
+    "需要先停止 Profile",
+    "修改 AE、端口或保存目录前，需要停止当前接收服务。未完成任务会保留恢复点；确认后将等待 Web 与 DICOM 接收端口全部释放。",
+    async () => {
+      try {
+        const profileNumber = profileNumberOf(profile);
+        const result = await stopManagedProfileNow(profile);
+        const latest = state.profiles.find(
+          (item) => profileNumberOf(item) === profileNumber,
+        ) || profile;
+        showToast(result?.message || `${profileDisplayName(profile)} 已停止`);
+        configureProfile(latest);
+      } catch (error) {
+        await refreshProfiles();
+        showAlert(error.message, "停止 Profile 失败");
+      }
+    },
+    { confirmLabel: "停止并修改", tone: "primary" },
+  );
 }
 
 function openProfileConfig(profile, launchAfterSave) {
@@ -2145,8 +2178,8 @@ function bindEvents() {
   $("#dismiss-alert").addEventListener("click", clearAlert);
   $("#workspace-config-button").addEventListener("click", () => {
     if (state.managerMode && currentProfileNumber() == null) return;
-    if (state.managerMode && !state.activeProfileRunning) {
-      configureProfile(currentProfile());
+    if (state.managerMode) {
+      requestManagedProfileConfiguration(currentProfile());
       return;
     }
     showPage("settings");

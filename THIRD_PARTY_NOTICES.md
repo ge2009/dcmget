@@ -6,6 +6,9 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [cryptography](https://github.com/pyca/cryptography)：Apache License 2.0 / BSD 3-Clause 双许可。
 - [FastAPI](https://github.com/fastapi/fastapi)：MIT License。
 - [NiceGUI](https://github.com/zauberzeug/nicegui)：MIT License。DcmGet 使用其离线内置的 Vue、Quasar 与 Socket.IO Web 资源构建本地操作工作台，不加载 CDN。
+- [pywebview](https://github.com/r0x0r/pywebview)：BSD 3-Clause License。Windows 交互入口使用 pywebview 调用系统 WebView2 Runtime 承载本地 NiceGUI 工作台。
+- [pythonnet](https://github.com/pythonnet/pythonnet)：MIT License。由 pywebview 在 Windows 上用于 .NET 互操作。
+- [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)：遵循 Microsoft 软件许可条款；DcmGet 不内置该运行时，Windows 交互入口使用系统现有的 WebView2 Runtime。
 - [Starlette](https://github.com/Kludex/starlette)：BSD 3-Clause License。
 - [Uvicorn](https://github.com/Kludex/uvicorn)：BSD 3-Clause License。
 - [Pydantic](https://github.com/pydantic/pydantic)：MIT License。

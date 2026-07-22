@@ -569,6 +569,22 @@ def test_remote_anonymous_session_cannot_shutdown_server(web: WebFixture):
     assert web.service.stopped
 
 
+def test_shutdown_failure_keeps_web_server_running_and_returns_conflict(
+    web: WebFixture,
+):
+    csrf = web.setup()
+    web.service.shutdown = lambda: False  # type: ignore[method-assign]
+
+    response = web.client.post(
+        "/api/ops/shutdown",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409
+    assert "DCMTK" in response.json()["detail"]
+
+
 def test_legacy_auth_endpoints_remain_compatible_without_password(web: WebFixture):
     csrf = web.setup()
     changed = web.client.post(

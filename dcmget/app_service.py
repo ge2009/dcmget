@@ -48,6 +48,18 @@ RunnerFactory = Callable[..., object]
 ExporterFactory = Callable[..., object]
 VerifierFactory = Callable[..., object]
 
+_RUNNER_STATE_MESSAGES = {
+    "starting_receiver": "正在启动 DICOM 接收器",
+    "downloading": "正在接收影像",
+    "pause_pending": "当前检查号完成后暂停",
+    "paused": "下载已暂停，可以随时继续",
+    "stopping": "正在停止当前任务",
+    "cancelled": "任务已取消",
+    "download_retryable": "部分检查号未完成，可以重试失败项",
+    "interrupted": "下载已安全中断，可以继续",
+    "completed": "下载已完成",
+}
+
 
 class AppServiceError(RuntimeError):
     """A safe, user-facing application service error."""
@@ -743,7 +755,10 @@ class DcmGetAppService:
             "partial": "download_retryable",
             "safety_paused": "interrupted",
         }.get(str(state), str(state))
-        self._set_status(normalized, str(state))
+        self._set_status(
+            normalized,
+            _RUNNER_STATE_MESSAGES.get(normalized, str(state)),
+        )
 
     def _on_progress(
         self,

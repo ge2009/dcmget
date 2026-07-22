@@ -23,6 +23,7 @@ from .profile_manager import (
 )
 from .profile_runtime_state import PROFILE_RUNTIME_FILE_NAME, ProfileRuntimeState
 from .runtime import is_frozen, resource_root
+from .task_state import TaskCheckpointStore, TaskStateError
 
 
 JsonDict = dict[str, object]
@@ -42,6 +43,7 @@ class ProfileWebOperations:
         popen: Callable[..., subprocess.Popen[Any]] | None = None,
         runtime_state: ProfileRuntimeState | None = None,
         shutdown_profile: Callable[[ProfileInfo], object] | None = None,
+        stop_timeout_seconds: float = 45.0,
     ) -> None:
         self.manager = manager or ProfileManager()
         self.project_root = (
@@ -65,6 +67,7 @@ class ProfileWebOperations:
             self.manager.state_root / "management" / PROFILE_RUNTIME_FILE_NAME
         )
         self._shutdown_profile = shutdown_profile
+        self.stop_timeout_seconds = max(0.0, float(stop_timeout_seconds))
         self._lifecycle_locks_guard = threading.Lock()
         self._lifecycle_locks: dict[int, threading.RLock] = {}
 
@@ -211,26 +214,71 @@ class ProfileWebOperations:
         profile_number = _require_profile_number(body, "profile_number")
         with self._lifecycle_lock(profile_number):
             profile = self.manager.get_profile(profile_number)
-            self.runtime_state.set_desired(profile.number, False)
-            if not profile.is_running:
-                return {
-                    "ok": True,
-                    "already_stopped": True,
-                    "profile": self._serialize_profile(profile),
-                }
-            if self._shutdown_profile is None:
+            was_running = profile.is_running
+            shutdown_error: Exception | None = None
+            orphan_cleanup_attempted = False
+            if was_running and self._shutdown_profile is None:
                 raise RuntimeError(
-                    "已保存停止状态，等待 Windows 服务停止该 Profile"
+                    "当前入口不能停止正在运行的 Profile，请从统一管理中心执行停止"
                 )
-            self._shutdown_profile(profile)
-            return {
+            if was_running and self._shutdown_profile is not None:
+                try:
+                    result = self._shutdown_profile(profile)
+                    if result is False:
+                        raise RuntimeError("Profile 后台清理未完成")
+                except Exception as exc:
+                    shutdown_error = exc
+            elif not was_running and self.manager.profile_stop_blockers(profile.number):
+                checkpoint_path = (
+                    self.manager.state_profiles
+                    / f"i{profile.number}"
+                    / "active-task.sqlite3"
+                )
+                if checkpoint_path.is_file():
+                    orphan_cleanup_attempted = True
+                    try:
+                        store = TaskCheckpointStore(checkpoint_path)
+                        checkpoint = store.load(include_archived_files=False)
+                        if checkpoint is not None:
+                            store.cleanup_recorded_processes(checkpoint.task_id)
+                    except TaskStateError as exc:
+                        shutdown_error = exc
+
+            # Tell the Windows supervisor to finish process-tree cleanup only
+            # after the graceful request had a chance to complete.
+            self.runtime_state.set_desired(profile.number, False)
+            stopped, blockers = self.manager.wait_for_profile_stopped(
+                profile.number,
+                timeout=(
+                    self.stop_timeout_seconds
+                    if was_running
+                    else min(self.stop_timeout_seconds, 10.0)
+                    if orphan_cleanup_attempted
+                    else 0
+                ),
+            )
+            if not stopped:
+                detail = "、".join(blockers) or "未知后台进程"
+                if shutdown_error is not None:
+                    detail = f"{detail}；优雅停止失败：{shutdown_error}"
+                raise RuntimeError(
+                    f"实例 {profile.number} 未完全停止，仍被占用：{detail}"
+                )
+
+            latest = self.manager.get_profile(profile.number)
+            response: JsonDict = {
                 "ok": True,
-                "stopping": True,
+                "stopped": True,
+                "already_stopped": not was_running,
+                "message": "Profile 已停止，Web 与 DICOM 接收端口均已释放",
                 "profile": self._serialize_profile(
-                    profile,
+                    latest,
                     desired_profiles=frozenset(),
                 ),
             }
+            if shutdown_error is not None:
+                response["warning"] = str(shutdown_error)
+            return response
 
     async def _stop_profile_handler(self, payload: object) -> JsonDict:
         return await asyncio.to_thread(self.stop_profile, payload)

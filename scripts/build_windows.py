@@ -303,6 +303,8 @@ def pyinstaller_args(
         "uvicorn",
         "--collect-all",
         "nicegui",
+        "--collect-all",
+        "webview",
         "--hidden-import",
         "dcmget.nicegui_ui",
         "--add-data",

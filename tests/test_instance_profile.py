@@ -1004,11 +1004,11 @@ def test_explicit_profile_number_is_validated(tmp_path, value):
         acquire_instance_profile(value, **_profile_kwargs(tmp_path))
 
 
-def test_profile_web_browser_waits_until_http_service_is_ready():
+def test_profile_web_ui_waits_until_http_service_is_ready():
     import DICOM_download_ui as entry
 
     attempts = 0
-    opened: list[tuple[str, int]] = []
+    opened: list[str] = []
 
     class _Response:
         def close(self) -> None:
@@ -1021,23 +1021,23 @@ def test_profile_web_browser_waits_until_http_service_is_ready():
             raise OSError("service is still starting")
         return _Response()
 
-    assert entry._open_browser_when_ready(
+    assert entry._open_ui_when_ready(
         "http://127.0.0.1:8787/",
         timeout=1,
         poll_interval=0,
         urlopen=probe,
-        opener=lambda url, new=0: opened.append((url, new)) or True,
+        opener=lambda url: opened.append(url) or True,
     )
     assert attempts == 2
-    assert opened == [("http://127.0.0.1:8787/", 1)]
+    assert opened == ["http://127.0.0.1:8787/"]
 
 
-def test_profile_web_browser_is_not_opened_when_service_never_starts():
+def test_profile_web_ui_is_not_opened_when_service_never_starts():
     import DICOM_download_ui as entry
 
     opened: list[str] = []
 
-    assert not entry._open_browser_when_ready(
+    assert not entry._open_ui_when_ready(
         "http://127.0.0.1:8787/",
         timeout=0.01,
         poll_interval=0.001,
@@ -1068,5 +1068,8 @@ def test_profile_web_launch_and_service_browser_flags_are_parsed():
     assert args.no_open_browser
     assert args.storage_port == 6777
     assert args.web_port == 8899
-    assert not entry._activation_requests_browser({"action": "ensure-running"})
-    assert entry._activation_requests_browser({"action": "open-profile-web"})
+    assert not entry._activation_requests_ui({"action": "ensure-running"})
+    assert entry._activation_requests_ui({"action": "open-profile-web"})
+    assert entry.build_parser().parse_args(
+        ["--native-shell-url", "http://127.0.0.1:8786/"]
+    ).native_shell_url == "http://127.0.0.1:8786/"
