@@ -20,10 +20,17 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, Mapping, Protocol, Sequence
 
+from .update_signing import (
+    MAX_ENVELOPE_BYTES,
+    UpdateSigningError,
+    verify_manifest,
+)
+from .update_trust import TRUSTED_UPDATE_PUBLIC_KEYS
+
 
 PRODUCT = "DcmGet"
 PLATFORM = "windows-x64"
-SIGNED_MANIFEST_NAME = "UPDATE-MANIFEST.json.p7"
+SIGNED_MANIFEST_NAME = "UPDATE-MANIFEST.signed.json"
 PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
@@ -333,8 +340,10 @@ def _validated_candidate(
                 or _SHA256_PATTERN.fullmatch(target_tree_sha256) is None
             ):
                 raise UpdateSecurityError(f"增量包 {name} 的应用树指纹无效")
-        elif signature_status != "SIGNED":
-            raise UpdateSecurityError(f"完整安装包未标记为 SIGNED：{name}")
+        elif signature_status not in {"SIGNED", "UNSIGNED"}:
+            raise UpdateSecurityError(
+                f"完整安装包签名状态必须为 SIGNED 或 UNSIGNED：{name}"
+            )
 
         seen_names.add(name)
         assets.append(
@@ -434,7 +443,7 @@ def _is_allowed_component_path(value: str) -> bool:
 
 
 class StaticMirrorReleaseSource:
-    """Read the PKCS#7-signed manifest from the fixed HTTPS update mirror."""
+    """Read the signed manifest from the fixed HTTPS update mirror."""
 
     def __init__(
         self,
@@ -450,7 +459,7 @@ class StaticMirrorReleaseSource:
     def fetch_latest(self) -> UpdateCandidate:
         signed_payload = self._read_bytes(
             _STATIC_MIRROR_MANIFEST_URL,
-            MAX_MANIFEST_BYTES,
+            MAX_ENVELOPE_BYTES,
         )
         try:
             verified_payload = self._verifier(signed_payload)
@@ -525,7 +534,7 @@ class StaticMirrorReleaseSource:
         return urllib.request.Request(
             url,
             headers={
-                "Accept": "application/pkcs7-mime, application/octet-stream",
+                "Accept": "application/json, application/octet-stream",
                 "User-Agent": "DcmGet-Windows-Updater",
             },
         )
@@ -760,6 +769,26 @@ class MirrorFirstReleaseSource:
             raise UpdateSecurityError(
                 f"无法清理镜像下载残留文件：{exc}"
             ) from exc
+
+
+class Ed25519SignedManifestVerifier:
+    """Verify the single-file Ed25519 envelope against embedded public keys."""
+
+    def __init__(
+        self,
+        trusted_public_keys: Mapping[str, bytes] = TRUSTED_UPDATE_PUBLIC_KEYS,
+    ) -> None:
+        self._trusted_public_keys = dict(trusted_public_keys)
+
+    def __call__(self, signed_payload: bytes) -> bytes:
+        try:
+            return verify_manifest(
+                signed_payload,
+                self._trusted_public_keys,
+                max_manifest_bytes=MAX_MANIFEST_BYTES,
+            )
+        except UpdateSigningError as exc:
+            raise UpdateSecurityError(str(exc)) from exc
 
 
 class WindowsSignedManifestVerifier:
@@ -1439,7 +1468,7 @@ class WindowsUpdateService:
         source: ReleaseSource,
         staging: SecureStagingDirectory,
         scheduler: UpdateScheduler | Callable[[ApplyRequest], None],
-        authenticode_verifier: AuthenticodeVerifier,
+        authenticode_verifier: AuthenticodeVerifier | None = None,
         policy: str | UpdatePolicy = UpdatePolicy.AUTOMATIC,
         platform_name: str | None = None,
         state_file: str | Path | None = None,
@@ -1663,7 +1692,7 @@ class WindowsUpdateService:
                     base_tree_sha256=asset.base_tree_sha256,
                     target_tree_sha256=asset.target_tree_sha256,
                 )
-            else:
+            elif self._authenticode_verifier is not None:
                 self._authenticode_verifier(partial_path, asset)
             os.replace(partial_path, final_path)
             with self._lock:
@@ -1691,7 +1720,10 @@ class WindowsUpdateService:
                 return self.status()
         try:
             _verify_download(downloaded, asset)
-            if asset.is_full_installer:
+            if (
+                asset.is_full_installer
+                and self._authenticode_verifier is not None
+            ):
                 self._authenticode_verifier(downloaded, asset)
             request = ApplyRequest(
                 package_path=downloaded,
@@ -1897,8 +1929,10 @@ def _validate_service_candidate(candidate: UpdateCandidate) -> None:
                         f"增量包文件清单无效：{asset.name} / {item.path}"
                     )
                 seen.add(canonical)
-        elif asset.signature_status != "SIGNED":
-            raise UpdateSecurityError(f"完整安装包未签名：{asset.name}")
+        elif asset.signature_status not in {"SIGNED", "UNSIGNED"}:
+            raise UpdateSecurityError(
+                f"完整安装包签名状态无效：{asset.name}"
+            )
 
 
 def _verify_download(path: Path, asset: UpdateAsset) -> None:
@@ -2185,26 +2219,12 @@ def create_windows_update_service(
     updater_root = (program_data / "DcmGetUpdater").resolve()
     acl = WindowsDirectoryAcl()
     staging = SecureStagingDirectory(updater_root, access_controller=acl)
-    manifest_working = updater_root / "manifest"
-    if sys.platform == "win32":
-        # Manifest verification also uses updater-owned storage, never the
-        # user-modifiable application state directory.
-        SecureStagingDirectory(
-            manifest_working, access_controller=acl
-        ).prepare(current_version)
-    current_executable = install_root / "DcmGet.exe"
-    signed_manifest_verifier = WindowsSignedManifestVerifier(
-        current_executable,
-        manifest_working,
-    )
-    github_source = GitHubReleaseSource(
-        signed_manifest_verifier=signed_manifest_verifier,
-    )
-    mirror_source = StaticMirrorReleaseSource(
-        signed_manifest_verifier=signed_manifest_verifier,
+    source = StaticMirrorReleaseSource(
+        signed_manifest_verifier=Ed25519SignedManifestVerifier(
+            TRUSTED_UPDATE_PUBLIC_KEYS
+        ),
         timeout_seconds=3.0,
     )
-    source = MirrorFirstReleaseSource(mirror_source, github_source)
     scheduler = WindowsScheduledTaskUpdater(
         staging,
         install_directory=install_root,
@@ -2214,7 +2234,7 @@ def create_windows_update_service(
         source=source,
         staging=staging,
         scheduler=scheduler,
-        authenticode_verifier=WindowsAuthenticodeVerifier(current_executable),
+        authenticode_verifier=None,
         policy=UpdatePolicy.AUTOMATIC,
         state_file=state_root / "windows-update.json",
     )
@@ -2225,6 +2245,7 @@ def create_windows_update_service(
 __all__ = [
     "ApplyRequest",
     "ComponentFile",
+    "Ed25519SignedManifestVerifier",
     "GitHubReleaseSource",
     "MirrorFirstReleaseSource",
     "SecureStagingDirectory",
@@ -2236,6 +2257,7 @@ __all__ = [
     "UpdatePhase",
     "UpdatePolicy",
     "UpdateSecurityError",
+    "TRUSTED_UPDATE_PUBLIC_KEYS",
     "WindowsAuthenticodeVerifier",
     "WindowsDirectoryAcl",
     "WindowsScheduledTaskUpdater",

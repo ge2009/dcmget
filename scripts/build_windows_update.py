@@ -12,49 +12,60 @@ patch.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
 import re
-import subprocess
+import stat
 import sys
 import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 try:
     from scripts.windows_release_gate import (
-        AuthenticodeConfig,
         DEFAULT_CHECKSUMS_NAME,
         DEFAULT_MANIFEST_NAME,
         PLATFORM,
         ReleaseGateError,
-        SignatureStatus,
         file_sha256,
-        verify_windows_files,
     )
 except ModuleNotFoundError:  # direct execution from the scripts directory
     from windows_release_gate import (  # type: ignore[no-redef]
-        AuthenticodeConfig,
         DEFAULT_CHECKSUMS_NAME,
         DEFAULT_MANIFEST_NAME,
         PLATFORM,
         ReleaseGateError,
-        SignatureStatus,
         file_sha256,
-        verify_windows_files,
     )
 
 from dcmget.architecture import require_amd64_pe
+from dcmget.update_signing import (
+    UpdateSigningError,
+    load_private_key,
+    sign_manifest,
+    verify_manifest,
+)
+from dcmget.update_trust import (
+    DEFAULT_UPDATE_KEY_ID,
+    TRUSTED_UPDATE_PUBLIC_KEYS,
+)
 
 
 UPDATE_SCHEMA_VERSION = 1
 UPDATE_LAYOUT_VERSION = 1
 UPDATE_MANIFEST_NAME = "UPDATE-MANIFEST.json"
-UPDATE_SIGNATURE_NAME = f"{UPDATE_MANIFEST_NAME}.p7"
+UPDATE_SIGNATURE_NAME = "UPDATE-MANIFEST.signed.json"
 PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
 COMPONENT_BASELINE_NAME = "component-baseline.zip"
 MAX_COMPONENT_BASELINES = 5
@@ -73,31 +84,6 @@ _PROTECTED_NAMES = {
     "trial.json",
 }
 _PROTECTED_PARTS = {"downloads", "logs", "quarantine", "tasks", "trial"}
-_VERIFY_BASE_MANIFEST_SCRIPT = r"""
-$ErrorActionPreference = 'Stop'
-$application = Get-AuthenticodeSignature -LiteralPath $env:DCMGET_CURRENT_EXE
-if ($application.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-    throw "Current DcmGet signature is $($application.Status)"
-}
-if ($null -eq $application.SignerCertificate) {
-    throw 'Current DcmGet signer is missing'
-}
-$cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-$cms.Decode([IO.File]::ReadAllBytes($env:DCMGET_BASE_UPDATE_P7))
-$cms.CheckSignature($true)
-if ($cms.SignerInfos.Count -ne 1) { throw 'Base manifest must have one signer' }
-$signer = $cms.SignerInfos[0].Certificate
-if ($null -eq $signer) { throw 'Base manifest signer is missing' }
-if ($signer.Thumbprint -ne $application.SignerCertificate.Thumbprint) {
-    throw 'Base manifest signer does not match current DcmGet'
-}
-[IO.File]::WriteAllBytes(
-    $env:DCMGET_BASE_UPDATE_CONTENT,
-    $cms.ContentInfo.Content
-)
-""".strip()
-
-
 class WindowsUpdateBuildError(ReleaseGateError):
     pass
 
@@ -131,9 +117,6 @@ class WindowsUpdateBuildResult:
     baseline_snapshot_path: Path | None = None
 
 
-CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
-
-
 def build_windows_update_release(
     *,
     release_directory: str | Path,
@@ -150,30 +133,28 @@ def build_windows_update_release(
     base_update_signature: str | Path | None = None,
     baselines: Iterable[ComponentBaseline] = (),
     patch_only: bool = False,
-    authenticode: AuthenticodeConfig | None = None,
-    runner: CommandRunner = subprocess.run,
+    update_private_key: Ed25519PrivateKey | None = None,
+    update_key_id: str | None = None,
+    trusted_update_public_keys: Mapping[
+        str, bytes | Ed25519PublicKey
+    ] = TRUSTED_UPDATE_PUBLIC_KEYS,
 ) -> WindowsUpdateBuildResult:
-    """Create a signed update manifest and safe direct component patches.
+    """Create an Ed25519-signed manifest and safe direct component patches.
 
     The legacy single-baseline arguments remain supported.  ``patch_only``
     omits the full installer and is intended for fast releases produced from a
-    signed onedir payload.  A patch-only release must have at least one trusted
-    baseline, so the update chain must always start from a signed full release.
+    onedir payload. A patch-only release must have at least one trusted baseline,
+    so the update chain always starts from a complete release.
     """
 
     _validate_version(version, "目标版本")
     release_root = _require_directory(release_directory, "Windows 发布目录")
     payload_root = _require_directory(install_root, "Windows 安装负载目录")
 
-    signing = authenticode or AuthenticodeConfig.from_environment()
-    if not signing.configured:
-        raise WindowsUpdateBuildError(
-            "自动更新发布必须配置 Authenticode 签名证书"
-        )
-    if not signing.timestamp_url:
-        raise WindowsUpdateBuildError(
-            "自动更新发布必须配置 RFC 3161 时间戳地址"
-        )
+    signing_key = update_private_key or _load_update_private_key()
+    signing_key_id = update_key_id or os.environ.get(
+        "DCMGET_UPDATE_SIGNING_KEY_ID", DEFAULT_UPDATE_KEY_ID
+    )
 
     current_files = _inventory_install_root(payload_root)
     current_tree_sha256 = _tree_digest(current_files)
@@ -185,11 +166,6 @@ def build_windows_update_release(
         if release_manifest_path is not None or full_installer is not None:
             raise WindowsUpdateBuildError(
                 "patch-only 发布不能同时指定完整安装包或 Windows 发布清单"
-            )
-        statuses = verify_windows_files([application], signing, runner=runner)
-        if statuses.get(application) is not SignatureStatus.SIGNED:
-            raise WindowsUpdateBuildError(
-                "patch-only 发布的 DcmGet.exe 未通过 Authenticode 签名校验"
             )
     else:
         release_manifest_file = Path(
@@ -236,7 +212,7 @@ def build_windows_update_release(
         )
     if patch_only and not requested_baselines:
         raise WindowsUpdateBuildError(
-            "首个组件更新基线必须来自已签名完整发布；patch-only 至少需要一个可信基线"
+            "首个组件更新基线必须来自可信完整发布；patch-only 至少需要一个可信基线"
         )
 
     ordered_baselines = _normalise_baselines(requested_baselines, version=version)
@@ -246,12 +222,10 @@ def build_windows_update_release(
     chain_anchors: dict[str, str] = {}
     for baseline in ordered_baselines:
         base_manifest_path = baseline.update_manifest.expanduser().resolve()
-        verify_pkcs7_base_manifest(
+        verify_ed25519_base_manifest(
             base_manifest_path,
             baseline.update_signature.expanduser().resolve(),
-            current_executable=application,
-            working_directory=release_root,
-            runner=runner,
+            trusted_public_keys=trusted_update_public_keys,
         )
         base_manifest = _load_json_object(
             base_manifest_path,
@@ -302,25 +276,6 @@ def build_windows_update_release(
             raise WindowsUpdateBuildError(
                 f"从 {baseline.version} 更新没有检测到任何文件变化"
             )
-
-        changed_executables = [
-            payload_root / PurePosixPath(record.path)
-            for record in changed_files
-            if record.path.lower().endswith(".exe")
-        ]
-        if changed_executables:
-            statuses = verify_windows_files(
-                changed_executables, signing, runner=runner
-            )
-            unsigned = [
-                path.name
-                for path, status in statuses.items()
-                if status is not SignatureStatus.SIGNED
-            ]
-            if unsigned:
-                raise WindowsUpdateBuildError(
-                    "组件增量包包含未签名可执行文件：" + "、".join(unsigned)
-                )
 
         patch_file_records: list[dict[str, object]] = []
         for record in changed_files:
@@ -384,7 +339,7 @@ def build_windows_update_release(
             "kind": "full_installer",
             "size": installer_path.stat().st_size,
             "sha256": file_sha256(installer_path),
-            "signature_status": "SIGNED",
+            "signature_status": installer_record.get("signature_status"),
             "preserves_user_data": True,
             "content_scope": "application",
             "source_release_manifest_kind": installer_record.get("kind"),
@@ -413,7 +368,7 @@ def build_windows_update_release(
     }
     if not component_chain["root_full_releases"]:
         raise WindowsUpdateBuildError(
-            "组件更新链缺少已签名完整发布锚点"
+            "组件更新链缺少可信完整发布锚点"
         )
     update_manifest = {
         "schema_version": UPDATE_SCHEMA_VERSION,
@@ -431,10 +386,10 @@ def build_windows_update_release(
         "component_patches": component_patches,
         "manifest_signature": {
             "name": UPDATE_SIGNATURE_NAME,
-            "kind": "pkcs7_signed_data",
-            "content_encoding": "Embedded",
-            "digest_algorithm": "SHA256",
-            "timestamped": True,
+            "kind": "ed25519_signed_envelope",
+            "algorithm": "Ed25519",
+            "key_id": signing_key_id,
+            "content_encoding": "base64",
         },
     }
     manifest_path = release_root / UPDATE_MANIFEST_NAME
@@ -443,11 +398,27 @@ def build_windows_update_release(
         json.dumps(update_manifest, ensure_ascii=False, indent=2, sort_keys=True)
         + "\n",
     )
-    signature_path = sign_pkcs7_manifest(
-        manifest_path,
-        signing,
-        runner=runner,
-    )
+    try:
+        signed_envelope = sign_manifest(
+            manifest_path.read_bytes(),
+            private_key=signing_key,
+            key_id=signing_key_id,
+        )
+    except (OSError, UpdateSigningError) as exc:
+        raise WindowsUpdateBuildError(f"无法签名更新清单：{exc}") from exc
+    try:
+        verified_manifest = verify_manifest(
+            signed_envelope,
+            trusted_update_public_keys,
+        )
+    except UpdateSigningError as exc:
+        raise WindowsUpdateBuildError(
+            f"更新签名密钥与内置受信公钥不匹配：{exc}"
+        ) from exc
+    if verified_manifest != manifest_path.read_bytes():
+        raise WindowsUpdateBuildError("更新签名信封与更新清单内容不一致")
+    signature_path = release_root / UPDATE_SIGNATURE_NAME
+    _atomic_write_bytes(signature_path, signed_envelope)
     _update_checksums(
         release_root,
         [manifest_path, signature_path, *component_patch_paths],
@@ -472,129 +443,35 @@ def build_windows_update_release(
     )
 
 
-def sign_pkcs7_manifest(
-    manifest_path: str | Path,
-    config: AuthenticodeConfig,
-    *,
-    runner: CommandRunner = subprocess.run,
-) -> Path:
-    """Create an embedded, timestamped PKCS#7 signature for update metadata."""
-
-    path = Path(manifest_path).expanduser().resolve()
-    if path.is_symlink() or not path.is_file():
-        raise WindowsUpdateBuildError(f"更新清单不存在或类型无效：{path}")
-    if not config.configured or config.signtool is None:
-        raise WindowsUpdateBuildError("更新清单签名所需的 signtool 或证书未配置")
-    if not config.timestamp_url:
-        raise WindowsUpdateBuildError("更新清单签名必须包含 RFC 3161 时间戳")
-
-    command = [str(config.signtool), "sign", "/fd", "SHA256"]
-    if config.certificate_path is not None:
-        command.extend(["/f", str(config.certificate_path)])
-        if config.certificate_password:
-            command.extend(["/p", config.certificate_password])
-    else:
-        command.extend(["/sha1", config.certificate_sha1])
-    command.extend(
-        [
-            "/tr",
-            config.timestamp_url,
-            "/td",
-            "SHA256",
-            "/p7",
-            str(path.parent),
-            "/p7ce",
-            "Embedded",
-            str(path),
-        ]
-    )
-    _run_command(command, f"无法签名更新清单 {path.name}", runner)
-    signature_path = path.with_name(path.name + ".p7")
-    if signature_path.is_symlink() or not signature_path.is_file():
-        raise WindowsUpdateBuildError(
-            f"signtool 未生成预期的 PKCS#7 文件：{signature_path}"
-        )
-    _run_command(
-        [
-            str(config.signtool),
-            "verify",
-            "/p7",
-            "/v",
-            str(signature_path),
-        ],
-        f"无法验证更新清单签名 {signature_path.name}",
-        runner,
-    )
-    return signature_path
-
-
-def verify_pkcs7_base_manifest(
+def verify_ed25519_base_manifest(
     manifest_path: str | Path,
     signature_path: str | Path,
     *,
-    current_executable: str | Path,
-    working_directory: str | Path,
-    runner: CommandRunner = subprocess.run,
+    trusted_public_keys: Mapping[str, bytes | Ed25519PublicKey],
 ) -> None:
-    """Verify and bind the previous manifest to the current release signer."""
+    """Verify that a baseline manifest exactly matches its signed envelope."""
 
     manifest = Path(manifest_path).expanduser().resolve()
     signature = Path(signature_path).expanduser().resolve()
-    executable = Path(current_executable).expanduser().resolve()
-    working = _require_directory(working_directory, "更新清单验证目录")
     for path, label in (
         (manifest, "上一稳定版更新清单"),
         (signature, "上一稳定版更新清单签名"),
-        (executable, "当前 DcmGet.exe"),
     ):
         if path.is_symlink() or not path.is_file():
             raise WindowsUpdateBuildError(f"{label}不存在或类型无效：{path}")
-    extracted = working / f".base-update-content.{uuid.uuid4().hex}.tmp"
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "DCMGET_CURRENT_EXE": str(executable),
-            "DCMGET_BASE_UPDATE_P7": str(signature),
-            "DCMGET_BASE_UPDATE_CONTENT": str(extracted),
-        }
-    )
-    command = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        _VERIFY_BASE_MANIFEST_SCRIPT,
-    ]
     try:
-        completed = runner(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            env=environment,
+        verified = verify_manifest(
+            signature.read_bytes(),
+            trusted_public_keys,
         )
-        if completed.returncode:
-            detail = (completed.stderr or completed.stdout or "").strip()
+        if verified != manifest.read_bytes():
             raise WindowsUpdateBuildError(
-                "上一稳定版更新清单 PKCS#7 验证失败"
-                + (f"：{detail}" if detail else "")
+                "上一稳定版 UPDATE-MANIFEST.json 与 Ed25519 已签内容不一致"
             )
-        if extracted.is_symlink() or not extracted.is_file():
-            raise WindowsUpdateBuildError("PKCS#7 验证未输出已签名清单内容")
-        if extracted.read_bytes() != manifest.read_bytes():
-            raise WindowsUpdateBuildError(
-                "上一稳定版 UPDATE-MANIFEST.json 与 PKCS#7 已签内容不一致"
-            )
-    except OSError as exc:
+    except (OSError, UpdateSigningError) as exc:
         raise WindowsUpdateBuildError(
-            f"上一稳定版更新清单 PKCS#7 验证失败：{exc}"
+            f"上一稳定版更新清单 Ed25519 验证失败：{exc}"
         ) from exc
-    finally:
-        extracted.unlink(missing_ok=True)
 
 
 def _validate_signed_release(
@@ -613,11 +490,14 @@ def _validate_signed_release(
     signing = manifest.get("signing")
     if not isinstance(signing, Mapping):
         raise WindowsUpdateBuildError("Windows 发布清单缺少签名状态")
-    if signing.get("status") != "SIGNED" or signing.get("timestamped") is not True:
-        raise WindowsUpdateBuildError(
-            "只有已通过 Authenticode 签名并带时间戳的 x64 发布"
-            "才能上线自动更新"
-        )
+    release_signature_status = signing.get("status")
+    if release_signature_status not in {"SIGNED", "UNSIGNED"}:
+        raise WindowsUpdateBuildError("Windows 发布清单签名状态无效")
+    if (
+        release_signature_status == "SIGNED"
+        and signing.get("timestamped") is not True
+    ):
+        raise WindowsUpdateBuildError("已签名 Windows 发布缺少时间戳")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise WindowsUpdateBuildError("Windows 发布清单缺少发布物列表")
@@ -629,8 +509,8 @@ def _validate_signed_release(
     if len(installers) != 1:
         raise WindowsUpdateBuildError("Windows 发布清单必须且只能包含一个安装器")
     record = installers[0]
-    if record.get("signature_status") != "SIGNED":
-        raise WindowsUpdateBuildError("完整安装器未通过 Authenticode 签名校验")
+    if record.get("signature_status") != release_signature_status:
+        raise WindowsUpdateBuildError("完整安装器签名状态与发布清单不一致")
     relative = record.get("relative_path")
     if not isinstance(relative, str) or not relative:
         raise WindowsUpdateBuildError("完整安装器缺少安全的相对路径")
@@ -753,13 +633,13 @@ def _validate_compatible_base_manifest(
     if (
         not isinstance(manifest_signature, Mapping)
         or manifest_signature.get("name") != UPDATE_SIGNATURE_NAME
-        or manifest_signature.get("kind") != "pkcs7_signed_data"
-        or manifest_signature.get("content_encoding") != "Embedded"
-        or manifest_signature.get("digest_algorithm") != "SHA256"
-        or manifest_signature.get("timestamped") is not True
+        or manifest_signature.get("kind") != "ed25519_signed_envelope"
+        or manifest_signature.get("algorithm") != "Ed25519"
+        or not isinstance(manifest_signature.get("key_id"), str)
+        or manifest_signature.get("content_encoding") != "base64"
     ):
         raise WindowsUpdateBuildError(
-            "上一稳定版更新清单没有有效的带时间戳 PKCS#7 声明"
+            "上一稳定版更新清单没有有效的 Ed25519 签名声明"
         )
     install_tree_sha256 = str(manifest.get("install_tree_sha256", "")).lower()
     if _SHA256_PATTERN.fullmatch(install_tree_sha256) is None:
@@ -824,7 +704,7 @@ def _validate_base_update_artifacts(
         kind = raw_record.get("kind")
         if kind == "full_installer":
             if (
-                raw_record.get("signature_status") != "SIGNED"
+                raw_record.get("signature_status") not in {"SIGNED", "UNSIGNED"}
                 or raw_record.get("preserves_user_data") is not True
                 or raw_record.get("content_scope") != "application"
             ):
@@ -850,7 +730,7 @@ def _validate_base_update_artifacts(
         )
     if not full_installers and not component_patches:
         raise WindowsUpdateBuildError(
-            "上一稳定版必须包含已签名完整安装包或可信组件增量包"
+            "上一稳定版必须包含可信完整安装包或可信组件增量包"
         )
     declared_full = manifest.get("full_installer")
     if full_installers:
@@ -885,12 +765,12 @@ def _component_chain_anchors(
     chain = manifest.get("component_chain")
     if not isinstance(chain, Mapping) or chain.get("schema_version") != 1:
         raise WindowsUpdateBuildError(
-            "patch-only 基线缺少已签名完整发布链锚点"
+            "patch-only 基线缺少可信完整发布链锚点"
         )
     raw_anchors = chain.get("root_full_releases")
     if not isinstance(raw_anchors, list) or not raw_anchors:
         raise WindowsUpdateBuildError(
-            "patch-only 基线缺少已签名完整发布链锚点"
+            "patch-only 基线缺少可信完整发布链锚点"
         )
     anchors: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -1097,31 +977,60 @@ def _update_checksums(release_root: Path, values: Iterable[Path | None]) -> None
     )
 
 
-def _run_command(
-    command: Sequence[str],
-    error_prefix: str,
-    runner: CommandRunner,
-) -> None:
-    try:
-        completed = runner(
-            list(command),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except OSError as exc:
-        raise WindowsUpdateBuildError(f"{error_prefix}：{exc}") from exc
-    if completed.returncode:
-        detail = "\n".join(
-            value.strip()
-            for value in (completed.stdout or "", completed.stderr or "")
-            if value.strip()
-        )
+def _load_update_private_key(
+    private_key_path: str | Path | None = None,
+) -> Ed25519PrivateKey:
+    """Load the release-only private key from an explicit path or environment."""
+
+    configured_path = private_key_path or os.environ.get(
+        "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_PATH"
+    )
+    configured_base64 = os.environ.get(
+        "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64"
+    )
+    if configured_path and configured_base64:
         raise WindowsUpdateBuildError(
-            error_prefix + (f"：{detail}" if detail else "")
+            "更新签名私钥路径和 Base64 环境变量不能同时配置"
         )
+    if configured_path:
+        source_path = Path(configured_path).expanduser()
+        if source_path.is_symlink() or not source_path.is_file():
+            raise WindowsUpdateBuildError(
+                f"更新签名私钥不存在或类型无效：{source_path}"
+            )
+        path = source_path.resolve()
+        if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise WindowsUpdateBuildError(
+                "更新签名私钥权限过宽；请执行 chmod 600 后重试"
+            )
+        try:
+            private_key_pem = path.read_bytes()
+        except OSError as exc:
+            raise WindowsUpdateBuildError(
+                f"无法读取更新签名私钥：{path}"
+            ) from exc
+    elif configured_base64:
+        try:
+            private_key_pem = base64.b64decode(
+                configured_base64.encode("ascii"),
+                validate=True,
+            )
+        except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+            raise WindowsUpdateBuildError(
+                "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 不是有效 Base64"
+            ) from exc
+    else:
+        raise WindowsUpdateBuildError(
+            "缺少更新签名私钥；请配置 --update-private-key、"
+            "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_PATH 或"
+            " DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64"
+        )
+    password_text = os.environ.get("DCMGET_UPDATE_SIGNING_PRIVATE_KEY_PASSWORD")
+    password = password_text.encode("utf-8") if password_text else None
+    try:
+        return load_private_key(private_key_pem, password=password)
+    except UpdateSigningError as exc:
+        raise WindowsUpdateBuildError(f"无法加载更新签名私钥：{exc}") from exc
 
 
 def _load_json_object(path: Path, label: str) -> Mapping[str, object]:
@@ -1197,6 +1106,18 @@ def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> 
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _path(value: str) -> Path:
     return Path(value).expanduser()
 
@@ -1227,6 +1148,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-version")
     parser.add_argument("--base-update-manifest", type=_path)
     parser.add_argument("--base-update-signature", type=_path)
+    parser.add_argument(
+        "--update-private-key",
+        type=_path,
+        help=(
+            "Ed25519 私钥 PEM 路径；也可用"
+            " DCMGET_UPDATE_SIGNING_PRIVATE_KEY_PATH 或 Base64 secret 环境变量"
+        ),
+    )
+    parser.add_argument(
+        "--update-key-id",
+        default=os.environ.get(
+            "DCMGET_UPDATE_SIGNING_KEY_ID", DEFAULT_UPDATE_KEY_ID
+        ),
+    )
     parser.add_argument(
         "--baseline",
         nargs=4,
@@ -1260,6 +1195,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_update_signature=args.base_update_signature,
         baselines=baselines,
         patch_only=args.patch_only,
+        update_private_key=_load_update_private_key(args.update_private_key),
+        update_key_id=args.update_key_id,
     )
     print(result.manifest_path)
     print(result.signature_path)

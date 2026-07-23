@@ -1077,14 +1077,14 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
         _topbar("Windows 管理中心")
         with ui.element("section").classes("hero"):
             with ui.element("div"):
-                ui.label("PROFILE ORCHESTRATION / 8786").classes("eyebrow")
-                ui.label("让每一条影像链路，清楚地运行。 ").classes("headline")
-                ui.label("统一查看、启动和停止独立 Profile。每个 Profile 保持自己的 PACS、接收端口、保存目录与任务状态。").classes("lede")
+                ui.label("本机管理 / 8786").classes("eyebrow")
+                ui.label("Profile 管理").classes("headline")
+                ui.label("查看并启动或停止各个 Profile；各 Profile 使用独立的 PACS、端口、保存目录和任务状态。").classes("lede")
             with ui.element("div").classes("surface surface-body summary-card"):
                 with ui.element("div").classes("summary-head"):
                     with ui.element("div").classes("summary-copy"):
                         ui.label("工作台概况").classes("eyebrow")
-                        ui.label("统一入口，按需启动；不再把细碎配置堆在首屏。").classes("text-sm")
+                        ui.label("查看 Profile 数量与运行状态。").classes("text-sm")
                     ui.label("当前 Profile 默认不启动").classes("summary-badge")
                 with ui.element("div").classes("manager-summary"):
                     with ui.element("div"):
@@ -1115,7 +1115,7 @@ def _topbar(context: str, *, connection_state: str = "connected") -> None:
                 ui.label("DCMGET").classes("brand-title")
                 ui.label(context.upper()).classes("brand-sub")
         with ui.element("div").classes("topbar-stack"):
-            ui.label("浏览器安全会话").classes("topbar-chip")
+            ui.label("浏览器会话").classes("topbar-chip")
             theme_button = ui.button(icon="contrast").props(
                 'flat round dense aria-label="切换浅色或深色主题"'
             ).classes("theme-toggle")
@@ -1533,7 +1533,7 @@ async def _build_profile(
             with ui.element("div").classes("surface-head"):
                 with ui.element("div"):
                     ui.label("软件授权").classes("text-xl")
-                    ui.label("未注册设备默认可免费启动 30 个下载任务")
+                    ui.label("未注册设备可启动 30 个试用任务")
                 ui.button(icon="close", on_click=dialog.close).props("flat round")
             with ui.element("div").classes("surface-body stack"):
                 status_label = ui.label("正在读取授权状态…").classes("font-semibold")
@@ -1919,15 +1919,15 @@ async def _build_profile(
                 ).props("outlined dense options-dense").classes("w-64 max-w-full")
         with ui.element("section").classes("hero"):
             with ui.element("div"):
-                ui.label("DICOM RETRIEVAL WORKSPACE").classes("eyebrow")
-                ui.label("把影像取回这件事，变得简单而确定。 ").classes("headline")
-                ui.label("粘贴检查号，确认保存位置，然后开始。预检、接收、下载、失败重试与 PDI 导出均由后台持续执行。").classes("lede")
+                ui.label("当前 Profile").classes("eyebrow")
+                ui.label("DICOM 影像下载").classes("headline")
+                ui.label("输入检查号并选择保存目录，预检通过后开始下载；关闭浏览器不会停止后台任务。").classes("lede")
             with ui.element("div").classes("hero-panel"):
                 with ui.element("div").classes("surface summary-card"):
                     with ui.element("div").classes("summary-head"):
                         with ui.element("div").classes("summary-copy"):
                             ui.label("当前工作上下文").classes("eyebrow")
-                            ui.label("主流程只保留任务输入、预检与下载控制。").classes("text-sm")
+                            ui.label("当前 Profile 的连接与运行信息。").classes("text-sm")
                         refs["license_badge"] = ui.label(
                             license_label(license_data)
                         ).classes("summary-badge")
@@ -1944,7 +1944,7 @@ async def _build_profile(
 
         with ui.element("section").classes("launch-bar"):
             with ui.element("div").classes("launch-copy"):
-                ui.label("准备好后即可开始").classes("launch-title")
+                ui.label("启动下载任务").classes("launch-title")
                 refs["readiness"] = ui.label(
                     "输入检查号和保存目录后将自动预检"
                 ).classes("launch-state")
@@ -1968,7 +1968,7 @@ async def _build_profile(
                         with ui.element("div").classes("section-copy"):
                             ui.label("01 / 输入检查号").classes("step-index")
                             ui.label("新建下载任务").classes("text-xl")
-                            ui.label("支持粘贴和导入文件；大批量任务会自动切换为聚合视图。").classes("section-note")
+                            ui.label("可粘贴检查号，或导入 TXT、CSV、XLSX 文件。").classes("section-note")
                         with ui.row().classes("items-center gap-2"):
                             ui.button("清空", icon="delete_sweep", on_click=clear_accessions).props("flat").classes("button-quiet")
                             ui.upload(
@@ -1995,7 +1995,7 @@ async def _build_profile(
                         with ui.element("div").classes("section-copy"):
                             ui.label("02 / 保存与交付").classes("step-index")
                             ui.label("快速选项").classes("text-xl")
-                            ui.label("常用参数留在当前页，低频参数进入完整设置。").classes("section-note")
+                            ui.label("设置保存目录和 PDI 选项。").classes("section-note")
                         ui.button("完整设置", icon="settings", on_click=open_settings).props("flat").classes("button-quiet")
                     with ui.element("div").classes("surface-body stack"):
                         with ui.element("div").classes("quick-grid"):
@@ -2082,7 +2082,7 @@ async def _build_profile(
                     with ui.element("div").classes("surface-head"):
                         with ui.element("div"):
                             ui.label("工具与版本").classes("text-lg")
-                            ui.label("低频功能集中放置，保持主流程简洁")
+                            ui.label("验收、支持、备份与版本信息")
                     with ui.element("div").classes("surface-body"):
                         with ui.expansion("展开工具", icon="build").classes("w-full"):
                             with ui.element("div").classes("stack pt-2"):
@@ -2241,7 +2241,7 @@ def install_nicegui(app: Any, mount_path: str = "/workspace") -> None:
     ui.run_with(
         app,
         mount_path=normalized_mount,
-        title="DcmGet 影像下载工作台",
+        title="DcmGet DICOM 影像下载",
         favicon=favicon if favicon.is_file() else None,
         language="zh-CN",
         dark=False,

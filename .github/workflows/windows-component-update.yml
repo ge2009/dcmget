@@ -18,22 +18,18 @@ permissions:
 
 jobs:
   build:
-    name: Build signed Windows x64 component update
+    name: Build Windows x64 component update
     runs-on: windows-2025
     timeout-minutes: 40
 
     steps:
-      - name: Require signing secrets before doing build work
+      - name: Require update signing key before doing build work
         shell: pwsh
         env:
-          SIGN_CERTIFICATE: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
-          SIGN_PASSWORD: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
+          UPDATE_PRIVATE_KEY: ${{ secrets.DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGN_CERTIFICATE)) {
-            throw "DCMGET_SIGN_CERTIFICATE_BASE64 is required"
-          }
-          if ([string]::IsNullOrWhiteSpace($env:SIGN_PASSWORD)) {
-            throw "DCMGET_SIGN_CERTIFICATE_PASSWORD is required"
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_PRIVATE_KEY)) {
+            throw "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 is required"
           }
 
       - uses: actions/checkout@v4
@@ -43,21 +39,6 @@ jobs:
           python-version: "3.12"
           architecture: x64
           cache: pip
-
-      - name: Configure required Authenticode certificate
-        shell: pwsh
-        env:
-          SIGN_CERTIFICATE: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
-          SIGN_PASSWORD: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
-        run: |
-          $certificatePath = Join-Path $env:RUNNER_TEMP "dcmget-authenticode.pfx"
-          [IO.File]::WriteAllBytes(
-            $certificatePath,
-            [Convert]::FromBase64String($env:SIGN_CERTIFICATE)
-          )
-          "DCMGET_SIGN_CERTIFICATE_PATH=$certificatePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "DCMGET_SIGN_CERTIFICATE_PASSWORD=$env:SIGN_PASSWORD" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "DCMGET_SIGN_TIMESTAMP_URL=http://timestamp.digicert.com" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install component build dependencies
         run: |
@@ -86,7 +67,7 @@ jobs:
         shell: pwsh
         run: python scripts/prepare_ohif.py
 
-      - name: Build signed onedir update payload
+      - name: Build onedir update payload
         shell: pwsh
         run: python scripts/build_windows.py --version "${{ inputs.version }}" --update-payload-only
 
@@ -135,7 +116,7 @@ jobs:
             $assetNames = @($release.assets | ForEach-Object { [string]$_.name })
             if (
               $assetNames -notcontains "UPDATE-MANIFEST.json" -or
-              $assetNames -notcontains "UPDATE-MANIFEST.json.p7"
+              $assetNames -notcontains "UPDATE-MANIFEST.signed.json"
             ) { continue }
 
             $directory = Join-Path $baselineRoot $baseVersion
@@ -157,28 +138,20 @@ jobs:
               --repo $env:GITHUB_REPOSITORY `
               --pattern $archiveName `
               --pattern "UPDATE-MANIFEST.json" `
-              --pattern "UPDATE-MANIFEST.json.p7" `
+              --pattern "UPDATE-MANIFEST.signed.json" `
               --dir $directory
             if ($LASTEXITCODE -ne 0) { throw "Could not download baseline $baseVersion" }
 
             $manifestPath = Join-Path $directory "UPDATE-MANIFEST.json"
-            $signaturePath = Join-Path $directory "UPDATE-MANIFEST.json.p7"
-            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-            $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
-            $cms.CheckSignature($true)
-            if ($cms.SignerInfos.Count -ne 1) {
-              throw "Baseline $baseVersion update manifest must have one signer"
-            }
+            $signaturePath = Join-Path $directory "UPDATE-MANIFEST.signed.json"
             $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
-            if (
-              [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
-              [Convert]::ToBase64String($rawManifest)
-            ) {
+            python -c "import sys; from pathlib import Path; from dcmget.update_signing import verify_manifest; from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS; assert verify_manifest(Path(sys.argv[1]).read_bytes(), TRUSTED_UPDATE_PUBLIC_KEYS) == Path(sys.argv[2]).read_bytes()" $signaturePath $manifestPath
+            if ($LASTEXITCODE -ne 0) {
               throw "Baseline $baseVersion signed manifest content mismatch"
             }
             try {
               $utf8 = [Text.UTF8Encoding]::new($false, $true)
-              $manifest = $utf8.GetString($cms.ContentInfo.Content) | ConvertFrom-Json
+              $manifest = $utf8.GetString($rawManifest) | ConvertFrom-Json
             } catch {
               throw "Baseline $baseVersion signed manifest is not valid UTF-8 JSON: $_"
             }
@@ -207,17 +180,19 @@ jobs:
               version = $baseVersion
               install_root = $installRoot
               manifest = (Join-Path $directory "UPDATE-MANIFEST.json")
-              signature = (Join-Path $directory "UPDATE-MANIFEST.json.p7")
+              signature = (Join-Path $directory "UPDATE-MANIFEST.signed.json")
             }
             [void]$acceptedVersions.Add($baseVersion)
           }
           if ($baselines.Count -eq 0) {
-            throw "No component baseline is available. Publish one signed full release first."
+            throw "No component baseline is available. Publish one trusted full release first."
           }
           $baselines | ConvertTo-Json -Depth 4 | Set-Content "build/windows/component-baselines.json" -Encoding utf8
 
-      - name: Build signed multi-baseline update manifest
+      - name: Build Ed25519 signed multi-baseline update manifest
         shell: pwsh
+        env:
+          DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
         run: |
           $ErrorActionPreference = "Stop"
           $arguments = @(
@@ -256,34 +231,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $root = (Resolve-Path "release/windows").Path
-          $applicationPath = (Resolve-Path "build/windows/dist/DcmGet/DcmGet.exe").Path
-          $application = Get-AuthenticodeSignature -LiteralPath $applicationPath
-          if ($application.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            throw "DcmGet.exe Authenticode validation failed: $($application.Status)"
-          }
           $manifestPath = Join-Path $root "UPDATE-MANIFEST.json"
-          $signaturePath = Join-Path $root "UPDATE-MANIFEST.json.p7"
+          $signaturePath = Join-Path $root "UPDATE-MANIFEST.signed.json"
           $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
           if ($null -ne $manifest.full_installer) { throw "Patch-only manifest declared a full payload" }
           $patches = @($manifest.component_patches)
           if ($patches.Count -lt 1 -or $patches.Count -gt 5) {
             throw "Patch-only manifest must contain between one and five direct patches"
           }
-          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
-          $cms.CheckSignature($true)
-          if ($cms.SignerInfos.Count -ne 1) { throw "Update manifest must have one signer" }
-          $signer = $cms.SignerInfos[0].Certificate
-          if ($null -eq $signer -or $null -eq $application.SignerCertificate) {
-            throw "Update signer is missing"
-          }
-          if ($signer.Thumbprint -ne $application.SignerCertificate.Thumbprint) {
-            throw "Update manifest signer does not match DcmGet.exe"
-          }
-          if (
-            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
-            [Convert]::ToBase64String([IO.File]::ReadAllBytes($manifestPath))
-          ) { throw "Signed manifest content mismatch" }
+          python -c "from pathlib import Path; from dcmget.update_signing import verify_manifest; from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS; e=Path(r'$signaturePath').read_bytes(); m=Path(r'$manifestPath').read_bytes(); assert verify_manifest(e, TRUSTED_UPDATE_PUBLIC_KEYS) == m"
+          if ($LASTEXITCODE -ne 0) { throw "Signed manifest content mismatch" }
           if (-not (Test-Path (Join-Path $root "component-baseline.zip") -PathType Leaf)) {
             throw "Builder baseline snapshot is missing"
           }
@@ -296,7 +253,7 @@ jobs:
             release/windows/DcmGet-${{ inputs.version }}-windows-x64-components-from-*.zip
             release/windows/SHA256SUMS.txt
             release/windows/UPDATE-MANIFEST.json
-            release/windows/UPDATE-MANIFEST.json.p7
+            release/windows/UPDATE-MANIFEST.signed.json
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -311,7 +268,7 @@ jobs:
           compression-level: 0
 
   publish:
-    name: Publish signed Windows x64 component update
+    name: Publish Windows x64 component update
     if: ${{ inputs.publish_update }}
     needs: build
     runs-on: windows-2025
@@ -320,6 +277,16 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install manifest verification dependency
+        run: python -m pip install "cryptography>=44,<47"
+
       - name: Download verified component payload
         uses: actions/download-artifact@v4
         with:
@@ -336,18 +303,13 @@ jobs:
         shell: pwsh
         run: |
           $manifestPath = (Resolve-Path "release/UPDATE-MANIFEST.json").Path
-          $signaturePath = (Resolve-Path "release/UPDATE-MANIFEST.json.p7").Path
+          $signaturePath = (Resolve-Path "release/UPDATE-MANIFEST.signed.json").Path
           $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
           if ($manifest.version -ne "${{ inputs.version }}") { throw "Version mismatch" }
           if ($null -ne $manifest.full_installer) { throw "Unexpected full payload" }
           if (@($manifest.component_patches).Count -lt 1) { throw "No component patch" }
-          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
-          $cms.CheckSignature($true)
-          if (
-            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
-            [Convert]::ToBase64String([IO.File]::ReadAllBytes($manifestPath))
-          ) { throw "Signed manifest content mismatch" }
+          python -c "from pathlib import Path; from dcmget.update_signing import verify_manifest; from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS; e=Path(r'$signaturePath').read_bytes(); m=Path(r'$manifestPath').read_bytes(); assert verify_manifest(e, TRUSTED_UPDATE_PUBLIC_KEYS) == m"
+          if ($LASTEXITCODE -ne 0) { throw "Signed manifest content mismatch" }
 
       - name: Publish immutable component update
         shell: bash

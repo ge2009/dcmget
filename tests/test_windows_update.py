@@ -13,15 +13,21 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from dcmget.update_signing import sign_manifest
 from dcmget.windows_update import (
     ApplyRequest,
     ComponentFile,
+    Ed25519SignedManifestVerifier,
     GitHubReleaseSource,
     MirrorFirstReleaseSource,
+    SIGNED_MANIFEST_NAME,
     SecureStagingDirectory,
     STATIC_MIRROR_BASE_URL,
     StaticMirrorReleaseSource,
+    TRUSTED_UPDATE_PUBLIC_KEYS,
     UpdateAsset,
     UpdateCandidate,
     UpdateNetworkError,
@@ -623,6 +629,39 @@ def test_full_installer_is_reverified_before_independent_schedule(tmp_path: Path
     assert len(scheduler.requests) == 1
 
 
+def test_unsigned_full_installer_uses_signed_manifest_hash_without_authenticode(
+    tmp_path: Path,
+):
+    content = b"unsigned installer authenticated by the signed manifest"
+    installer = replace(
+        _asset(
+            content,
+            name="DcmGet-3.6.0-Setup-x64.exe",
+            kind="full_installer",
+            base_version=None,
+        ),
+        signature_status="UNSIGNED",
+    )
+    source = FakeSource(
+        UpdateCandidate("3.6.0", (installer,)),
+        {installer.name: content},
+    )
+    scheduler = FakeScheduler(supports_component_patch=False)
+    service = WindowsUpdateService(
+        current_version="3.5.2",
+        source=source,
+        staging=SecureStagingDirectory(tmp_path / "updates"),
+        scheduler=scheduler,
+        platform_name="win32",
+    )
+
+    assert service.check(wait=True)["phase"] == "available"
+    assert service.download(wait=True)["phase"] == "ready"
+    assert service.apply()["phase"] == "applying"
+    assert len(scheduler.requests) == 1
+    assert scheduler.requests[0].asset_kind == "full_installer"
+
+
 def test_size_or_hash_mismatch_never_reaches_scheduler(tmp_path: Path):
     patch, expected = _component_package()
     source = FakeSource(
@@ -696,26 +735,62 @@ class FakeResponse:
         return self._url
 
 
+def test_ed25519_manifest_verifier_rejects_tampering_and_unknown_keys():
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    manifest = b'{"version":"3.6.0"}'
+    envelope = sign_manifest(
+        manifest,
+        private_key=private_key,
+        key_id="test-release",
+    )
+    verifier = Ed25519SignedManifestVerifier({"test-release": public_key})
+
+    assert verifier(envelope) == manifest
+
+    tampered = json.loads(envelope)
+    signature = str(tampered["signature"])
+    tampered["signature"] = (
+        ("A" if signature[0] != "A" else "B") + signature[1:]
+    )
+    with pytest.raises(UpdateSecurityError, match="签名无效"):
+        verifier(json.dumps(tampered, separators=(",", ":")).encode("utf-8"))
+
+    unknown_envelope = sign_manifest(
+        manifest,
+        private_key=private_key,
+        key_id="unknown-release",
+    )
+    with pytest.raises(UpdateSecurityError, match="不受信任"):
+        verifier(unknown_envelope)
+
+
 def test_static_mirror_source_verifies_fixed_manifest_and_release_layout(
     tmp_path: Path,
 ):
     patch_content = b"patch payload"
     manifest = _signed_update_manifest(patch_content)
-    signed_payload = b"pkcs7 envelope, not json"
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    signed_payload = sign_manifest(
+        json.dumps(manifest).encode("utf-8"),
+        private_key=private_key,
+        key_id="test-release",
+    )
     asset_name = "DcmGet-3.6.0-from-3.5.2-component.zip"
     manifest_url = (
-        f"{STATIC_MIRROR_BASE_URL}stable/UPDATE-MANIFEST.json.p7"
+        f"{STATIC_MIRROR_BASE_URL}stable/{SIGNED_MANIFEST_NAME}"
     )
     asset_url = (
         f"{STATIC_MIRROR_BASE_URL}releases/3.6.0/{asset_name}"
     )
     requests: list[tuple[str, float]] = []
-    verified_inputs: list[bytes] = []
-
-    def verifier(content: bytes) -> bytes:
-        verified_inputs.append(content)
-        return json.dumps(manifest).encode("utf-8")
-
     def urlopen(request, **kwargs):
         url = request.full_url
         requests.append((url, kwargs["timeout"]))
@@ -726,7 +801,9 @@ def test_static_mirror_source_verifies_fixed_manifest_and_release_layout(
         raise AssertionError(url)
 
     source = StaticMirrorReleaseSource(
-        signed_manifest_verifier=verifier,
+        signed_manifest_verifier=Ed25519SignedManifestVerifier(
+            {"test-release": public_key}
+        ),
         urlopen=urlopen,
         timeout_seconds=1.25,
     )
@@ -735,7 +812,6 @@ def test_static_mirror_source_verifies_fixed_manifest_and_release_layout(
     destination = tmp_path / asset_name
     source.download_asset(candidate.assets[0], destination)
 
-    assert verified_inputs == [signed_payload]
     assert candidate.version == "3.6.0"
     assert candidate.release_url == (
         f"{STATIC_MIRROR_BASE_URL}releases/3.6.0/"
@@ -745,14 +821,62 @@ def test_static_mirror_source_verifies_fixed_manifest_and_release_layout(
     assert requests == [(manifest_url, 1.25), (asset_url, 1.25)]
 
 
+@pytest.mark.parametrize("signature_status", ["SIGNED", "UNSIGNED"])
+def test_signed_mirror_manifest_accepts_full_installer_signature_status(
+    signature_status: str,
+):
+    installer = b"installer authenticated by Ed25519 manifest"
+    installer_name = "DcmGet-3.6.0-Setup-x64.exe"
+    manifest = {
+        "schema_version": 1,
+        "product": "DcmGet",
+        "platform": "windows-x64",
+        "channel": "stable",
+        "version": "3.6.0",
+        "artifacts": [
+            {
+                "name": installer_name,
+                "kind": "full_installer",
+                "size": len(installer),
+                "sha256": _sha256(installer),
+                "signature_status": signature_status,
+            }
+        ],
+    }
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    envelope = sign_manifest(
+        json.dumps(manifest).encode("utf-8"),
+        private_key=private_key,
+        key_id="test-release",
+    )
+    manifest_url = f"{STATIC_MIRROR_BASE_URL}stable/{SIGNED_MANIFEST_NAME}"
+    source = StaticMirrorReleaseSource(
+        signed_manifest_verifier=Ed25519SignedManifestVerifier(
+            {"test-release": public_key}
+        ),
+        urlopen=lambda request, **kwargs: FakeResponse(
+            envelope,
+            manifest_url,
+        ),
+    )
+
+    candidate = source.fetch_latest()
+
+    assert candidate.assets[0].signature_status == signature_status
+
+
 @pytest.mark.parametrize(
     "redirect_url",
     [
-        "http://dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.json.p7",
-        "https://dcmget.v2ex.com.cn.evil.example/updates/stable/UPDATE-MANIFEST.json.p7",
-        "https://user@dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.json.p7",
+        "http://dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.signed.json",
+        "https://dcmget.v2ex.com.cn.evil.example/updates/stable/UPDATE-MANIFEST.signed.json",
+        "https://user@dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.signed.json",
         "https://dcmget.v2ex.com.cn/updates/releases/3.6.0/update.zip",
-        "https://dcmget.v2ex.com.cn/updates/stable/../UPDATE-MANIFEST.json.p7",
+        "https://dcmget.v2ex.com.cn/updates/stable/../UPDATE-MANIFEST.signed.json",
     ],
 )
 def test_static_mirror_rejects_redirects_outside_exact_manifest_boundary(
@@ -849,7 +973,7 @@ def test_mirror_first_source_fails_closed_on_mirror_security_errors(
     candidate = UpdateCandidate("3.6.0", (_asset(b"patch"),))
     github = FakeSource(candidate, {})
     manifest_url = (
-        f"{STATIC_MIRROR_BASE_URL}stable/UPDATE-MANIFEST.json.p7"
+        f"{STATIC_MIRROR_BASE_URL}stable/{SIGNED_MANIFEST_NAME}"
     )
 
     def verifier(content: bytes) -> bytes:
@@ -1092,7 +1216,7 @@ def test_github_source_only_parses_manifest_after_injected_pkcs7_verification(
     }
     manifest_url = (
         "https://github.com/ge2009/dcmget/releases/download/"
-        f"{release_tag}/UPDATE-MANIFEST.json.p7"
+        f"{release_tag}/{SIGNED_MANIFEST_NAME}"
     )
     patch_url = (
         f"https://github.com/ge2009/dcmget/releases/download/{release_tag}/"
@@ -1105,7 +1229,7 @@ def test_github_source_only_parses_manifest_after_injected_pkcs7_verification(
         "html_url": f"https://github.com/ge2009/dcmget/releases/tag/{release_tag}",
         "assets": [
             {
-                "name": "UPDATE-MANIFEST.json.p7",
+                "name": SIGNED_MANIFEST_NAME,
                 "browser_download_url": manifest_url,
             },
             {
@@ -1172,7 +1296,7 @@ def test_github_source_rejects_unsafe_or_manifest_mismatched_release_tags(
     }
     manifest_url = (
         "https://github.com/ge2009/dcmget/releases/download/"
-        "v3.6.0/UPDATE-MANIFEST.json.p7"
+        f"v3.6.0/{SIGNED_MANIFEST_NAME}"
     )
     installer_url = (
         "https://github.com/ge2009/dcmget/releases/download/"
@@ -1185,7 +1309,7 @@ def test_github_source_rejects_unsafe_or_manifest_mismatched_release_tags(
         "html_url": "",
         "assets": [
             {
-                "name": "UPDATE-MANIFEST.json.p7",
+                "name": SIGNED_MANIFEST_NAME,
                 "browser_download_url": manifest_url,
             },
             {
@@ -1452,11 +1576,17 @@ def test_production_factory_is_quietly_unsupported_off_windows(
         "3.5.2",
     )
     try:
-        assert isinstance(service._source, MirrorFirstReleaseSource)
-        assert isinstance(service._source._mirror, StaticMirrorReleaseSource)
-        assert service._source._mirror._timeout == 3.0
-        assert isinstance(service._source._github, GitHubReleaseSource)
-        assert service._source._mirror._verifier is service._source._github._verifier
+        assert isinstance(service._source, StaticMirrorReleaseSource)
+        assert service._source._timeout == 3.0
+        assert isinstance(
+            service._source._verifier,
+            Ed25519SignedManifestVerifier,
+        )
+        assert (
+            service._source._verifier._trusted_public_keys
+            == TRUSTED_UPDATE_PUBLIC_KEYS
+        )
+        assert service._authenticode_verifier is None
         assert service.status()["state"] == "unsupported"
         assert service.check()["state"] == "unsupported"
         assert not (tmp_path / "program-data").exists()

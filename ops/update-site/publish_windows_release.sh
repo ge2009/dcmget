@@ -51,13 +51,16 @@ require_command ssh
 require_command scp
 require_command rsync
 require_command awk
-require_command openssl
 require_command python3
 require_command sort
 
 SOURCE_DIR=$(cd -- "$SOURCE_INPUT" && pwd -P)
-MANIFEST_PATH="${SOURCE_DIR}/UPDATE-MANIFEST.json.p7"
-[[ -f $MANIFEST_PATH && ! -L $MANIFEST_PATH ]] || die '发布目录必须包含普通文件 UPDATE-MANIFEST.json.p7'
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)
+MANIFEST_PATH="${SOURCE_DIR}/UPDATE-MANIFEST.signed.json"
+RAW_MANIFEST_PATH="${SOURCE_DIR}/UPDATE-MANIFEST.json"
+[[ -f $MANIFEST_PATH && ! -L $MANIFEST_PATH ]] || die '发布目录必须包含普通文件 UPDATE-MANIFEST.signed.json'
+[[ -f $RAW_MANIFEST_PATH && ! -L $RAW_MANIFEST_PATH ]] || die '发布目录必须包含普通文件 UPDATE-MANIFEST.json'
 
 shopt -s nullglob dotglob
 source_entries=("${SOURCE_DIR}"/*)
@@ -77,7 +80,7 @@ CHECKSUM_FILE="${WORK_DIR}/expected-sha256"
 REMOTE_NONCE="$(date -u +%Y%m%d%H%M%S)-$$"
 REMOTE_RELEASE_TEMP="${REMOTE_RELEASES_ROOT}/.publish-${VERSION}-${REMOTE_NONCE}"
 REMOTE_RELEASE_TARGET="${REMOTE_RELEASES_ROOT}/${VERSION}"
-REMOTE_STABLE_TEMP="${REMOTE_STABLE_ROOT}/.UPDATE-MANIFEST.json.p7.publish-${REMOTE_NONCE}"
+REMOTE_STABLE_TEMP="${REMOTE_STABLE_ROOT}/.UPDATE-MANIFEST.signed.json.publish-${REMOTE_NONCE}"
 REMOTE_TEMP_CREATED=0
 REMOTE_STABLE_TEMP_CREATED=0
 
@@ -100,7 +103,7 @@ set -euo pipefail
 stable_root=$1
 temp_path=$2
 case "$temp_path" in
-    "${stable_root}/.UPDATE-MANIFEST.json.p7.publish-"*) rm -f -- "$temp_path" ;;
+    "${stable_root}/.UPDATE-MANIFEST.signed.json.publish-"*) rm -f -- "$temp_path" ;;
     *) exit 2 ;;
 esac
 REMOTE_CLEANUP
@@ -122,30 +125,37 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-SIGNED_MANIFEST_CONTENT="${WORK_DIR}/signed-update-manifest.json"
-if ! openssl smime -verify -binary -inform DER -noverify \
-    -in "$MANIFEST_PATH" -out "$SIGNED_MANIFEST_CONTENT" \
-    >/dev/null 2>&1; then
-    die 'UPDATE-MANIFEST.json.p7 签名无效或不是内嵌 DER PKCS#7'
-fi
-
-python3 - "$SIGNED_MANIFEST_CONTENT" "$SOURCE_DIR" "$VERSION" <<'PY'
+python3 - "$PROJECT_ROOT" "$MANIFEST_PATH" "$RAW_MANIFEST_PATH" "$SOURCE_DIR" "$VERSION" <<'PY'
 import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
-source_dir = Path(sys.argv[2])
-expected_version = sys.argv[3]
+project_root = Path(sys.argv[1])
+envelope_path = Path(sys.argv[2])
+manifest_path = Path(sys.argv[3])
+source_dir = Path(sys.argv[4])
+expected_version = sys.argv[5]
+sys.path.insert(0, str(project_root))
+
+from dcmget.update_signing import UpdateSigningError, verify_manifest
+from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS
+
 safe_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 sha256 = re.compile(r"^[0-9a-f]{64}$")
 
 try:
-    raw_manifest = manifest_path.read_bytes()
+    raw_manifest = verify_manifest(
+        envelope_path.read_bytes(),
+        TRUSTED_UPDATE_PUBLIC_KEYS,
+    )
+    if raw_manifest != manifest_path.read_bytes():
+        raise SystemExit(
+            "UPDATE-MANIFEST.json 与 Ed25519 签名信封内容不一致"
+        )
     manifest = json.loads(raw_manifest.decode("utf-8"))
-except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, UpdateSigningError) as exc:
     raise SystemExit(f"已签名更新清单不是有效 UTF-8 JSON: {exc}") from exc
 
 expected = {
@@ -163,12 +173,16 @@ for field, value in expected.items():
             f"expected={value!r} actual={manifest.get(field)!r}"
         )
 
-unsigned_manifest = source_dir / "UPDATE-MANIFEST.json"
-if unsigned_manifest.exists():
-    if unsigned_manifest.is_symlink() or not unsigned_manifest.is_file():
-        raise SystemExit("UPDATE-MANIFEST.json 必须是普通文件")
-    if unsigned_manifest.read_bytes() != raw_manifest:
-        raise SystemExit("UPDATE-MANIFEST.json 与 PKCS#7 内嵌已签内容不一致")
+signature = manifest.get("manifest_signature")
+if (
+    not isinstance(signature, dict)
+    or signature.get("name") != "UPDATE-MANIFEST.signed.json"
+    or signature.get("kind") != "ed25519_signed_envelope"
+    or signature.get("algorithm") != "Ed25519"
+    or signature.get("content_encoding") != "base64"
+    or not isinstance(signature.get("key_id"), str)
+):
+    raise SystemExit("已签名更新清单缺少有效 Ed25519 签名声明")
 
 artifacts = manifest.get("artifacts")
 if not isinstance(artifacts, list) or not artifacts:
@@ -275,7 +289,7 @@ for record in artifacts:
     kind = record.get("kind")
     if kind == "full_installer":
         if (
-            record.get("signature_status") != "SIGNED"
+            record.get("signature_status") not in {"SIGNED", "UNSIGNED"}
             or record.get("preserves_user_data") is not True
             or record.get("content_scope") != "application"
         ):
@@ -299,7 +313,7 @@ if full_installers == 0:
         or not isinstance(roots, list)
         or not roots
     ):
-        raise SystemExit("patch-only 更新缺少已签名完整发布链锚点")
+        raise SystemExit("patch-only 更新缺少可信完整发布链锚点")
     root_versions = set()
     for root in roots:
         if not isinstance(root, dict):
@@ -442,7 +456,7 @@ REMOTE_TEMP_CREATED=0
 echo '清理旧版本（保留最新两个，并保护当前 stable 与正在发布版本）...'
 ssh "$REMOTE_HOST" bash -s -- \
     "$REMOTE_RELEASES_ROOT" \
-    "$REMOTE_STABLE_ROOT/UPDATE-MANIFEST.json.p7" \
+    "$REMOTE_STABLE_ROOT/UPDATE-MANIFEST.signed.json" \
     "$VERSION" <<'REMOTE_RETENTION'
 set -euo pipefail
 IFS=$'\n\t'
@@ -474,7 +488,7 @@ if [[ -e $stable_manifest || -L $stable_manifest ]]; then
     stable_hash=$(sha256sum -- "$stable_manifest" | awk '{print $1}')
     matches=()
     for candidate in "${versions[@]}"; do
-        candidate_manifest="${releases_root}/${candidate}/UPDATE-MANIFEST.json.p7"
+        candidate_manifest="${releases_root}/${candidate}/UPDATE-MANIFEST.signed.json"
         [[ -f $candidate_manifest && ! -L $candidate_manifest ]] || continue
         candidate_hash=$(sha256sum -- "$candidate_manifest" | awk '{print $1}')
         [[ $candidate_hash == "$stable_hash" ]] && matches+=("$candidate")
@@ -520,7 +534,7 @@ set -euo pipefail
 stable_root=$1
 stable_temp=$2
 expected_sha256=$3
-stable_target="${stable_root}/UPDATE-MANIFEST.json.p7"
+stable_target="${stable_root}/UPDATE-MANIFEST.signed.json"
 
 [[ -d $stable_root && ! -L $stable_root ]] || exit 1
 [[ -f $stable_temp && ! -L $stable_temp ]] || exit 1
@@ -538,5 +552,5 @@ REMOTE_COMMIT_STABLE
 REMOTE_STABLE_TEMP_CREATED=0
 
 echo "发布完成: ${VERSION}"
-echo '清单: https://dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.json.p7'
+echo '清单: https://dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.signed.json'
 echo "资源: https://dcmget.v2ex.com.cn/updates/releases/${VERSION}/"

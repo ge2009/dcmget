@@ -1037,9 +1037,9 @@ function applyManagerBootstrap(payload) {
   renderEnvironment(payload);
   renderLicense(payload.license || {});
   $("#manager-overview").hidden = false;
-  setText("#operations-eyebrow", "Windows 服务工作台");
+  setText("#operations-eyebrow", "Windows 服务管理");
   setText("#operations-title", "DcmGet 管理中心");
-  setText("#operations-description", "统一管理这台 Windows 主机上的 Profile，并在同一工作台内切换当前上下文。");
+  setText("#operations-description", "查看这台 Windows 主机上的 Profile，并切换当前 Profile。");
   setConnectionState("connected", "管理中心已连接");
   showIdleState({ display_name: "请选择 Profile" });
 }
@@ -1053,7 +1053,7 @@ async function loadBootstrap() {
     document.body.classList.toggle("manager-mode", state.managerMode);
     showApplication();
     if (state.managerMode) {
-      document.title = "DcmGet · 8786 工作台";
+      document.title = "DcmGet · Profile 管理";
       applyManagerBootstrap(payload);
       state.initialized = true;
       await refreshOperations();
@@ -1098,8 +1098,8 @@ function renderEnvironment(payload) {
   const version = payload.version || payload.app_version;
   const dcmtkVersion = payload.dcmtk?.version || payload.dcmtk_version || receiver.dcmtk_version;
   if (state.managerMode && !state.activeProfileNumber) {
-    setText("#header-profile", "8786 管理工作台");
-    setText("#header-pacs", "统一调度所有 Profile");
+    setText("#header-profile", "8786 Profile 管理");
+    setText("#header-pacs", "查看并控制各个 Profile");
     setText("#header-receiver", `管理端口 ${profile.manager_port || window.location.port || "8786"}`);
   } else {
     setText("#header-profile", displayName);
@@ -1842,7 +1842,7 @@ async function refreshProfiles() {
     if (requestId !== state.profileListRequestId) return;
     const profiles = result.profiles || result.items || result;
     renderProfiles(profiles || []);
-    setText("#profile-management-hint", "工作台保持 8786 单入口；切换左侧 Profile 后，右侧任务、设置与维护会同步切换。");
+    setText("#profile-management-hint", "通过 8786 页面切换 Profile；右侧显示所选 Profile 的任务、设置与维护操作。");
     if (!state.profiles.length) {
       clearManagedProfileSelection();
       return;

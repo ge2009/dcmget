@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.6.0
+        default: 3.6.1
       publish_release:
         description: Publish the verified build to GitHub Releases
         required: true
@@ -29,6 +29,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Require update signing key for publication
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          UPDATE_PRIVATE_KEY: ${{ secrets.DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_PRIVATE_KEY)) {
+            throw "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 is required"
+          }
 
       - name: Validate update publication inputs
         if: ${{ inputs.component_update && !inputs.publish_release }}
@@ -1452,7 +1462,7 @@ jobs:
           }
           $tagVersion = [string]$Matches["version"]
           $assetNames = @($release.assets | ForEach-Object { [string]$_.name })
-          foreach ($required in @("UPDATE-MANIFEST.json", "UPDATE-MANIFEST.json.p7")) {
+          foreach ($required in @("UPDATE-MANIFEST.json", "UPDATE-MANIFEST.signed.json")) {
             if ($assetNames -notcontains $required) {
               throw "Previous stable release does not support component updates: missing $required"
             }
@@ -1475,28 +1485,20 @@ jobs:
             --repo $env:GITHUB_REPOSITORY `
             --pattern $archiveName `
             --pattern "UPDATE-MANIFEST.json" `
-            --pattern "UPDATE-MANIFEST.json.p7" `
+            --pattern "UPDATE-MANIFEST.signed.json" `
             --dir $baseline
           if ($LASTEXITCODE -ne 0) { throw "Could not download previous stable update assets" }
 
           $manifestPath = Join-Path $baseline "UPDATE-MANIFEST.json"
-          $signaturePath = Join-Path $baseline "UPDATE-MANIFEST.json.p7"
-          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
-          $cms.CheckSignature($true)
-          if ($cms.SignerInfos.Count -ne 1) {
-            throw "Previous update manifest must have one signer"
-          }
+          $signaturePath = Join-Path $baseline "UPDATE-MANIFEST.signed.json"
           $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
-          if (
-            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
-            [Convert]::ToBase64String($rawManifest)
-          ) {
+          python -c "import sys; from pathlib import Path; from dcmget.update_signing import verify_manifest; from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS; assert verify_manifest(Path(sys.argv[1]).read_bytes(), TRUSTED_UPDATE_PUBLIC_KEYS) == Path(sys.argv[2]).read_bytes()" $signaturePath $manifestPath
+          if ($LASTEXITCODE -ne 0) {
             throw "Previous signed manifest content mismatch"
           }
           try {
             $utf8 = [Text.UTF8Encoding]::new($false, $true)
-            $manifest = $utf8.GetString($cms.ContentInfo.Content) | ConvertFrom-Json
+            $manifest = $utf8.GetString($rawManifest) | ConvertFrom-Json
           } catch {
             throw "Previous signed manifest is not valid UTF-8 JSON: $_"
           }
@@ -1535,6 +1537,7 @@ jobs:
         shell: pwsh
         env:
           DCMGET_ENABLE_COMPONENT_PATCH: ${{ inputs.component_update }}
+          DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
         run: |
           $ErrorActionPreference = "Stop"
           $arguments = @(
@@ -1617,13 +1620,13 @@ jobs:
             release/windows/SHA256SUMS.txt
             release/windows/RELEASE-MANIFEST.json
             release/windows/UPDATE-MANIFEST.json
-            release/windows/UPDATE-MANIFEST.json.p7
+            release/windows/UPDATE-MANIFEST.signed.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
   publish:
-    name: Publish signed Windows x64 Release
+    name: Publish Windows x64 Release
     if: ${{ inputs.publish_release }}
     needs: build
     runs-on: windows-2025
@@ -1632,6 +1635,16 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install manifest verification dependency
+        run: python -m pip install "cryptography>=44,<47"
+
       - name: Download verified release payload
         uses: actions/download-artifact@v4
         with:
@@ -1650,23 +1663,32 @@ jobs:
           from pathlib import Path
           from pathlib import PurePosixPath
 
+          from dcmget.update_signing import verify_manifest
+          from dcmget.update_trust import TRUSTED_UPDATE_PUBLIC_KEYS
+
           root = Path("release")
           release = json.loads((root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
-          update = json.loads((root / "UPDATE-MANIFEST.json").read_text(encoding="utf-8"))
+          raw_update = (root / "UPDATE-MANIFEST.json").read_bytes()
+          envelope_path = root / "UPDATE-MANIFEST.signed.json"
+          if verify_manifest(envelope_path.read_bytes(), TRUSTED_UPDATE_PUBLIC_KEYS) != raw_update:
+              raise SystemExit("UPDATE-MANIFEST.json does not match the Ed25519 signed content")
+          update = json.loads(raw_update.decode("utf-8"))
           expected = os.environ["EXPECTED_VERSION"]
           if release.get("product") != "DcmGet" or release.get("platform") != "windows-x64":
               raise SystemExit("release manifest is not DcmGet windows-x64")
           if release.get("version") != expected or update.get("version") != expected:
               raise SystemExit("release version does not match workflow input")
           signing = release.get("signing", {})
-          if signing.get("status") != "SIGNED" or signing.get("timestamped") is not True:
-              raise SystemExit("only timestamped SIGNED releases may be published")
+          if signing.get("status") not in {"SIGNED", "UNSIGNED"}:
+              raise SystemExit("release signing status is invalid")
+          if signing.get("status") == "SIGNED" and signing.get("timestamped") is not True:
+              raise SystemExit("signed release has no timestamp")
           artifacts = update.get("artifacts")
           if not isinstance(artifacts, list) or not any(
-              item.get("kind") == "full_installer" and item.get("signature_status") == "SIGNED"
+              item.get("kind") == "full_installer" and item.get("signature_status") in {"SIGNED", "UNSIGNED"}
               for item in artifacts if isinstance(item, dict)
           ):
-              raise SystemExit("update manifest has no signed full installer")
+              raise SystemExit("update manifest has no full installer")
           install_tree = str(update.get("install_tree_sha256", "")).lower()
           if re.fullmatch(r"[0-9a-f]{64}", install_tree) is None:
               raise SystemExit("update manifest has no valid install tree SHA-256")
@@ -1712,46 +1734,11 @@ jobs:
                   raise SystemExit("component patch has no valid base tree SHA-256")
               if target_tree != install_tree:
                   raise SystemExit("component patch target tree does not match release tree")
-          if not (root / "UPDATE-MANIFEST.json.p7").is_file():
+          if not envelope_path.is_file():
               raise SystemExit("authenticated update manifest is missing")
           PY
         env:
           EXPECTED_VERSION: ${{ inputs.version }}
-
-      - name: Verify PKCS#7 manifest and signer before publication
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $root = (Resolve-Path "release").Path
-          $manifestPath = Join-Path $root "UPDATE-MANIFEST.json"
-          $signaturePath = Join-Path $root "UPDATE-MANIFEST.json.p7"
-          $installerPath = Join-Path $root "DcmGet-${{ inputs.version }}-Setup-x64.exe"
-          $installer = Get-AuthenticodeSignature -LiteralPath $installerPath
-          if ($installer.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            throw "Installer Authenticode validation failed: $($installer.Status)"
-          }
-          if ($null -eq $installer.SignerCertificate) { throw "Installer signer is missing" }
-          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
-          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
-          $cms.CheckSignature($true)
-          if ($cms.SignerInfos.Count -ne 1) { throw "Update manifest must have one signer" }
-          $signer = $cms.SignerInfos[0].Certificate
-          if ($null -eq $signer) { throw "Update manifest signer is missing" }
-          if ($signer.Thumbprint -ne $installer.SignerCertificate.Thumbprint) {
-            throw "Update manifest signer does not match installer signer"
-          }
-          $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
-          function Get-ByteHash([byte[]]$content) {
-            $sha256 = [Security.Cryptography.SHA256]::Create()
-            try {
-              return ([BitConverter]::ToString($sha256.ComputeHash($content))).Replace("-", "")
-            } finally {
-              $sha256.Dispose()
-            }
-          }
-          if ((Get-ByteHash $cms.ContentInfo.Content) -ne (Get-ByteHash $rawManifest)) {
-            throw "UPDATE-MANIFEST.json does not match the signed PKCS#7 content"
-          }
 
       - name: Publish immutable stable GitHub Release
         shell: bash

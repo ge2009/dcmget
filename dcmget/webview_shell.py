@@ -78,7 +78,7 @@ def run_webview_shell(
             raise WebViewShellError("缺少 Windows WebView 组件，请重新安装 DcmGet") from exc
     try:
         webview_module.create_window(
-            "DcmGet 影像下载工作台",
+            "DcmGet DICOM 影像下载",
             target,
             width=1440,
             height=900,

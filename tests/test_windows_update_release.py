@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
-import subprocess
 import zipfile
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from dcmget.architecture import IMAGE_FILE_MACHINE_AMD64
 from dcmget.windows_update import _validated_candidate
@@ -21,9 +23,10 @@ from scripts.build_windows_update import (
     UPDATE_SIGNATURE_NAME,
     WindowsUpdateBuildError,
     _component_chain_anchors,
+    _load_update_private_key,
     build_windows_update_release,
 )
-from scripts.windows_release_gate import AuthenticodeConfig
+from dcmget.update_signing import verify_manifest
 
 
 def _write_pe(path: Path, *, suffix: bytes = b"") -> Path:
@@ -102,37 +105,33 @@ def _install_root(root: Path, *, changed: bool = False) -> Path:
     return install
 
 
-def _signing_fixture(root: Path) -> AuthenticodeConfig:
-    signtool = root / "signtool.exe"
-    signtool.write_bytes(b"signtool")
-    return AuthenticodeConfig(
-        signtool=signtool,
-        certificate_sha1="A" * 40,
-        timestamp_url="https://timestamp.example.test",
+def _signing_fixture() -> tuple[Ed25519PrivateKey, dict[str, bytes]]:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
     )
+    return private_key, {"test-update-key": public_key}
 
 
-def _successful_signtool_runner(commands: list[list[str]]):
-    def runner(command, **kwargs):
-        commands.append(list(command))
-        if command[0] == "powershell.exe":
-            environment = kwargs.get("env", {})
-            if "DCMGET_BASE_UPDATE_CONTENT" in environment:
-                Path(environment["DCMGET_BASE_UPDATE_CONTENT"]).write_bytes(
-                    Path(environment["DCMGET_BASE_UPDATE_P7"])
-                    .with_suffix("")
-                    .read_bytes()
-                )
-                return subprocess.CompletedProcess(command, 0, "ok", "")
-            return subprocess.CompletedProcess(command, 0, "A" * 40, "")
-        if command[1] == "sign" and "/p7" in command:
-            manifest = Path(command[-1])
-            manifest.with_name(manifest.name + ".p7").write_bytes(
-                b"signed-pkcs7"
-            )
-        return subprocess.CompletedProcess(command, 0, "ok", "")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes only")
+def test_private_key_file_rejects_group_or_world_access(tmp_path: Path):
+    private_key, _trusted_keys = _signing_fixture()
+    private_key_path = tmp_path / "update-private.pem"
+    private_key_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    private_key_path.chmod(0o644)
 
-    return runner
+    with pytest.raises(WindowsUpdateBuildError, match="权限过宽"):
+        _load_update_private_key(private_key_path)
+
+    private_key_path.chmod(0o600)
+    assert isinstance(_load_update_private_key(private_key_path), Ed25519PrivateKey)
 
 
 def _build_base_update(
@@ -140,8 +139,8 @@ def _build_base_update(
     *,
     version: str,
     compatibility_file: Path,
-    signing: AuthenticodeConfig,
-    runner,
+    signing: Ed25519PrivateKey,
+    trusted_keys: dict[str, bytes],
 ) -> tuple[Path, Path, Path]:
     release, installer, release_manifest = _signed_release_fixture(
         root, version=version
@@ -155,8 +154,9 @@ def _build_base_update(
         full_installer=installer,
         compatibility_files=[compatibility_file],
         compatibility_root=compatibility_file.parent,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
     return install, result.manifest_path, result.signature_path
 
@@ -167,8 +167,8 @@ def _build_full_baseline(
     version: str,
     suffix: bytes,
     compatibility_file: Path,
-    signing: AuthenticodeConfig,
-    runner,
+    signing: Ed25519PrivateKey,
+    trusted_keys: dict[str, bytes],
 ) -> ComponentBaseline:
     release, installer, release_manifest = _signed_release_fixture(
         root, version=version
@@ -183,8 +183,9 @@ def _build_full_baseline(
         full_installer=installer,
         compatibility_files=[compatibility_file],
         compatibility_root=compatibility_file.parent,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
     assert result.baseline_snapshot_path is not None
     return ComponentBaseline(
@@ -195,28 +196,34 @@ def _build_full_baseline(
     )
 
 
-def test_update_manifest_requires_signed_timestamped_x64_release(tmp_path: Path):
+def test_update_manifest_accepts_unsigned_full_release(tmp_path: Path):
     release, installer, release_manifest = _signed_release_fixture(
         tmp_path, version="3.6.0"
     )
     manifest = json.loads(release_manifest.read_text(encoding="utf-8"))
     manifest["signing"]["status"] = "UNSIGNED"
+    manifest["signing"]["timestamped"] = False
+    manifest["artifacts"][0]["signature_status"] = "UNSIGNED"
     release_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     install = _install_root(tmp_path)
+    signing, trusted_keys = _signing_fixture()
 
-    with pytest.raises(WindowsUpdateBuildError, match="已通过 Authenticode"):
-        build_windows_update_release(
-            release_directory=release,
-            version="3.6.0",
-            install_root=install,
-            release_manifest_path=release_manifest,
-            full_installer=installer,
-            authenticode=_signing_fixture(tmp_path),
-            runner=_successful_signtool_runner([]),
-        )
+    result = build_windows_update_release(
+        release_directory=release,
+        version="3.6.0",
+        install_root=install,
+        release_manifest_path=release_manifest,
+        full_installer=installer,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
+    )
+
+    update = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert update["full_installer"]["signature_status"] == "UNSIGNED"
 
 
-def test_full_update_manifest_is_pkcs7_signed_and_lists_exact_installer(
+def test_full_update_manifest_is_ed25519_signed_and_lists_exact_installer(
     tmp_path: Path,
 ):
     release, installer, release_manifest = _signed_release_fixture(
@@ -226,7 +233,7 @@ def test_full_update_manifest_is_pkcs7_signed_and_lists_exact_installer(
     compatibility = tmp_path / "packaging" / "windows" / "dcmget.iss"
     compatibility.parent.mkdir(parents=True)
     compatibility.write_text("stable layout", encoding="utf-8")
-    commands: list[list[str]] = []
+    signing, trusted_keys = _signing_fixture()
 
     result = build_windows_update_release(
         release_directory=release,
@@ -236,13 +243,16 @@ def test_full_update_manifest_is_pkcs7_signed_and_lists_exact_installer(
         full_installer=installer,
         compatibility_files=[compatibility],
         compatibility_root=tmp_path,
-        authenticode=_signing_fixture(tmp_path),
-        runner=_successful_signtool_runner(commands),
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
 
     assert result.manifest_path.name == UPDATE_MANIFEST_NAME
     assert result.signature_path.name == UPDATE_SIGNATURE_NAME
-    assert result.signature_path.read_bytes() == b"signed-pkcs7"
+    assert verify_manifest(
+        result.signature_path.read_bytes(), trusted_keys
+    ) == result.manifest_path.read_bytes()
     assert result.component_patch_path is None
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 1
@@ -265,28 +275,11 @@ def test_full_update_manifest_is_pkcs7_signed_and_lists_exact_installer(
     assert manifest["artifacts"] == [manifest["full_installer"]]
     assert manifest["manifest_signature"] == {
         "name": UPDATE_SIGNATURE_NAME,
-        "kind": "pkcs7_signed_data",
-        "content_encoding": "Embedded",
-        "digest_algorithm": "SHA256",
-        "timestamped": True,
+        "kind": "ed25519_signed_envelope",
+        "algorithm": "Ed25519",
+        "key_id": "test-update-key",
+        "content_encoding": "base64",
     }
-    sign_command = next(
-        command
-        for command in commands
-        if len(command) > 1 and command[1] == "sign"
-    )
-    assert sign_command[-7:] == [
-        "/td",
-        "SHA256",
-        "/p7",
-        str(release),
-        "/p7ce",
-        "Embedded",
-        str(result.manifest_path),
-    ]
-    verify_command = commands[-1]
-    assert verify_command[1:3] == ["verify", "/p7"]
-    assert verify_command[-2:] == ["/v", str(result.signature_path)]
     checksum_lines = (release / "SHA256SUMS.txt").read_text(
         encoding="ascii"
     )
@@ -294,19 +287,40 @@ def test_full_update_manifest_is_pkcs7_signed_and_lists_exact_installer(
     assert UPDATE_SIGNATURE_NAME in checksum_lines
 
 
+def test_update_builder_rejects_private_key_not_pinned_by_clients(
+    tmp_path: Path,
+):
+    release, installer, release_manifest = _signed_release_fixture(
+        tmp_path, version="3.6.0"
+    )
+    install = _install_root(tmp_path)
+    signing, _trusted_keys = _signing_fixture()
+    _other_signing, other_trusted_keys = _signing_fixture()
+
+    with pytest.raises(WindowsUpdateBuildError, match="内置受信公钥不匹配"):
+        build_windows_update_release(
+            release_directory=release,
+            version="3.6.0",
+            install_root=install,
+            release_manifest_path=release_manifest,
+            full_installer=installer,
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=other_trusted_keys,
+        )
+
+
 def test_component_patch_only_contains_changed_allowlisted_files(tmp_path: Path):
     compatibility = tmp_path / "layout" / "dcmget.iss"
     compatibility.parent.mkdir(parents=True)
     compatibility.write_text("layout v1", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    commands: list[list[str]] = []
-    runner = _successful_signtool_runner(commands)
+    signing, trusted_keys = _signing_fixture()
     baseline_install, base_manifest, base_signature = _build_base_update(
         tmp_path / "base",
         version="3.5.2",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
 
     target_root = tmp_path / "target"
@@ -328,8 +342,9 @@ def test_component_patch_only_contains_changed_allowlisted_files(tmp_path: Path)
         base_version="3.5.2",
         base_update_manifest=base_manifest,
         base_update_signature=base_signature,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
 
     assert result.component_patch_path is not None
@@ -394,27 +409,18 @@ def test_component_patch_only_contains_changed_allowlisted_files(tmp_path: Path)
         release_url="https://github.com/ge2009/dcmget/releases/tag/v3.6.0",
     )
     assert candidate.preferred_asset("3.5.2").name == patch_record["name"]
-    executable_verify = next(
-        command
-        for command in commands
-        if len(command) > 1
-        and command[1] == "verify"
-        and command[-1].endswith("DcmGet.exe")
-    )
-    assert executable_verify[1:4] == ["verify", "/pa", "/all"]
 
 
 def test_component_patch_refuses_removed_installed_file(tmp_path: Path):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("same", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     baseline_install, base_manifest, base_signature = _build_base_update(
         tmp_path / "base",
         version="3.5.2",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
     release, installer, release_manifest = _signed_release_fixture(
         tmp_path / "target", version="3.6.0"
@@ -436,8 +442,9 @@ def test_component_patch_refuses_removed_installed_file(tmp_path: Path):
             base_version="3.5.2",
             base_update_manifest=base_manifest,
             base_update_signature=base_signature,
-            authenticode=signing,
-            runner=runner,
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
@@ -446,14 +453,13 @@ def test_component_patch_refuses_layout_or_full_install_input_change(
 ):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("old layout", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     baseline_install, base_manifest, base_signature = _build_base_update(
         tmp_path / "base",
         version="3.5.2",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
     compatibility.write_text("new layout", encoding="utf-8")
     release, installer, release_manifest = _signed_release_fixture(
@@ -475,38 +481,31 @@ def test_component_patch_refuses_layout_or_full_install_input_change(
             base_version="3.5.2",
             base_update_manifest=base_manifest,
             base_update_signature=base_signature,
-            authenticode=signing,
-            runner=runner,
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
-def test_component_patch_rejects_base_json_that_does_not_match_pkcs7(
+def test_component_patch_rejects_base_json_that_does_not_match_envelope(
     tmp_path: Path,
 ):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("same", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    normal_runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     baseline_install, base_manifest, base_signature = _build_base_update(
         tmp_path / "base",
         version="3.5.2",
         compatibility_file=compatibility,
         signing=signing,
-        runner=normal_runner,
+        trusted_keys=trusted_keys,
     )
     release, installer, release_manifest = _signed_release_fixture(
         tmp_path / "target", version="3.6.0"
     )
     target_install = _install_root(tmp_path / "target", changed=True)
 
-    def mismatched_runner(command, **kwargs):
-        environment = kwargs.get("env", {})
-        if "DCMGET_BASE_UPDATE_CONTENT" in environment:
-            Path(environment["DCMGET_BASE_UPDATE_CONTENT"]).write_bytes(
-                b'{"tampered":true}'
-            )
-            return subprocess.CompletedProcess(command, 0, "ok", "")
-        return normal_runner(command, **kwargs)
+    base_manifest.write_bytes(base_manifest.read_bytes() + b" ")
 
     with pytest.raises(WindowsUpdateBuildError, match="已签内容不一致"):
         build_windows_update_release(
@@ -522,22 +521,22 @@ def test_component_patch_rejects_base_json_that_does_not_match_pkcs7(
             base_version="3.5.2",
             base_update_manifest=base_manifest,
             base_update_signature=base_signature,
-            authenticode=signing,
-            runner=mismatched_runner,
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
 def test_component_patch_rejects_baseline_zip_tree_drift(tmp_path: Path):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("same", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     baseline_install, base_manifest, base_signature = _build_base_update(
         tmp_path / "base",
         version="3.5.2",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
     (baseline_install / "_internal" / "unchanged.dat").write_bytes(
         b"drifted after signed baseline"
@@ -561,8 +560,9 @@ def test_component_patch_rejects_baseline_zip_tree_drift(tmp_path: Path):
             base_version="3.5.2",
             base_update_manifest=base_manifest,
             base_update_signature=base_signature,
-            authenticode=signing,
-            runner=runner,
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
@@ -589,6 +589,7 @@ def test_component_inventory_rejects_user_state_and_non_install_paths(
     forbidden = install / relative
     forbidden.parent.mkdir(parents=True, exist_ok=True)
     forbidden.write_bytes(b"must never ship")
+    signing, trusted_keys = _signing_fixture()
 
     with pytest.raises(WindowsUpdateBuildError, match="白名单之外"):
         build_windows_update_release(
@@ -597,8 +598,9 @@ def test_component_inventory_rejects_user_state_and_non_install_paths(
             install_root=install,
             release_manifest_path=release_manifest,
             full_installer=installer,
-            authenticode=_signing_fixture(tmp_path),
-            runner=_successful_signtool_runner([]),
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
@@ -607,15 +609,14 @@ def test_patch_only_release_builds_direct_patches_from_recent_baselines(
 ):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("stable layout", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     older = _build_full_baseline(
         tmp_path / "base-older",
         version="3.5.0",
         suffix=b"3.5.0",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
     newer = _build_full_baseline(
         tmp_path / "base-newer",
@@ -623,7 +624,7 @@ def test_patch_only_release_builds_direct_patches_from_recent_baselines(
         suffix=b"3.5.9",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
     release = tmp_path / "target" / "release"
     release.mkdir(parents=True)
@@ -638,8 +639,9 @@ def test_patch_only_release_builds_direct_patches_from_recent_baselines(
         compatibility_root=compatibility.parent,
         baselines=[older, newer],
         patch_only=True,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
 
     assert [path.name for path in result.component_patch_paths] == [
@@ -683,15 +685,14 @@ def test_patch_only_manifest_can_be_a_verified_baseline_for_next_release(
 ):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("stable layout", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     full_base = _build_full_baseline(
         tmp_path / "full-base",
         version="3.5.0",
         suffix=b"3.5.0",
         compatibility_file=compatibility,
         signing=signing,
-        runner=runner,
+        trusted_keys=trusted_keys,
     )
 
     middle_release = tmp_path / "middle" / "release"
@@ -706,8 +707,9 @@ def test_patch_only_manifest_can_be_a_verified_baseline_for_next_release(
         compatibility_root=compatibility.parent,
         baselines=[full_base],
         patch_only=True,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
     assert middle.baseline_snapshot_path is not None
     expanded = tmp_path / "middle-expanded"
@@ -732,8 +734,9 @@ def test_patch_only_manifest_can_be_a_verified_baseline_for_next_release(
         compatibility_root=compatibility.parent,
         baselines=[patch_only_base],
         patch_only=True,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -752,8 +755,7 @@ def test_component_release_keeps_only_five_most_recent_direct_baselines(
 ):
     compatibility = tmp_path / "layout.txt"
     compatibility.write_text("stable layout", encoding="utf-8")
-    signing = _signing_fixture(tmp_path)
-    runner = _successful_signtool_runner([])
+    signing, trusted_keys = _signing_fixture()
     baselines = [
         _build_full_baseline(
             tmp_path / f"base-{patch}",
@@ -761,7 +763,7 @@ def test_component_release_keeps_only_five_most_recent_direct_baselines(
             suffix=f"3.5.{patch}".encode(),
             compatibility_file=compatibility,
             signing=signing,
-            runner=runner,
+            trusted_keys=trusted_keys,
         )
         for patch in range(6)
     ]
@@ -778,8 +780,9 @@ def test_component_release_keeps_only_five_most_recent_direct_baselines(
         compatibility_root=compatibility.parent,
         baselines=list(reversed(baselines)),
         patch_only=True,
-        authenticode=signing,
-        runner=runner,
+        update_private_key=signing,
+        update_key_id="test-update-key",
+        trusted_update_public_keys=trusted_keys,
     )
 
     assert len(result.component_patch_paths) == MAX_COMPONENT_BASELINES
@@ -798,6 +801,7 @@ def test_patch_only_release_requires_a_signed_full_release_chain_anchor(
     release = tmp_path / "release"
     release.mkdir()
     install = _install_root(tmp_path)
+    signing, trusted_keys = _signing_fixture()
 
     with pytest.raises(WindowsUpdateBuildError, match="首个组件更新基线"):
         build_windows_update_release(
@@ -805,8 +809,9 @@ def test_patch_only_release_requires_a_signed_full_release_chain_anchor(
             version="3.6.0",
             install_root=install,
             patch_only=True,
-            authenticode=_signing_fixture(tmp_path),
-            runner=_successful_signtool_runner([]),
+            update_private_key=signing,
+            update_key_id="test-update-key",
+            trusted_update_public_keys=trusted_keys,
         )
 
 
@@ -842,14 +847,15 @@ def test_windows_workflow_publishes_only_explicit_authenticated_release():
     assert "if: ${{ inputs.publish_release }}" in workflow
     assert "if: ${{ inputs.publish_release && inputs.component_update }}" in workflow
     assert "scripts/build_windows_update.py" in workflow
-    assert "UPDATE-MANIFEST.json.p7" in workflow
+    assert "UPDATE-MANIFEST.signed.json" in workflow
     assert "--base-update-signature" in workflow
-    assert "name: Publish signed Windows x64 Release" in workflow
+    assert "name: Publish Windows x64 Release" in workflow
     assert "runs-on: windows-2025" in workflow
     assert "contents: write" in workflow
-    assert "only timestamped SIGNED releases may be published" in workflow
-    assert "Verify PKCS#7 manifest and signer before publication" in workflow
-    assert "does not match the signed PKCS#7 content" in workflow
+    assert "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 is required" in workflow
+    assert "verify_manifest" in workflow
+    assert "does not match the Ed25519 signed content" in workflow
+    assert 'signing.get("status") not in {"SIGNED", "UNSIGNED"}' in workflow
     assert "update manifest has no valid install tree SHA-256" in workflow
     assert "standalone archive tree does not match signed update manifest" in workflow
     assert "component patch target tree does not match release tree" in workflow
@@ -866,14 +872,13 @@ def test_component_workflow_is_manual_patch_only_and_skips_full_build_stages():
     assert "publish_update:" in workflow
     assert "default: false" in workflow
     assert "if: ${{ inputs.publish_update }}" in workflow
-    assert "DCMGET_SIGN_CERTIFICATE_BASE64 is required" in workflow
-    assert "DCMGET_SIGN_CERTIFICATE_PASSWORD is required" in workflow
+    assert "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 is required" in workflow
     assert "--update-payload-only" in workflow
     assert "--patch-only" in workflow
     assert '"--baseline"' in workflow
     assert "component-baseline.zip" in workflow
     assert "if ($baselines.Count -ge 5)" in workflow
-    assert "Publish one signed full release first" in workflow
+    assert "Publish one trusted full release first" in workflow
     assert 'tag="component-v${{ inputs.version }}"' in workflow
     assert 'tag="v${{ inputs.version }}"' not in workflow
     assert "Build current one-click installer" not in workflow
@@ -885,7 +890,7 @@ def test_component_workflow_is_manual_patch_only_and_skips_full_build_stages():
     assert "Uninstaller" not in workflow
 
 
-def test_release_workflows_accept_only_signed_version_matched_baselines():
+def test_release_workflows_accept_only_ed25519_verified_version_matched_baselines():
     root = Path(__file__).resolve().parents[1]
     component_workflow = (
         root / ".github/workflows/windows-component-update.yml"
@@ -896,8 +901,10 @@ def test_release_workflows_accept_only_signed_version_matched_baselines():
 
     for workflow in (component_workflow, full_workflow):
         assert "component-baseline.zip" in workflow
-        assert "System.Security.Cryptography.Pkcs.SignedCms" in workflow
-        assert "$cms.CheckSignature($true)" in workflow
+        assert "verify_manifest" in workflow
+        assert "TRUSTED_UPDATE_PUBLIC_KEYS" in workflow
+        assert "UPDATE-MANIFEST.signed.json" in workflow
+        assert "System.Security.Cryptography.Pkcs.SignedCms" not in workflow
         assert "(?:component-)?v(?<version>\\d+\\.\\d+\\.\\d+)" in workflow
 
     assert "Baseline release tag and signed manifest version mismatch" in (

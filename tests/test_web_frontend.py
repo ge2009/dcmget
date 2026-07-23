@@ -76,7 +76,7 @@ def test_web_frontend_is_a_self_contained_single_workspace_application() -> None
     )
     assert all(script.get("src") for script in document.scripts)
     assert 'href="/assets/app.css"' in source
-    assert "影像下载工作台" in source
+    assert "DICOM 影像下载" in source
     assert all(value.startswith(("/", "#")) for _attribute, value in document.references)
 
 

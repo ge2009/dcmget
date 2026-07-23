@@ -340,7 +340,7 @@ with TestClient(
     assert root_response.status_code == 307
     page = client.get('/workspace/')
     assert page.status_code == 200
-    assert 'DcmGet 影像下载工作台' in page.text
+    assert 'DcmGet DICOM 影像下载' in page.text
     assert 'data-dcmget-theme-bootstrap' in page.text
     assert '/workspace/_nicegui/' in page.text
     assert client.get('/workspace/favicon.ico').status_code == 200
