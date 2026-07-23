@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 import DICOM_download_ui as entry
+import dcmget
 import dcmget.management_server as management_server_module
 from dcmget.config import AppConfig, save_config
 from dcmget.management_server import (
@@ -62,6 +64,41 @@ def _csrf(client: TestClient) -> str:
     return response.json()["csrf_token"]
 
 
+class FakeUpdateService:
+    def __init__(self) -> None:
+        self.policy = "automatic"
+        self.calls: list[object] = []
+
+    def status(self) -> dict[str, object]:
+        return {
+            "supported": True,
+            "policy": self.policy,
+            "state": "available",
+            "current_version": "3.5.2",
+            "latest_version": "3.5.3",
+            "available": True,
+            "package_kind": "patch",
+            "download_size": 1_048_576,
+        }
+
+    def check(self) -> dict[str, object]:
+        self.calls.append("check")
+        return self.status()
+
+    def download(self) -> dict[str, object]:
+        self.calls.append("download")
+        return {**self.status(), "state": "downloading"}
+
+    def apply(self) -> dict[str, object]:
+        self.calls.append("apply")
+        return {**self.status(), "state": "applying"}
+
+    def set_policy(self, policy: str) -> dict[str, object]:
+        self.calls.append(("policy", policy))
+        self.policy = policy
+        return self.status()
+
+
 def test_management_service_is_task_free_and_idempotently_stoppable():
     service = WindowsManagementService()
 
@@ -72,6 +109,79 @@ def test_management_service_is_task_free_and_idempotently_stoppable():
     assert service.shutdown() is True
     assert service.shutdown() is True
     assert service.snapshot()["status"] == "stopped"
+
+
+def test_management_update_api_is_loopback_only_for_mutations(tmp_path: Path):
+    updater = FakeUpdateService()
+    server = create_windows_management_server(
+        profile_manager=_profile_manager(tmp_path),
+        project_root=PROJECT_ROOT,
+        state_directory=tmp_path / "manager-state",
+        trusted_hosts=("127.0.0.1", "192.168.1.50"),
+        update_service=updater,
+    )
+    with TestClient(
+        server.app,
+        base_url="http://127.0.0.1:8786",
+        client=("127.0.0.1", 50123),
+    ) as local:
+        bootstrap = local.get("/api/bootstrap").json()
+        csrf = bootstrap["csrf_token"]
+        assert bootstrap["update"]["package_kind"] == "patch"
+        assert local.get("/api/update/status").json()["latest_version"] == "3.5.3"
+
+        for path in ("check", "download", "apply"):
+            response = local.post(
+                f"/api/update/{path}",
+                json={},
+                headers={"Origin": "http://127.0.0.1:8786", "X-CSRF-Token": csrf},
+            )
+            assert response.status_code == 200, response.text
+        policy = local.put(
+            "/api/update/policy",
+            json={"policy": "disabled"},
+            headers={"Origin": "http://127.0.0.1:8786", "X-CSRF-Token": csrf},
+        )
+        assert policy.status_code == 200, policy.text
+        assert policy.json()["policy"] == "disabled"
+
+    remote = TestClient(
+        server.app,
+        base_url=MANAGER_URL,
+        client=("192.168.1.20", 50124),
+    )
+    remote_bootstrap = remote.get("/api/bootstrap").json()
+    assert remote.get("/api/update/status").status_code == 200
+    denied = remote.post(
+        "/api/update/check",
+        json={},
+        headers={
+            "Origin": MANAGER_URL,
+            "X-CSRF-Token": remote_bootstrap["csrf_token"],
+        },
+    )
+    assert denied.status_code == 403
+    assert updater.calls == ["check", "download", "apply", ("policy", "disabled")]
+
+
+def test_update_api_is_fail_closed_outside_management_mode(tmp_path: Path):
+    updater = FakeUpdateService()
+    server = DcmGetWebServer(
+        WindowsManagementService(),
+        state_directory=tmp_path / "profile-state",
+        host="127.0.0.1",
+        port=8787,
+        trusted_hosts=("127.0.0.1",),
+        update_service=updater,
+        management_mode=False,
+    )
+    with TestClient(
+        server.app,
+        base_url="http://127.0.0.1:8787",
+        client=("127.0.0.1", 50123),
+    ) as client:
+        client.get("/api/bootstrap")
+        assert client.get("/api/update/status").status_code == 403
 
 
 def test_profile_runtime_state_is_atomic_sorted_and_stopped_by_default(tmp_path: Path):
@@ -725,7 +835,16 @@ def test_hidden_cli_manager_mode_skips_profile_and_dcmtk_startup(
 def test_management_runner_always_stops_server(monkeypatch: pytest.MonkeyPatch):
     events: list[object] = []
 
+    class FakeUpdater:
+        def close(self) -> None:
+            events.append("close-updater")
+
     class FakeServer:
+        def __init__(self) -> None:
+            self.app = SimpleNamespace(
+                state=SimpleNamespace(update_service=FakeUpdater())
+            )
+
         def run(self) -> None:
             events.append("run")
 
@@ -739,4 +858,52 @@ def test_management_runner_always_stops_server(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert management_server_module.run_windows_management_server() == 0
-    assert events == ["run", ("stop", 15)]
+    assert events == ["run", "close-updater", ("stop", 15)]
+
+
+def test_frozen_windows_manager_wires_default_update_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import dcmget.windows_update as windows_update_module
+
+    updater = FakeUpdateService()
+    calls: list[tuple[Path, Path, str]] = []
+    monkeypatch.setattr(management_server_module.sys, "platform", "win32")
+    monkeypatch.setattr(management_server_module, "is_frozen", lambda: True)
+
+    def create_update_service(
+        state_directory: str | Path,
+        install_directory: str | Path,
+        current_version: str,
+    ) -> FakeUpdateService:
+        calls.append(
+            (
+                Path(state_directory),
+                Path(install_directory),
+                current_version,
+            )
+        )
+        return updater
+
+    monkeypatch.setattr(
+        windows_update_module,
+        "create_windows_update_service",
+        create_update_service,
+    )
+    management_state = tmp_path / "manager-state"
+    server = create_windows_management_server(
+        profile_manager=_profile_manager(tmp_path),
+        project_root=PROJECT_ROOT,
+        state_directory=management_state,
+        trusted_hosts=("127.0.0.1",),
+    )
+
+    assert server.app.state.update_service is updater
+    assert calls == [
+        (
+            management_state.resolve(),
+            Path(management_server_module.sys.executable).resolve().parent,
+            dcmget.__version__,
+        )
+    ]

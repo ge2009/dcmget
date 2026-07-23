@@ -465,6 +465,7 @@ def create_web_app(
     preflight_provider: Callable[[AppConfig], object] | None = None,
     operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
     profile_api_proxy: Callable[..., object] | None = None,
+    update_service: object | None = None,
     management_mode: bool = False,
     nicegui_mount_path: str | None = None,
 ) -> FastAPI:
@@ -545,6 +546,14 @@ def create_web_app(
             raise HTTPException(status_code=500, detail="DCMTK 解析器返回了无效结果")
         return tools
 
+    async def invoke_update(method_name: str, *args: object) -> dict[str, object]:
+        if not management_mode or update_service is None:
+            raise HTTPException(status_code=404, detail="当前安装未配置更新服务")
+        result = await _invoke(update_service, method_name, *args)
+        if not isinstance(result, Mapping):
+            raise HTTPException(status_code=500, detail="更新服务返回了无效状态")
+        return {"supported": True, **dict(result)}
+
     app = FastAPI(
         title="DcmGet Web",
         version=__version__,
@@ -559,6 +568,7 @@ def create_web_app(
     app.state.profile_metadata = metadata
     app.state.session_cookie_name = session_cookie
     app.state.profile_api_proxy = profile_api_proxy
+    app.state.update_service = update_service
     app.state.nicegui_mount_path = workspace_path
 
     if workspace_path is not None:
@@ -757,6 +767,26 @@ def create_web_app(
                 "data_dir": metadata.get("data_dir", ""),
             }
         )
+        if management_mode:
+            if update_service is None:
+                payload["update"] = {
+                    "supported": False,
+                    "policy": "disabled",
+                    "state": "unavailable",
+                    "message": "当前安装未配置更新服务",
+                }
+            else:
+                try:
+                    update_status = await invoke_update("status")
+                except HTTPException as exc:
+                    LOGGER.warning("读取更新状态失败：%s", exc.detail)
+                    update_status = {
+                        "supported": True,
+                        "policy": "disabled",
+                        "state": "error",
+                        "message": "暂时无法读取更新状态",
+                    }
+                payload["update"] = update_status
         return payload
 
     @app.get("/api/bootstrap")
@@ -1400,6 +1430,51 @@ def create_web_app(
             raise HTTPException(status_code=501, detail=f"管理操作未配置：{name}")
         return handler
 
+    @app.get("/api/update/status")
+    async def update_status(
+        request: Request,
+        _session: WebSession = Depends(require_session),
+    ) -> Any:
+        """Expose read-only update state to trusted management clients."""
+
+        require_management_peer(request)
+        return await invoke_update("status")
+
+    @app.post("/api/update/check")
+    async def update_check(
+        request: Request,
+        _session: WebSession = Depends(require_local_csrf),
+    ) -> Any:
+        await _json_body(request)
+        return await invoke_update("check")
+
+    @app.post("/api/update/download")
+    async def update_download(
+        request: Request,
+        _session: WebSession = Depends(require_local_csrf),
+    ) -> Any:
+        await _json_body(request)
+        return await invoke_update("download")
+
+    @app.post("/api/update/apply")
+    async def update_apply(
+        request: Request,
+        _session: WebSession = Depends(require_local_csrf),
+    ) -> Any:
+        await _json_body(request)
+        return await invoke_update("apply")
+
+    @app.put("/api/update/policy")
+    async def update_policy(
+        request: Request,
+        _session: WebSession = Depends(require_local_csrf),
+    ) -> Any:
+        payload = await _json_body(request)
+        policy = str(payload.get("policy", "")).strip().lower()
+        if policy not in {"disabled", "automatic"}:
+            raise HTTPException(status_code=400, detail="更新策略必须是 disabled 或 automatic")
+        return await invoke_update("set_policy", policy)
+
     @app.get("/api/management/profiles")
     async def management_profiles(
         request: Request,
@@ -1656,6 +1731,7 @@ class DcmGetWebServer:
         preflight_provider: Callable[[AppConfig], object] | None = None,
         operation_handlers: Mapping[str, Callable[[dict[str, Any]], object]] | None = None,
         profile_api_proxy: Callable[..., object] | None = None,
+        update_service: object | None = None,
         management_mode: bool = False,
         nicegui_enabled: bool = False,
         log_level: str = "info",
@@ -1700,6 +1776,7 @@ class DcmGetWebServer:
             preflight_provider=preflight_provider,
             operation_handlers=operation_handlers,
             profile_api_proxy=profile_api_proxy,
+            update_service=update_service,
             management_mode=self.management_mode,
             nicegui_mount_path="/workspace" if self.nicegui_enabled else None,
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from http.cookiejar import CookieJar
@@ -23,7 +24,7 @@ from .profile_manager import (
 )
 from .profile_runtime_state import PROFILE_RUNTIME_FILE_NAME, ProfileRuntimeState
 from .profile_web_operations import ProfileWebOperations
-from .runtime import resource_root
+from .runtime import is_frozen, resource_root
 from .windows_service_control import windows_service_operation_handlers
 from .web_server import DcmGetWebServer
 
@@ -382,6 +383,7 @@ def create_windows_management_server(
     state_directory: str | Path | None = None,
     trusted_hosts: Iterable[str] = (),
     static_root: str | Path | None = None,
+    update_service: object | None = None,
     nicegui_enabled: bool = False,
     log_level: str = "info",
 ) -> DcmGetWebServer:
@@ -392,6 +394,20 @@ def create_windows_management_server(
     management_state = Path(
         state_directory or manager.state_root / "management"
     ).expanduser().resolve()
+    if update_service is None and sys.platform == "win32" and is_frozen():
+        try:
+            from . import __version__
+            from .windows_update import create_windows_update_service
+
+            update_service = create_windows_update_service(
+                management_state,
+                Path(sys.executable).resolve().parent,
+                __version__,
+            )
+        except Exception:
+            # Updating is optional.  A damaged/offline updater must never make
+            # the management center itself unavailable.
+            LOGGER.exception("Windows 自动更新服务初始化失败，管理中心将继续启动")
     try:
         profiles = manager.list_profiles()
     except ProfileManagerError as exc:
@@ -433,6 +449,7 @@ def create_windows_management_server(
         },
         operation_handlers=handlers,
         profile_api_proxy=profile_proxy.request,
+        update_service=update_service,
         management_mode=True,
         nicegui_enabled=nicegui_enabled,
         log_level=log_level,
@@ -446,6 +463,7 @@ def run_windows_management_server(
     state_directory: str | Path | None = None,
     trusted_hosts: Iterable[str] = (),
     static_root: str | Path | None = None,
+    update_service: object | None = None,
     log_level: str = "info",
 ) -> int:
     """Run the management hub until its supervising Windows process stops it."""
@@ -456,6 +474,7 @@ def run_windows_management_server(
         state_directory=state_directory,
         trusted_hosts=trusted_hosts,
         static_root=static_root,
+        update_service=update_service,
         nicegui_enabled=True,
         log_level=log_level,
     )
@@ -468,4 +487,9 @@ def run_windows_management_server(
         server.run()
         return 0
     finally:
+        app_state = getattr(getattr(server, "app", None), "state", None)
+        active_update_service = getattr(app_state, "update_service", None)
+        close_update_service = getattr(active_update_service, "close", None)
+        if callable(close_update_service):
+            close_update_service()
         server.stop(timeout=15)

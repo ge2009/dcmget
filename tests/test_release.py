@@ -279,6 +279,24 @@ def test_nicegui_manager_dialog_survives_profile_grid_refresh():
     assert grid_position < host_position < initial_refresh_position
 
 
+def test_nicegui_manager_exposes_safe_incremental_update_controls():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+    manager = source[
+        source.index("async def _build_manager") : source.index("def _topbar")
+    ]
+
+    assert '"/api/update/status"' in manager
+    assert '"/api/update/check"' in manager
+    assert '"/api/update/download"' in manager
+    assert '"/api/update/apply"' in manager
+    assert '"/api/update/policy"' in manager
+    assert "组件增量包" in manager
+    assert "没有可用增量包时才回退完整安装包" in manager
+    assert "远程页面仅可查看状态" in manager
+    assert "confirm_apply_update" in manager
+
+
 def test_nicegui_typography_uses_offline_platform_fonts_and_readable_sizes():
     root = Path(__file__).resolve().parents[1]
     source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
@@ -306,6 +324,42 @@ def test_nicegui_workspace_has_persistent_theme_and_accessibility_fallbacks():
     assert 'ui.add_head_html(THEME_BOOTSTRAP)' in source
     assert 'js_handler=THEME_TOGGLE_HANDLER' in source
     assert 'aria-label="切换浅色或深色主题"' in source
+
+
+def test_nicegui_baseui_style_layer_stays_offline_and_styles_quasar_components():
+    from dcmget.nicegui_ui import CSS
+
+    normalized = CSS.lower()
+    assert "@import" not in normalized
+    assert "http://" not in normalized
+    assert "https://" not in normalized
+    for token in (
+        "--base-color-primary:",
+        "--base-color-content-primary:",
+        "--base-color-background:",
+        "--base-color-surface:",
+        "--base-color-border:",
+        "--base-radius-control:",
+        "--base-control-height:",
+    ):
+        assert token in CSS
+    assert ".q-btn {" in CSS
+    assert ".q-field--outlined .q-field__control {" in CSS
+    assert ".surface {" in CSS
+    assert ".settings-dialog {" in CSS
+
+
+def test_nicegui_baseui_style_keeps_keyboard_and_platform_accessibility():
+    from dcmget.nicegui_ui import CSS
+
+    assert ".q-btn:focus-visible" in CSS
+    assert "--base-focus-ring:" in CSS
+    assert ".q-btn.q-btn--disabled" in CSS
+    assert ".q-field--disabled .q-field__control" in CSS
+    assert "@media(prefers-reduced-motion:reduce)" in CSS
+    assert "@media(forced-colors:active)" in CSS
+    assert "@media(max-width:900px)" in CSS
+    assert "@media(max-width:520px)" in CSS
 
 
 def test_nicegui_primary_action_is_high_and_runtime_buttons_remain_legible():

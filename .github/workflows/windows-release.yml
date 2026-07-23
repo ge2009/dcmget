@@ -6,7 +6,17 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.5.2
+        default: 3.6.0
+      publish_release:
+        description: Publish the verified build to GitHub Releases
+        required: true
+        type: boolean
+        default: false
+      component_update:
+        description: Build a component patch from the previous stable GitHub Release
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,6 +29,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate update publication inputs
+        if: ${{ inputs.component_update && !inputs.publish_release }}
+        shell: pwsh
+        run: throw "component_update requires publish_release"
 
       - name: Check out 2.6.1 upgrade baseline
         uses: actions/checkout@v4
@@ -1417,6 +1432,88 @@ jobs:
             --dcmtk-bin "build/windows/dcmtk-runtime/dcmtk-3.7.0-win64-dynamic/bin" `
             --verify-existing-signatures
 
+      - name: Download previous stable release for component diff
+        if: ${{ inputs.publish_release && inputs.component_update }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "component_update requires a previous stable GitHub Release"
+          }
+          $release = $releaseJson | ConvertFrom-Json
+          $baseVersion = ([string]$release.tag_name).TrimStart("v")
+          if ($baseVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Previous stable release tag is not vX.Y.Z: $($release.tag_name)"
+          }
+          $archiveName = "DcmGet-$baseVersion-windows-x64.zip"
+          $assetNames = @($release.assets | ForEach-Object { [string]$_.name })
+          foreach ($required in @($archiveName, "UPDATE-MANIFEST.json", "UPDATE-MANIFEST.json.p7")) {
+            if ($assetNames -notcontains $required) {
+              throw "Previous stable release does not support component updates: missing $required"
+            }
+          }
+          $baseline = Join-Path $env:RUNNER_TEMP "dcmget-update-baseline"
+          Remove-Item $baseline -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $baseline | Out-Null
+          gh release download $release.tag_name `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $archiveName `
+            --pattern "UPDATE-MANIFEST.json" `
+            --pattern "UPDATE-MANIFEST.json.p7" `
+            --dir $baseline
+          if ($LASTEXITCODE -ne 0) { throw "Could not download previous stable update assets" }
+          $expanded = Join-Path $baseline "expanded"
+          Expand-Archive (Join-Path $baseline $archiveName) $expanded
+          $installRoot = Join-Path $expanded "DcmGet"
+          if (-not (Test-Path (Join-Path $installRoot "DcmGet.exe") -PathType Leaf)) {
+            throw "Previous stable archive does not contain DcmGet/DcmGet.exe"
+          }
+          "DCMGET_UPDATE_BASE_VERSION=$baseVersion" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_UPDATE_BASE_ROOT=$installRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_UPDATE_BASE_MANIFEST=$(Join-Path $baseline 'UPDATE-MANIFEST.json')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_UPDATE_BASE_SIGNATURE=$(Join-Path $baseline 'UPDATE-MANIFEST.json.p7')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build authenticated Windows update feed
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          DCMGET_ENABLE_COMPONENT_PATCH: ${{ inputs.component_update }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arguments = @(
+            "scripts/build_windows_update.py",
+            "--release-dir", "release/windows",
+            "--version", "${{ inputs.version }}",
+            "--install-root", "build/windows/dist/DcmGet",
+            "--release-manifest", "release/windows/RELEASE-MANIFEST.json",
+            "--full-installer", "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe",
+            "--compatibility-root", ".",
+            "--compatibility-file", "packaging/windows/dcmget.iss",
+            "--compatibility-file", "packaging/windows/LICENSE-WINSW.txt",
+            "--compatibility-file", "packaging/windows/kayisoft-dcmget-host.ps1",
+            "--compatibility-file", "packaging/windows/kayisoft-dcmget.xml.template",
+            "--compatibility-file", "requirements.txt",
+            "--compatibility-file", "requirements-build.txt",
+            "--compatibility-file", "scripts/build_windows.py",
+            "--compatibility-file", "scripts/build_windows_update.py",
+            "--compatibility-file", "scripts/download_dcmtk.py",
+            "--compatibility-file", "scripts/prepare_ohif.py"
+          )
+          if ($env:DCMGET_ENABLE_COMPONENT_PATCH -eq "true") {
+            $arguments += @(
+              "--enable-component-patch",
+              "--baseline-install-root", $env:DCMGET_UPDATE_BASE_ROOT,
+              "--base-version", $env:DCMGET_UPDATE_BASE_VERSION,
+              "--base-update-manifest", $env:DCMGET_UPDATE_BASE_MANIFEST,
+              "--base-update-signature", $env:DCMGET_UPDATE_BASE_SIGNATURE
+            )
+          }
+          python @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Windows update feed build failed" }
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
@@ -1452,3 +1549,169 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+      - name: Stage signed GitHub Release payload
+        if: ${{ inputs.publish_release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-GitHub-Release
+          path: |
+            release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64.zip
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64-components-from-*.zip
+            release/windows/SHA256SUMS.txt
+            release/windows/RELEASE-MANIFEST.json
+            release/windows/UPDATE-MANIFEST.json
+            release/windows/UPDATE-MANIFEST.json.p7
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish signed Windows x64 Release
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified release payload
+        uses: actions/download-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-GitHub-Release
+          path: release
+
+      - name: Recheck signed x64 release metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import hashlib
+          import os
+          import re
+          import zipfile
+          from pathlib import Path
+          from pathlib import PurePosixPath
+
+          root = Path("release")
+          release = json.loads((root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
+          update = json.loads((root / "UPDATE-MANIFEST.json").read_text(encoding="utf-8"))
+          expected = os.environ["EXPECTED_VERSION"]
+          if release.get("product") != "DcmGet" or release.get("platform") != "windows-x64":
+              raise SystemExit("release manifest is not DcmGet windows-x64")
+          if release.get("version") != expected or update.get("version") != expected:
+              raise SystemExit("release version does not match workflow input")
+          signing = release.get("signing", {})
+          if signing.get("status") != "SIGNED" or signing.get("timestamped") is not True:
+              raise SystemExit("only timestamped SIGNED releases may be published")
+          artifacts = update.get("artifacts")
+          if not isinstance(artifacts, list) or not any(
+              item.get("kind") == "full_installer" and item.get("signature_status") == "SIGNED"
+              for item in artifacts if isinstance(item, dict)
+          ):
+              raise SystemExit("update manifest has no signed full installer")
+          install_tree = str(update.get("install_tree_sha256", "")).lower()
+          if re.fullmatch(r"[0-9a-f]{64}", install_tree) is None:
+              raise SystemExit("update manifest has no valid install tree SHA-256")
+          archive_path = root / f"DcmGet-{expected}-windows-x64.zip"
+          tree_records = {}
+          with zipfile.ZipFile(archive_path) as archive:
+              for info in archive.infolist():
+                  if info.is_dir():
+                      continue
+                  pure = PurePosixPath(info.filename.replace("\\", "/"))
+                  if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+                      raise SystemExit(f"standalone archive path is unsafe: {info.filename}")
+                  if pure.parts[0] != "DcmGet" or len(pure.parts) < 2:
+                      raise SystemExit(f"standalone archive path is outside DcmGet: {info.filename}")
+                  relative = PurePosixPath(*pure.parts[1:]).as_posix()
+                  if relative != "DcmGet.exe" and not relative.startswith("_internal/"):
+                      raise SystemExit(f"standalone archive path is outside update scope: {relative}")
+                  if relative.casefold() in tree_records:
+                      raise SystemExit(f"standalone archive path is duplicated: {relative}")
+                  digest = hashlib.sha256()
+                  with archive.open(info) as source:
+                      for block in iter(lambda: source.read(1024 * 1024), b""):
+                          digest.update(block)
+                  tree_records[relative.casefold()] = (relative, info.file_size, digest.hexdigest())
+          if "dcmget.exe" not in tree_records:
+              raise SystemExit("standalone archive has no DcmGet.exe")
+          tree_digest = hashlib.sha256()
+          for relative, size, digest in sorted(tree_records.values()):
+              tree_digest.update(relative.encode("utf-8"))
+              tree_digest.update(b"\0")
+              tree_digest.update(str(size).encode("ascii"))
+              tree_digest.update(b"\0")
+              tree_digest.update(digest.encode("ascii"))
+              tree_digest.update(b"\n")
+          if tree_digest.hexdigest() != install_tree:
+              raise SystemExit("standalone archive tree does not match signed update manifest")
+          for item in artifacts:
+              if not isinstance(item, dict) or item.get("kind") != "component_patch":
+                  continue
+              base_tree = str(item.get("base_tree_sha256", "")).lower()
+              target_tree = str(item.get("target_tree_sha256", "")).lower()
+              if re.fullmatch(r"[0-9a-f]{64}", base_tree) is None:
+                  raise SystemExit("component patch has no valid base tree SHA-256")
+              if target_tree != install_tree:
+                  raise SystemExit("component patch target tree does not match release tree")
+          if not (root / "UPDATE-MANIFEST.json.p7").is_file():
+              raise SystemExit("authenticated update manifest is missing")
+          PY
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+
+      - name: Verify PKCS#7 manifest and signer before publication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = (Resolve-Path "release").Path
+          $manifestPath = Join-Path $root "UPDATE-MANIFEST.json"
+          $signaturePath = Join-Path $root "UPDATE-MANIFEST.json.p7"
+          $installerPath = Join-Path $root "DcmGet-${{ inputs.version }}-Setup-x64.exe"
+          $installer = Get-AuthenticodeSignature -LiteralPath $installerPath
+          if ($installer.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Installer Authenticode validation failed: $($installer.Status)"
+          }
+          if ($null -eq $installer.SignerCertificate) { throw "Installer signer is missing" }
+          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
+          $cms.CheckSignature($true)
+          if ($cms.SignerInfos.Count -ne 1) { throw "Update manifest must have one signer" }
+          $signer = $cms.SignerInfos[0].Certificate
+          if ($null -eq $signer) { throw "Update manifest signer is missing" }
+          if ($signer.Thumbprint -ne $installer.SignerCertificate.Thumbprint) {
+            throw "Update manifest signer does not match installer signer"
+          }
+          $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
+          function Get-ByteHash([byte[]]$content) {
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              return ([BitConverter]::ToString($sha256.ComputeHash($content))).Replace("-", "")
+            } finally {
+              $sha256.Dispose()
+            }
+          }
+          if ((Get-ByteHash $cms.ContentInfo.Content) -ne (Get-ByteHash $rawManifest)) {
+            throw "UPDATE-MANIFEST.json does not match the signed PKCS#7 content"
+          }
+
+      - name: Publish immutable stable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ inputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace published update assets." >&2
+            exit 1
+          fi
+          gh release create "$tag" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "DcmGet ${{ inputs.version }}" \
+            --generate-notes \
+            --latest

@@ -96,7 +96,7 @@ THEME_BOOTSTRAP = r"""
     document.documentElement.dataset.theme = resolved;
     document.documentElement.style.colorScheme = resolved;
     document.querySelector('meta[name="theme-color"]')
-      ?.setAttribute('content', resolved === 'dark' ? '#0e1518' : '#147da6');
+      ?.setAttribute('content', resolved === 'dark' ? '#10181d' : '#147da6');
   };
   const preferred = () => {
     try {
@@ -124,7 +124,7 @@ THEME_TOGGLE_HANDLER = r"""
   root.style.colorScheme = next;
   try { window.localStorage.setItem('dcmget-theme', next); } catch (_) {}
   document.querySelector('meta[name="theme-color"]')
-    ?.setAttribute('content', next === 'dark' ? '#0e1518' : '#147da6');
+    ?.setAttribute('content', next === 'dark' ? '#10181d' : '#147da6');
 }
 """
 
@@ -137,48 +137,79 @@ CSS = r"""
     "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular",
     Menlo, "Liberation Mono", monospace;
-  --ink: #1b2a33;
-  --panel: #ffffff;
-  --panel-hi: #f8fbfc;
-  --line: #dce5e9;
-  --muted: #647985;
-  --paper: #f3f7f9;
-  --signal: #147da6;
+  /* BaseUI-inspired clinical design tokens. Quasar components consume these
+     semantic aliases instead of introducing a second frontend runtime. */
+  --base-color-primary: #147da6;
+  --base-color-primary-hover: #0e6d92;
+  --base-color-primary-active: #0a5d7d;
+  --base-color-primary-soft: #edf7fb;
+  --base-color-content-primary: #17252d;
+  --base-color-content-secondary: #5f737e;
+  --base-color-background: #f4f7f8;
+  --base-color-surface: #ffffff;
+  --base-color-surface-alt: #f7f9fa;
+  --base-color-border: #d2dce1;
+  --base-color-border-strong: #9fb0b9;
+  --base-color-positive: #248663;
+  --base-color-negative: #b93f43;
+  --base-color-warning: #a85d12;
+  --base-space-1: 4px;
+  --base-space-2: 8px;
+  --base-space-3: 12px;
+  --base-space-4: 16px;
+  --base-space-5: 24px;
+  --base-radius-control: 6px;
+  --base-radius-surface: 10px;
+  --base-control-height: 40px;
+  --base-focus-ring: 0 0 0 3px color-mix(in srgb,var(--base-color-primary) 26%,transparent);
+  --base-shadow-surface: 0 1px 2px rgba(18,38,48,.05), 0 4px 12px rgba(18,38,48,.04);
+  --base-shadow-overlay: 0 18px 54px rgba(18,38,48,.18);
+  --ink: var(--base-color-content-primary);
+  --panel: var(--base-color-surface);
+  --panel-hi: var(--base-color-surface-alt);
+  --line: var(--base-color-border);
+  --muted: var(--base-color-content-secondary);
+  --paper: var(--base-color-background);
+  --signal: var(--base-color-primary);
   --signal-2: #36a4c6;
-  --good: #248663;
-  --bad: #c54848;
+  --good: var(--base-color-positive);
+  --bad: var(--base-color-negative);
+  --warning: var(--base-color-warning);
   --cyan: #4d8f98;
   --on-signal: #ffffff;
-  --panel-glass: rgba(255,255,255,.86);
-  --page-top: #f7fafb;
-  --page-bottom: #f1f5f7;
-  --quiet-bg: #ffffff;
+  --panel-glass: var(--base-color-surface);
+  --page-top: var(--base-color-background);
+  --page-bottom: var(--base-color-background);
+  --quiet-bg: var(--base-color-surface);
   --neutral-soft: #edf2f4;
-  --progress-bg: #eaf0f3;
-  --error-soft: #fff4f3;
-  --error-copy: #8c4a48;
-  --summary-soft: #f1f8fb;
-  --summary-copy: #3a687a;
+  --progress-bg: #e7edef;
+  --error-soft: #fff1f0;
+  --error-copy: #873f42;
+  --summary-soft: var(--base-color-primary-soft);
+  --summary-copy: #315f73;
   --log-info: #49636f;
-  --shadow: 0 12px 34px rgba(37,64,78,.07);
+  --shadow: var(--base-shadow-surface);
 }
 :root[data-theme="dark"] {
-  --ink: #e7eef1;
-  --panel: #17242a;
-  --panel-hi: #1b2b32;
-  --line: #2c3e46;
-  --muted: #a2b4bc;
-  --paper: #0e1518;
-  --signal: #45bdce;
+  --base-color-primary: #45bdce;
+  --base-color-primary-hover: #63c9d7;
+  --base-color-primary-active: #2ba7ba;
+  --base-color-primary-soft: #142d35;
+  --base-color-content-primary: #e7eef1;
+  --base-color-content-secondary: #a2b4bc;
+  --base-color-background: #10181d;
+  --base-color-surface: #17242a;
+  --base-color-surface-alt: #1b2b32;
+  --base-color-border: #31444d;
+  --base-color-border-strong: #617780;
+  --base-color-positive: #55c58f;
+  --base-color-negative: #f07b82;
+  --base-color-warning: #e4a65f;
+  --base-shadow-surface: 0 1px 2px rgba(0,0,0,.32), 0 5px 16px rgba(0,0,0,.20);
+  --base-shadow-overlay: 0 22px 64px rgba(0,0,0,.48);
   --signal-2: #6ccddd;
-  --good: #55c58f;
-  --bad: #f07b82;
   --cyan: #74b9c1;
   --on-signal: #05262c;
-  --panel-glass: rgba(23,36,42,.90);
-  --page-top: #111b20;
-  --page-bottom: #0e1518;
-  --quiet-bg: #1b2b32;
   --neutral-soft: #233239;
   --progress-bg: #23343c;
   --error-soft: #2c171a;
@@ -186,7 +217,6 @@ CSS = r"""
   --summary-soft: #142a33;
   --summary-copy: #a9d5e3;
   --log-info: #a8bac2;
-  --shadow: 0 14px 38px rgba(0,0,0,.34);
 }
 html, body, #q-app {
   background: var(--paper); color: var(--ink); font-family: var(--font-ui);
@@ -196,14 +226,19 @@ html, body, #q-app {
 html { font-size:16px; }
 body {
   font-size:14px;
-  background-image:
-    radial-gradient(circle at 88% 0%, color-mix(in srgb,var(--signal) 9%,transparent), transparent 32rem),
-    linear-gradient(180deg, var(--page-top) 0, var(--page-bottom) 100%);
+  background-image: linear-gradient(180deg, var(--page-top) 0, var(--page-bottom) 100%);
 }
 button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog {
   font-family: var(--font-ui) !important;
 }
-.q-btn__content { font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+.q-btn {
+  min-height:var(--base-control-height); border-radius:var(--base-radius-control);
+  padding:0 var(--base-space-4); text-transform:none; box-shadow:none !important;
+  transition:background-color .14s ease,border-color .14s ease,color .14s ease,box-shadow .14s ease;
+}
+.q-btn__content { font-size: 13px; font-weight: 600; letter-spacing: 0; }
+.q-btn:focus-visible { outline:0; box-shadow:var(--base-focus-ring) !important; }
+.q-btn.q-btn--disabled { cursor:not-allowed; opacity:.5 !important; }
 .q-field__native, .q-field__input { font-size: 14px; line-height: 1.5; }
 .q-field__label { font-size: 13px; }
 .font-mono { font-family: var(--font-mono) !important; }
@@ -215,29 +250,28 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .workspace { width: min(1480px, 100%); margin: 0 auto; padding: 20px 24px 48px; }
 .topbar {
   display: flex; align-items: center; justify-content: space-between; gap: 20px;
-  padding: 8px 2px 18px; border-bottom: 1px solid var(--line); margin-bottom: 22px;
+  padding: 8px 0 16px; border-bottom: 1px solid var(--line); margin-bottom: 24px;
 }
 .topbar-stack { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
 .brand-lockup { display: flex; align-items: center; gap: 13px; }
 .brand-mark {
-  width: 38px; height: 38px; border: 1px solid color-mix(in srgb,var(--signal) 35%,transparent);
-  display: grid; place-items: center; color: var(--signal); position: relative;
-  border-radius: 10px; background: color-mix(in srgb,var(--signal) 8%,transparent);
+  width: 40px; height: 40px; border: 1px solid var(--signal);
+  display: grid; place-items: center; color: var(--on-signal); position: relative;
+  border-radius: var(--base-radius-control); background: var(--signal);
 }
-.brand-mark::before, .brand-mark::after { content: ""; position:absolute; background: var(--signal); opacity:.55; }
+.brand-mark::before, .brand-mark::after { content: ""; position:absolute; background: currentColor; opacity:.82; }
 .brand-mark::before { width: 16px; height: 1px; }
 .brand-mark::after { width: 1px; height: 16px; }
-.brand-title { font-family:var(--font-display); font-size:20px; font-weight:700; letter-spacing:.055em; }
-.brand-sub { color:var(--muted); font:11px var(--font-mono); letter-spacing:.16em; }
+.brand-title { font-family:var(--font-display); font-size:20px; font-weight:700; letter-spacing:.025em; }
+.brand-sub { color:var(--muted); font:11px var(--font-mono); letter-spacing:.1em; }
 .topbar-chip {
-  display:flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
-  border:1px solid color-mix(in srgb,var(--signal) 14%,var(--line));
-  background:color-mix(in srgb,var(--panel) 84%,transparent);
+  display:flex; align-items:center; gap:8px; min-height:32px; padding:5px 10px; border-radius:var(--base-radius-control);
+  border:1px solid var(--line); background:var(--panel);
   color:var(--muted); font:600 12px var(--font-ui);
 }
 .connection {
   font:600 12px var(--font-ui); font-variant-numeric:tabular-nums; color:var(--good);
-  display:flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
+  display:flex; align-items:center; gap:8px; min-height:32px; padding:5px 10px; border-radius:var(--base-radius-control);
   border:1px solid color-mix(in srgb,var(--good) 18%,var(--line));
   background:color-mix(in srgb,var(--good) 10%,transparent);
 }
@@ -249,17 +283,17 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .headline { font-family:var(--font-display); font-size:clamp(28px,2.3vw,36px); font-weight:700; line-height:1.25; letter-spacing:-.015em; margin:8px 0 12px; }
 .lede { color:var(--muted); max-width:680px; line-height:1.72; font-size:15px; }
 .hero-panel { display:grid; gap:14px; }
-.summary-card { padding:20px; background:linear-gradient(180deg, color-mix(in srgb,var(--panel) 98%,transparent), color-mix(in srgb,var(--summary-soft) 78%,var(--panel))); }
+.summary-card { padding:20px; background:var(--panel); }
 .summary-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
 .summary-copy { display:grid; gap:4px; }
 .summary-copy p { margin:0; color:var(--muted); font-size:13px; line-height:1.6; }
 .summary-badge {
-  display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px;
+  display:inline-flex; align-items:center; gap:8px; min-height:30px; padding:5px 9px; border-radius:var(--base-radius-control);
   border:1px solid color-mix(in srgb,var(--signal) 20%,var(--line));
   background:color-mix(in srgb,var(--signal) 10%,transparent);
   color:var(--signal); font:600 12px var(--font-ui); white-space:nowrap;
 }
-.hero-facts { display:grid; grid-template-columns:repeat(2,1fr); border:1px solid var(--line); border-radius:14px; background:var(--panel-glass); box-shadow:var(--shadow); overflow:hidden; }
+.hero-facts { display:grid; grid-template-columns:repeat(2,1fr); border:1px solid var(--line); border-radius:var(--base-radius-surface); background:var(--panel); overflow:hidden; }
 .hero-fact { padding:17px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); min-width:0; }
 .hero-fact:nth-child(2n) { border-right:0; }
 .hero-fact:nth-last-child(-n+2) { border-bottom:0; }
@@ -269,9 +303,9 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .hero-actions .q-btn { min-width:0; }
 .launch-bar {
   display:flex; align-items:center; justify-content:space-between; gap:18px;
-  margin-top:20px; padding:15px 18px; border:1px solid color-mix(in srgb,var(--signal) 24%,var(--line));
-  border-radius:15px; background:var(--panel-glass);
-  box-shadow:var(--shadow); position:sticky; top:10px; z-index:20;
+  margin-top:20px; padding:14px 16px; border:1px solid var(--line); border-left:4px solid var(--signal);
+  border-radius:var(--base-radius-surface); background:var(--panel);
+  box-shadow:var(--base-shadow-surface); position:sticky; top:10px; z-index:20;
 }
 .launch-copy { min-width:0; }
 .launch-title { display:block; font-size:16px; font-weight:700; }
@@ -279,7 +313,7 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .launch-actions { display:flex; align-items:center; gap:9px; flex:0 0 auto; }
 .grid-main { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(330px,.5fr); gap:22px; margin-top:25px; align-items:start; }
 .stack { display:grid; gap:18px; }
-.surface { border:1px solid var(--line); border-radius:15px; background:var(--panel); box-shadow:var(--shadow); overflow:hidden; }
+.surface { border:1px solid var(--line); border-radius:var(--base-radius-surface); background:var(--panel); box-shadow:var(--base-shadow-surface); overflow:hidden; }
 .surface-head { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 20px; border-bottom:1px solid var(--line); }
 .surface-head h2 { font-size:20px; margin:0; }
 .surface-head p { color:var(--muted); font-size:12px; margin:3px 0 0; }
@@ -287,26 +321,40 @@ button, input, textarea, select, .q-btn, .q-field, .q-item, .q-table, .q-dialog 
 .step-index { color:var(--signal); font:600 12px var(--font-ui); font-variant-numeric:tabular-nums; letter-spacing:.03em; }
 .section-copy { display:grid; gap:2px; }
 .section-note { color:var(--muted); font-size:12px; line-height:1.55; }
-.q-field--outlined .q-field__control:before { border-color:var(--line) !important; }
-.q-field--outlined .q-field__control:hover:before { border-color:color-mix(in srgb,var(--signal) 55%,var(--line)) !important; }
+.q-field--outlined .q-field__control {
+  min-height:44px; border-radius:var(--base-radius-control); background:var(--panel);
+  transition:box-shadow .14s ease,background-color .14s ease;
+}
+.q-field--outlined .q-field__control:before { border:1px solid var(--base-color-border-strong) !important; }
+.q-field--outlined .q-field__control:hover:before { border-color:var(--signal) !important; }
+.q-field--outlined.q-field--focused .q-field__control { box-shadow:var(--base-focus-ring); }
+.q-field--outlined.q-field--focused .q-field__control:after { border:2px solid var(--signal) !important; }
+.q-field--outlined.q-field--error .q-field__control:before,
+.q-field--outlined.q-field--error .q-field__control:after { border-color:var(--bad) !important; }
+.q-field--disabled .q-field__control { background:var(--neutral-soft); opacity:.72; }
 .q-field__native, .q-field__input, .q-field__label { color:var(--ink) !important; }
 .q-field__bottom { color:var(--muted); }
 .q-field__control, .q-menu, .q-card { background:var(--panel); color:var(--ink); }
 .accession-input textarea { min-height:170px !important; font:13px/1.62 var(--font-mono) !important; }
 .inline-stats { display:flex; flex-wrap:wrap; gap:8px; margin-top:11px; }
-.stat-pill { border:1px solid var(--line); padding:5px 9px; color:var(--muted); font:12px var(--font-ui); font-variant-numeric:tabular-nums; }
+.stat-pill { border:1px solid var(--line); border-radius:4px; padding:5px 9px; color:var(--muted); font:12px var(--font-ui); font-variant-numeric:tabular-nums; }
 .stat-pill strong { color:var(--ink); }
 .quick-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
-.button-primary { background:var(--signal) !important; color:var(--on-signal) !important; font-weight:700; letter-spacing:.02em; }
+.button-primary { background:var(--signal) !important; border:1px solid var(--signal) !important; color:var(--on-signal) !important; font-weight:700; letter-spacing:0; }
+.button-primary:hover { background:var(--base-color-primary-hover) !important; border-color:var(--base-color-primary-hover) !important; }
+.button-primary:active { background:var(--base-color-primary-active) !important; border-color:var(--base-color-primary-active) !important; }
 .button-primary .q-btn__content, .button-primary .q-icon { color:var(--on-signal) !important; opacity:1 !important; }
 .button-primary.q-btn--disabled { opacity:.52 !important; }
-.button-danger { color:var(--bad) !important; border-color:color-mix(in srgb,var(--bad) 35%,transparent) !important; }
+.button-danger { color:var(--bad) !important; border:1px solid color-mix(in srgb,var(--bad) 42%,var(--line)) !important; background:var(--panel) !important; }
+.button-danger:hover { background:color-mix(in srgb,var(--bad) 9%,var(--panel)) !important; border-color:var(--bad) !important; }
 .button-quiet { color:var(--ink) !important; border:1px solid var(--line); background:var(--quiet-bg) !important; }
+.button-quiet:hover { background:var(--panel-hi) !important; border-color:var(--base-color-border-strong) !important; }
 html body .q-btn.button-danger { color:var(--bad) !important; }
 html body .q-btn.button-quiet { color:var(--ink) !important; }
 .button-danger .q-btn__content, .button-danger .q-icon { color:var(--bad) !important; }
 .button-quiet .q-btn__content, .button-quiet .q-icon { color:var(--ink) !important; }
-.drop-upload { width:100%; border:1px dashed color-mix(in srgb,var(--cyan) 42%,transparent); background:color-mix(in srgb,var(--cyan) 4%,transparent); }
+.drop-upload { width:100%; border:1px dashed var(--base-color-border-strong); border-radius:var(--base-radius-control); background:var(--panel-hi); overflow:hidden; }
+.drop-upload .q-uploader__header { background:transparent !important; color:var(--ink) !important; box-shadow:none !important; }
 .preflight-list { display:grid; gap:10px; }
 .check-row { display:grid; grid-template-columns:24px 1fr; gap:10px; align-items:start; padding:9px 0; border-bottom:1px solid var(--line); }
 .check-dot { width:20px;height:20px;border-radius:50%;display:grid;place-items:center;background:var(--neutral-soft);color:var(--muted);font-size:11px; }
@@ -314,9 +362,9 @@ html body .q-btn.button-quiet { color:var(--ink) !important; }
 .check-dot.bad { color:var(--bad); background:color-mix(in srgb,var(--bad) 12%,transparent); }
 .check-copy strong { display:block;font-size:13px; }.check-copy small{color:var(--muted);font-size:12px;}
 .progress-rail { height:9px; background:var(--progress-bg); border:1px solid var(--line); border-radius:999px; overflow:hidden; }
-.progress-fill { height:100%; width:0; background:linear-gradient(90deg,var(--signal),var(--signal-2)); transition:width .4s ease; }
+.progress-fill { height:100%; width:0; background:var(--signal); transition:width .4s ease; }
 .progress-label { color:var(--signal); font:600 12px var(--font-mono); }
-.metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:18px; }
+.metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--base-radius-control); margin-top:18px; overflow:hidden; }
 .metric { background:var(--panel-hi); padding:15px; min-width:0; }.metric span{display:block;color:var(--muted);font-size:12px;letter-spacing:.05em}.metric strong{display:block;margin-top:8px;font:600 15px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .action-row { display:flex;flex-wrap:wrap;gap:9px;margin-top:18px; }
 .error-block { border-left:3px solid var(--bad); background:var(--error-soft); padding:14px; margin-bottom:14px; }
@@ -328,31 +376,43 @@ html body .q-btn.button-quiet { color:var(--ink) !important; }
 .log-line { display:grid;grid-template-columns:70px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font:12px/1.55 var(--font-mono); }
 .log-time { color:var(--muted); }.log-error{color:var(--bad)}.log-info{color:var(--log-info)}
 .profile-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px;margin-top:22px; }
-.profile-card { border:1px solid var(--line); border-radius:15px; background:var(--panel);padding:19px;position:relative;overflow:hidden;box-shadow:var(--shadow); }
-.profile-card::after { content:"";position:absolute;width:80px;height:80px;border:1px solid color-mix(in srgb,var(--cyan) 8%,transparent);border-radius:50%;right:-30px;top:-30px; }
+.profile-card { border:1px solid var(--line); border-radius:var(--base-radius-surface); background:var(--panel);padding:19px;position:relative;overflow:hidden;box-shadow:var(--base-shadow-surface); }
+.profile-card::after { content:none; }
 .profile-card.running { border-color:color-mix(in srgb,var(--good) 32%,var(--line)); }.profile-card.issue{border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
 .profile-name { font-family:var(--font-display);font-size:20px;font-weight:700; }.profile-no{color:var(--signal);font:11px var(--font-mono);}
 .profile-facts { display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0; }.profile-fact span{display:block;color:var(--muted);font-size:12px}.profile-fact strong{font:12px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:4px}
-.profile-status { position:absolute;right:15px;top:15px;font:500 12px var(--font-ui);color:var(--muted); }.profile-status.on{color:var(--good)}
+.profile-status { position:absolute;right:15px;top:15px;display:inline-flex;align-items:center;gap:6px;padding:4px 7px;border:1px solid var(--line);border-radius:4px;font:600 12px var(--font-ui);color:var(--muted);background:var(--panel-hi); }.profile-status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.profile-status.on{color:var(--good);border-color:color-mix(in srgb,var(--good) 28%,var(--line));background:color-mix(in srgb,var(--good) 8%,var(--panel))}
 .manager-summary { display:flex;gap:25px;margin-top:16px; }.manager-summary strong{font-family:var(--font-display);font-size:30px;font-weight:700}.manager-summary span{display:block;color:var(--muted);font-size:12px}
 .manager-cta { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
-.settings-dialog { width:min(850px,94vw);max-width:850px;background:var(--panel) !important;color:var(--ink);border:1px solid var(--line); }
+.manager-update { display:flex;align-items:center;gap:8px;margin-top:13px;color:var(--muted);font-size:12px;line-height:1.5; }
+.manager-update::before { content:"";width:7px;height:7px;border-radius:50%;background:var(--signal);flex:0 0 auto; }
+.update-facts { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--base-radius-control);overflow:hidden;margin:16px 0; }
+.update-fact { min-width:0;background:var(--panel-hi);padding:13px; }.update-fact span{display:block;color:var(--muted);font-size:12px}.update-fact strong{display:block;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:600 13px var(--font-mono)}
+.settings-dialog { width:min(850px,94vw);max-width:850px;max-height:calc(100vh - 32px);overflow:auto;background:var(--panel) !important;color:var(--ink);border:1px solid var(--line);border-radius:var(--base-radius-surface);box-shadow:var(--base-shadow-overlay); }
 .settings-grid { display:grid;grid-template-columns:1fr 1fr;gap:13px; }.settings-section{padding:4px 0 12px}.settings-section-title{color:var(--signal);font:600 12px var(--font-ui);letter-spacing:.05em;margin-bottom:12px}
 .dialog-host { display:contents; }
 .q-expansion-item { border-bottom:1px solid var(--line); }.q-expansion-item__container > .q-item{color:var(--ink)}
-.directory-dialog { width:min(720px,94vw);background:var(--panel) !important;color:var(--ink);border:1px solid var(--line); }
-.directory-row { width:100%;justify-content:flex-start;color:var(--ink)!important;border-bottom:1px solid var(--line); }
+.directory-dialog { width:min(720px,94vw);max-height:calc(100vh - 32px);overflow:auto;background:var(--panel) !important;color:var(--ink);border:1px solid var(--line);border-radius:var(--base-radius-surface);box-shadow:var(--base-shadow-overlay); }
+.directory-row { width:100%;justify-content:flex-start;color:var(--ink)!important;border-bottom:1px solid var(--line);border-radius:0; }
+.directory-row:hover { background:var(--panel-hi) !important; }
 .loading-card { min-height:220px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:var(--muted); }
 .theme-toggle { color:var(--ink) !important; border:1px solid var(--line); background:var(--quiet-bg) !important; }
+.theme-toggle:hover { background:var(--panel-hi) !important; border-color:var(--base-color-border-strong); }
 .text-slate-400, .text-slate-500 { color:var(--muted) !important; }
-.q-notification { border:1px solid color-mix(in srgb,currentColor 20%,transparent); box-shadow:var(--shadow); }
-.surface, .profile-card, .launch-bar { transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
-.profile-card:hover { border-color:color-mix(in srgb,var(--signal) 38%,var(--line)); transform:translateY(-1px); }
-.q-btn:active { transform:translateY(1px); }
+.q-dialog__backdrop { background:rgba(10,22,28,.48); backdrop-filter:blur(2px); }
+.q-menu { border:1px solid var(--line); border-radius:var(--base-radius-control); box-shadow:var(--base-shadow-overlay); }
+.q-item { min-height:40px; border-radius:4px; }
+.q-item.q-manual-focusable--focused, .q-item:hover { background:var(--panel-hi); }
+.q-table th { background:var(--panel-hi); font-weight:600; }
+.q-table tbody tr:hover { background:var(--panel-hi); }
+.q-notification { border:1px solid color-mix(in srgb,currentColor 20%,transparent); border-radius:var(--base-radius-control); box-shadow:var(--base-shadow-overlay); }
+.surface, .profile-card, .launch-bar { transition:border-color .16s ease, box-shadow .16s ease; }
+.profile-card:hover { border-color:color-mix(in srgb,var(--signal) 38%,var(--line)); box-shadow:0 2px 5px rgba(18,38,48,.08); }
+.q-btn:active { transform:none; }
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}}
 @media(forced-colors:active){.surface,.profile-card,.launch-bar,.q-btn,.q-field__control{border:1px solid ButtonBorder!important}.button-primary{border-color:ButtonText!important}.connection::before{forced-color-adjust:none}}
 @media(max-width:900px){.hero,.grid-main{grid-template-columns:1fr}.hero-facts{margin-top:4px}.metric-grid{grid-template-columns:1fr 1fr}.workspace{padding:14px 14px 36px}.settings-grid{grid-template-columns:1fr}.launch-bar{top:6px}.topbar{align-items:flex-start;flex-direction:column}.topbar-stack{justify-content:flex-start}}
-@media(max-width:520px){.headline{font-size:34px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0!important;border-bottom:1px solid var(--line)}.hero-fact:last-child{border-bottom:0}.metric-grid{grid-template-columns:1fr}.connection{display:none}.topbar-chip{width:100%;justify-content:center}.launch-bar{align-items:stretch;flex-direction:column}.launch-actions{display:grid;grid-template-columns:1fr 1.25fr}.launch-actions .q-btn{width:100%}}
+@media(max-width:520px){.headline{font-size:28px}.hero-facts{grid-template-columns:1fr}.hero-fact{border-right:0!important;border-bottom:1px solid var(--line)}.hero-fact:last-child{border-bottom:0}.metric-grid{grid-template-columns:1fr}.connection{padding:5px 8px}.topbar-chip{width:100%;justify-content:center}.launch-bar{align-items:stretch;flex-direction:column}.launch-actions{display:grid;grid-template-columns:1fr 1.25fr}.launch-actions .q-btn{width:100%}.quick-grid,.profile-facts,.update-facts{grid-template-columns:1fr}.profile-grid{grid-template-columns:minmax(0,1fr)}.surface-head{align-items:flex-start;flex-direction:column}}
 """
 
 
@@ -516,11 +576,267 @@ def _notify_error(exc: Exception, prefix: str = "操作失败") -> None:
 
 async def _build_manager(bootstrap: dict[str, Any]) -> None:
     profiles: list[dict[str, Any]] = []
+    update = dict(bootstrap.get("update") or {})
+    web = dict(bootstrap.get("web") or {})
+    local_session = bool(web.get("local_session", False))
     grid: Any = None
     dialog_host: Any = None
     active_profile_dialog: Any = None
+    active_update_dialog: Any = None
     count_label: Any = None
     running_label: Any = None
+    update_summary_label: Any = None
+    update_dialog_status: Any = None
+    update_current_label: Any = None
+    update_latest_label: Any = None
+    update_package_label: Any = None
+    update_size_label: Any = None
+    update_policy_button: Any = None
+    update_check_button: Any = None
+    update_download_button: Any = None
+    update_apply_button: Any = None
+
+    def update_package_text() -> str:
+        kind = str(update.get("package_kind") or "").strip().lower()
+        if kind in {"component", "components", "patch", "delta"}:
+            return "组件增量包"
+        if kind in {"installer", "full", "full_installer"}:
+            return "完整安装包"
+        return "等待检查"
+
+    def update_size_text() -> str:
+        try:
+            size = max(0, int(update.get("download_size") or 0))
+        except (TypeError, ValueError):
+            return "—"
+        if not size:
+            return "—"
+        units = ("B", "KB", "MB", "GB")
+        value = float(size)
+        unit = units[0]
+        for candidate in units:
+            unit = candidate
+            if value < 1024 or candidate == units[-1]:
+                break
+            value /= 1024
+        return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+
+    def update_status_text() -> str:
+        if not bool(update.get("supported", False)):
+            return str(update.get("message") or "当前安装未配置更新服务")
+        state = str(update.get("state") or "idle").strip().lower()
+        latest = str(update.get("latest_version") or "").strip()
+        message = str(update.get("message") or "").strip()
+        labels = {
+            "checking": "正在检查更新…",
+            "downloading": "正在下载更新…",
+            "ready": "更新包已就绪",
+            "downloaded": "更新包已就绪",
+            "applying": "正在交给 Windows 安装服务…",
+            "offline": "当前无法访问外网，已静默跳过",
+            "error": "更新检查未完成",
+            "current": "当前已是最新版本",
+            "up_to_date": "当前已是最新版本",
+        }
+        if bool(update.get("available")):
+            return f"发现新版本 {latest or ''} · {update_package_text()}".rstrip(" ·")
+        default = (
+            "自动更新已启用"
+            if update.get("policy") == "automatic"
+            else "自动更新已关闭"
+        )
+        return message or labels.get(state, default)
+
+    def update_is_downloaded() -> bool:
+        state = str(update.get("state") or "").strip().lower()
+        return bool(update.get("downloaded")) or state in {"ready", "downloaded"}
+
+    def render_update_state() -> None:
+        if update_summary_label is not None:
+            update_summary_label.set_text(update_status_text())
+        if update_dialog_status is None:
+            return
+        state = str(update.get("state") or "idle").strip().lower()
+        busy = state in {"checking", "downloading", "applying"}
+        supported = bool(update.get("supported", False))
+        available = bool(update.get("available"))
+        downloaded = update_is_downloaded()
+        update_dialog_status.set_text(update_status_text())
+        update_current_label.set_text(
+            str(update.get("current_version") or bootstrap.get("version") or "—")
+        )
+        update_latest_label.set_text(str(update.get("latest_version") or "—"))
+        update_package_label.set_text(update_package_text())
+        update_size_label.set_text(update_size_text())
+        update_policy_button.set_text(
+            "关闭自动检查" if update.get("policy") == "automatic" else "启用自动检查"
+        )
+        update_policy_button.set_visibility(supported and local_session)
+        update_check_button.set_visibility(supported and local_session)
+        update_download_button.set_visibility(
+            supported and local_session and available and not downloaded
+        )
+        update_apply_button.set_visibility(supported and local_session and downloaded)
+        for button in (
+            update_policy_button,
+            update_check_button,
+            update_download_button,
+            update_apply_button,
+        ):
+            button.set_enabled(not busy)
+
+    async def refresh_update_status(*, notify_errors: bool = False) -> None:
+        nonlocal update
+        if not bool(update.get("supported", False)):
+            render_update_state()
+            return
+        try:
+            payload = await _browser_api("/api/update/status")
+            if isinstance(payload, Mapping):
+                update = dict(payload)
+            render_update_state()
+        except Exception as exc:
+            if notify_errors:
+                _notify_error(exc, "读取更新状态失败")
+
+    async def check_update() -> None:
+        nonlocal update
+        try:
+            payload = await _browser_api("/api/update/check", method="POST", body={})
+            if isinstance(payload, Mapping):
+                update = dict(payload)
+            render_update_state()
+            ui.notify("更新检查已启动", type="positive")
+        except Exception as exc:
+            _notify_error(exc, "检查更新失败")
+
+    async def download_update() -> None:
+        nonlocal update
+        try:
+            payload = await _browser_api("/api/update/download", method="POST", body={})
+            if isinstance(payload, Mapping):
+                update = dict(payload)
+            render_update_state()
+            ui.notify("更新包下载已启动", type="positive")
+        except Exception as exc:
+            _notify_error(exc, "下载更新失败")
+
+    async def toggle_update_policy() -> None:
+        nonlocal update
+        policy = "disabled" if update.get("policy") == "automatic" else "automatic"
+        try:
+            payload = await _browser_api(
+                "/api/update/policy", method="PUT", body={"policy": policy}
+            )
+            if isinstance(payload, Mapping):
+                update = dict(payload)
+            render_update_state()
+            ui.notify(
+                "已启用外网自动检查" if policy == "automatic" else "已关闭自动更新联网",
+                type="positive",
+            )
+        except Exception as exc:
+            _notify_error(exc, "更新策略保存失败")
+
+    def confirm_apply_update() -> None:
+        if dialog_host is None:
+            return
+        with dialog_host:
+            with ui.dialog() as confirm, ui.card().classes("settings-dialog p-0"):
+                with ui.element("div").classes("surface-head"):
+                    with ui.element("div"):
+                        ui.label("安装软件更新").classes("text-xl")
+                        ui.label("Windows 服务会在安装期间短暂重启")
+                    ui.button(icon="close", on_click=confirm.close).props("flat round")
+                with ui.element("div").classes("surface-body"):
+                    ui.label(
+                        "已下载的更新会再次校验后安装。任务恢复点和 Profile 配置会保留；"
+                        "安装期间请不要关闭计算机。"
+                    ).classes("text-sm")
+
+                    async def apply_update() -> None:
+                        nonlocal update
+                        apply_button.disable()
+                        apply_button.set_text("正在准备安装…")
+                        try:
+                            payload = await _browser_api(
+                                "/api/update/apply", method="POST", body={}, timeout=30
+                            )
+                            if isinstance(payload, Mapping):
+                                update = dict(payload)
+                            confirm.close()
+                            render_update_state()
+                            ui.notify("更新安装已提交，管理中心将短暂断开", type="positive")
+                        except Exception as exc:
+                            apply_button.enable()
+                            apply_button.set_text("确认安装")
+                            _notify_error(exc, "安装更新失败")
+
+                    with ui.row().classes("justify-end w-full pt-5"):
+                        ui.button("取消", on_click=confirm.close).props("flat")
+                        apply_button = ui.button(
+                            "确认安装", icon="system_update_alt", on_click=apply_update
+                        ).props("unelevated no-caps").classes("button-primary")
+        confirm.open()
+
+    def open_update_dialog() -> None:
+        nonlocal active_update_dialog
+        nonlocal update_dialog_status, update_current_label, update_latest_label
+        nonlocal update_package_label, update_size_label, update_policy_button
+        nonlocal update_check_button
+        nonlocal update_download_button, update_apply_button
+        if dialog_host is None:
+            ui.notify("更新面板尚未就绪，请稍后重试", type="warning")
+            return
+        if active_update_dialog is not None:
+            active_update_dialog.delete()
+        with dialog_host:
+            with ui.dialog() as dialog, ui.card().classes("settings-dialog p-0"):
+                with ui.element("div").classes("surface-head"):
+                    with ui.element("div"):
+                        ui.label("软件更新").classes("text-xl")
+                        update_dialog_status = ui.label(update_status_text()).classes(
+                            "text-sm"
+                        )
+                    ui.button(icon="close", on_click=dialog.close).props("flat round")
+                with ui.element("div").classes("surface-body"):
+                    with ui.element("div").classes("update-facts"):
+                        with ui.element("div").classes("update-fact"):
+                            ui.label("当前版本")
+                            update_current_label = ui.label("—").classes("font-semibold")
+                        with ui.element("div").classes("update-fact"):
+                            ui.label("可用版本")
+                            update_latest_label = ui.label("—").classes("font-semibold")
+                        with ui.element("div").classes("update-fact"):
+                            ui.label("更新方式")
+                            update_package_label = ui.label("—").classes("font-semibold")
+                        with ui.element("div").classes("update-fact"):
+                            ui.label("下载大小")
+                            update_size_label = ui.label("—").classes("font-semibold")
+                    ui.label(
+                        "优先下载组件增量包；没有可用增量包时才回退完整安装包。"
+                        "外网不可达时自动检查会静默跳过，关闭自动检查后不会访问更新服务器。"
+                    ).classes("text-sm")
+                    if not local_session:
+                        ui.label(
+                            "远程页面仅可查看状态；请在服务器本机确认下载和安装。"
+                        ).classes("large-summary mt-4")
+                    with ui.row().classes("justify-end w-full pt-5"):
+                        update_policy_button = ui.button(
+                            "更新策略", icon="public", on_click=toggle_update_policy
+                        ).props("flat no-caps").classes("button-quiet")
+                        update_check_button = ui.button(
+                            "立即检查", icon="refresh", on_click=check_update
+                        ).props("flat no-caps").classes("button-quiet")
+                        update_download_button = ui.button(
+                            "下载更新", icon="download", on_click=download_update
+                        ).props("unelevated no-caps").classes("button-primary")
+                        update_apply_button = ui.button(
+                            "安装更新", icon="system_update_alt", on_click=confirm_apply_update
+                        ).props("unelevated no-caps").classes("button-primary")
+        active_update_dialog = dialog
+        render_update_state()
+        dialog.open()
 
     async def profile_action(
         profile: Mapping[str, Any],
@@ -773,10 +1089,16 @@ async def _build_manager(bootstrap: dict[str, Any]) -> None:
                         ui.label("正在运行")
                 with ui.element("div").classes("manager-cta"):
                     ui.button("新建 Profile", icon="add", on_click=create_profile).props("unelevated").classes("button-primary")
+                    ui.button(
+                        "软件更新", icon="system_update_alt", on_click=open_update_dialog
+                    ).props("flat no-caps").classes("button-quiet")
+                update_summary_label = ui.label(update_status_text()).classes("manager-update")
         grid = ui.element("section").classes("profile-grid")
         dialog_host = ui.element("div").classes("dialog-host")
     await refresh_profiles()
+    await refresh_update_status()
     ui.timer(4.0, refresh_profiles)
+    ui.timer(8.0, refresh_update_status)
 
 
 def _topbar(context: str, *, connection_state: str = "connected") -> None:
@@ -1788,7 +2110,7 @@ def install_nicegui(app: Any, mount_path: str = "/workspace") -> None:
             primary="#147da6",
             secondary="#4d8f98",
             positive="#248663",
-            negative="#c54848",
+            negative="#b93f43",
         )
         root = ui.element("div").classes("w-full")
         with root:

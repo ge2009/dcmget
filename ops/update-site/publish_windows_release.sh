@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly REMOTE_HOST='bwg-snell'
+readonly REMOTE_SITE_ROOT='/opt/1panel/www/sites/dcmget.v2ex.com.cn/index'
+readonly REMOTE_UPDATES_ROOT="${REMOTE_SITE_ROOT}/updates"
+readonly REMOTE_RELEASES_ROOT="${REMOTE_UPDATES_ROOT}/releases"
+readonly REMOTE_STABLE_ROOT="${REMOTE_UPDATES_ROOT}/stable"
+readonly VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+readonly SAFE_FILE_PATTERN='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+
+usage() {
+    echo "用法: $0 <本地 release/windows 目录> <MAJOR.MINOR.PATCH>" >&2
+}
+
+die() {
+    echo "错误: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+}
+
+local_sha256() {
+    local file=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$file" | awk '{print $1}'
+    else
+        die '本机缺少 sha256sum 或 shasum'
+    fi
+}
+
+[[ $# -eq 2 ]] || {
+    usage
+    exit 2
+}
+
+SOURCE_INPUT=$1
+VERSION=$2
+
+[[ $VERSION =~ $VERSION_PATTERN ]] || die '版本号必须是安全的 MAJOR.MINOR.PATCH 格式，例如 3.2.0'
+[[ -d $SOURCE_INPUT ]] || die "发布目录不存在: $SOURCE_INPUT"
+[[ ! -L $SOURCE_INPUT ]] || die '发布目录不能是符号链接'
+
+require_command ssh
+require_command scp
+require_command rsync
+require_command awk
+require_command sort
+
+SOURCE_DIR=$(cd -- "$SOURCE_INPUT" && pwd -P)
+MANIFEST_PATH="${SOURCE_DIR}/UPDATE-MANIFEST.json.p7"
+[[ -f $MANIFEST_PATH && ! -L $MANIFEST_PATH ]] || die '发布目录必须包含普通文件 UPDATE-MANIFEST.json.p7'
+
+shopt -s nullglob dotglob
+source_entries=("${SOURCE_DIR}"/*)
+(( ${#source_entries[@]} > 0 )) || die '发布目录为空'
+
+source_files=()
+for path in "${source_entries[@]}"; do
+    [[ ! -L $path ]] || die "拒绝符号链接: ${path##*/}"
+    [[ -f $path ]] || die "发布目录只允许包含顶层普通文件: ${path##*/}"
+    name=${path##*/}
+    [[ $name =~ $SAFE_FILE_PATTERN ]] || die "拒绝不安全的文件名: $name"
+    source_files+=("$path")
+done
+
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dcmget-update-publish.XXXXXX")
+CHECKSUM_FILE="${WORK_DIR}/expected-sha256"
+REMOTE_NONCE="$(date -u +%Y%m%d%H%M%S)-$$"
+REMOTE_RELEASE_TEMP="${REMOTE_RELEASES_ROOT}/.publish-${VERSION}-${REMOTE_NONCE}"
+REMOTE_RELEASE_TARGET="${REMOTE_RELEASES_ROOT}/${VERSION}"
+REMOTE_STABLE_TEMP="${REMOTE_STABLE_ROOT}/.UPDATE-MANIFEST.json.p7.publish-${REMOTE_NONCE}"
+REMOTE_TEMP_CREATED=0
+REMOTE_STABLE_TEMP_CREATED=0
+
+cleanup_remote_release_temp() {
+    ssh "$REMOTE_HOST" bash -s -- "$REMOTE_RELEASES_ROOT" "$VERSION" "$REMOTE_RELEASE_TEMP" <<'REMOTE_CLEANUP' >/dev/null 2>&1 || true
+set -euo pipefail
+releases_root=$1
+version=$2
+temp_path=$3
+case "$temp_path" in
+    "${releases_root}/.publish-${version}-"*) rm -rf -- "$temp_path" ;;
+    *) exit 2 ;;
+esac
+REMOTE_CLEANUP
+}
+
+cleanup_remote_stable_temp() {
+    ssh "$REMOTE_HOST" bash -s -- "$REMOTE_STABLE_ROOT" "$REMOTE_STABLE_TEMP" <<'REMOTE_CLEANUP' >/dev/null 2>&1 || true
+set -euo pipefail
+stable_root=$1
+temp_path=$2
+case "$temp_path" in
+    "${stable_root}/.UPDATE-MANIFEST.json.p7.publish-"*) rm -f -- "$temp_path" ;;
+    *) exit 2 ;;
+esac
+REMOTE_CLEANUP
+}
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    if (( REMOTE_STABLE_TEMP_CREATED )); then
+        cleanup_remote_stable_temp
+    fi
+    if (( REMOTE_TEMP_CREATED )); then
+        cleanup_remote_release_temp
+    fi
+    rm -rf -- "$WORK_DIR"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for file in "${source_files[@]}"; do
+    digest=$(local_sha256 "$file")
+    printf '%s  %s\n' "$digest" "${file##*/}"
+done | LC_ALL=C sort > "$CHECKSUM_FILE"
+
+EXPECTED_FILE_COUNT=${#source_files[@]}
+MANIFEST_SHA256=$(local_sha256 "$MANIFEST_PATH")
+
+echo "准备远端同文件系统临时目录: ${REMOTE_HOST}:${REMOTE_RELEASE_TEMP}"
+ssh "$REMOTE_HOST" bash -s -- \
+    "$REMOTE_UPDATES_ROOT" \
+    "$REMOTE_RELEASES_ROOT" \
+    "$REMOTE_STABLE_ROOT" \
+    "$REMOTE_RELEASE_TEMP" \
+    "$REMOTE_RELEASE_TARGET" <<'REMOTE_PREPARE'
+set -euo pipefail
+updates_root=$1
+releases_root=$2
+stable_root=$3
+release_temp=$4
+release_target=$5
+
+command -v sha256sum >/dev/null 2>&1 || {
+    echo '远端缺少 sha256sum' >&2
+    exit 1
+}
+
+mkdir -p -- "$updates_root"
+[[ ! -L $updates_root && -d $updates_root ]] || {
+    echo "拒绝符号链接或非目录: $updates_root" >&2
+    exit 1
+}
+
+for directory in "$releases_root" "$stable_root"; do
+    if [[ -e $directory || -L $directory ]]; then
+        [[ -d $directory && ! -L $directory ]] || {
+            echo "拒绝符号链接或非目录: $directory" >&2
+            exit 1
+        }
+    else
+        mkdir -- "$directory"
+    fi
+done
+
+[[ ! -e $release_temp && ! -L $release_temp ]] || {
+    echo "远端临时目录已存在: $release_temp" >&2
+    exit 1
+}
+[[ ! -L $release_target ]] || {
+    echo "拒绝符号链接版本目录: $release_target" >&2
+    exit 1
+}
+mkdir -- "$release_temp"
+REMOTE_PREPARE
+REMOTE_TEMP_CREATED=1
+
+echo "上传 releases/${VERSION} 文件..."
+rsync -a --delete -- "$SOURCE_DIR/" "$REMOTE_HOST:$REMOTE_RELEASE_TEMP/"
+scp -q -- "$CHECKSUM_FILE" "$REMOTE_HOST:$REMOTE_RELEASE_TEMP/.expected-sha256"
+
+echo '校验上传文件的远端 SHA-256...'
+ssh "$REMOTE_HOST" bash -s -- "$REMOTE_RELEASE_TEMP" "$EXPECTED_FILE_COUNT" <<'REMOTE_VERIFY'
+set -euo pipefail
+directory=$1
+expected_count=$2
+checksum_file="${directory}/.expected-sha256"
+
+[[ -d $directory && ! -L $directory ]] || exit 1
+[[ -f $checksum_file && ! -L $checksum_file ]] || exit 1
+if find "$directory" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+    echo "远端临时目录包含非普通文件: $directory" >&2
+    exit 1
+fi
+actual_count=$(find "$directory" -mindepth 1 -maxdepth 1 -type f ! -name '.expected-sha256' | wc -l | tr -d '[:space:]')
+[[ $actual_count == "$expected_count" ]] || {
+    echo "远端文件数不一致: expected=$expected_count actual=$actual_count" >&2
+    exit 1
+}
+(cd -- "$directory" && sha256sum -c -- '.expected-sha256')
+REMOTE_VERIFY
+
+echo "原子发布 releases/${VERSION}..."
+ssh "$REMOTE_HOST" bash -s -- \
+    "$REMOTE_RELEASE_TEMP" \
+    "$REMOTE_RELEASE_TARGET" \
+    "$EXPECTED_FILE_COUNT" <<'REMOTE_COMMIT_RELEASE'
+set -euo pipefail
+release_temp=$1
+release_target=$2
+expected_count=$3
+checksum_file="${release_temp}/.expected-sha256"
+
+verify_existing_target() {
+    [[ -d $release_target && ! -L $release_target ]] || return 1
+    if find "$release_target" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+        return 1
+    fi
+    actual_count=$(find "$release_target" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')
+    [[ $actual_count == "$expected_count" ]] || return 1
+    (cd -- "$release_target" && sha256sum -c -- "$checksum_file")
+}
+
+if [[ -e $release_target || -L $release_target ]]; then
+    if ! verify_existing_target; then
+        echo "同版本目录已存在且内容不同，拒绝覆盖: $release_target" >&2
+        exit 1
+    fi
+    echo '同版本目录内容完全一致，继续切换 stable 清单。'
+    rm -rf -- "$release_temp"
+else
+    rm -- "$checksum_file"
+    mv -- "$release_temp" "$release_target"
+fi
+REMOTE_COMMIT_RELEASE
+REMOTE_TEMP_CREATED=0
+
+echo '清理旧版本（保留最新两个，并保护当前 stable 与正在发布版本）...'
+ssh "$REMOTE_HOST" bash -s -- \
+    "$REMOTE_RELEASES_ROOT" \
+    "$REMOTE_STABLE_ROOT/UPDATE-MANIFEST.json.p7" \
+    "$VERSION" <<'REMOTE_RETENTION'
+set -euo pipefail
+IFS=$'\n\t'
+releases_root=$1
+stable_manifest=$2
+publishing_version=$3
+version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+shopt -s nullglob
+versions=()
+for path in "$releases_root"/*; do
+    name=${path##*/}
+    [[ $name =~ $version_pattern ]] || continue
+    [[ -d $path && ! -L $path ]] || {
+        echo "拒绝处理符号链接或非目录版本项: $path" >&2
+        exit 1
+    }
+    versions+=("$name")
+done
+
+(( ${#versions[@]} > 2 )) || exit 0
+
+current_version=''
+if [[ -e $stable_manifest || -L $stable_manifest ]]; then
+    [[ -f $stable_manifest && ! -L $stable_manifest ]] || {
+        echo "stable 清单不是普通文件，跳过旧版本清理: $stable_manifest" >&2
+        exit 0
+    }
+    stable_hash=$(sha256sum -- "$stable_manifest" | awk '{print $1}')
+    matches=()
+    for candidate in "${versions[@]}"; do
+        candidate_manifest="${releases_root}/${candidate}/UPDATE-MANIFEST.json.p7"
+        [[ -f $candidate_manifest && ! -L $candidate_manifest ]] || continue
+        candidate_hash=$(sha256sum -- "$candidate_manifest" | awk '{print $1}')
+        [[ $candidate_hash == "$stable_hash" ]] && matches+=("$candidate")
+    done
+    if (( ${#matches[@]} != 1 )); then
+        echo '无法唯一确认当前 stable 对应版本，为避免误删，跳过旧版本清理。' >&2
+        exit 0
+    fi
+    current_version=${matches[0]}
+fi
+
+sorted_versions=()
+while IFS= read -r candidate; do
+    [[ -n $candidate ]] && sorted_versions+=("$candidate")
+done < <(printf '%s\n' "${versions[@]}" | sort -V)
+
+version_count=${#sorted_versions[@]}
+newest_a=${sorted_versions[$((version_count - 1))]}
+newest_b=${sorted_versions[$((version_count - 2))]}
+
+for candidate in "${sorted_versions[@]}"; do
+    [[ $candidate == "$newest_a" || $candidate == "$newest_b" ]] && continue
+    [[ $candidate == "$publishing_version" ]] && continue
+    [[ -n $current_version && $candidate == "$current_version" ]] && continue
+    [[ $candidate =~ $version_pattern ]] || exit 1
+    candidate_path="${releases_root}/${candidate}"
+    [[ -d $candidate_path && ! -L $candidate_path ]] || exit 1
+    rm -rf -- "$candidate_path"
+    echo "已删除旧版本: $candidate"
+done
+REMOTE_RETENTION
+
+echo '上传并校验 stable 清单临时文件...'
+[[ $REMOTE_STABLE_TEMP == "$REMOTE_STABLE_ROOT/"* ]] || die 'stable 临时路径越界'
+REMOTE_STABLE_TEMP_CREATED=1
+scp -q -- "$MANIFEST_PATH" "$REMOTE_HOST:$REMOTE_STABLE_TEMP"
+
+ssh "$REMOTE_HOST" bash -s -- \
+    "$REMOTE_STABLE_ROOT" \
+    "$REMOTE_STABLE_TEMP" \
+    "$MANIFEST_SHA256" <<'REMOTE_COMMIT_STABLE'
+set -euo pipefail
+stable_root=$1
+stable_temp=$2
+expected_sha256=$3
+stable_target="${stable_root}/UPDATE-MANIFEST.json.p7"
+
+[[ -d $stable_root && ! -L $stable_root ]] || exit 1
+[[ -f $stable_temp && ! -L $stable_temp ]] || exit 1
+actual_sha256=$(sha256sum -- "$stable_temp" | awk '{print $1}')
+[[ $actual_sha256 == "$expected_sha256" ]] || {
+    echo "stable 清单 SHA-256 不一致: expected=$expected_sha256 actual=$actual_sha256" >&2
+    exit 1
+}
+[[ ! -L $stable_target ]] || {
+    echo "拒绝覆盖符号链接 stable 清单: $stable_target" >&2
+    exit 1
+}
+mv -f -- "$stable_temp" "$stable_target"
+REMOTE_COMMIT_STABLE
+REMOTE_STABLE_TEMP_CREATED=0
+
+echo "发布完成: ${VERSION}"
+echo '清单: https://dcmget.v2ex.com.cn/updates/stable/UPDATE-MANIFEST.json.p7'
+echo "资源: https://dcmget.v2ex.com.cn/updates/releases/${VERSION}/"
