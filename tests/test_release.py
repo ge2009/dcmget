@@ -442,6 +442,23 @@ def test_windows_release_tests_the_signed_installer_and_only_reverifies_it():
     assert "--verify-existing-signatures" in workflow
 
 
+def test_windows_service_tree_fixture_uses_explicit_powershell_children():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    fixture_section = workflow[
+        workflow.index("$serviceTreeChild = Join-Path $serviceTreeFixture \"service-tree-child.ps1\"") :
+        workflow.index("Builtin Users receive only query/start/stop rights.")
+    ]
+
+    assert "service-tree-child.ps1" in fixture_section
+    assert 'WindowsPowerShell\\v1.0\\powershell.exe' in fixture_section
+    assert '"$env:SystemRoot\\System32\\ping.exe"' in fixture_section
+    assert 'Copy-Item "$env:SystemRoot\\System32\\cmd.exe"' not in fixture_section
+    assert '@("/d", "/c", "ping.exe -t 127.0.0.1 >NUL")' not in fixture_section
+
+
 def test_windows_pdi_smoke_uses_authenticated_directory_entry():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
@@ -660,8 +677,18 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "Could not stop fixture process" in workflow
     assert "CreationTicks = ([DateTime]$treeProcess.CreationDate)" in workflow
     assert "$serviceTreeIdentities" in workflow
+    assert "$directServiceTreeIdentities" in workflow
+    assert "Service tree fixture did not maintain all helper processes" in workflow
+    assert "Service tree fixture direct-process identity mismatch" in workflow
+    assert "Service tree fixture direct-process labels incomplete" in workflow
+    assert '([string]$_.Name) -ieq "ping.exe"' in workflow
+    assert "ToUniversalTime().Ticks -ge $directProcess.CreationTicks" in workflow
+    assert "Service tree fixture did not create a verified child" in workflow
     assert "Service tree process survived stop" in workflow
-    assert 'foreach ($fixtureName in @("DcmGet.exe", "storescp.exe", "movescu.exe", "DcmGetPdiServer.exe"))' in workflow
+    assert '$fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")' in workflow
+    assert '$expectedFixtureHost = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in workflow
+    assert '$commandLine.IndexOf("service-tree-child.ps1", [StringComparison]::OrdinalIgnoreCase) -lt 0' in workflow
+    assert '[PSCustomObject]@{' in workflow and "Label = [string]$matchedLabel" in workflow
     assert '$opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)' in workflow
     assert '$attempt -lt 120 -and (Test-Path $installDir)' in workflow
     assert "--- Remaining installation directory contents ---" in workflow
