@@ -206,6 +206,9 @@ AuditCallback = Callable[
 
 @dataclass(slots=True)
 class _MoveDiagnostics:
+    association_accepted: bool = False
+    association_request_failed: bool = False
+    transport_timeout: bool = False
     pending_responses: int = 0
     final_response_status: str | None = None
     dimse_status_code: int | None = None
@@ -236,6 +239,16 @@ _PENDING_DIMSE_STATUSES = {0xFF00, 0xFF01}
 
 
 def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
+    folded = text.casefold()
+    if "association accepted" in folded:
+        diagnostics.association_accepted = True
+    if "association request failed" in folded:
+        diagnostics.association_request_failed = True
+    if "timeout" in folded and (
+        diagnostics.association_request_failed or "tcp initialization error" in folded
+    ):
+        diagnostics.transport_timeout = True
+
     response = _MOVE_RESPONSE_RE.search(text)
     if response:
         response_status = response.group("status").strip()
@@ -304,9 +317,9 @@ def _move_has_problem(diagnostics: _MoveDiagnostics) -> bool:
         return True
     if (diagnostics.warning_suboperations or 0) > 0:
         return True
-    return diagnostics.pending_responses > 0 and not _move_has_final_response(
-        diagnostics
-    )
+    return (
+        diagnostics.association_accepted or diagnostics.pending_responses > 0
+    ) and not _move_has_final_response(diagnostics)
 
 
 def _move_archive_mismatch(
@@ -359,6 +372,17 @@ def _move_diagnostic_summary(diagnostics: _MoveDiagnostics) -> str:
     if counts:
         details.append("子操作：" + "、".join(counts))
     return "；".join(details)
+
+
+def _association_failure_summary(
+    diagnostics: _MoveDiagnostics, config: AppConfig
+) -> str:
+    if not diagnostics.association_request_failed:
+        return ""
+    endpoint = f"{config.pacs_server_ip}:{config.pacs_server_port}"
+    if diagnostics.transport_timeout:
+        return f"连接 PACS {endpoint} 超时，C-MOVE 尚未提交"
+    return f"无法与 PACS {endpoint} 建立 DICOM 关联，C-MOVE 尚未提交"
 
 
 class _LiveStagingTracker:
@@ -439,6 +463,68 @@ class _LiveStagingTracker:
         previous = self._sizes.pop(path, None)
         if previous is not None:
             self._total_bytes -= previous
+
+
+_RECEIVER_DRAIN_INITIAL_WAIT_SECONDS = 1.0
+_RECEIVER_DRAIN_QUIET_SECONDS = 0.5
+_RECEIVER_DRAIN_MAX_SECONDS = 30.0
+_RECEIVER_DRAIN_POLL_SECONDS = 0.1
+
+
+def _wait_for_late_store_writes(
+    directory: Path,
+    baseline: set[Path],
+    cancel_event: threading.Event,
+    *,
+    dcmdump: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> bool | None:
+    """Wait briefly for a receiver child that outlives a broken C-MOVE socket."""
+
+    started = time.monotonic()
+    first_file_deadline = started + _RECEIVER_DRAIN_INITIAL_WAIT_SECONDS
+    hard_deadline = started + _RECEIVER_DRAIN_MAX_SECONDS
+    last_snapshot: tuple[tuple[str, int], ...] = ()
+    quiet_since: float | None = None
+    observed_file = False
+    next_validation_at = 0.0
+
+    while not cancel_event.is_set():
+        snapshot_items: list[tuple[str, int]] = []
+        for path in sorted(_files_in(directory) - baseline):
+            try:
+                snapshot_items.append((str(path), path.stat().st_size))
+            except OSError:
+                continue
+        snapshot = tuple(snapshot_items)
+        now = time.monotonic()
+        if snapshot:
+            observed_file = True
+            if snapshot != last_snapshot:
+                last_snapshot = snapshot
+                quiet_since = now
+            elif (
+                quiet_since is not None
+                and now - quiet_since >= _RECEIVER_DRAIN_QUIET_SECONDS
+                and now >= next_validation_at
+            ):
+                files = [Path(path) for path, _size in snapshot]
+                validation_errors = _validate_dicom_files(
+                    files,
+                    dcmdump=dcmdump,
+                    environment=environment,
+                    cancel_event=cancel_event,
+                )
+                if not validation_errors:
+                    return True
+                next_validation_at = now + _RECEIVER_DRAIN_QUIET_SECONDS
+        elif now >= first_file_deadline:
+            return None
+
+        if now >= hard_deadline:
+            return False if observed_file else None
+        cancel_event.wait(_RECEIVER_DRAIN_POLL_SECONDS)
+    return None
 
 
 class DcmtkResolver:
@@ -768,16 +854,62 @@ def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
             for result in verified_attempts
             if result.verification_status == ResultVerificationStatus.UNVERIFIABLE
         )
+    elif verified_attempts:
+        verification_status = ResultVerificationStatus.MATCHED
+        verification_message = next(
+            (
+                result.verification_message
+                for result in reversed(verified_attempts)
+                if result.verification_message
+            ),
+            "本次接收文件核对通过",
+        )
     duration = sum(result.duration_seconds for result in attempts)
     received_bytes = sum(result.received_bytes for result in attempts)
+    conflict_preserved_count = sum(
+        result.conflict_preserved_count for result in attempts
+    )
+    retained_file_count = max(
+        len(archived_files) + conflict_preserved_count,
+        *(result.file_count for result in attempts),
+    )
+    output_directory = next(
+        (
+            result.output_directory
+            for result in reversed(attempts)
+            if result.output_directory
+        ),
+        "",
+    )
+    status = final.status
+    message = f"第 {len(attempts)} 次尝试完成；{final.message}"
+    if retained_file_count and final.status in {
+        AccessionStatus.FAILED,
+        AccessionStatus.NO_DATA,
+    }:
+        status = AccessionStatus.PARTIAL
+        message = (
+            f"共尝试 {len(attempts)} 次，累计已保留 {retained_file_count} 个文件；"
+            f"最后一次：{final.message}"
+        )
+    if conflict_preserved_count and status != AccessionStatus.CANCELLED:
+        status = AccessionStatus.PARTIAL
+        message += f"；累计 {conflict_preserved_count} 个冲突文件需人工核对"
     return replace(
         final,
-        file_count=max(final.file_count, len(archived_files)),
+        status=status,
+        file_count=retained_file_count,
         duration_seconds=duration,
-        message=f"第 {len(attempts)} 次尝试完成；{final.message}",
+        message=message,
+        output_directory=output_directory,
         received_bytes=received_bytes,
         speed_bytes_per_second=(received_bytes / duration if duration > 0 else 0.0),
         archived_files=archived_files or list(final.archived_files),
+        new_file_count=sum(result.new_file_count for result in attempts),
+        existing_skipped_count=sum(
+            result.existing_skipped_count for result in attempts
+        ),
+        conflict_preserved_count=conflict_preserved_count,
         verification_status=verification_status,
         verification_message=verification_message,
         actual_accessions=actual_accessions,
@@ -790,6 +922,34 @@ def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
             result.local_verified_files for result in attempts
         ),
         attempt_count=sum(max(1, result.attempt_count) for result in attempts),
+    )
+
+
+_UNCONFIRMED_MOVE_SAFETY_PAUSE = (
+    "C-MOVE 未返回最终响应，已保留完整文件，但无法确认全部实例已到齐；"
+    "任务已安全暂停，请重试当前检查号"
+)
+
+
+def _with_unconfirmed_move_safety_pause(
+    result: AccessionResult,
+    *,
+    retained_by_earlier_unconfirmed_attempt: bool = False,
+) -> AccessionResult:
+    if (
+        result.status != AccessionStatus.PARTIAL
+        or result.file_count <= 0
+        or not (
+            result.transient_failure
+            or retained_by_earlier_unconfirmed_attempt
+        )
+        or result.safety_pause_reason
+    ):
+        return result
+    return replace(
+        result,
+        message=f"{result.message}；{_UNCONFIRMED_MOVE_SAFETY_PAUSE}",
+        safety_pause_reason=_UNCONFIRMED_MOVE_SAFETY_PAUSE,
     )
 
 
@@ -935,7 +1095,18 @@ class DownloadRunner:
                 raise RuntimeError("当前执行器已连接到另一个 storescp")
             self._storescp_process = receiver_process
         try:
-            return self._download_one(accession, staging, 1, 1)
+            result = self._download_one(accession, staging, 1, 1)
+            original_safety_pause = result.safety_pause_reason
+            result = _with_unconfirmed_move_safety_pause(result)
+            if result.safety_pause_reason and not original_safety_pause:
+                self._emit(
+                    "movescu",
+                    f"{accession}：{result.safety_pause_reason}",
+                    "error",
+                )
+            elif result.status == AccessionStatus.FAILED and result.transient_failure:
+                self._emit("movescu", f"{accession}：{result.message}", "error")
+            return result
         finally:
             with self._process_lock:
                 if self._storescp_process is receiver_process:
@@ -1087,7 +1258,33 @@ class DownloadRunner:
             )
             if self._cancel.wait(delay):
                 break
-        return _combine_retry_attempts(attempts)
+        combined = _combine_retry_attempts(attempts)
+        final = attempts[-1]
+        original_safety_pause = combined.safety_pause_reason
+        retained_by_earlier_unconfirmed_attempt = (
+            final.status in {AccessionStatus.FAILED, AccessionStatus.NO_DATA}
+            and any(
+                result.file_count > 0 and result.transient_failure
+                for result in attempts[:-1]
+            )
+        )
+        combined = _with_unconfirmed_move_safety_pause(
+            combined,
+            retained_by_earlier_unconfirmed_attempt=(
+                retained_by_earlier_unconfirmed_attempt
+            ),
+        )
+        if combined.safety_pause_reason and not original_safety_pause:
+            self._emit(
+                "movescu",
+                f"{accession}：{combined.safety_pause_reason}",
+                "error",
+            )
+        elif combined.status == AccessionStatus.FAILED and final.transient_failure:
+            self._emit("movescu", f"{accession}：{combined.message}", "error")
+        elif len(attempts) > 1 and combined.status != final.status:
+            self._emit("movescu", f"{accession}：{combined.message}", "warning")
+        return combined
 
     def _disk_space_issue(self, staging: Path) -> str:
         minimum = self.config.minimum_free_space_bytes
@@ -1310,6 +1507,34 @@ class DownloadRunner:
                         "movescu", getattr(process, "pid", 0), command[0], False
                     )
 
+        if (
+            not self._cancel.is_set()
+            and not _move_has_final_response(diagnostics)
+            and (
+                diagnostics.association_accepted
+                or diagnostics.pending_responses
+            )
+        ):
+            self._emit(
+                "storescp",
+                "C-MOVE 连接已结束，正在等待接收中的文件写入完成",
+                "info",
+            )
+            drain_result = _wait_for_late_store_writes(
+                staging,
+                before,
+                self._cancel,
+                dcmdump=self.tools.dcmdump,
+                environment=_dcmtk_environment(self.tools),
+            )
+            transfer_finished = time.monotonic()
+            if drain_result is False and not safety_pause_reason:
+                safety_pause_reason = (
+                    "接收文件在等待期内仍未完整写入，任务已安全暂停；"
+                    "请检查 PACS、网络和接收器日志后重试当前检查号"
+                )
+                self._emit("storescp", safety_pause_reason, "error")
+
         all_files = _files_in(staging)
         new_files = all_files - before
         # Each 2.9 instance owns one receiver and runs only one C-MOVE at a
@@ -1371,6 +1596,12 @@ class DownloadRunner:
             receiver_aborts = self._storescp_abort_count - aborts_before
         move_problem = _move_has_problem(diagnostics)
         move_detail = _move_diagnostic_summary(diagnostics)
+        association_failure = _association_failure_summary(diagnostics, self.config)
+        if association_failure:
+            move_problem = True
+            move_detail = "；".join(
+                detail for detail in (association_failure, move_detail) if detail
+            )
         archive_mismatch = _move_archive_mismatch(diagnostics, accepted_file_count)
         if archive_mismatch:
             move_problem = True
@@ -1390,6 +1621,23 @@ class DownloadRunner:
         if self._cancel.is_set():
             status = AccessionStatus.CANCELLED
             message = "用户已取消"
+        elif safety_pause_reason:
+            status = (
+                AccessionStatus.PARTIAL
+                if accepted_file_count
+                else AccessionStatus.FAILED
+            )
+            details = []
+            if accepted_file_count:
+                details.append(
+                    _archive_result_message(accepted_file_count, archive_stats)
+                )
+            if move_detail:
+                details.append(move_detail)
+            if rejected:
+                details.append(rejected_detail)
+            details.append(safety_pause_reason)
+            message = "；".join(details)
         elif receiver_exit_code is not None:
             status = (
                 AccessionStatus.PARTIAL
@@ -1429,7 +1677,7 @@ class DownloadRunner:
                 details.append(move_detail or "C-MOVE 未正常完成")
             if rejected:
                 details.append(rejected_detail)
-            message = "；".join(details) + "；未收到文件"
+            message = "；".join(details) + "；本次未归档新文件"
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
             message = "C-MOVE 完成，但未收到文件"
@@ -1445,7 +1693,7 @@ class DownloadRunner:
                 message += f"，{rejected_detail}"
         else:
             status = AccessionStatus.FAILED
-            message = f"movescu 退出码 {return_code}，未收到文件"
+            message = f"movescu 退出码 {return_code}，本次未归档新文件"
             if move_detail:
                 message += f"；{move_detail}"
             if rejected:
@@ -1460,13 +1708,25 @@ class DownloadRunner:
         transient_failure = bool(
             not safety_pause_reason
             and receiver_exit_code is None
-            and return_code != 0
             and not _move_has_final_response(diagnostics)
+            and (
+                return_code != 0
+                or diagnostics.association_accepted
+                or diagnostics.pending_responses > 0
+            )
         )
 
-        level = "success" if status == AccessionStatus.COMPLETED else (
-            "warning" if status in {AccessionStatus.NO_DATA, AccessionStatus.PARTIAL, AccessionStatus.CANCELLED} else "error"
-        )
+        warning_statuses = {
+            AccessionStatus.NO_DATA,
+            AccessionStatus.PARTIAL,
+            AccessionStatus.CANCELLED,
+        }
+        if status == AccessionStatus.COMPLETED:
+            level = "success"
+        elif transient_failure or status in warning_statuses:
+            level = "warning"
+        else:
+            level = "error"
         self._emit("movescu", f"{accession}：{message}", level)
         result = AccessionResult(
             accession=accession,
@@ -1575,13 +1835,22 @@ class DownloadRunner:
                         elif source == "movescu" and diagnostics is not None:
                             _record_move_diagnostic(diagnostics, text)
                     level = (
-                        "error"
+                        "warning"
+                        if source == "movescu" and text.startswith(("E:", "F:"))
+                        else "error"
                         if text.startswith(("E:", "F:"))
                         else "warning"
                         if "Association Aborted" in text
                         else "info"
                     )
-                    self._emit(source, text, level)
+                    self._emit(
+                        source,
+                        text,
+                        level,
+                        file_level=(
+                            "error" if text.startswith(("E:", "F:")) else None
+                        ),
+                    )
 
         thread = threading.Thread(target=read_output, name=f"{source}-output", daemon=True)
         thread.start()
@@ -1637,7 +1906,14 @@ class DownloadRunner:
         except Exception as exc:
             self._emit("恢复", f"无法更新 {kind} 进程恢复信息：{exc}", "error")
 
-    def _emit(self, source: str, message: str, level: str) -> None:
+    def _emit(
+        self,
+        source: str,
+        message: str,
+        level: str,
+        *,
+        file_level: str | None = None,
+    ) -> None:
         self.log_callback(source, message, level)
         log_level = {
             "debug": logging.DEBUG,
@@ -1645,7 +1921,7 @@ class DownloadRunner:
             "success": logging.INFO,
             "warning": logging.WARNING,
             "error": logging.ERROR,
-        }.get(level, logging.INFO)
+        }.get(file_level or level, logging.INFO)
         self._logger.log(log_level, "[%s] %s", source, message)
 
     def _build_file_logger(self) -> logging.Logger:

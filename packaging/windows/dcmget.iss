@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.5.1"
+  #define AppVersion "3.5.2"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
