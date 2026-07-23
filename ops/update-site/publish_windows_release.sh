@@ -51,6 +51,8 @@ require_command ssh
 require_command scp
 require_command rsync
 require_command awk
+require_command openssl
+require_command python3
 require_command sort
 
 SOURCE_DIR=$(cd -- "$SOURCE_INPUT" && pwd -P)
@@ -119,6 +121,93 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+SIGNED_MANIFEST_CONTENT="${WORK_DIR}/signed-update-manifest.json"
+if ! openssl smime -verify -binary -inform DER -noverify \
+    -in "$MANIFEST_PATH" -out "$SIGNED_MANIFEST_CONTENT" \
+    >/dev/null 2>&1; then
+    die 'UPDATE-MANIFEST.json.p7 签名无效或不是内嵌 DER PKCS#7'
+fi
+
+python3 - "$SIGNED_MANIFEST_CONTENT" "$SOURCE_DIR" "$VERSION" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+source_dir = Path(sys.argv[2])
+expected_version = sys.argv[3]
+safe_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+sha256 = re.compile(r"^[0-9a-f]{64}$")
+
+try:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = json.loads(raw_manifest.decode("utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"已签名更新清单不是有效 UTF-8 JSON: {exc}") from exc
+
+expected = {
+    "product": "DcmGet",
+    "platform": "windows-x64",
+    "channel": "stable",
+    "version": expected_version,
+}
+for field, value in expected.items():
+    if manifest.get(field) != value:
+        raise SystemExit(
+            f"已签名更新清单 {field} 不匹配: "
+            f"expected={value!r} actual={manifest.get(field)!r}"
+        )
+
+unsigned_manifest = source_dir / "UPDATE-MANIFEST.json"
+if unsigned_manifest.exists():
+    if unsigned_manifest.is_symlink() or not unsigned_manifest.is_file():
+        raise SystemExit("UPDATE-MANIFEST.json 必须是普通文件")
+    if unsigned_manifest.read_bytes() != raw_manifest:
+        raise SystemExit("UPDATE-MANIFEST.json 与 PKCS#7 内嵌已签内容不一致")
+
+artifacts = manifest.get("artifacts")
+if not isinstance(artifacts, list) or not artifacts:
+    raise SystemExit("已签名更新清单没有发布资源")
+
+seen = set()
+full_installers = 0
+for record in artifacts:
+    if not isinstance(record, dict):
+        raise SystemExit("已签名更新清单包含无效资源记录")
+    name = record.get("name")
+    if not isinstance(name, str) or safe_name.fullmatch(name) is None:
+        raise SystemExit(f"已签名更新清单包含不安全资源名: {name!r}")
+    canonical = name.casefold()
+    if canonical in seen:
+        raise SystemExit(f"已签名更新清单包含重复资源名: {name}")
+    seen.add(canonical)
+    path = source_dir / name
+    if path.is_symlink() or not path.is_file() or path.parent != source_dir:
+        raise SystemExit(f"已签名更新资源不存在或类型无效: {name}")
+    try:
+        expected_size = int(record.get("size"))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"已签名更新资源大小无效: {name}") from exc
+    expected_sha256 = str(record.get("sha256", "")).lower()
+    if expected_size < 0 or sha256.fullmatch(expected_sha256) is None:
+        raise SystemExit(f"已签名更新资源指纹无效: {name}")
+    if path.stat().st_size != expected_size:
+        raise SystemExit(f"已签名更新资源大小不一致: {name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected_sha256:
+        raise SystemExit(f"已签名更新资源 SHA-256 不一致: {name}")
+    if record.get("kind") == "full_installer":
+        full_installers += 1
+
+if full_installers != 1:
+    raise SystemExit("已签名更新清单必须且只能包含一个完整安装包")
+PY
 
 for file in "${source_files[@]}"; do
     digest=$(local_sha256 "$file")
