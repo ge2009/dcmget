@@ -453,8 +453,10 @@ def test_windows_service_tree_fixture_uses_explicit_powershell_children():
     ]
 
     assert "service-tree-child.ps1" in fixture_section
+    assert "service-tree-identities.json" in fixture_section
     assert 'WindowsPowerShell\\v1.0\\powershell.exe' in fixture_section
     assert '"$env:SystemRoot\\System32\\ping.exe"' in fixture_section
+    assert "CreationTicks = ([DateTime]$childCim.CreationDate)" in fixture_section
     assert 'Copy-Item "$env:SystemRoot\\System32\\cmd.exe"' not in fixture_section
     assert '@("/d", "/c", "ping.exe -t 127.0.0.1 >NUL")' not in fixture_section
 
@@ -679,16 +681,14 @@ def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles()
     assert "$serviceTreeIdentities" in workflow
     assert "$directServiceTreeIdentities" in workflow
     assert "Service tree fixture did not maintain all helper processes" in workflow
-    assert "Service tree fixture direct-process identity mismatch" in workflow
-    assert "Service tree fixture direct-process labels incomplete" in workflow
+    assert "Service tree fixture direct process no longer running" in workflow
+    assert "-ne [long]$record.CreationTicks" in workflow
     assert '([string]$_.Name) -ieq "ping.exe"' in workflow
     assert "ToUniversalTime().Ticks -ge $directProcess.CreationTicks" in workflow
     assert "Service tree fixture did not create a verified child" in workflow
     assert "Service tree process survived stop" in workflow
     assert '$fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")' in workflow
-    assert '$expectedFixtureHost = "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in workflow
-    assert '$commandLine.IndexOf("service-tree-child.ps1", [StringComparison]::OrdinalIgnoreCase) -lt 0' in workflow
-    assert '[PSCustomObject]@{' in workflow and "Label = [string]$matchedLabel" in workflow
+    assert '[PSCustomObject]@{' in workflow and "Label = [string]$record.Label" in workflow
     assert '$opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)' in workflow
     assert '$attempt -lt 120 -and (Test-Path $installDir)' in workflow
     assert "--- Remaining installation directory contents ---" in workflow

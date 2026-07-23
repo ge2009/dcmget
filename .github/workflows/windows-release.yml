@@ -1287,17 +1287,27 @@ jobs:
           $childScript = Join-Path $fixtureRoot "service-tree-child.ps1"
           $powerShellExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           $children = @()
+          $childRecords = @()
           try {
               foreach ($label in @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")) {
-                  $children += Start-Process $powerShellExe -ArgumentList @(
+                  $child = Start-Process $powerShellExe -ArgumentList @(
                       "-NoLogo",
                       "-NoProfile",
                       "-ExecutionPolicy", "Bypass",
                       "-File", $childScript,
                       "-Label", $label
                   ) -PassThru -WindowStyle Hidden
+                  $children += $child
+                  $childCim = Get-CimInstance Win32_Process -Filter "ProcessId = $($child.Id)" -ErrorAction Stop
+                  $childRecords += [PSCustomObject]@{
+                      Label = $label
+                      ProcessId = $child.Id
+                      CreationTicks = ([DateTime]$childCim.CreationDate).ToUniversalTime().Ticks
+                  }
               }
-              $children.Id | Set-Content (Join-Path $fixtureRoot "pids.txt") -Encoding ascii
+              $childRecords |
+                  ConvertTo-Json -Depth 2 |
+                  Set-Content (Join-Path $fixtureRoot "service-tree-identities.json") -Encoding utf8
               while ($true) { Start-Sleep -Seconds 1 }
           } finally {
               foreach ($child in @($children)) {
@@ -1317,56 +1327,44 @@ jobs:
           & "$env:SystemRoot\System32\sc.exe" start $serviceName | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Could not start service process-tree fixture" }
           Wait-DcmGetServiceStatus "Running" | Out-Null
-          $serviceTreePidFile = Join-Path $serviceTreeFixture "pids.txt"
-          for ($attempt = 0; $attempt -lt 80 -and -not (Test-Path $serviceTreePidFile -PathType Leaf); $attempt++) {
+          $serviceTreeIdentityFile = Join-Path $serviceTreeFixture "service-tree-identities.json"
+          for ($attempt = 0; $attempt -lt 80 -and -not (Test-Path $serviceTreeIdentityFile -PathType Leaf); $attempt++) {
             Start-Sleep -Milliseconds 250
           }
-          if (-not (Test-Path $serviceTreePidFile -PathType Leaf)) { throw "Service process-tree fixture did not start" }
+          if (-not (Test-Path $serviceTreeIdentityFile -PathType Leaf)) { throw "Service process-tree fixture did not start" }
           Start-Sleep -Milliseconds 500
           $fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")
-          $expectedFixtureHost = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-          $serviceTreeIds = @([int[]](Get-Content $serviceTreePidFile))
-          if (($serviceTreeIds | Sort-Object -Unique).Count -ne $fixtureLabels.Count) {
+          $directServiceTreeRecords = @(
+            Get-Content $serviceTreeIdentityFile -Raw -Encoding utf8 |
+              ConvertFrom-Json
+          )
+          if (
+            $directServiceTreeRecords.Count -ne $fixtureLabels.Count -or
+            (@($directServiceTreeRecords.Label | Sort-Object -Unique)).Count -ne $fixtureLabels.Count
+          ) {
             throw "Service tree fixture did not maintain all helper processes"
           }
           $directServiceTreeIdentities = @(
-            foreach ($directId in @($serviceTreeIds | Sort-Object -Unique)) {
+            foreach ($record in $directServiceTreeRecords) {
+              $directId = [int]$record.ProcessId
               $treeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $directId" -ErrorAction SilentlyContinue
-              $commandLine = [string]$treeProcess.CommandLine
-              $matchedLabel = $null
-              foreach ($label in $fixtureLabels) {
-                if ($commandLine -match ("(?:^|\\s)-Label\\s+{0}(?:\\s|$)" -f [Regex]::Escape($label))) {
-                  $matchedLabel = $label
-                  break
-                }
-              }
               if (
                 $null -eq $treeProcess -or
-                ([string]$treeProcess.Name) -ine "powershell.exe" -or
-                -not [string]::Equals(
-                  ([string]$treeProcess.ExecutablePath),
-                  $expectedFixtureHost,
-                  [StringComparison]::OrdinalIgnoreCase
-                ) -or
-                $commandLine.IndexOf("service-tree-child.ps1", [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
-                $null -eq $matchedLabel
+                ([DateTime]$treeProcess.CreationDate).ToUniversalTime().Ticks -ne [long]$record.CreationTicks
               ) {
-                throw "Service tree fixture direct-process identity mismatch: $directId"
+                throw "Service tree fixture direct process no longer running: $directId"
               }
               [PSCustomObject]@{
                 ProcessId = [int]$treeProcess.ProcessId
-                CreationTicks = ([DateTime]$treeProcess.CreationDate).ToUniversalTime().Ticks
+                CreationTicks = [long]$record.CreationTicks
                 Name = [string]$treeProcess.Name
-                Label = [string]$matchedLabel
+                Label = [string]$record.Label
                 ParentProcessId = [int]$treeProcess.ParentProcessId
                 ExecutablePath = [string]$treeProcess.ExecutablePath
-                CommandLine = $commandLine
+                CommandLine = [string]$treeProcess.CommandLine
               }
             }
           )
-          if ((@($directServiceTreeIdentities.Label | Sort-Object -Unique)).Count -ne $fixtureLabels.Count) {
-            throw "Service tree fixture direct-process labels incomplete"
-          }
           $serviceTreeIdentities = @($directServiceTreeIdentities)
           foreach ($directProcess in @($directServiceTreeIdentities)) {
             $fixtureChildren = @(
