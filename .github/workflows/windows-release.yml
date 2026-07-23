@@ -1332,7 +1332,8 @@ jobs:
             Start-Sleep -Milliseconds 250
           }
           if (-not (Test-Path $serviceTreeIdentityFile -PathType Leaf)) { throw "Service process-tree fixture did not start" }
-          Start-Sleep -Milliseconds 500
+          # Windows PowerShell cold-starts asynchronously under LocalSystem.
+          Start-Sleep -Seconds 5
           $fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")
           $directServiceTreeRecords = @(
             Get-Content $serviceTreeIdentityFile -Raw -Encoding utf8 |

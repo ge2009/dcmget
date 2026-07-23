@@ -457,6 +457,8 @@ def test_windows_service_tree_fixture_uses_explicit_powershell_children():
     assert 'WindowsPowerShell\\v1.0\\powershell.exe' in fixture_section
     assert '"$env:SystemRoot\\System32\\ping.exe"' in fixture_section
     assert "CreationTicks = ([DateTime]$childCim.CreationDate)" in fixture_section
+    assert "Windows PowerShell cold-starts asynchronously" in fixture_section
+    assert "Start-Sleep -Seconds 5" in fixture_section
     assert 'Copy-Item "$env:SystemRoot\\System32\\cmd.exe"' not in fixture_section
     assert '@("/d", "/c", "ping.exe -t 127.0.0.1 >NUL")' not in fixture_section
 
