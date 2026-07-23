@@ -155,6 +155,7 @@ def test_pause_resume_cancel_are_forwarded_and_shutdown_drains_worker(tmp_path):
     service.shutdown(timeout=2)
     assert Runner.instances[-1].cancelled
     assert service.snapshot()["status"] == "stopped"
+    assert service.task_store.path.exists()
 
 
 def test_failed_task_can_retry_without_repeating_completed_accessions(tmp_path):
@@ -426,3 +427,250 @@ def test_cancel_during_runner_construction_is_not_lost(tmp_path):
     assert service.wait(2)
     assert Runner.instances[-1].cancelled
     assert service.snapshot()["status"] == "cancelled"
+
+
+def test_end_running_task_waits_for_worker_then_clears_recovery_only(
+    tmp_path, monkeypatch
+):
+    started = threading.Event()
+    allow_exit = threading.Event()
+    downloaded = tmp_path / "dicom" / "A001.dcm"
+    downloaded.parent.mkdir()
+
+    class Runner(_CompletingRunner):
+        def run(self, accessions):
+            downloaded.write_bytes(b"DICM")
+            result = AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                file_count=1,
+                received_bytes=4,
+                archived_files=[str(downloaded)],
+            )
+            self.callbacks["progress_callback"](1, len(list(accessions)), result)
+            started.set()
+            assert allow_exit.wait(2)
+            return BatchSummary([result], cancelled=self.cancelled)
+
+    service = _service(tmp_path, runner_factory=Runner)
+    cleanup_calls: list[str] = []
+    cleanup = service.task_store.cleanup_recorded_processes
+    monkeypatch.setattr(
+        service.task_store,
+        "cleanup_recorded_processes",
+        lambda task_id: cleanup_calls.append(task_id) or cleanup(task_id),
+    )
+    service.start_task(AppConfig(), _tools(tmp_path), ["A001"])
+    assert started.wait(2)
+    task_id = str(service.snapshot()["task"]["id"])
+
+    pending = service.end_task()
+
+    assert Runner.instances[-1].cancelled
+    assert pending["status"] == "ending"
+    assert pending["actions"]["can_cancel"] is False
+    assert pending["actions"]["can_end"] is False
+    assert service.task_store.path.exists()
+    allow_exit.set()
+    assert service.wait(2)
+
+    assert not service.task_store.path.exists()
+    assert downloaded.read_bytes() == b"DICM"
+    assert cleanup_calls == [task_id]
+    assert service.task_ledger.load_batch(task_id).status == "ended"
+    finished = service.snapshot()
+    assert finished["status"] == "ended"
+    assert finished["actions"]["can_start"] is True
+    assert finished["actions"]["can_end"] is False
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_status"),
+    [
+        ("downloading", "interrupted"),
+        ("download_retryable", "download_retryable"),
+        ("pdi_retryable", "pdi_retryable"),
+    ],
+)
+def test_end_saved_task_clears_each_recoverable_phase(
+    tmp_path, phase, expected_status
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    if phase != "downloading":
+        store.set_phase(checkpoint.task_id, phase)
+    store.release_lease()
+    service = DcmGetAppService(
+        task_store=store,
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+
+    restored = service.snapshot()
+    assert restored["status"] == expected_status
+    assert restored["actions"]["can_end"] is True
+
+    finished = service.end_task()
+
+    assert finished["status"] == "ended"
+    assert not store.path.exists()
+    assert service.task_ledger.load_batch(checkpoint.task_id).status == "ended"
+
+
+def test_locked_checkpoint_does_not_advertise_end_action(tmp_path):
+    path = tmp_path / "active-task.sqlite3"
+    owner = TaskCheckpointStore(path)
+    assert owner.try_acquire_lease()
+    owner.start(AppConfig(), ["A001"], trial_required=False)
+    try:
+        service = DcmGetAppService(
+            task_store=TaskCheckpointStore(path),
+            task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+            project_root=tmp_path,
+            load_license_fn=lambda: object(),
+        )
+
+        snapshot = service.snapshot()
+        assert snapshot["status"] == "locked"
+        assert snapshot["actions"]["can_end"] is False
+    finally:
+        owner.release_lease()
+
+
+def test_end_keeps_checkpoint_when_recorded_process_cannot_be_stopped(
+    tmp_path, monkeypatch
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    store.release_lease()
+    service = DcmGetAppService(
+        task_store=store,
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+    monkeypatch.setattr(
+        store,
+        "cleanup_recorded_processes",
+        lambda _task_id: ["未能清理 storescp 进程"],
+    )
+
+    result = service.end_task()
+
+    assert result["status"] == "end_failed"
+    assert result["actions"]["can_end"] is True
+    assert store.path.exists()
+    assert service.task_ledger.load_batch(checkpoint.task_id).status == "running"
+
+
+def test_recoverable_cancel_can_be_permanently_ended_after_worker_exits(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    class Runner(_CompletingRunner):
+        def run(self, _accessions):
+            started.set()
+            assert release.wait(2)
+            return BatchSummary(cancelled=self.cancelled)
+
+        def request_cancel(self):
+            super().request_cancel()
+            release.set()
+
+    service = _service(tmp_path, runner_factory=Runner)
+    service.start_task(AppConfig(), _tools(tmp_path), ["A001"])
+    assert started.wait(2)
+    task_id = str(service.snapshot()["task"]["id"])
+    service.cancel()
+    assert service.wait(2)
+
+    cancelled = service.snapshot()
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["actions"]["can_resume"] is True
+    assert cancelled["actions"]["can_end"] is True
+    assert service.task_store.path.exists()
+
+    service.end_task()
+
+    assert not service.task_store.path.exists()
+    assert service.task_ledger.load_batch(task_id).status == "ended"
+
+
+def test_end_during_runner_construction_is_not_lost(tmp_path):
+    constructor_entered = threading.Event()
+    allow_constructor = threading.Event()
+
+    class Runner(_CompletingRunner):
+        def __init__(self, *args, **kwargs):
+            constructor_entered.set()
+            assert allow_constructor.wait(2)
+            super().__init__(*args, **kwargs)
+
+        def run(self, _accessions):
+            return BatchSummary(cancelled=self.cancelled)
+
+    service = _service(tmp_path, runner_factory=Runner)
+    service.start_task(AppConfig(), _tools(tmp_path), ["A001"])
+    assert constructor_entered.wait(2)
+
+    service.end_task()
+    assert service.task_store.path.exists()
+    allow_constructor.set()
+    assert service.wait(2)
+
+    assert Runner.instances[-1].cancelled
+    assert not service.task_store.path.exists()
+    assert service.snapshot()["status"] == "ended"
+
+
+def test_end_running_pdi_waits_for_exporter_and_preserves_output(tmp_path):
+    exporter_started = threading.Event()
+    allow_exporter_exit = threading.Event()
+    pdi_output = tmp_path / "PDI" / "INDEX.HTM"
+    pdi_output.parent.mkdir()
+
+    class Exporter:
+        instances: list["Exporter"] = []
+
+        def __init__(self, _config, _tools, **_kwargs):
+            self.cancelled = False
+            self.__class__.instances.append(self)
+
+        def request_cancel(self):
+            self.cancelled = True
+
+        def export(self, _files):
+            pdi_output.write_text("partial PDI", encoding="utf-8")
+            exporter_started.set()
+            assert allow_exporter_exit.wait(2)
+            return PdiExportResult(
+                PdiStatus.CANCELLED,
+                output_directory=str(pdi_output.parent),
+                message="cancelled",
+            )
+
+    service = _service(
+        tmp_path,
+        runner_factory=_CompletingRunner,
+        pdi_exporter_factory=Exporter,
+    )
+    service.start_task(
+        AppConfig(
+            pdi_export_enabled=True,
+            pdi_institution_name="测试医院",
+        ),
+        _tools(tmp_path),
+        ["A001"],
+    )
+    assert exporter_started.wait(2)
+
+    service.end_task()
+    assert Exporter.instances[-1].cancelled
+    assert service.task_store.path.exists()
+    allow_exporter_exit.set()
+    assert service.wait(2)
+
+    assert not service.task_store.path.exists()
+    assert pdi_output.read_text(encoding="utf-8") == "partial PDI"
+    assert service.snapshot()["status"] == "ended"

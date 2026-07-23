@@ -381,6 +381,42 @@ def pdi_server_pyinstaller_args(
     ]
 
 
+def verify_update_payload_architecture() -> tuple[Path, ...]:
+    """Verify the signed onedir payload used by component-only releases."""
+
+    expected = [
+        DIST_ROOT / "DcmGet" / "DcmGet.exe",
+        DIST_ROOT / "DcmGetPdiServer.exe",
+        DIST_ROOT / "DcmGet" / "_internal" / "DcmGetPdiServer.exe",
+    ]
+    for name in WINDOWS_DCMTK_PE_FILES:
+        matches = sorted((DIST_ROOT / "DcmGet").rglob(name))
+        if not matches:
+            expected.append(DIST_ROOT / "DcmGet" / name)
+        else:
+            expected.extend(matches)
+
+    missing = [path for path in expected if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Windows 组件更新负载缺少文件："
+            + "、".join(str(path) for path in missing)
+        )
+
+    unique = tuple(dict.fromkeys(path.resolve() for path in expected))
+    for path in unique:
+        require_amd64_pe(path, path.name)
+    verify_packaged_dcmtk_tree(
+        DIST_ROOT
+        / "DcmGet"
+        / "_internal"
+        / ".runtime"
+        / "dcmtk"
+        / "windows-x86_64"
+    )
+    return unique
+
+
 def verify_built_architecture(version: str) -> tuple[Path, ...]:
     """Verify that every executable entry point and DCMTK transport is AMD64."""
 
@@ -478,7 +514,7 @@ def sign_windows_payloads(paths: list[Path]) -> str:
     return status.value
 
 
-def build_payloads(version: str) -> None:
+def build_payloads(version: str, *, update_payload_only: bool = False) -> None:
     if os.name != "nt":
         raise SystemExit("Windows 可执行文件必须在 Windows 上使用 PyInstaller 构建")
     ensure_supported_runtime()
@@ -486,8 +522,9 @@ def build_payloads(version: str) -> None:
     for name in WINDOWS_DCMTK_PE_FILES:
         require_amd64_pe(dcmtk_bin / name, f"DCMTK {name}")
     ohif = find_ohif_payload()
-    winsw = prepare_winsw_service_wrapper()
-    print(f"Verified WinSW {WINSW_VERSION}: {winsw}")
+    if not update_payload_only:
+        winsw = prepare_winsw_service_wrapper()
+        print(f"Verified WinSW {WINSW_VERSION}: {winsw}")
     from PyInstaller.__main__ import run as run_pyinstaller
 
     if BUILD_ROOT.exists():
@@ -498,11 +535,13 @@ def build_payloads(version: str) -> None:
     icon = make_icon()
     version_file = make_version_file(version)
     minimal_runtime, minimal_bin = stage_minimal_windows_dcmtk(PLATFORM_RUNTIME)
-    portable_runtime_manifest = create_portable_runtime_manifest(
-        minimal_runtime,
-        minimal_bin,
-        BUILD_ROOT / PORTABLE_RUNTIME_MANIFEST_NAME,
-    )
+    portable_runtime_manifest = None
+    if not update_payload_only:
+        portable_runtime_manifest = create_portable_runtime_manifest(
+            minimal_runtime,
+            minimal_bin,
+            BUILD_ROOT / PORTABLE_RUNTIME_MANIFEST_NAME,
+        )
 
     run_pyinstaller(pdi_server_pyinstaller_args(icon, version_file))
     pdi_server = DIST_ROOT / "DcmGetPdiServer.exe"
@@ -521,6 +560,12 @@ def build_payloads(version: str) -> None:
             pdi_server,
         )
     )
+    application = DIST_ROOT / "DcmGet" / "DcmGet.exe"
+    if update_payload_only:
+        sign_windows_payloads([application])
+        verify_update_payload_architecture()
+        return
+
     run_pyinstaller(
         pyinstaller_args(
             "DcmGet-Portable",
@@ -534,7 +579,6 @@ def build_payloads(version: str) -> None:
         )
     )
 
-    application = DIST_ROOT / "DcmGet" / "DcmGet.exe"
     portable_payload = DIST_ROOT / "DcmGet-Portable.exe"
     sign_windows_payloads([application, portable_payload])
 
@@ -580,10 +624,21 @@ def main() -> int:
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--checksums-only", action="store_true")
     actions.add_argument("--verify-architecture-only", action="store_true")
+    actions.add_argument(
+        "--onedir-only",
+        "--update-payload-only",
+        dest="update_payload_only",
+        action="store_true",
+        help="仅构建并签名组件更新使用的 onedir 负载",
+    )
     args = parser.parse_args()
     if args.verify_architecture_only:
         verified = verify_built_architecture(args.version)
         print("\n".join(str(path) for path in verified))
+        return 0
+    if args.update_payload_only:
+        build_payloads(args.version, update_payload_only=True)
+        print(DIST_ROOT / "DcmGet")
         return 0
     if not args.checksums_only:
         build_payloads(args.version)

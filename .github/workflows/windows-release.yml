@@ -1437,6 +1437,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
           $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest"
@@ -1444,16 +1445,28 @@ jobs:
             throw "component_update requires a previous stable GitHub Release"
           }
           $release = $releaseJson | ConvertFrom-Json
-          $baseVersion = ([string]$release.tag_name).TrimStart("v")
-          if ($baseVersion -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Previous stable release tag is not vX.Y.Z: $($release.tag_name)"
+          $releaseTag = [string]$release.tag_name
+          $tagPattern = '^(?:component-)?v(?<version>\d+\.\d+\.\d+)$'
+          if ($releaseTag -notmatch $tagPattern) {
+            throw "Previous release tag is not vX.Y.Z or component-vX.Y.Z: $releaseTag"
           }
-          $archiveName = "DcmGet-$baseVersion-windows-x64.zip"
+          $tagVersion = [string]$Matches["version"]
           $assetNames = @($release.assets | ForEach-Object { [string]$_.name })
-          foreach ($required in @($archiveName, "UPDATE-MANIFEST.json", "UPDATE-MANIFEST.json.p7")) {
+          foreach ($required in @("UPDATE-MANIFEST.json", "UPDATE-MANIFEST.json.p7")) {
             if ($assetNames -notcontains $required) {
               throw "Previous stable release does not support component updates: missing $required"
             }
+          }
+          $snapshotName = "component-baseline.zip"
+          $fullArchiveName = "DcmGet-$tagVersion-windows-x64.zip"
+          if ($assetNames -contains $snapshotName) {
+            $archiveName = $snapshotName
+            $usesFullRelease = $false
+          } elseif ($assetNames -contains $fullArchiveName) {
+            $archiveName = $fullArchiveName
+            $usesFullRelease = $true
+          } else {
+            throw "Previous stable release has neither $snapshotName nor $fullArchiveName"
           }
           $baseline = Join-Path $env:RUNNER_TEMP "dcmget-update-baseline"
           Remove-Item $baseline -Recurse -Force -ErrorAction SilentlyContinue
@@ -1465,16 +1478,57 @@ jobs:
             --pattern "UPDATE-MANIFEST.json.p7" `
             --dir $baseline
           if ($LASTEXITCODE -ne 0) { throw "Could not download previous stable update assets" }
+
+          $manifestPath = Join-Path $baseline "UPDATE-MANIFEST.json"
+          $signaturePath = Join-Path $baseline "UPDATE-MANIFEST.json.p7"
+          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
+          $cms.CheckSignature($true)
+          if ($cms.SignerInfos.Count -ne 1) {
+            throw "Previous update manifest must have one signer"
+          }
+          $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
+          if (
+            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
+            [Convert]::ToBase64String($rawManifest)
+          ) {
+            throw "Previous signed manifest content mismatch"
+          }
+          try {
+            $utf8 = [Text.UTF8Encoding]::new($false, $true)
+            $manifest = $utf8.GetString($cms.ContentInfo.Content) | ConvertFrom-Json
+          } catch {
+            throw "Previous signed manifest is not valid UTF-8 JSON: $_"
+          }
+          if (
+            [string]$manifest.product -ne "DcmGet" -or
+            [string]$manifest.platform -ne "windows-x64" -or
+            [string]$manifest.channel -ne "stable"
+          ) {
+            throw "Previous signed manifest identity is invalid"
+          }
+          $baseVersion = [string]$manifest.version
+          if ($baseVersion -ne $tagVersion) {
+            throw "Previous release tag and signed manifest version mismatch: $tagVersion / $baseVersion"
+          }
+          if ([Version]$baseVersion -ge [Version]$env:TARGET_VERSION) {
+            throw "Previous signed baseline version must be lower than target version: $baseVersion / $env:TARGET_VERSION"
+          }
+
           $expanded = Join-Path $baseline "expanded"
           Expand-Archive (Join-Path $baseline $archiveName) $expanded
-          $installRoot = Join-Path $expanded "DcmGet"
+          $installRoot = if ($usesFullRelease) {
+            Join-Path $expanded "DcmGet"
+          } else {
+            $expanded
+          }
           if (-not (Test-Path (Join-Path $installRoot "DcmGet.exe") -PathType Leaf)) {
-            throw "Previous stable archive does not contain DcmGet/DcmGet.exe"
+            throw "Previous stable baseline does not contain DcmGet.exe"
           }
           "DCMGET_UPDATE_BASE_VERSION=$baseVersion" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "DCMGET_UPDATE_BASE_ROOT=$installRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "DCMGET_UPDATE_BASE_MANIFEST=$(Join-Path $baseline 'UPDATE-MANIFEST.json')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "DCMGET_UPDATE_BASE_SIGNATURE=$(Join-Path $baseline 'UPDATE-MANIFEST.json.p7')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_UPDATE_BASE_MANIFEST=$manifestPath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_UPDATE_BASE_SIGNATURE=$signaturePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build authenticated Windows update feed
         if: ${{ inputs.publish_release }}

@@ -28,6 +28,9 @@ PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
 _VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_GITHUB_RELEASE_TAG_PATTERN = re.compile(
+    r"^(?:v|component-v)(\d+\.\d+\.\d+)$"
+)
 _SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _GITHUB_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -608,8 +611,9 @@ class GitHubReleaseSource:
             asset_urls,
             release_url=release_url,
         )
-        tag = str(release.get("tag_name", "")).removeprefix("v")
-        if tag != candidate.version:
+        tag = str(release.get("tag_name", ""))
+        tag_match = _GITHUB_RELEASE_TAG_PATTERN.fullmatch(tag)
+        if tag_match is None or tag_match.group(1) != candidate.version:
             raise UpdateSecurityError("GitHub release 标签与签名清单版本不一致")
         return candidate
 

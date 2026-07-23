@@ -56,11 +56,14 @@ UPDATE_LAYOUT_VERSION = 1
 UPDATE_MANIFEST_NAME = "UPDATE-MANIFEST.json"
 UPDATE_SIGNATURE_NAME = f"{UPDATE_MANIFEST_NAME}.p7"
 PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
+COMPONENT_BASELINE_NAME = "component-baseline.zip"
+MAX_COMPONENT_BASELINES = 5
 PRODUCT = "DcmGet"
 CHANNEL = "stable"
 INSTALL_PATH_ALLOWLIST = ("DcmGet.exe", "_internal/**")
 _VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_SAFE_FILE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
 _PROTECTED_NAMES = {
     "active-task.sqlite3",
     "config.json",
@@ -110,11 +113,22 @@ class FileRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentBaseline:
+    version: str
+    install_root: Path
+    update_manifest: Path
+    update_signature: Path
+
+
+@dataclass(frozen=True, slots=True)
 class WindowsUpdateBuildResult:
     manifest_path: Path
     signature_path: Path
     component_patch_path: Path | None
     changed_files: tuple[FileRecord, ...]
+    component_patch_paths: tuple[Path, ...] = ()
+    changed_files_by_base: tuple[tuple[str, tuple[FileRecord, ...]], ...] = ()
+    baseline_snapshot_path: Path | None = None
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -134,26 +148,22 @@ def build_windows_update_release(
     base_version: str | None = None,
     base_update_manifest: str | Path | None = None,
     base_update_signature: str | Path | None = None,
+    baselines: Iterable[ComponentBaseline] = (),
+    patch_only: bool = False,
     authenticode: AuthenticodeConfig | None = None,
     runner: CommandRunner = subprocess.run,
 ) -> WindowsUpdateBuildResult:
-    """Create a signed update manifest and, when requested, a safe delta ZIP."""
+    """Create a signed update manifest and safe direct component patches.
+
+    The legacy single-baseline arguments remain supported.  ``patch_only``
+    omits the full installer and is intended for fast releases produced from a
+    signed onedir payload.  A patch-only release must have at least one trusted
+    baseline, so the update chain must always start from a signed full release.
+    """
 
     _validate_version(version, "目标版本")
     release_root = _require_directory(release_directory, "Windows 发布目录")
     payload_root = _require_directory(install_root, "Windows 安装负载目录")
-    release_manifest_file = Path(
-        release_manifest_path or release_root / DEFAULT_MANIFEST_NAME
-    ).expanduser().resolve()
-    release_manifest = _load_json_object(
-        release_manifest_file, "Windows 发布清单"
-    )
-    installer_path, installer_record = _validate_signed_release(
-        release_root,
-        release_manifest,
-        version=version,
-        full_installer=full_installer,
-    )
 
     signing = authenticode or AuthenticodeConfig.from_environment()
     if not signing.configured:
@@ -169,61 +179,116 @@ def build_windows_update_release(
     current_tree_sha256 = _tree_digest(current_files)
     application = payload_root / "DcmGet.exe"
     require_amd64_pe(application, "增量更新 DcmGet.exe")
+    installer_path: Path | None = None
+    installer_record: Mapping[str, object] | None = None
+    if patch_only:
+        if release_manifest_path is not None or full_installer is not None:
+            raise WindowsUpdateBuildError(
+                "patch-only 发布不能同时指定完整安装包或 Windows 发布清单"
+            )
+        statuses = verify_windows_files([application], signing, runner=runner)
+        if statuses.get(application) is not SignatureStatus.SIGNED:
+            raise WindowsUpdateBuildError(
+                "patch-only 发布的 DcmGet.exe 未通过 Authenticode 签名校验"
+            )
+    else:
+        release_manifest_file = Path(
+            release_manifest_path or release_root / DEFAULT_MANIFEST_NAME
+        ).expanduser().resolve()
+        release_manifest = _load_json_object(
+            release_manifest_file, "Windows 发布清单"
+        )
+        installer_path, installer_record = _validate_signed_release(
+            release_root,
+            release_manifest,
+            version=version,
+            full_installer=full_installer,
+        )
+
     compatibility = _compatibility_metadata(
         compatibility_files,
         root=compatibility_root,
     )
 
-    component_patch_path: Path | None = None
-    changed_files: tuple[FileRecord, ...] = ()
-    component_patch: dict[str, object] | None = None
-    if enable_component_patch:
-        if baseline_install_root is None or base_version is None:
+    requested_baselines = list(baselines)
+    legacy_values = (
+        baseline_install_root,
+        base_version,
+        base_update_manifest,
+        base_update_signature,
+    )
+    if any(value is not None for value in legacy_values):
+        if any(value is None for value in legacy_values):
             raise WindowsUpdateBuildError(
-                "启用组件增量更新时必须提供上一稳定版目录和版本"
+                "旧版单基线参数必须同时提供目录、版本、更新清单和签名"
             )
-        _validate_version(base_version, "基础版本")
-        if _version_tuple(base_version) >= _version_tuple(version):
-            raise WindowsUpdateBuildError("基础版本必须低于目标版本")
-        if base_update_manifest is None:
-            raise WindowsUpdateBuildError(
-                "启用组件增量更新时必须提供上一稳定版 UPDATE-MANIFEST.json"
+        requested_baselines.append(
+            ComponentBaseline(
+                version=str(base_version),
+                install_root=Path(baseline_install_root),  # type: ignore[arg-type]
+                update_manifest=Path(base_update_manifest),  # type: ignore[arg-type]
+                update_signature=Path(base_update_signature),  # type: ignore[arg-type]
             )
-        if base_update_signature is None:
-            raise WindowsUpdateBuildError(
-                "启用组件增量更新时必须提供上一稳定版 UPDATE-MANIFEST.json.p7"
-            )
-        base_manifest_path = Path(base_update_manifest).expanduser().resolve()
+        )
+    elif enable_component_patch and not requested_baselines:
+        raise WindowsUpdateBuildError(
+            "启用组件增量更新时必须提供至少一个可信基线"
+        )
+    if patch_only and not requested_baselines:
+        raise WindowsUpdateBuildError(
+            "首个组件更新基线必须来自已签名完整发布；patch-only 至少需要一个可信基线"
+        )
+
+    ordered_baselines = _normalise_baselines(requested_baselines, version=version)
+    component_patches: list[dict[str, object]] = []
+    component_patch_paths: list[Path] = []
+    changed_files_by_base: list[tuple[str, tuple[FileRecord, ...]]] = []
+    chain_anchors: dict[str, str] = {}
+    for baseline in ordered_baselines:
+        base_manifest_path = baseline.update_manifest.expanduser().resolve()
         verify_pkcs7_base_manifest(
             base_manifest_path,
-            Path(base_update_signature).expanduser().resolve(),
+            baseline.update_signature.expanduser().resolve(),
             current_executable=application,
             working_directory=release_root,
             runner=runner,
         )
         base_manifest = _load_json_object(
             base_manifest_path,
-            "上一稳定版更新清单",
+            f"{baseline.version} 更新清单",
         )
         expected_base_tree_sha256 = _validate_compatible_base_manifest(
             base_manifest,
-            base_version=base_version,
+            base_version=baseline.version,
             compatibility=compatibility,
         )
+        for anchor_version, anchor_tree in _component_chain_anchors(
+            base_manifest,
+            version=baseline.version,
+            install_tree_sha256=expected_base_tree_sha256,
+        ):
+            existing_tree = chain_anchors.get(anchor_version)
+            if existing_tree is not None and existing_tree != anchor_tree:
+                raise WindowsUpdateBuildError(
+                    f"组件更新链的完整发布锚点冲突：{anchor_version}"
+                )
+            chain_anchors[anchor_version] = anchor_tree
         baseline_root = _require_directory(
-            baseline_install_root, "上一稳定版安装负载目录"
+            baseline.install_root,
+            f"{baseline.version} 安装负载目录",
         )
         baseline_files = _inventory_install_root(baseline_root)
         actual_base_tree_sha256 = _tree_digest(baseline_files)
         if actual_base_tree_sha256 != expected_base_tree_sha256:
             raise WindowsUpdateBuildError(
-                "上一稳定版 ZIP 安装树与签名更新清单不一致，"
-                "请改用完整安装包"
+                f"{baseline.version} 基线 ZIP 安装树与签名更新清单不一致，"
+                "请改用可信 component-baseline.zip 或完整发布 ZIP"
             )
         removed_paths = sorted(set(baseline_files) - set(current_files))
         if removed_paths:
             raise WindowsUpdateBuildError(
-                "组件增量更新不允许删除已安装文件，请改用完整安装包："
+                f"从 {baseline.version} 更新时不允许删除已安装文件，"
+                "请改用完整安装包："
                 + "、".join(removed_paths[:8])
             )
         changed_files = tuple(
@@ -234,7 +299,9 @@ def build_windows_update_release(
             or current_files[path].size != baseline_files[path].size
         )
         if not changed_files:
-            raise WindowsUpdateBuildError("组件增量更新没有检测到任何文件变化")
+            raise WindowsUpdateBuildError(
+                f"从 {baseline.version} 更新没有检测到任何文件变化"
+            )
 
         changed_executables = [
             payload_root / PurePosixPath(record.path)
@@ -258,17 +325,17 @@ def build_windows_update_release(
         patch_file_records: list[dict[str, object]] = []
         for record in changed_files:
             item = record.to_dict()
-            baseline = baseline_files.get(record.path)
-            if baseline is None:
+            base_record = baseline_files.get(record.path)
+            if base_record is None:
                 item["base_missing"] = True
             else:
                 item["base_missing"] = False
-                item["base_size"] = baseline.size
-                item["base_sha256"] = baseline.sha256
+                item["base_size"] = base_record.size
+                item["base_sha256"] = base_record.sha256
             patch_file_records.append(item)
 
         patch_name = (
-            f"DcmGet-{version}-windows-x64-components-from-{base_version}.zip"
+            f"DcmGet-{version}-windows-x64-components-from-{baseline.version}.zip"
         )
         component_patch_path = release_root / patch_name
         patch_manifest = {
@@ -276,7 +343,7 @@ def build_windows_update_release(
             "product": PRODUCT,
             "platform": PLATFORM,
             "layout_version": UPDATE_LAYOUT_VERSION,
-            "base_version": base_version,
+            "base_version": baseline.version,
             "version": version,
             "install_path_allowlist": list(INSTALL_PATH_ALLOWLIST),
             "base_tree_sha256": actual_base_tree_sha256,
@@ -296,7 +363,7 @@ def build_windows_update_release(
             "size": component_patch_path.stat().st_size,
             "sha256": file_sha256(component_patch_path),
             "signature_status": "NOT_APPLICABLE",
-            "base_version": base_version,
+            "base_version": baseline.version,
             "preserves_user_data": True,
             "content_scope": "application",
             "layout_version": UPDATE_LAYOUT_VERSION,
@@ -306,17 +373,48 @@ def build_windows_update_release(
             "files": patch_manifest["files"],
             "removed_paths": [],
         }
+        component_patch_paths.append(component_patch_path)
+        component_patches.append(component_patch)
+        changed_files_by_base.append((baseline.version, changed_files))
 
-    full_installer_record = {
-        "name": installer_path.name,
-        "kind": "full_installer",
-        "size": installer_path.stat().st_size,
-        "sha256": file_sha256(installer_path),
-        "signature_status": "SIGNED",
-        "preserves_user_data": True,
-        "content_scope": "application",
-        "source_release_manifest_kind": installer_record.get("kind"),
+    full_installer_record: dict[str, object] | None = None
+    if installer_path is not None and installer_record is not None:
+        full_installer_record = {
+            "name": installer_path.name,
+            "kind": "full_installer",
+            "size": installer_path.stat().st_size,
+            "sha256": file_sha256(installer_path),
+            "signature_status": "SIGNED",
+            "preserves_user_data": True,
+            "content_scope": "application",
+            "source_release_manifest_kind": installer_record.get("kind"),
+        }
+    update_artifacts = [
+        *([] if full_installer_record is None else [full_installer_record]),
+        *component_patches,
+    ]
+    if not update_artifacts:
+        raise WindowsUpdateBuildError("更新清单至少需要一个完整安装包或组件增量包")
+    if full_installer_record is not None:
+        chain_anchors = {version: current_tree_sha256}
+    component_chain = {
+        "schema_version": 1,
+        "root_full_releases": [
+            {
+                "version": anchor_version,
+                "install_tree_sha256": chain_anchors[anchor_version],
+            }
+            for anchor_version in sorted(
+                chain_anchors,
+                key=_version_tuple,
+                reverse=True,
+            )
+        ],
     }
+    if not component_chain["root_full_releases"]:
+        raise WindowsUpdateBuildError(
+            "组件更新链缺少已签名完整发布锚点"
+        )
     update_manifest = {
         "schema_version": UPDATE_SCHEMA_VERSION,
         "product": PRODUCT,
@@ -327,12 +425,10 @@ def build_windows_update_release(
         "install_tree_sha256": current_tree_sha256,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "compatibility": compatibility,
-        "artifacts": [
-            full_installer_record,
-            *([] if component_patch is None else [component_patch]),
-        ],
+        "component_chain": component_chain,
+        "artifacts": update_artifacts,
         "full_installer": full_installer_record,
-        "component_patches": [] if component_patch is None else [component_patch],
+        "component_patches": component_patches,
         "manifest_signature": {
             "name": UPDATE_SIGNATURE_NAME,
             "kind": "pkcs7_signed_data",
@@ -354,13 +450,25 @@ def build_windows_update_release(
     )
     _update_checksums(
         release_root,
-        [manifest_path, signature_path, component_patch_path],
+        [manifest_path, signature_path, *component_patch_paths],
     )
+    baseline_snapshot_path = release_root / COMPONENT_BASELINE_NAME
+    _write_component_baseline(
+        baseline_snapshot_path,
+        payload_root=payload_root,
+        files=current_files,
+    )
+    first_changed = changed_files_by_base[0][1] if changed_files_by_base else ()
     return WindowsUpdateBuildResult(
         manifest_path=manifest_path,
         signature_path=signature_path,
-        component_patch_path=component_patch_path,
-        changed_files=changed_files,
+        component_patch_path=(
+            component_patch_paths[0] if component_patch_paths else None
+        ),
+        changed_files=first_changed,
+        component_patch_paths=tuple(component_patch_paths),
+        changed_files_by_base=tuple(changed_files_by_base),
+        baseline_snapshot_path=baseline_snapshot_path,
     )
 
 
@@ -644,28 +752,14 @@ def _validate_compatible_base_manifest(
     manifest_signature = manifest.get("manifest_signature")
     if (
         not isinstance(manifest_signature, Mapping)
+        or manifest_signature.get("name") != UPDATE_SIGNATURE_NAME
         or manifest_signature.get("kind") != "pkcs7_signed_data"
         or manifest_signature.get("content_encoding") != "Embedded"
+        or manifest_signature.get("digest_algorithm") != "SHA256"
         or manifest_signature.get("timestamped") is not True
     ):
         raise WindowsUpdateBuildError(
             "上一稳定版更新清单没有有效的带时间戳 PKCS#7 声明"
-        )
-    artifacts = manifest.get("artifacts")
-    signed_installers = (
-        [
-            item
-            for item in artifacts
-            if isinstance(item, Mapping)
-            and item.get("kind") == "full_installer"
-            and item.get("signature_status") == "SIGNED"
-        ]
-        if isinstance(artifacts, list)
-        else []
-    )
-    if len(signed_installers) != 1:
-        raise WindowsUpdateBuildError(
-            "上一稳定版更新清单必须包含一个已签名完整安装包"
         )
     install_tree_sha256 = str(manifest.get("install_tree_sha256", "")).lower()
     if _SHA256_PATTERN.fullmatch(install_tree_sha256) is None:
@@ -679,12 +773,208 @@ def _validate_compatible_base_manifest(
         base_compatibility.get("layout_version") != UPDATE_LAYOUT_VERSION
         or base_compatibility.get("full_install_inputs_sha256")
         != compatibility.get("full_install_inputs_sha256")
+        or base_compatibility.get("full_install_inputs")
+        != compatibility.get("full_install_inputs")
     ):
         raise WindowsUpdateBuildError(
             "安装布局、Windows 服务、DCMTK 或依赖发生变化，"
             "请改用完整安装包"
         )
+    _validate_base_update_artifacts(
+        manifest,
+        version=base_version,
+        install_tree_sha256=install_tree_sha256,
+    )
     return install_tree_sha256
+
+
+def _validate_base_update_artifacts(
+    manifest: Mapping[str, object],
+    *,
+    version: str,
+    install_tree_sha256: str,
+) -> None:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise WindowsUpdateBuildError(
+            "上一稳定版更新清单没有有效的更新资源"
+        )
+
+    full_installers: list[Mapping[str, object]] = []
+    component_patches: list[Mapping[str, object]] = []
+    seen_names: set[str] = set()
+    for raw_record in artifacts:
+        if not isinstance(raw_record, Mapping):
+            raise WindowsUpdateBuildError("上一稳定版更新清单包含无效资源记录")
+        name = raw_record.get("name")
+        if not isinstance(name, str) or _SAFE_FILE_PATTERN.fullmatch(name) is None:
+            raise WindowsUpdateBuildError("上一稳定版更新清单包含不安全资源名")
+        canonical_name = name.casefold()
+        if canonical_name in seen_names:
+            raise WindowsUpdateBuildError("上一稳定版更新清单包含重复资源名")
+        seen_names.add(canonical_name)
+        try:
+            size = int(raw_record.get("size", 0))
+        except (TypeError, ValueError) as exc:
+            raise WindowsUpdateBuildError("上一稳定版更新资源大小无效") from exc
+        sha256 = str(raw_record.get("sha256", "")).lower()
+        if size <= 0 or _SHA256_PATTERN.fullmatch(sha256) is None:
+            raise WindowsUpdateBuildError("上一稳定版更新资源指纹无效")
+
+        kind = raw_record.get("kind")
+        if kind == "full_installer":
+            if (
+                raw_record.get("signature_status") != "SIGNED"
+                or raw_record.get("preserves_user_data") is not True
+                or raw_record.get("content_scope") != "application"
+            ):
+                raise WindowsUpdateBuildError(
+                    "上一稳定版完整安装包声明无效"
+                )
+            full_installers.append(raw_record)
+        elif kind == "component_patch":
+            _validate_component_patch_record(
+                raw_record,
+                version=version,
+                install_tree_sha256=install_tree_sha256,
+            )
+            component_patches.append(raw_record)
+        else:
+            raise WindowsUpdateBuildError(
+                f"上一稳定版更新清单包含不支持的资源类型：{kind}"
+            )
+
+    if len(full_installers) > 1:
+        raise WindowsUpdateBuildError(
+            "上一稳定版更新清单包含多个完整安装包"
+        )
+    if not full_installers and not component_patches:
+        raise WindowsUpdateBuildError(
+            "上一稳定版必须包含已签名完整安装包或可信组件增量包"
+        )
+    declared_full = manifest.get("full_installer")
+    if full_installers:
+        if declared_full != full_installers[0]:
+            raise WindowsUpdateBuildError(
+                "上一稳定版 full_installer 与 artifacts 不一致"
+            )
+    elif declared_full is not None:
+        raise WindowsUpdateBuildError(
+            "patch-only 基线不能声明不存在的 full_installer"
+        )
+    if manifest.get("component_patches") != component_patches:
+        raise WindowsUpdateBuildError(
+            "上一稳定版 component_patches 与 artifacts 不一致"
+        )
+
+
+def _component_chain_anchors(
+    manifest: Mapping[str, object],
+    *,
+    version: str,
+    install_tree_sha256: str,
+) -> tuple[tuple[str, str], ...]:
+    artifacts = manifest.get("artifacts")
+    has_full_release = isinstance(artifacts, list) and any(
+        isinstance(item, Mapping) and item.get("kind") == "full_installer"
+        for item in artifacts
+    )
+    if has_full_release:
+        return ((version, install_tree_sha256),)
+
+    chain = manifest.get("component_chain")
+    if not isinstance(chain, Mapping) or chain.get("schema_version") != 1:
+        raise WindowsUpdateBuildError(
+            "patch-only 基线缺少已签名完整发布链锚点"
+        )
+    raw_anchors = chain.get("root_full_releases")
+    if not isinstance(raw_anchors, list) or not raw_anchors:
+        raise WindowsUpdateBuildError(
+            "patch-only 基线缺少已签名完整发布链锚点"
+        )
+    anchors: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_anchors:
+        if not isinstance(item, Mapping):
+            raise WindowsUpdateBuildError("组件更新链锚点格式无效")
+        anchor_version = str(item.get("version", ""))
+        _validate_version(anchor_version, "组件更新链完整发布版本")
+        if _version_tuple(anchor_version) >= _version_tuple(version):
+            raise WindowsUpdateBuildError(
+                "patch-only 组件更新链锚点版本必须低于基线版本"
+            )
+        anchor_tree = str(item.get("install_tree_sha256", "")).lower()
+        if _SHA256_PATTERN.fullmatch(anchor_tree) is None:
+            raise WindowsUpdateBuildError("组件更新链锚点树指纹无效")
+        if anchor_version in seen:
+            raise WindowsUpdateBuildError("组件更新链锚点版本重复")
+        seen.add(anchor_version)
+        anchors.append((anchor_version, anchor_tree))
+    return tuple(anchors)
+
+
+def _validate_component_patch_record(
+    record: Mapping[str, object],
+    *,
+    version: str,
+    install_tree_sha256: str,
+) -> None:
+    base_version = str(record.get("base_version", ""))
+    _validate_version(base_version, "上一稳定版增量包基础版本")
+    if _version_tuple(base_version) >= _version_tuple(version):
+        raise WindowsUpdateBuildError("上一稳定版增量包基础版本无效")
+    base_tree_sha256 = str(record.get("base_tree_sha256", "")).lower()
+    target_tree_sha256 = str(record.get("target_tree_sha256", "")).lower()
+    if (
+        _SHA256_PATTERN.fullmatch(base_tree_sha256) is None
+        or target_tree_sha256 != install_tree_sha256
+        or record.get("signature_status") != "NOT_APPLICABLE"
+        or record.get("preserves_user_data") is not True
+        or record.get("content_scope") != "application"
+        or record.get("layout_version") != UPDATE_LAYOUT_VERSION
+        or record.get("install_path_allowlist") != list(INSTALL_PATH_ALLOWLIST)
+        or record.get("removed_paths") != []
+    ):
+        raise WindowsUpdateBuildError("上一稳定版组件增量包布局或树指纹无效")
+
+    files = record.get("files")
+    if not isinstance(files, list) or not files:
+        raise WindowsUpdateBuildError("上一稳定版组件增量包缺少文件清单")
+    seen_paths: set[str] = set()
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise WindowsUpdateBuildError("上一稳定版增量文件记录无效")
+        path = str(item.get("path", "")).replace("\\", "/")
+        canonical_path = path.casefold()
+        if (
+            not _is_allowed_install_path(path)
+            or _is_protected_state_path(path)
+            or canonical_path in seen_paths
+        ):
+            raise WindowsUpdateBuildError("上一稳定版增量文件路径无效或重复")
+        seen_paths.add(canonical_path)
+        try:
+            size = int(item.get("size", -1))
+        except (TypeError, ValueError) as exc:
+            raise WindowsUpdateBuildError("上一稳定版增量文件大小无效") from exc
+        sha256 = str(item.get("sha256", "")).lower()
+        if size < 0 or _SHA256_PATTERN.fullmatch(sha256) is None:
+            raise WindowsUpdateBuildError("上一稳定版增量文件指纹无效")
+        if item.get("base_missing") is True:
+            if item.get("base_size") is not None or item.get("base_sha256"):
+                raise WindowsUpdateBuildError("上一稳定版新增文件基础状态冲突")
+        else:
+            try:
+                base_size = int(item.get("base_size", -1))
+            except (TypeError, ValueError) as exc:
+                raise WindowsUpdateBuildError(
+                    "上一稳定版增量文件基础大小无效"
+                ) from exc
+            base_sha256 = str(item.get("base_sha256", "")).lower()
+            if base_size < 0 or _SHA256_PATTERN.fullmatch(base_sha256) is None:
+                raise WindowsUpdateBuildError(
+                    "上一稳定版增量文件基础指纹无效"
+                )
 
 
 def _write_component_patch(
@@ -720,6 +1010,34 @@ def _write_component_patch(
                 _write_deterministic_zip_bytes(
                     archive,
                     record.path,
+                    source.read_bytes(),
+                )
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_component_baseline(
+    output: Path,
+    *,
+    payload_root: Path,
+    files: Mapping[str, FileRecord],
+) -> None:
+    """Write the exact install tree used only by future release builders."""
+
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            mode="x",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for relative in sorted(files):
+                source = payload_root / PurePosixPath(relative)
+                _write_deterministic_zip_bytes(
+                    archive,
+                    relative,
                     source.read_bytes(),
                 )
         os.replace(temporary, output)
@@ -842,6 +1160,31 @@ def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
 
 
+def _normalise_baselines(
+    values: Iterable[ComponentBaseline],
+    *,
+    version: str,
+) -> tuple[ComponentBaseline, ...]:
+    by_version: dict[str, ComponentBaseline] = {}
+    for value in values:
+        if not isinstance(value, ComponentBaseline):
+            raise WindowsUpdateBuildError("组件更新基线格式无效")
+        _validate_version(value.version, "基础版本")
+        if _version_tuple(value.version) >= _version_tuple(version):
+            raise WindowsUpdateBuildError("基础版本必须低于目标版本")
+        if value.version in by_version:
+            raise WindowsUpdateBuildError(
+                f"组件更新基线版本重复：{value.version}"
+            )
+        by_version[value.version] = value
+    ordered = sorted(
+        by_version.values(),
+        key=lambda item: _version_tuple(item.version),
+        reverse=True,
+    )
+    return tuple(ordered[:MAX_COMPONENT_BASELINES])
+
+
 def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -867,6 +1210,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--install-root", type=_path, required=True)
     parser.add_argument("--release-manifest", type=_path)
     parser.add_argument("--full-installer", type=_path)
+    parser.add_argument(
+        "--patch-only",
+        action="store_true",
+        help="只发布组件增量包，不要求或声明完整安装包",
+    )
     parser.add_argument("--compatibility-root", type=_path, default=Path.cwd())
     parser.add_argument(
         "--compatibility-file",
@@ -879,7 +1227,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-version")
     parser.add_argument("--base-update-manifest", type=_path)
     parser.add_argument("--base-update-signature", type=_path)
+    parser.add_argument(
+        "--baseline",
+        nargs=4,
+        action="append",
+        metavar=("VERSION", "INSTALL_ROOT", "MANIFEST", "SIGNATURE"),
+        default=[],
+        help="可信基线；可重复，自动选取版本最近的五个",
+    )
     args = parser.parse_args(argv)
+    baselines = [
+        ComponentBaseline(
+            version=value[0],
+            install_root=Path(value[1]),
+            update_manifest=Path(value[2]),
+            update_signature=Path(value[3]),
+        )
+        for value in args.baseline
+    ]
     result = build_windows_update_release(
         release_directory=args.release_dir,
         version=args.version,
@@ -893,11 +1258,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_version=args.base_version,
         base_update_manifest=args.base_update_manifest,
         base_update_signature=args.base_update_signature,
+        baselines=baselines,
+        patch_only=args.patch_only,
     )
     print(result.manifest_path)
     print(result.signature_path)
-    if result.component_patch_path is not None:
-        print(result.component_patch_path)
+    for path in result.component_patch_paths:
+        print(path)
+    if result.baseline_snapshot_path is not None:
+        print(result.baseline_snapshot_path)
     return 0
 
 

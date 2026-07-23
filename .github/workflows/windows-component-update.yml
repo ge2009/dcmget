@@ -1,0 +1,367 @@
+name: Windows Component Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Update version in X.Y.Z format
+        required: true
+        default: 3.6.1
+      publish_update:
+        description: Publish the verified component update to GitHub Releases
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build signed Windows x64 component update
+    runs-on: windows-2025
+    timeout-minutes: 40
+
+    steps:
+      - name: Require signing secrets before doing build work
+        shell: pwsh
+        env:
+          SIGN_CERTIFICATE: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
+          SIGN_PASSWORD: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGN_CERTIFICATE)) {
+            throw "DCMGET_SIGN_CERTIFICATE_BASE64 is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGN_PASSWORD)) {
+            throw "DCMGET_SIGN_CERTIFICATE_PASSWORD is required"
+          }
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+
+      - name: Configure required Authenticode certificate
+        shell: pwsh
+        env:
+          SIGN_CERTIFICATE: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
+          SIGN_PASSWORD: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "dcmget-authenticode.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:SIGN_CERTIFICATE)
+          )
+          "DCMGET_SIGN_CERTIFICATE_PATH=$certificatePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_CERTIFICATE_PASSWORD=$env:SIGN_PASSWORD" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_TIMESTAMP_URL=http://timestamp.digicert.com" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install component build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Restore DCMTK cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .runtime/dcmtk/windows-x86_64
+            .runtime/downloads
+          key: dcmtk-3.7.0-integrity-v2-windows-x86_64
+
+      - name: Prepare DCMTK
+        shell: pwsh
+        run: python scripts/download_dcmtk.py --platform windows-x86_64
+
+      - name: Restore OHIF Viewer cache
+        uses: actions/cache@v4
+        with:
+          path: .runtime/ohif
+          key: ohif-3.12.6-${{ hashFiles('packaging/ohif/**', 'scripts/prepare_ohif.py') }}
+
+      - name: Prepare OHIF Viewer offline assets
+        shell: pwsh
+        run: python scripts/prepare_ohif.py
+
+      - name: Build signed onedir update payload
+        shell: pwsh
+        run: python scripts/build_windows.py --version "${{ inputs.version }}" --update-payload-only
+
+      - name: Download up to five recent trusted baselines
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = [Version]$env:TARGET_VERSION
+          $releaseData = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=30" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not list previous releases" }
+          $tagPattern = '^(?:component-)?v(?<version>\d+\.\d+\.\d+)$'
+          $candidates = @(
+            $releaseData |
+              Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match $tagPattern } |
+              ForEach-Object {
+                $tag = [string]$_.tag_name
+                if ($tag -notmatch $tagPattern) {
+                  throw "Unsafe baseline release tag: $tag"
+                }
+                $tagVersion = [string]$Matches["version"]
+                $parsed = [Version]$tagVersion
+                if ($parsed -lt $target) {
+                  [PSCustomObject]@{
+                    Release = $_
+                    Version = $parsed
+                    TagVersion = $tagVersion
+                  }
+                }
+              } |
+              Sort-Object Version -Descending
+          )
+          $baselineRoot = Join-Path $env:RUNNER_TEMP "dcmget-component-baselines"
+          New-Item -ItemType Directory -Force $baselineRoot | Out-Null
+          $baselines = @()
+          $acceptedVersions = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal
+          )
+          foreach ($candidate in $candidates) {
+            if ($baselines.Count -ge 5) { break }
+            $release = $candidate.Release
+            $baseVersion = [string]$candidate.TagVersion
+            if ($acceptedVersions.Contains($baseVersion)) { continue }
+            $assetNames = @($release.assets | ForEach-Object { [string]$_.name })
+            if (
+              $assetNames -notcontains "UPDATE-MANIFEST.json" -or
+              $assetNames -notcontains "UPDATE-MANIFEST.json.p7"
+            ) { continue }
+
+            $directory = Join-Path $baselineRoot $baseVersion
+            New-Item -ItemType Directory -Force $directory | Out-Null
+            $snapshotName = "component-baseline.zip"
+            $fullArchiveName = "DcmGet-$baseVersion-windows-x64.zip"
+            if ($assetNames -contains $snapshotName) {
+              $archiveName = $snapshotName
+              $usesFullRelease = $false
+            } elseif ($assetNames -contains $fullArchiveName) {
+              $archiveName = $fullArchiveName
+              $usesFullRelease = $true
+            } else {
+              Remove-Item $directory -Recurse -Force
+              continue
+            }
+
+            gh release download $release.tag_name `
+              --repo $env:GITHUB_REPOSITORY `
+              --pattern $archiveName `
+              --pattern "UPDATE-MANIFEST.json" `
+              --pattern "UPDATE-MANIFEST.json.p7" `
+              --dir $directory
+            if ($LASTEXITCODE -ne 0) { throw "Could not download baseline $baseVersion" }
+
+            $manifestPath = Join-Path $directory "UPDATE-MANIFEST.json"
+            $signaturePath = Join-Path $directory "UPDATE-MANIFEST.json.p7"
+            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+            $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
+            $cms.CheckSignature($true)
+            if ($cms.SignerInfos.Count -ne 1) {
+              throw "Baseline $baseVersion update manifest must have one signer"
+            }
+            $rawManifest = [IO.File]::ReadAllBytes($manifestPath)
+            if (
+              [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
+              [Convert]::ToBase64String($rawManifest)
+            ) {
+              throw "Baseline $baseVersion signed manifest content mismatch"
+            }
+            try {
+              $utf8 = [Text.UTF8Encoding]::new($false, $true)
+              $manifest = $utf8.GetString($cms.ContentInfo.Content) | ConvertFrom-Json
+            } catch {
+              throw "Baseline $baseVersion signed manifest is not valid UTF-8 JSON: $_"
+            }
+            if (
+              [string]$manifest.product -ne "DcmGet" -or
+              [string]$manifest.platform -ne "windows-x64" -or
+              [string]$manifest.channel -ne "stable"
+            ) {
+              throw "Baseline $baseVersion signed manifest identity is invalid"
+            }
+            if ([string]$manifest.version -ne $baseVersion) {
+              throw "Baseline release tag and signed manifest version mismatch: $baseVersion / $($manifest.version)"
+            }
+
+            $expanded = Join-Path $directory "expanded"
+            Expand-Archive (Join-Path $directory $archiveName) $expanded
+            $installRoot = if ($usesFullRelease) {
+              Join-Path $expanded "DcmGet"
+            } else {
+              $expanded
+            }
+            if (-not (Test-Path (Join-Path $installRoot "DcmGet.exe") -PathType Leaf)) {
+              throw "Baseline $baseVersion has no DcmGet.exe"
+            }
+            $baselines += [PSCustomObject]@{
+              version = $baseVersion
+              install_root = $installRoot
+              manifest = (Join-Path $directory "UPDATE-MANIFEST.json")
+              signature = (Join-Path $directory "UPDATE-MANIFEST.json.p7")
+            }
+            [void]$acceptedVersions.Add($baseVersion)
+          }
+          if ($baselines.Count -eq 0) {
+            throw "No component baseline is available. Publish one signed full release first."
+          }
+          $baselines | ConvertTo-Json -Depth 4 | Set-Content "build/windows/component-baselines.json" -Encoding utf8
+
+      - name: Build signed multi-baseline update manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arguments = @(
+            "scripts/build_windows_update.py",
+            "--release-dir", "release/windows",
+            "--version", "${{ inputs.version }}",
+            "--install-root", "build/windows/dist/DcmGet",
+            "--patch-only",
+            "--compatibility-root", ".",
+            "--compatibility-file", "packaging/windows/dcmget.iss",
+            "--compatibility-file", "packaging/windows/LICENSE-WINSW.txt",
+            "--compatibility-file", "packaging/windows/kayisoft-dcmget-host.ps1",
+            "--compatibility-file", "packaging/windows/kayisoft-dcmget.xml.template",
+            "--compatibility-file", "requirements.txt",
+            "--compatibility-file", "requirements-build.txt",
+            "--compatibility-file", "scripts/build_windows.py",
+            "--compatibility-file", "scripts/build_windows_update.py",
+            "--compatibility-file", "scripts/download_dcmtk.py",
+            "--compatibility-file", "scripts/prepare_ohif.py"
+          )
+          $baselines = @(Get-Content "build/windows/component-baselines.json" -Raw | ConvertFrom-Json)
+          foreach ($baseline in $baselines) {
+            $arguments += @(
+              "--baseline",
+              [string]$baseline.version,
+              [string]$baseline.install_root,
+              [string]$baseline.manifest,
+              [string]$baseline.signature
+            )
+          }
+          python @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Component update build failed" }
+
+      - name: Verify signed patch-only output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = (Resolve-Path "release/windows").Path
+          $applicationPath = (Resolve-Path "build/windows/dist/DcmGet/DcmGet.exe").Path
+          $application = Get-AuthenticodeSignature -LiteralPath $applicationPath
+          if ($application.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "DcmGet.exe Authenticode validation failed: $($application.Status)"
+          }
+          $manifestPath = Join-Path $root "UPDATE-MANIFEST.json"
+          $signaturePath = Join-Path $root "UPDATE-MANIFEST.json.p7"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($null -ne $manifest.full_installer) { throw "Patch-only manifest declared a full payload" }
+          $patches = @($manifest.component_patches)
+          if ($patches.Count -lt 1 -or $patches.Count -gt 5) {
+            throw "Patch-only manifest must contain between one and five direct patches"
+          }
+          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
+          $cms.CheckSignature($true)
+          if ($cms.SignerInfos.Count -ne 1) { throw "Update manifest must have one signer" }
+          $signer = $cms.SignerInfos[0].Certificate
+          if ($null -eq $signer -or $null -eq $application.SignerCertificate) {
+            throw "Update signer is missing"
+          }
+          if ($signer.Thumbprint -ne $application.SignerCertificate.Thumbprint) {
+            throw "Update manifest signer does not match DcmGet.exe"
+          }
+          if (
+            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($manifestPath))
+          ) { throw "Signed manifest content mismatch" }
+          if (-not (Test-Path (Join-Path $root "component-baseline.zip") -PathType Leaf)) {
+            throw "Builder baseline snapshot is missing"
+          }
+
+      - name: Upload component update payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Component-Update
+          path: |
+            release/windows/DcmGet-${{ inputs.version }}-windows-x64-components-from-*.zip
+            release/windows/SHA256SUMS.txt
+            release/windows/UPDATE-MANIFEST.json
+            release/windows/UPDATE-MANIFEST.json.p7
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload builder baseline snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Component-Baseline
+          path: release/windows/component-baseline.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish signed Windows x64 component update
+    if: ${{ inputs.publish_update }}
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified component payload
+        uses: actions/download-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Component-Update
+          path: release
+
+      - name: Download builder baseline snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: DcmGet-${{ inputs.version }}-Component-Baseline
+          path: baseline
+
+      - name: Recheck authenticated manifest
+        shell: pwsh
+        run: |
+          $manifestPath = (Resolve-Path "release/UPDATE-MANIFEST.json").Path
+          $signaturePath = (Resolve-Path "release/UPDATE-MANIFEST.json.p7").Path
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.version -ne "${{ inputs.version }}") { throw "Version mismatch" }
+          if ($null -ne $manifest.full_installer) { throw "Unexpected full payload" }
+          if (@($manifest.component_patches).Count -lt 1) { throw "No component patch" }
+          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+          $cms.Decode([IO.File]::ReadAllBytes($signaturePath))
+          $cms.CheckSignature($true)
+          if (
+            [Convert]::ToBase64String($cms.ContentInfo.Content) -ne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($manifestPath))
+          ) { throw "Signed manifest content mismatch" }
+
+      - name: Publish immutable component update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="component-v${{ inputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace update assets." >&2
+            exit 1
+          fi
+          gh release create "$tag" release/* baseline/component-baseline.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "DcmGet ${{ inputs.version }} component update" \
+            --generate-notes \
+            --latest

@@ -12,11 +12,15 @@ import pytest
 from dcmget.architecture import IMAGE_FILE_MACHINE_AMD64
 from dcmget.windows_update import _validated_candidate
 from scripts.build_windows_update import (
+    COMPONENT_BASELINE_NAME,
+    MAX_COMPONENT_BASELINES,
+    ComponentBaseline,
     INSTALL_PATH_ALLOWLIST,
     PATCH_MANIFEST_NAME,
     UPDATE_MANIFEST_NAME,
     UPDATE_SIGNATURE_NAME,
     WindowsUpdateBuildError,
+    _component_chain_anchors,
     build_windows_update_release,
 )
 from scripts.windows_release_gate import AuthenticodeConfig
@@ -155,6 +159,40 @@ def _build_base_update(
         runner=runner,
     )
     return install, result.manifest_path, result.signature_path
+
+
+def _build_full_baseline(
+    root: Path,
+    *,
+    version: str,
+    suffix: bytes,
+    compatibility_file: Path,
+    signing: AuthenticodeConfig,
+    runner,
+) -> ComponentBaseline:
+    release, installer, release_manifest = _signed_release_fixture(
+        root, version=version
+    )
+    install = _install_root(root)
+    _write_pe(install / "DcmGet.exe", suffix=suffix)
+    result = build_windows_update_release(
+        release_directory=release,
+        version=version,
+        install_root=install,
+        release_manifest_path=release_manifest,
+        full_installer=installer,
+        compatibility_files=[compatibility_file],
+        compatibility_root=compatibility_file.parent,
+        authenticode=signing,
+        runner=runner,
+    )
+    assert result.baseline_snapshot_path is not None
+    return ComponentBaseline(
+        version=version,
+        install_root=install,
+        update_manifest=result.manifest_path,
+        update_signature=result.signature_path,
+    )
 
 
 def test_update_manifest_requires_signed_timestamped_x64_release(tmp_path: Path):
@@ -564,6 +602,234 @@ def test_component_inventory_rejects_user_state_and_non_install_paths(
         )
 
 
+def test_patch_only_release_builds_direct_patches_from_recent_baselines(
+    tmp_path: Path,
+):
+    compatibility = tmp_path / "layout.txt"
+    compatibility.write_text("stable layout", encoding="utf-8")
+    signing = _signing_fixture(tmp_path)
+    runner = _successful_signtool_runner([])
+    older = _build_full_baseline(
+        tmp_path / "base-older",
+        version="3.5.0",
+        suffix=b"3.5.0",
+        compatibility_file=compatibility,
+        signing=signing,
+        runner=runner,
+    )
+    newer = _build_full_baseline(
+        tmp_path / "base-newer",
+        version="3.5.9",
+        suffix=b"3.5.9",
+        compatibility_file=compatibility,
+        signing=signing,
+        runner=runner,
+    )
+    release = tmp_path / "target" / "release"
+    release.mkdir(parents=True)
+    install = _install_root(tmp_path / "target")
+    _write_pe(install / "DcmGet.exe", suffix=b"3.6.0")
+
+    result = build_windows_update_release(
+        release_directory=release,
+        version="3.6.0",
+        install_root=install,
+        compatibility_files=[compatibility],
+        compatibility_root=compatibility.parent,
+        baselines=[older, newer],
+        patch_only=True,
+        authenticode=signing,
+        runner=runner,
+    )
+
+    assert [path.name for path in result.component_patch_paths] == [
+        "DcmGet-3.6.0-windows-x64-components-from-3.5.9.zip",
+        "DcmGet-3.6.0-windows-x64-components-from-3.5.0.zip",
+    ]
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["full_installer"] is None
+    assert manifest["artifacts"] == manifest["component_patches"]
+    assert [item["base_version"] for item in manifest["component_patches"]] == [
+        "3.5.9",
+        "3.5.0",
+    ]
+    for base_version in ("3.5.9", "3.5.0"):
+        candidate = _validated_candidate(
+            manifest,
+            {
+                item["name"]: f"https://example.test/{item['name']}"
+                for item in manifest["artifacts"]
+            },
+            release_url="https://example.test/release",
+            allowed_asset_url=lambda _url: True,
+        )
+        assert candidate.preferred_asset(base_version).base_version == base_version
+
+    assert result.baseline_snapshot_path == release / COMPONENT_BASELINE_NAME
+    assert result.baseline_snapshot_path.is_file()
+    with zipfile.ZipFile(result.baseline_snapshot_path) as archive:
+        assert PATCH_MANIFEST_NAME not in archive.namelist()
+        assert "DcmGet.exe" in archive.namelist()
+        assert all(
+            name == "DcmGet.exe" or name.startswith("_internal/")
+            for name in archive.namelist()
+        )
+    checksums = (release / "SHA256SUMS.txt").read_text(encoding="ascii")
+    assert COMPONENT_BASELINE_NAME not in checksums
+
+
+def test_patch_only_manifest_can_be_a_verified_baseline_for_next_release(
+    tmp_path: Path,
+):
+    compatibility = tmp_path / "layout.txt"
+    compatibility.write_text("stable layout", encoding="utf-8")
+    signing = _signing_fixture(tmp_path)
+    runner = _successful_signtool_runner([])
+    full_base = _build_full_baseline(
+        tmp_path / "full-base",
+        version="3.5.0",
+        suffix=b"3.5.0",
+        compatibility_file=compatibility,
+        signing=signing,
+        runner=runner,
+    )
+
+    middle_release = tmp_path / "middle" / "release"
+    middle_release.mkdir(parents=True)
+    middle_install = _install_root(tmp_path / "middle")
+    _write_pe(middle_install / "DcmGet.exe", suffix=b"3.5.1")
+    middle = build_windows_update_release(
+        release_directory=middle_release,
+        version="3.5.1",
+        install_root=middle_install,
+        compatibility_files=[compatibility],
+        compatibility_root=compatibility.parent,
+        baselines=[full_base],
+        patch_only=True,
+        authenticode=signing,
+        runner=runner,
+    )
+    assert middle.baseline_snapshot_path is not None
+    expanded = tmp_path / "middle-expanded"
+    with zipfile.ZipFile(middle.baseline_snapshot_path) as archive:
+        archive.extractall(expanded)
+    patch_only_base = ComponentBaseline(
+        version="3.5.1",
+        install_root=expanded,
+        update_manifest=middle.manifest_path,
+        update_signature=middle.signature_path,
+    )
+
+    target_release = tmp_path / "target" / "release"
+    target_release.mkdir(parents=True)
+    target_install = _install_root(tmp_path / "target")
+    _write_pe(target_install / "DcmGet.exe", suffix=b"3.6.0")
+    result = build_windows_update_release(
+        release_directory=target_release,
+        version="3.6.0",
+        install_root=target_install,
+        compatibility_files=[compatibility],
+        compatibility_root=compatibility.parent,
+        baselines=[patch_only_base],
+        patch_only=True,
+        authenticode=signing,
+        runner=runner,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["full_installer"] is None
+    assert [item["base_version"] for item in manifest["component_patches"]] == [
+        "3.5.1"
+    ]
+    assert [
+        item["version"]
+        for item in manifest["component_chain"]["root_full_releases"]
+    ] == ["3.5.0"]
+
+
+def test_component_release_keeps_only_five_most_recent_direct_baselines(
+    tmp_path: Path,
+):
+    compatibility = tmp_path / "layout.txt"
+    compatibility.write_text("stable layout", encoding="utf-8")
+    signing = _signing_fixture(tmp_path)
+    runner = _successful_signtool_runner([])
+    baselines = [
+        _build_full_baseline(
+            tmp_path / f"base-{patch}",
+            version=f"3.5.{patch}",
+            suffix=f"3.5.{patch}".encode(),
+            compatibility_file=compatibility,
+            signing=signing,
+            runner=runner,
+        )
+        for patch in range(6)
+    ]
+    release = tmp_path / "target" / "release"
+    release.mkdir(parents=True)
+    install = _install_root(tmp_path / "target")
+    _write_pe(install / "DcmGet.exe", suffix=b"3.6.0")
+
+    result = build_windows_update_release(
+        release_directory=release,
+        version="3.6.0",
+        install_root=install,
+        compatibility_files=[compatibility],
+        compatibility_root=compatibility.parent,
+        baselines=list(reversed(baselines)),
+        patch_only=True,
+        authenticode=signing,
+        runner=runner,
+    )
+
+    assert len(result.component_patch_paths) == MAX_COMPONENT_BASELINES
+    assert [version for version, _files in result.changed_files_by_base] == [
+        "3.5.5",
+        "3.5.4",
+        "3.5.3",
+        "3.5.2",
+        "3.5.1",
+    ]
+
+
+def test_patch_only_release_requires_a_signed_full_release_chain_anchor(
+    tmp_path: Path,
+):
+    release = tmp_path / "release"
+    release.mkdir()
+    install = _install_root(tmp_path)
+
+    with pytest.raises(WindowsUpdateBuildError, match="首个组件更新基线"):
+        build_windows_update_release(
+            release_directory=release,
+            version="3.6.0",
+            install_root=install,
+            patch_only=True,
+            authenticode=_signing_fixture(tmp_path),
+            runner=_successful_signtool_runner([]),
+        )
+
+
+def test_patch_only_chain_anchor_must_precede_the_baseline_version():
+    tree = hashlib.sha256(b"tree").hexdigest()
+    manifest = {
+        "artifacts": [{"kind": "component_patch"}],
+        "component_chain": {
+            "schema_version": 1,
+            "root_full_releases": [
+                {"version": "3.5.1", "install_tree_sha256": tree}
+            ],
+        },
+    }
+
+    with pytest.raises(WindowsUpdateBuildError, match="必须低于基线版本"):
+        _component_chain_anchors(
+            manifest,
+            version="3.5.1",
+            install_tree_sha256=tree,
+        )
+
+
 def test_windows_workflow_publishes_only_explicit_authenticated_release():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
@@ -588,3 +854,63 @@ def test_windows_workflow_publishes_only_explicit_authenticated_release():
     assert "standalone archive tree does not match signed update manifest" in workflow
     assert "component patch target tree does not match release tree" in workflow
     assert "refusing to replace published update assets" in workflow
+
+
+def test_component_workflow_is_manual_patch_only_and_skips_full_build_stages():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (
+        root / ".github/workflows/windows-component-update.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "publish_update:" in workflow
+    assert "default: false" in workflow
+    assert "if: ${{ inputs.publish_update }}" in workflow
+    assert "DCMGET_SIGN_CERTIFICATE_BASE64 is required" in workflow
+    assert "DCMGET_SIGN_CERTIFICATE_PASSWORD is required" in workflow
+    assert "--update-payload-only" in workflow
+    assert "--patch-only" in workflow
+    assert '"--baseline"' in workflow
+    assert "component-baseline.zip" in workflow
+    assert "if ($baselines.Count -ge 5)" in workflow
+    assert "Publish one signed full release first" in workflow
+    assert 'tag="component-v${{ inputs.version }}"' in workflow
+    assert 'tag="v${{ inputs.version }}"' not in workflow
+    assert "Build current one-click installer" not in workflow
+    assert "Build standalone and portable EXE" not in workflow
+    assert "Prepare Chinese installer language" not in workflow
+    assert "Download VC++ Runtime" not in workflow
+    assert "Smoke test portable application" not in workflow
+    assert "Upgrade installer" not in workflow
+    assert "Uninstaller" not in workflow
+
+
+def test_release_workflows_accept_only_signed_version_matched_baselines():
+    root = Path(__file__).resolve().parents[1]
+    component_workflow = (
+        root / ".github/workflows/windows-component-update.yml"
+    ).read_text(encoding="utf-8")
+    full_workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for workflow in (component_workflow, full_workflow):
+        assert "component-baseline.zip" in workflow
+        assert "System.Security.Cryptography.Pkcs.SignedCms" in workflow
+        assert "$cms.CheckSignature($true)" in workflow
+        assert "(?:component-)?v(?<version>\\d+\\.\\d+\\.\\d+)" in workflow
+
+    assert "Baseline release tag and signed manifest version mismatch" in (
+        component_workflow
+    )
+    assert "Baseline $baseVersion signed manifest content mismatch" in (
+        component_workflow
+    )
+    assert "Previous release tag and signed manifest version mismatch" in (
+        full_workflow
+    )
+    assert "Previous signed manifest content mismatch" in full_workflow
+    assert '"DcmGet-$tagVersion-windows-x64.zip"' in full_workflow
+    assert "Previous signed baseline version must be lower than target version" in (
+        full_workflow
+    )

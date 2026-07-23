@@ -49,6 +49,7 @@ TERMINAL_STATUSES = {
     "partial",
     "partial_success",
     "cancelled",
+    "ended",
     "pdi_completed",
 }
 
@@ -69,6 +70,9 @@ STATUS_LABELS = {
     "partial": "部分完成",
     "partial_success": "部分完成",
     "cancelled": "已取消",
+    "ending": "正在结束",
+    "ended": "已结束",
+    "end_failed": "结束失败",
     "pdi_pending": "PDI 等待生成",
     "pdi_running": "PDI 生成中",
     "pdi_retryable": "PDI 可重试",
@@ -82,6 +86,8 @@ STATUS_MESSAGES = {
     "paused": "下载已暂停，可以随时继续",
     "interrupted": "下载已安全中断，可以继续",
     "download_retryable": "部分检查号未完成，可以重试失败项",
+    "ending": "正在停止后台进程并清除任务恢复点",
+    "ended": "任务已结束；已下载文件和日志已保留",
 }
 
 
@@ -1424,11 +1430,12 @@ async def _build_profile(
             _notify_error(exc, "启动失败")
             refs["start"].enable()
 
-    async def task_action(action: str) -> None:
+    async def task_action(action: str) -> bool:
         labels = {
             "pause": "暂停",
             "resume": "继续",
             "cancel": "取消",
+            "end": "结束任务",
             "retry-failed": "重试",
             "accept-partial": "接受已有文件",
         }
@@ -1437,8 +1444,41 @@ async def _build_profile(
             state.task = dict(result.get("task") or result)
             render_task()
             ui.notify(f"{labels.get(action, '操作')}命令已提交", type="positive")
+            return True
         except Exception as exc:
             _notify_error(exc)
+            return False
+
+    def confirm_end_task() -> None:
+        with ui.dialog() as confirm, ui.card().classes("settings-dialog p-0"):
+            with ui.element("div").classes("surface-head"):
+                with ui.element("div"):
+                    ui.label("结束当前任务").classes("text-xl")
+                    ui.label("结束后不能继续或重试这个任务")
+                ui.button(icon="close", on_click=confirm.close).props("flat round")
+            with ui.element("div").classes("surface-body"):
+                ui.label(
+                    "将先停止当前下载或 PDI 进程，再删除任务恢复点。"
+                    "已经下载的 DICOM 文件和任务日志会保留，此操作不可撤销。"
+                ).classes("text-sm")
+
+                async def finish_task() -> None:
+                    end_button.disable()
+                    end_button.set_text("正在结束…")
+                    if await task_action("end"):
+                        confirm.close()
+                        return
+                    end_button.enable()
+                    end_button.set_text("确认结束")
+
+                with ui.row().classes("justify-end w-full pt-5"):
+                    ui.button("返回", on_click=confirm.close).props("flat")
+                    end_button = ui.button(
+                        "确认结束",
+                        icon="stop_circle",
+                        on_click=finish_task,
+                    ).props("unelevated no-caps").classes("button-danger")
+        confirm.open()
 
     async def pdi_action(action: str) -> None:
         labels = {"open": "打开 PDI", "verify": "校验 PDI", "retry": "重试 PDI"}
@@ -1622,7 +1662,8 @@ async def _build_profile(
             refs["readiness"].set_text(task_block_message())
         refs["pause"].set_visibility(bool(actions.get("can_pause", status in ACTIVE_STATUSES)))
         refs["resume"].set_visibility(bool(actions.get("can_resume", status in RESUMABLE_STATUSES)))
-        refs["cancel"].set_visibility(bool(actions.get("can_cancel", status not in TERMINAL_STATUSES | {"idle"})))
+        refs["cancel"].set_visibility(bool(actions.get("can_cancel")))
+        refs["end_task"].set_visibility(bool(actions.get("can_end")))
         refs["retry"].set_visibility(bool(actions.get("can_retry_failed", _task_count(task, "failed", "failed_count") > 0)))
         refs["accept"].set_visibility(bool(actions.get("can_accept_partial")))
         pdi = task.get("pdi")
@@ -2000,7 +2041,16 @@ async def _build_profile(
                         with ui.element("div").classes("action-row"):
                             refs["pause"] = ui.button("暂停", icon="pause", on_click=lambda: task_action("pause")).props("flat").classes("button-quiet")
                             refs["resume"] = ui.button("继续", icon="play_arrow", on_click=lambda: task_action("resume")).props("unelevated no-caps").classes("button-primary")
-                            refs["cancel"] = ui.button("取消任务", icon="close", on_click=lambda: task_action("cancel")).props("flat").classes("button-danger")
+                            refs["cancel"] = ui.button(
+                                "取消任务",
+                                icon="close",
+                                on_click=lambda: task_action("cancel"),
+                            ).props("flat no-caps").classes("button-quiet")
+                            refs["end_task"] = ui.button(
+                                "结束任务",
+                                icon="stop_circle",
+                                on_click=confirm_end_task,
+                            ).props("flat no-caps").classes("button-danger")
                             refs["retry"] = ui.button("重试失败项", icon="refresh", on_click=lambda: task_action("retry-failed")).props("flat").classes("button-quiet")
                             refs["accept"] = ui.button("接受已有文件", icon="done_all", on_click=lambda: task_action("accept-partial")).props("flat").classes("button-quiet")
                         refs["pdi_runtime"] = ui.element("div").classes("large-summary mt-5")

@@ -158,6 +158,8 @@ class WebAppService(Protocol):
 
     def cancel(self) -> object: ...
 
+    def end_task(self) -> object: ...
+
     def retry_failed(self, tools: object) -> object: ...
 
     def accept_partial(self) -> object: ...
@@ -946,6 +948,16 @@ def create_web_app(
     async def cancel(_session: WebSession = Depends(require_csrf)) -> Any:
         result = await no_body_action("cancel")
         return {"task": _task_view(result), "snapshot": result} if isinstance(result, dict) else result
+
+    @app.post("/api/task/end")
+    @app.post("/api/tasks/end")
+    async def end_task(_session: WebSession = Depends(require_csrf)) -> Any:
+        result = await no_body_action("end_task")
+        return (
+            {"task": _task_view(result), "snapshot": result}
+            if isinstance(result, dict)
+            else result
+        )
 
     @app.post("/api/task/retry")
     @app.post("/api/tasks/retry-failed")

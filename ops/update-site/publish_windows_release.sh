@@ -149,10 +149,12 @@ except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
     raise SystemExit(f"已签名更新清单不是有效 UTF-8 JSON: {exc}") from exc
 
 expected = {
+    "version": expected_version,
     "product": "DcmGet",
     "platform": "windows-x64",
     "channel": "stable",
-    "version": expected_version,
+    "schema_version": 1,
+    "layout_version": 1,
 }
 for field, value in expected.items():
     if manifest.get(field) != value:
@@ -174,6 +176,74 @@ if not isinstance(artifacts, list) or not artifacts:
 
 seen = set()
 full_installers = 0
+component_patches = 0
+install_tree = str(manifest.get("install_tree_sha256", "")).lower()
+if sha256.fullmatch(install_tree) is None:
+    raise SystemExit("已签名更新清单缺少有效安装树指纹")
+
+def validate_component_patch(record, name):
+    global component_patches
+    base_version = str(record.get("base_version", ""))
+    if re.fullmatch(r"\d+\.\d+\.\d+", base_version) is None:
+        raise SystemExit(f"组件增量包基础版本无效: {name}")
+    if tuple(map(int, base_version.split("."))) >= tuple(
+        map(int, expected_version.split("."))
+    ):
+        raise SystemExit(f"组件增量包基础版本不能高于或等于目标版本: {name}")
+    if (
+        record.get("signature_status") != "NOT_APPLICABLE"
+        or record.get("preserves_user_data") is not True
+        or record.get("content_scope") != "application"
+        or record.get("layout_version") != manifest.get("layout_version")
+        or record.get("install_path_allowlist") != ["DcmGet.exe", "_internal/**"]
+        or record.get("removed_paths") != []
+    ):
+        raise SystemExit(f"组件增量包安全范围声明无效: {name}")
+    base_tree = str(record.get("base_tree_sha256", "")).lower()
+    target_tree = str(record.get("target_tree_sha256", "")).lower()
+    if sha256.fullmatch(base_tree) is None or target_tree != install_tree:
+        raise SystemExit(f"组件增量包树指纹无效: {name}")
+    files = record.get("files")
+    if not isinstance(files, list) or not files:
+        raise SystemExit(f"组件增量包缺少文件清单: {name}")
+    paths = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise SystemExit(f"组件增量包文件记录无效: {name}")
+        relative = str(item.get("path", "")).replace("\\", "/")
+        parts = relative.split("/")
+        allowed = relative == "DcmGet.exe" or (
+            len(parts) >= 2 and parts[0] == "_internal"
+        )
+        canonical = relative.casefold()
+        if (
+            not allowed
+            or any(part in {"", ".", ".."} for part in parts)
+            or ":" in relative
+            or canonical in paths
+        ):
+            raise SystemExit(f"组件增量包文件路径无效或重复: {relative}")
+        paths.add(canonical)
+        try:
+            file_size = int(item.get("size", -1))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"组件增量包文件大小无效: {relative}") from exc
+        file_sha256 = str(item.get("sha256", "")).lower()
+        if file_size < 0 or sha256.fullmatch(file_sha256) is None:
+            raise SystemExit(f"组件增量包文件指纹无效: {relative}")
+        if item.get("base_missing") is True:
+            if item.get("base_size") is not None or item.get("base_sha256"):
+                raise SystemExit(f"组件增量包新增文件基础状态冲突: {relative}")
+        else:
+            try:
+                base_size = int(item.get("base_size", -1))
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(f"组件增量包基础文件大小无效: {relative}") from exc
+            base_sha256 = str(item.get("base_sha256", "")).lower()
+            if base_size < 0 or sha256.fullmatch(base_sha256) is None:
+                raise SystemExit(f"组件增量包基础文件指纹无效: {relative}")
+    component_patches += 1
+
 for record in artifacts:
     if not isinstance(record, dict):
         raise SystemExit("已签名更新清单包含无效资源记录")
@@ -202,11 +272,55 @@ for record in artifacts:
             digest.update(block)
     if digest.hexdigest() != expected_sha256:
         raise SystemExit(f"已签名更新资源 SHA-256 不一致: {name}")
-    if record.get("kind") == "full_installer":
+    kind = record.get("kind")
+    if kind == "full_installer":
+        if (
+            record.get("signature_status") != "SIGNED"
+            or record.get("preserves_user_data") is not True
+            or record.get("content_scope") != "application"
+        ):
+            raise SystemExit(f"完整安装包安全声明无效: {name}")
         full_installers += 1
+    elif kind == "component_patch":
+        validate_component_patch(record, name)
+    else:
+        raise SystemExit(f"已签名更新清单包含不支持的资源类型: {kind!r}")
 
-if full_installers != 1:
-    raise SystemExit("已签名更新清单必须且只能包含一个完整安装包")
+if full_installers > 1:
+    raise SystemExit("已签名更新清单最多只能包含一个完整安装包")
+if full_installers == 0 and component_patches == 0:
+    raise SystemExit("已签名更新清单没有有效的完整安装包或组件增量包")
+if full_installers == 0:
+    chain = manifest.get("component_chain")
+    roots = chain.get("root_full_releases") if isinstance(chain, dict) else None
+    if (
+        not isinstance(chain, dict)
+        or chain.get("schema_version") != 1
+        or not isinstance(roots, list)
+        or not roots
+    ):
+        raise SystemExit("patch-only 更新缺少已签名完整发布链锚点")
+    root_versions = set()
+    for root in roots:
+        if not isinstance(root, dict):
+            raise SystemExit("组件更新链锚点格式无效")
+        root_version = str(root.get("version", ""))
+        root_tree = str(root.get("install_tree_sha256", "")).lower()
+        if (
+            re.fullmatch(r"\d+\.\d+\.\d+", root_version) is None
+            or tuple(map(int, root_version.split(".")))
+            >= tuple(map(int, expected_version.split(".")))
+            or sha256.fullmatch(root_tree) is None
+            or root_version in root_versions
+        ):
+            raise SystemExit("组件更新链锚点无效或重复")
+        root_versions.add(root_version)
+artifact_full = [item for item in artifacts if item.get("kind") == "full_installer"]
+artifact_patches = [item for item in artifacts if item.get("kind") == "component_patch"]
+if manifest.get("full_installer") != (artifact_full[0] if artifact_full else None):
+    raise SystemExit("已签名更新清单 full_installer 与 artifacts 不一致")
+if manifest.get("component_patches") != artifact_patches:
+    raise SystemExit("已签名更新清单 component_patches 与 artifacts 不一致")
 PY
 
 for file in "${source_files[@]}"; do

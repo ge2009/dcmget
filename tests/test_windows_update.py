@@ -1050,7 +1050,10 @@ def test_mirror_asset_security_error_never_falls_back_to_github(tmp_path: Path):
     assert github.download_count == 0
 
 
-def test_github_source_only_parses_manifest_after_injected_pkcs7_verification():
+@pytest.mark.parametrize("release_tag", ["v3.6.0", "component-v3.6.0"])
+def test_github_source_only_parses_manifest_after_injected_pkcs7_verification(
+    release_tag: str,
+):
     patch_content = b"patch payload"
     manifest = {
         "schema_version": 1,
@@ -1089,17 +1092,17 @@ def test_github_source_only_parses_manifest_after_injected_pkcs7_verification():
     }
     manifest_url = (
         "https://github.com/ge2009/dcmget/releases/download/"
-        "v3.6.0/UPDATE-MANIFEST.json.p7"
+        f"{release_tag}/UPDATE-MANIFEST.json.p7"
     )
     patch_url = (
-        "https://github.com/ge2009/dcmget/releases/download/v3.6.0/"
+        f"https://github.com/ge2009/dcmget/releases/download/{release_tag}/"
         "DcmGet-3.6.0-from-3.5.2-component.zip"
     )
     release = {
-        "tag_name": "v3.6.0",
+        "tag_name": release_tag,
         "draft": False,
         "prerelease": False,
-        "html_url": "https://github.com/ge2009/dcmget/releases/tag/v3.6.0",
+        "html_url": f"https://github.com/ge2009/dcmget/releases/tag/{release_tag}",
         "assets": [
             {
                 "name": "UPDATE-MANIFEST.json.p7",
@@ -1135,6 +1138,78 @@ def test_github_source_only_parses_manifest_after_injected_pkcs7_verification():
     assert verified_inputs == [b"pkcs7 envelope, not json"]
     assert candidate.version == "3.6.0"
     assert candidate.assets[0].kind == "component_patch"
+
+
+@pytest.mark.parametrize(
+    "release_tag",
+    [
+        "3.6.0",
+        "v3.6",
+        "v3.6.0-extra",
+        "component-component-v3.6.0",
+        "component-v3.6.1",
+    ],
+)
+def test_github_source_rejects_unsafe_or_manifest_mismatched_release_tags(
+    release_tag: str,
+):
+    installer = b"signed installer"
+    manifest = {
+        "schema_version": 1,
+        "product": "DcmGet",
+        "platform": "windows-x64",
+        "channel": "stable",
+        "version": "3.6.0",
+        "artifacts": [
+            {
+                "name": "DcmGet-3.6.0-Setup-x64.exe",
+                "kind": "full_installer",
+                "size": len(installer),
+                "sha256": _sha256(installer),
+                "signature_status": "SIGNED",
+            }
+        ],
+    }
+    manifest_url = (
+        "https://github.com/ge2009/dcmget/releases/download/"
+        "v3.6.0/UPDATE-MANIFEST.json.p7"
+    )
+    installer_url = (
+        "https://github.com/ge2009/dcmget/releases/download/"
+        "v3.6.0/DcmGet-3.6.0-Setup-x64.exe"
+    )
+    release = {
+        "tag_name": release_tag,
+        "draft": False,
+        "prerelease": False,
+        "html_url": "",
+        "assets": [
+            {
+                "name": "UPDATE-MANIFEST.json.p7",
+                "browser_download_url": manifest_url,
+            },
+            {
+                "name": "DcmGet-3.6.0-Setup-x64.exe",
+                "browser_download_url": installer_url,
+            },
+        ],
+    }
+
+    def urlopen(request, **kwargs):
+        url = request.full_url
+        if url.endswith("/releases/latest"):
+            return FakeResponse(json.dumps(release).encode("utf-8"), url)
+        if url == manifest_url:
+            return FakeResponse(b"pkcs7 envelope", url)
+        raise AssertionError(url)
+
+    source = GitHubReleaseSource(
+        signed_manifest_verifier=lambda _: json.dumps(manifest).encode("utf-8"),
+        urlopen=urlopen,
+    )
+
+    with pytest.raises(UpdateSecurityError, match="标签与签名清单版本不一致"):
+        source.fetch_latest()
 
 
 def test_github_source_rejects_unsigned_json_and_non_github_redirects():

@@ -110,6 +110,42 @@ curl -I https://dcmget.v2ex.com.cn/healthz
 
 ## 发布 Windows 更新
 
+### 日常快速组件更新（默认）
+
+日常代码和界面迭代使用独立的 `Windows Component Update` 工作流。它只构建并签名 onedir 应用负载、生成最近最多 5 个稳定版本直达当前版本的组件补丁、签名更新清单，并生成供下一次构建使用的 `component-baseline.zip`。它不会构建完整安装发布物，也不会执行完整安装升级验收，因此反馈更快。
+
+```bash
+gh workflow run windows-component-update.yml \
+  --repo ge2009/dcmget \
+  --ref main \
+  -f version=3.6.1 \
+  -f publish_update=false
+```
+
+- `publish_update=false` 是默认值，只生成 GitHub Actions 验收产物。
+- 明确改为 `publish_update=true` 时，才会创建不可覆盖的 `component-vX.Y.Z` GitHub Release；正式完整发布仍独占 `vX.Y.Z` 标签。
+- 工作流在下载依赖和开始构建之前检查代码签名 secrets，缺失时立即失败。
+- `component-baseline.zip` 只供后续构建器比对应用树，不进入签名更新清单的 `artifacts`，客户端不会下载它。
+- 更新清单可以不包含完整安装包，但必须包含至少一个经过严格校验的组件补丁。没有匹配基线的旧客户端需要人工安装新的完整版本。
+- 自动更新链必须先有一个已签名完整发布作为初始基线；仓库尚无合格基线时，组件工作流会明确失败。
+
+只有下列情况才运行完整的 `Windows Release` 工作流：首次建立签名基线、安装逻辑或依赖布局变化、需要给新用户提供安装包，或者需要覆盖超过最近 5 个版本的升级场景。
+
+完整工作流的 `component_update` 入口会从 GitHub `latest` 读取上一份可信基线：组件发布使用 `component-baseline.zip`，完整发布使用 `DcmGet-<version>-windows-x64.zip`。两种情况都必须先验证 PKCS#7 签名内容，并确认 `vX.Y.Z` 或 `component-vX.Y.Z` 标签与签名清单版本完全一致，因此不需要为了避开组件版 `latest` 而关闭组件差分。
+
+静态更新镜像中的同一版本目录是不可变的。某个 `X.Y.Z` 组件更新一旦发布到镜像，后续如需完整安装包，请将完整发布版本提升到更高的三段式版本（例如 `X.Y.(Z+1)`），不要尝试用完整包覆盖同版本目录。
+
+```bash
+gh workflow run windows-release.yml \
+  --repo ge2009/dcmget \
+  --ref main \
+  -f version=3.7.0 \
+  -f publish_release=true \
+  -f component_update=true
+```
+
+### 发布到静态镜像
+
 `publish_windows_release.sh` 接受单个版本的扁平发布目录和严格的三段式版本号。目录必须包含 `UPDATE-MANIFEST.json.p7`，并且只允许顶层普通文件；不要直接传入混有历史产物和子目录的仓库 `release/windows/`。
 
 ```bash
@@ -121,13 +157,28 @@ gh run download <run-id> \
 ./ops/update-site/publish_windows_release.sh /tmp/dcmget-3.6.0-release 3.6.0
 ```
 
+组件更新使用不含 builder baseline 的独立 Actions 产物：
+
+```bash
+mkdir -p /tmp/dcmget-3.6.1-update
+gh run download <run-id> \
+  --repo ge2009/dcmget \
+  --name DcmGet-3.6.1-Component-Update \
+  --dir /tmp/dcmget-3.6.1-update
+./ops/update-site/publish_windows_release.sh /tmp/dcmget-3.6.1-update 3.6.1
+```
+
+不要把 `DcmGet-<version>-Component-Baseline` 下载到该目录；它只用于下一轮构建，不应发布到客户端静态镜像。
+
 脚本固定通过 `ssh bwg-snell` 发布，步骤如下：
 
-1. 使用 `rsync` 上传到 `updates/releases/` 下的同文件系统隐藏临时目录。
-2. 使用本地 SHA-256 清单逐文件校验远端内容。
-3. 原子改名为 `updates/releases/<version>/`；如果同版本已存在，仅在内容完全一致时继续。
-4. 清理旧的语义版本目录，保留最新两个；当前 stable 对应版本和正在发布版本始终受保护。若无法唯一识别当前 stable，安全地跳过清理。
-5. 最后单独上传、校验并原子替换 `updates/stable/UPDATE-MANIFEST.json.p7`。
+1. 本地验证 PKCS#7 内嵌清单、版本、所有声明资源的大小和 SHA-256。
+2. 允许“一个已签名完整安装包”或“零个完整安装包但至少一个合法组件补丁”；拒绝空清单、未知资源类型和越界组件路径。
+3. 使用 `rsync` 上传到 `updates/releases/` 下的同文件系统隐藏临时目录。
+4. 使用本地 SHA-256 清单逐文件校验远端内容。
+5. 原子改名为 `updates/releases/<version>/`；如果同版本已存在，仅在内容完全一致时继续。
+6. 清理旧的语义版本目录，保留最新两个；当前 stable 对应版本和正在发布版本始终受保护。若无法唯一识别当前 stable，安全地跳过清理。
+7. 最后单独上传、校验并原子替换 `updates/stable/UPDATE-MANIFEST.json.p7`。
 
 发布前需确保本机能够无交互访问 `ssh bwg-snell`，并安装 `ssh`、`scp`、`rsync` 及 `sha256sum` 或 `shasum`。脚本不负责签名清单，也不会修改 OpenResty 或 DNS。
 

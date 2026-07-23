@@ -378,6 +378,20 @@ def test_nicegui_primary_action_is_high_and_runtime_buttons_remain_legible():
     assert "停止并修改" in source
 
 
+def test_nicegui_exposes_irreversible_end_task_with_confirmation():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+
+    assert 'refs["end_task"] = ui.button(' in source
+    assert '"结束任务"' in source
+    assert "def confirm_end_task()" in source
+    assert "已经下载的 DICOM 文件和任务日志会保留" in source
+    assert "此操作不可撤销" in source
+    assert 'task_action("end")' in source
+    assert '"取消任务"' in source
+    assert 'task_action("cancel")' in source
+
+
 def test_windows_release_packages_only_the_required_dcmtk_runtime():
     root = Path(__file__).resolve().parents[1]
     build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")

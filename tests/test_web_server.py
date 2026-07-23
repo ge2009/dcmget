@@ -95,6 +95,11 @@ class FakeService:
         self.status = "cancelled"
         return self.snapshot()
 
+    def end_task(self):
+        self.calls.append("end_task")
+        self.status = "ended"
+        return self.snapshot()
+
     def retry_failed(self, tools: ToolPaths):
         self.calls.append("retry_failed")
         return self.snapshot()
@@ -507,6 +512,22 @@ def test_preflight_reports_current_task_before_its_receiver_port_as_conflict(
             ),
         }
     ]
+
+
+def test_end_task_route_is_distinct_from_recoverable_cancel(web: WebFixture):
+    csrf = web.setup()
+    web.service.task_id = "active-task"
+    web.service.status = "interrupted"
+
+    response = web.client.post(
+        "/api/tasks/end",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200
+    assert web.service.calls == ["end_task"]
+    assert response.json()["task"]["status"] == "ended"
 
 
 def test_default_web_preflight_still_reports_external_receiver_port_conflicts(

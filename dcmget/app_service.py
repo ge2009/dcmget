@@ -54,7 +54,9 @@ _RUNNER_STATE_MESSAGES = {
     "pause_pending": "当前检查号完成后暂停",
     "paused": "下载已暂停，可以随时继续",
     "stopping": "正在停止当前任务",
+    "ending": "正在结束当前任务",
     "cancelled": "任务已取消",
+    "ended": "任务已结束",
     "download_retryable": "部分检查号未完成，可以重试失败项",
     "interrupted": "下载已安全中断，可以继续",
     "completed": "下载已完成",
@@ -192,6 +194,7 @@ class DcmGetAppService:
         self._trial_required = False
         self._trial_consumed = False
         self._cancel_requested = False
+        self._end_requested = False
         self._pause_requested = False
         self._shutting_down = False
         self._restore_checkpoint()
@@ -327,6 +330,7 @@ class DcmGetAppService:
 
     def _action_snapshot_locked(self) -> dict[str, bool]:
         busy = bool(self._thread and self._thread.is_alive())
+        has_checkpoint = self.task_store.path.is_file()
         pdi_retryable = self._status == "pdi_retryable"
         download_retryable = self._status in {
             "download_retryable",
@@ -358,7 +362,13 @@ class DcmGetAppService:
                 and self._status in {"pause_pending", "paused"}
             )
             or (not busy and download_retryable),
-            "can_cancel": busy and not self._shutting_down,
+            "can_cancel": busy
+            and not self._end_requested
+            and not self._shutting_down,
+            "can_end": has_checkpoint
+            and not self._end_requested
+            and not self._shutting_down
+            and self._status not in {"locked", "recovery_error", "stopped"},
             "can_retry_failed": not busy and download_retryable,
             "can_accept_partial": can_accept,
             "can_retry_pdi": not busy and pdi_retryable,
@@ -515,6 +525,63 @@ class DcmGetAppService:
             callback()
         self._emit_event("state", status="stopping")
         return self.snapshot()
+
+    def end_task(self) -> dict[str, object]:
+        """Permanently end the current task while preserving received files.
+
+        Unlike :meth:`cancel`, this operation removes the recovery checkpoint.
+        An active worker is cancelled first; the checkpoint is only removed
+        after the worker has returned and can no longer write progress.
+        """
+
+        with self._lock:
+            if self._shutting_down or self._status == "stopped":
+                raise AppServiceError("DcmGet 服务正在停止或已经停止")
+            if self._end_requested:
+                raise AppServiceError("当前任务正在结束")
+            busy = bool(self._thread and self._thread.is_alive())
+            if busy and self._operation not in {"download", "pdi"}:
+                raise AppServiceError("当前后台操作不属于可结束的任务")
+            worker = self._worker
+            task_id = self._task_id
+
+        if not task_id or not self.task_store.path.is_file():
+            raise AppServiceError("当前没有可结束的任务")
+
+        if busy:
+            with self._lock:
+                self._end_requested = True
+                self._cancel_requested = True
+                self._status = "ending"
+                self._status_message = "正在停止后台进程并结束任务"
+                callback = getattr(worker, "request_cancel", None) or getattr(
+                    worker, "cancel", None
+                )
+            if callable(callback):
+                callback()
+            self._emit_event("state", status="ending")
+            return self.snapshot()
+
+        if not self.task_store.try_acquire_lease():
+            raise AppServiceError("当前任务正在另一个 DcmGet 进程中运行")
+        try:
+            checkpoint = self.task_store.load_required(
+                include_archived_files=False
+            )
+            self._ensure_ledger_batch(checkpoint)
+            self._load_checkpoint_state(checkpoint)
+            with self._lock:
+                self._end_requested = True
+                self._status = "ending"
+                self._status_message = "正在清理恢复点并结束任务"
+            self._emit_event("state", status="ending")
+            self._finalize_ended_task(checkpoint)
+            return self.snapshot()
+        except Exception:
+            with self._lock:
+                self._end_requested = False
+            self.task_store.release_lease()
+            raise
 
     def accept_partial(
         self, tools: ToolPaths | None = None
@@ -751,6 +818,9 @@ class DcmGetAppService:
                     self._operation = ""
 
     def _on_runner_state(self, state: str) -> None:
+        with self._lock:
+            if self._end_requested:
+                return
         normalized = {
             "partial": "download_retryable",
             "safety_paused": "interrupted",
@@ -828,6 +898,9 @@ class DcmGetAppService:
             self._last_summary = merged
             self._results = stored.result_by_accession
             self._partial_results = dict(stored.partial_results)
+        if self._is_end_requested(checkpoint.task_id):
+            self._finalize_ended_task(checkpoint)
+            return
         if merged.cancelled:
             self.task_store.release_lease()
             self._set_status("cancelled", "任务已取消，恢复点已保留")
@@ -862,6 +935,10 @@ class DcmGetAppService:
         self, checkpoint: TaskCheckpoint, exc: BaseException
     ) -> None:
         message = str(exc).strip() or exc.__class__.__name__
+        if self._is_end_requested(checkpoint.task_id):
+            self._log("应用", f"结束任务时后台退出：{message}", "warning")
+            self._finalize_ended_task(checkpoint)
+            return
         try:
             self.task_store.set_phase(
                 checkpoint.task_id,
@@ -972,6 +1049,10 @@ class DcmGetAppService:
         except Exception as exc:
             record_exception("DcmGetAppService.pdi", exc)
             message = str(exc).strip() or exc.__class__.__name__
+            if self._is_end_requested(checkpoint.task_id):
+                self._log("PDI", f"结束任务时后台退出：{message}", "warning")
+                self._finalize_ended_task(checkpoint)
+                return
             try:
                 self.task_store.set_phase(checkpoint.task_id, "pdi_retryable")
             except TaskStateError as state_exc:
@@ -999,6 +1080,10 @@ class DcmGetAppService:
             output_directory=str(getattr(result, "output_directory", "") or ""),
             message=str(getattr(result, "message", "") or ""),
         )
+        if self._is_end_requested(checkpoint.task_id):
+            self._finalize_ended_task(checkpoint)
+            self._emit_event("pdi_finished", result=result)
+            return
         if status == PdiStatus.COMPLETED:
             self.task_store.clear(checkpoint.task_id)
             self._complete_ledger(checkpoint.task_id, "completed")
@@ -1197,6 +1282,47 @@ class DcmGetAppService:
             anonymization_requested=checkpoint.config.anonymization_enabled,
             pdi_requested=checkpoint.config.pdi_export_enabled,
         )
+
+    def _is_end_requested(self, task_id: str) -> bool:
+        with self._lock:
+            return self._end_requested and self._task_id == task_id
+
+    def _finalize_ended_task(self, checkpoint: TaskCheckpoint) -> None:
+        """Clean runtime state and irreversibly remove one task checkpoint."""
+
+        try:
+            cleanup_messages = self.task_store.cleanup_recorded_processes(
+                checkpoint.task_id
+            )
+            for message in cleanup_messages:
+                self._log("结束任务", message, "warning")
+            if cleanup_messages:
+                unresolved = self.task_store.cleanup_recorded_processes(
+                    checkpoint.task_id
+                )
+                if unresolved:
+                    raise TaskStateError(
+                        "后台进程未能完全停止：" + "；".join(unresolved)
+                    )
+            self.task_ledger.complete_batch(checkpoint.task_id, "ended")
+            if self._config is not None:
+                self._export_acceptance_report(
+                    checkpoint.task_id, self._config
+                )
+            self.task_store.clear(checkpoint.task_id)
+        except (TaskStateError, TaskLedgerError, OSError) as exc:
+            self.task_store.release_lease()
+            with self._lock:
+                self._end_requested = False
+            self._log("结束任务", str(exc), "error")
+            self._set_status("end_failed", f"任务结束失败：{exc}")
+            return
+        self.task_store.release_lease()
+        with self._lock:
+            self._end_requested = False
+            self._cancel_requested = False
+        self._set_status("ended", "任务已结束；已下载文件和日志已保留")
+        self._emit_event("task_ended", task_id=checkpoint.task_id)
 
     def _complete_ledger(self, task_id: str, status: object) -> None:
         try:
