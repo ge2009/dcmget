@@ -49,7 +49,6 @@ VERSION=$2
 
 require_command ssh
 require_command scp
-require_command rsync
 require_command awk
 require_command python3
 require_command sort
@@ -394,7 +393,7 @@ REMOTE_PREPARE
 REMOTE_TEMP_CREATED=1
 
 echo "上传 releases/${VERSION} 文件..."
-rsync -a --delete -- "$SOURCE_DIR/" "$REMOTE_HOST:$REMOTE_RELEASE_TEMP/"
+scp -q -- "${source_files[@]}" "$REMOTE_HOST:$REMOTE_RELEASE_TEMP/"
 scp -q -- "$CHECKSUM_FILE" "$REMOTE_HOST:$REMOTE_RELEASE_TEMP/.expected-sha256"
 
 echo '校验上传文件的远端 SHA-256...'

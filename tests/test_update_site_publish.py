@@ -80,7 +80,7 @@ def _run_publish_with_manifest(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "network-called"
-    for command in ("ssh", "scp", "rsync"):
+    for command in ("ssh", "scp"):
         _write_executable(
             fake_bin / command,
             f"#!/bin/sh\ntouch '{marker}'\nexit 99\n",
@@ -96,6 +96,14 @@ def _run_publish_with_manifest(
         check=False,
     )
     return completed, marker
+
+
+def test_publish_uses_scp_without_remote_rsync() -> None:
+    script = PUBLISH_SCRIPT.read_text(encoding="utf-8")
+
+    assert "require_command rsync" not in script
+    assert "rsync -a" not in script
+    assert 'scp -q -- "${source_files[@]}"' in script
 
 
 def _patch_only_manifest(

@@ -174,13 +174,13 @@ gh run download <run-id> \
 
 1. 使用仓库内置公钥验证 Ed25519 签名信封，并确认其内容与 `UPDATE-MANIFEST.json` 逐字节一致，再校验版本、所有声明资源的大小和 SHA-256。
 2. 允许“一个完整安装包（可有或没有 Authenticode）”或“零个完整安装包但至少一个合法组件补丁”；拒绝空清单、未知资源类型和越界组件路径。
-3. 使用 `rsync` 上传到 `updates/releases/` 下的同文件系统隐藏临时目录。
+3. 使用 `scp` 上传到 `updates/releases/` 下的同文件系统隐藏临时目录。
 4. 使用本地 SHA-256 清单逐文件校验远端内容。
 5. 原子改名为 `updates/releases/<version>/`；如果同版本已存在，仅在内容完全一致时继续。
 6. 清理旧的语义版本目录，保留最新两个；当前 stable 对应版本和正在发布版本始终受保护。若无法唯一识别当前 stable，安全地跳过清理。
 7. 最后单独上传、校验并原子替换单文件 `updates/stable/UPDATE-MANIFEST.signed.json`。
 
-发布前需确保本机能够无交互访问 `ssh bwg-snell`，并安装 `ssh`、`scp`、`rsync` 及 `sha256sum` 或 `shasum`。脚本不负责签名清单，也不会修改 OpenResty 或 DNS。
+发布前需确保本机能够无交互访问 `ssh bwg-snell`，并安装 `ssh`、`scp` 及 `sha256sum` 或 `shasum`。脚本不负责签名清单，也不会修改 OpenResty 或 DNS。
 
 ## 发布注意事项
 
