@@ -1261,26 +1261,7 @@ jobs:
           Remove-Item $serviceTreeFixture -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $serviceTreeFixture | Out-Null
           $serviceTreeChild = Join-Path $serviceTreeFixture "service-tree-child.ps1"
-          $serviceTreeChildSource = @'
-          param([string]$Label)
-          $ping = $null
-          try {
-              $ping = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList @("-t", "127.0.0.1") -PassThru -WindowStyle Hidden
-              while ($true) { Start-Sleep -Seconds 1 }
-          } finally {
-              if ($null -ne $ping) {
-                  try {
-                      if (-not $ping.HasExited) {
-                          & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$ping.Id) /T /F 2>$null | Out-Null
-                          [void]$ping.WaitForExit(5000)
-                      }
-                  } catch {
-                      Write-Warning "Could not stop fixture ping $Label/$($ping.Id): $($_.Exception.Message)"
-                  }
-              }
-          }
-          '@
-          [IO.File]::WriteAllText($serviceTreeChild, $serviceTreeChildSource, [Text.UTF8Encoding]::new($false))
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE ".github\scripts\windows-service-tree-child.ps1") $serviceTreeChild -Force
           $fixtureHostSource = @'
           param([string]$Executable, [string]$AppDataRoot, [string]$LocalAppDataRoot, [string]$UserProfileRoot)
           $fixtureRoot = Join-Path $env:ProgramData "DcmGet\service-tree-fixture"
@@ -1332,9 +1313,19 @@ jobs:
             Start-Sleep -Milliseconds 250
           }
           if (-not (Test-Path $serviceTreeIdentityFile -PathType Leaf)) { throw "Service process-tree fixture did not start" }
-          # Windows PowerShell cold-starts asynchronously under LocalSystem.
-          Start-Sleep -Seconds 5
           $fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")
+          $readyFiles = @()
+          for ($attempt = 0; $attempt -lt 80; $attempt++) {
+            $readyFiles = @(Get-ChildItem $serviceTreeFixture -Filter "ready-*.json" -File -ErrorAction SilentlyContinue)
+            if ($readyFiles.Count -eq $fixtureLabels.Count) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if ($readyFiles.Count -ne $fixtureLabels.Count) { throw "Service tree fixture did not publish all verified children" }
+          $childServiceTreeRecords = @(
+            $readyFiles | ForEach-Object {
+              Get-Content $_.FullName -Raw -Encoding utf8 | ConvertFrom-Json
+            }
+          )
           $directServiceTreeRecords = @(
             Get-Content $serviceTreeIdentityFile -Raw -Encoding utf8 |
               ConvertFrom-Json
@@ -1367,27 +1358,25 @@ jobs:
             }
           )
           $serviceTreeIdentities = @($directServiceTreeIdentities)
-          foreach ($directProcess in @($directServiceTreeIdentities)) {
-            $fixtureChildren = @(
-              Get-CimInstance Win32_Process -Filter "ParentProcessId = $($directProcess.ProcessId)" -ErrorAction SilentlyContinue |
-                Where-Object {
-                  ([string]$_.Name) -ieq "ping.exe" -and
-                  ([string]$_.CommandLine) -match "(?:^|\\s)-t\\s+127\\.0\\.0\\.1(?:\\s|$)" -and
-                  ([DateTime]$_.CreationDate).ToUniversalTime().Ticks -ge $directProcess.CreationTicks
-                }
-            )
-            if ($fixtureChildren.Count -eq 0) {
-              throw "Service tree fixture did not create a verified child for PID $($directProcess.ProcessId)"
+          foreach ($record in $childServiceTreeRecords) {
+            $owner = @($directServiceTreeIdentities | Where-Object { $_.Label -eq [string]$record.Label })
+            $treeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$record.ProcessId)" -ErrorAction SilentlyContinue
+            if (
+              $owner.Count -ne 1 -or
+              $owner[0].ProcessId -ne [int]$record.OwnerProcessId -or
+              $null -eq $treeProcess -or
+              ([string]$treeProcess.Name) -ine "ping.exe" -or
+              ([DateTime]$treeProcess.CreationDate).ToUniversalTime().Ticks -ne [long]$record.CreationTicks
+            ) {
+              throw "Service tree fixture verified child no longer running: $($record.ProcessId)"
             }
-            foreach ($treeProcess in $fixtureChildren) {
-              $serviceTreeIdentities += [PSCustomObject]@{
-                ProcessId = [int]$treeProcess.ProcessId
-                CreationTicks = ([DateTime]$treeProcess.CreationDate).ToUniversalTime().Ticks
-                Name = [string]$treeProcess.Name
-                ParentProcessId = [int]$treeProcess.ParentProcessId
-                ExecutablePath = [string]$treeProcess.ExecutablePath
-                CommandLine = [string]$treeProcess.CommandLine
-              }
+            $serviceTreeIdentities += [PSCustomObject]@{
+              ProcessId = [int]$treeProcess.ProcessId
+              CreationTicks = [long]$record.CreationTicks
+              Name = [string]$treeProcess.Name
+              ParentProcessId = [int]$treeProcess.ParentProcessId
+              ExecutablePath = [string]$treeProcess.ExecutablePath
+              CommandLine = [string]$treeProcess.CommandLine
             }
           }
           & "$env:SystemRoot\System32\sc.exe" stop $serviceName | Out-Null
