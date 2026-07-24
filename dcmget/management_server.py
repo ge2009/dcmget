@@ -429,18 +429,6 @@ def create_windows_management_server(
     if profiles == ():
         manager.create_profile()
         profiles = manager.list_profiles()
-    if profiles:
-        for profile in profiles:
-            if profile.is_running:
-                continue
-            try:
-                manager.ensure_internal_web_endpoint(profile.number)
-            except ProfileManagerError as exc:
-                LOGGER.warning(
-                    "实例 %s 的内部 Web 端点自动修复失败：%s",
-                    profile.number,
-                    exc,
-                )
     runtime_state = ProfileRuntimeState(
         management_state / PROFILE_RUNTIME_FILE_NAME
     )

@@ -861,6 +861,8 @@ jobs:
           Assert-ProfileNotRunning 2 $profile2WebPort "Service host restarted a Profile after the operator stopped it"
           $profile2Process = Start-AdoptAndRestartProfile $profile2WebPort
           if (-not (Test-Path $profile2ConfigPath -PathType Leaf)) { throw "Dynamic Profile test lost Profile 2 config" }
+          $profile1Config = Get-Content $profile1ConfigPath -Raw | ConvertFrom-Json
+          Wait-DcmGetProfile 1 ([int]$profile1Config.web_port) | Out-Null
 
       - name: Windows service lifecycle, upgrade-state and uninstall test
         shell: pwsh
@@ -899,6 +901,15 @@ jobs:
               } |
               Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine |
               Format-List | Out-String | Write-Host
+            Get-Content (Join-Path $env:LOCALAPPDATA "DcmGet\management\profile-runtime.json") -Raw -ErrorAction SilentlyContinue | Write-Host
+            Get-ChildItem (Join-Path $configDir "instances") -Filter "config.json" -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "### $($_.FullName)"
+              Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue | Write-Host
+            }
+            $dcmGetPids = @(Get-CimInstance Win32_Process -Filter "Name = 'DcmGet.exe'" -ErrorAction SilentlyContinue | ForEach-Object ProcessId)
+            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+              Where-Object { $_.OwningProcess -in $dcmGetPids } |
+              Format-Table OwningProcess, LocalAddress, LocalPort | Out-String | Write-Host
             Write-Host "--- recent Service Control Manager events ---"
             Get-WinEvent -FilterHashtable @{
               LogName = "System"
@@ -938,6 +949,7 @@ jobs:
               }
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $deadline)
+            Write-DcmGetServiceDiagnostics
             throw "Profile $profileNumber did not become ready on Web port $webPort"
           }
 

@@ -368,7 +368,7 @@ def test_first_management_start_creates_one_stopped_default_profile(tmp_path: Pa
     assert response.json()["profiles"][0]["desired_running"] is False
 
 
-def test_management_start_repairs_hidden_profile_web_endpoint(tmp_path: Path):
+def test_management_start_does_not_claim_or_rewrite_stopped_profile(tmp_path: Path):
     config_path = _write_profile(tmp_path)
     manager = ProfileManager(
         config_root=tmp_path / "config",
@@ -383,9 +383,9 @@ def test_management_start_repairs_hidden_profile_web_endpoint(tmp_path: Path):
         trusted_hosts=("127.0.0.1",),
     )
 
-    repaired = load_config(config_path)
-    assert repaired.web_bind_address == "127.0.0.1"
-    assert repaired.web_port == 8788
+    unchanged = load_config(config_path)
+    assert unchanged.web_bind_address == "0.0.0.0"
+    assert unchanged.web_port == 8787
 
 
 def test_private_manager_peer_keeps_host_origin_session_and_csrf_controls(
