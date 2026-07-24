@@ -444,6 +444,7 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
 
     assert "ref: dc5547ee4bb7884867ecc97d64e1c11d63bed5d3" in workflow
     assert "path: upgrade-baseline" in workflow
+    assert 'Copy-Item -LiteralPath ".runtime\\downloads"' in workflow
     assert 'Copy-Item -LiteralPath ".runtime\\ohif\\cache"' in workflow
     assert 'python -m venv (Join-Path $baselineRoot ".venv")' in workflow
     assert '& $baselinePython -m pip install -r (Join-Path $baselineRoot "requirements-build.txt")' in workflow

@@ -454,6 +454,7 @@ jobs:
           $baselineRuntime = Join-Path $baselineRoot ".runtime"
           New-Item -ItemType Directory -Force $baselineRuntime | Out-Null
           Copy-Item -LiteralPath ".runtime\dcmtk" -Destination $baselineRuntime -Recurse -Force
+          Copy-Item -LiteralPath ".runtime\downloads" -Destination $baselineRuntime -Recurse -Force
           $baselineOhif = Join-Path $baselineRuntime "ohif"
           New-Item -ItemType Directory -Force $baselineOhif | Out-Null
           Copy-Item -LiteralPath ".runtime\ohif\cache" -Destination (Join-Path $baselineOhif "cache") -Recurse -Force
