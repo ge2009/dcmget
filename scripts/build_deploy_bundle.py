@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "3.6.1"
+VERSION = "3.7.0"
 ARCHIVE_NAME = f"dcmget-{VERSION}-source-deploy.zip"
 ROOT_FILES = (
     "DICOM_download_script.py",
@@ -24,7 +24,16 @@ ROOT_FILES = (
     "requirements-dev.txt",
     "requirements.txt",
 )
-TREE_ROOTS = ("assets", "dcmget", "scripts", "packaging", "tools")
+TREE_ROOTS = ("assets", "dcmget", "frontend", "scripts", "packaging", "tools")
+EXCLUDED_TREE_PARTS = frozenset({"__pycache__", "node_modules"})
+
+
+def include_tree_file(path: Path) -> bool:
+    return (
+        path.is_file()
+        and EXCLUDED_TREE_PARTS.isdisjoint(path.parts)
+        and path.suffix not in {".pyc", ".tsbuildinfo"}
+    )
 
 
 def digest(path: Path) -> str:
@@ -41,7 +50,7 @@ def source_files(root: Path) -> list[Path]:
         files.extend(
             path
             for path in (root / tree).rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+            if include_tree_file(path)
         )
     missing = [path.name for path in files if not path.is_file()]
     if missing:

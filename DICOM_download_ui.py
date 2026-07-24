@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
+from html.parser import HTMLParser
 from pathlib import Path
 
 from dcmget import __version__
@@ -63,6 +65,34 @@ from dcmget.webview_shell import run_webview_shell, spawn_webview_shell
 
 PROJECT_ROOT = resource_root()
 LOGGER = logging.getLogger("dcmget.diagnostics")
+
+
+class _ExternalHtmlReferenceScanner(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.external: list[str] = []
+
+    def handle_starttag(
+        self,
+        _tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        for name, value in attrs:
+            if name.casefold() not in {"src", "href", "action"} or not value:
+                continue
+            reference = value.strip().casefold()
+            if reference.startswith(("http://", "https://", "//")):
+                self.external.append(value)
+
+
+_EXTERNAL_CSS_REFERENCE = re.compile(
+    r"(?:@import\s+(?:url\()?|url\()\s*['\"]?(?:https?:)?//",
+    re.IGNORECASE,
+)
+_EXTERNAL_SCRIPT_NETWORK_CALL = re.compile(
+    r"\b(?:fetch|EventSource|WebSocket|sendBeacon)\s*\(\s*['\"`](?:https?:)?//",
+    re.IGNORECASE,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -322,7 +352,7 @@ def validate_frozen_pdi_resources(root: str | Path) -> None:
 
 
 def validate_web_resources(root: str | Path = PROJECT_ROOT) -> Path:
-    static_root = Path(root) / "dcmget" / "webui"
+    static_root = Path(root) / "dcmget" / "webui-react"
     required = tuple(
         static_root / name
         for name in ("index.html", "app.css", "app.js", "theme.js")
@@ -330,10 +360,19 @@ def validate_web_resources(root: str | Path = PROJECT_ROOT) -> Path:
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Web 离线资源缺失：{'、'.join(missing)}")
-    for path in required:
-        content = path.read_text(encoding="utf-8")
-        if "http://" in content or "https://" in content:
-            raise RuntimeError(f"Web 离线资源包含外部地址：{path.name}")
+    scanner = _ExternalHtmlReferenceScanner()
+    scanner.feed((static_root / "index.html").read_text(encoding="utf-8"))
+    if scanner.external:
+        raise RuntimeError("Web 离线资源包含外部地址：index.html")
+    if _EXTERNAL_CSS_REFERENCE.search(
+        (static_root / "app.css").read_text(encoding="utf-8")
+    ):
+        raise RuntimeError("Web 离线资源包含外部地址：app.css")
+    for script_name in ("app.js", "theme.js"):
+        if _EXTERNAL_SCRIPT_NETWORK_CALL.search(
+            (static_root / script_name).read_text(encoding="utf-8")
+        ):
+            raise RuntimeError(f"Web 离线资源包含外部地址：{script_name}")
     return static_root
 
 
@@ -618,7 +657,7 @@ def _operation_handlers(
 def run_web_self_test(config_path: str) -> int:
     from tempfile import TemporaryDirectory
 
-    validate_web_resources(PROJECT_ROOT)
+    react_static_root = validate_web_resources(PROJECT_ROOT)
     with TemporaryDirectory(prefix="dcmget-web-self-test-") as temporary:
         root = Path(temporary)
         config = load_config(config_path)
@@ -639,13 +678,12 @@ def run_web_self_test(config_path: str) -> int:
             host=config.web_bind_address,
             port=config.web_port,
             trusted_hosts=("127.0.0.1", "localhost"),
-            static_root=PROJECT_ROOT / "dcmget" / "webui",
+            react_static_root=react_static_root,
             directory_roots={"self-test": root},
             config_path=saved_config,
             project_root=PROJECT_ROOT,
             profile_metadata={"name": "自检", "number": 1},
             session_ttl_seconds=300,
-            nicegui_enabled=True,
         )
         try:
             url = server.start_background(timeout=10)
@@ -705,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.windows_management:
             return run_windows_management_server(
                 project_root=PROJECT_ROOT,
-                static_root=validate_web_resources(PROJECT_ROOT),
+                react_static_root=validate_web_resources(PROJECT_ROOT),
                 trusted_hosts=_lan_hosts(),
             )
         prepare_windows_portable_dcmtk(PROJECT_ROOT)
@@ -782,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
             host=config.web_bind_address,
             port=config.web_port,
             trusted_hosts=_lan_hosts(),
-            static_root=validate_web_resources(PROJECT_ROOT),
+            react_static_root=validate_web_resources(PROJECT_ROOT),
             directory_roots=_directory_roots(config),
             config_path=profile.config_path,
             project_root=PROJECT_ROOT,
@@ -796,7 +834,6 @@ def main(argv: list[str] | None = None) -> int:
             session_ttl_seconds=config.web_session_timeout_minutes * 60,
             tools_provider=tools_provider,
             operation_handlers=_operation_handlers(profile, service),
-            nicegui_enabled=True,
         )
         activation.set_activation_handler(
             lambda payload: (

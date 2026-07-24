@@ -1,5 +1,14 @@
 # DcmGet 版本说明
 
+## 3.7.0（2026-07-24）
+
+- 工作台前端迁移为唯一的 Vite + React + TypeScript 实现，移除 NiceGUI 和旧静态页面入口；Python/FastAPI、DCMTK 下载核心、Profile 进程隔离、任务恢复、授权、PDI 和 Windows WebView2 外壳保持不变。
+- 使用 `@base-ui/react`、Tailwind CSS、Motion、Zod 与 Lucide 建立离线设计和交互层；管理中心、Profile、任务、设置、日志、PDI、更新与运维继续使用原有同源 REST/SSE API、会话和 CSRF 边界。
+- Node.js 仅参与开发与发布构建。成品前端固定输出为 `dcmget/webui-react/index.html`、`app.js`、`app.css` 和 `theme.js`，运行时不需要 Node.js、CDN 或外部字体与图标服务，并保持组件增量更新所需的稳定路径。
+- 由于首次 React 版本会移除 NiceGUI 运行库和旧静态资源，3.6.1 升级到该版本需要安装一次完整 Windows 安装包；完成迁移后，固定文件名的前端更新可继续使用小体积组件增量包。
+- 工作台首次打开默认使用专业医疗浅色主题，同时保留用户主动选择的深色偏好；统一放大正文、控件、日志和辅助信息字号，并同步调整导航栏、按钮、输入框和弹窗间距。
+- 更新应用品牌图标为更清晰的 DICOM 切片接收标识，统一用于 Windows 程序、安装器、Web 工作台、favicon 与后续 macOS 资源。
+
 ## 3.6.1（2026-07-23）
 
 - 自动更新改为只访问 `bwg-snell` 提供的 `https://dcmget.v2ex.com.cn/updates/` 固定通道，不再依赖 GitHub Releases；断网或专网环境只显示离线状态，不影响 Profile 与 DICOM 下载。

@@ -12,14 +12,13 @@ import threading
 import time
 import string
 from collections.abc import Callable, Iterable, Mapping
-from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import unquote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -75,66 +74,6 @@ _MANAGEMENT_OPERATIONS = frozenset(
         "windows-service-stop",
     }
 )
-
-
-class NiceGuiSocketSecurityMiddleware:
-    """Apply the DcmGet HTTP trust boundary to NiceGUI's WebSocket channel."""
-
-    def __init__(
-        self,
-        app: object,
-        *,
-        mount_path: str,
-        host_policy: HostPolicy,
-        security: WebSecurityContext,
-        session_cookie: str,
-        management_mode: bool,
-    ) -> None:
-        self.app = app
-        self.socket_prefix = f"{mount_path.rstrip('/')}/_nicegui_ws/"
-        self.host_policy = host_policy
-        self.security = security
-        self.session_cookie = session_cookie
-        self.management_mode = bool(management_mode)
-
-    async def __call__(self, scope: dict[str, Any], receive: object, send: object) -> None:
-        if scope.get("type") != "websocket" or not str(scope.get("path", "")).startswith(
-            self.socket_prefix
-        ):
-            await self.app(scope, receive, send)  # type: ignore[misc]
-            return
-
-        headers = {
-            bytes(key).decode("latin-1").lower(): bytes(value).decode("latin-1")
-            for key, value in scope.get("headers", ())
-        }
-        client = scope.get("client") or ("", 0)
-        client_ip = str(client[0]) if client else ""
-        allowed = self.host_policy.allows_host_header(headers.get("host", ""))
-        allowed = allowed and self.host_policy.allows_origin(headers.get("origin"))
-        if self.management_mode:
-            allowed = allowed and is_management_peer_address(client_ip)
-
-        token = ""
-        try:
-            cookie = SimpleCookie()
-            cookie.load(headers.get("cookie", ""))
-            morsel = cookie.get(self.session_cookie)
-            token = morsel.value if morsel is not None else ""
-        except CookieError:
-            allowed = False
-        session = self.security.sessions.get(token, touch=False) if token else None
-        allowed = allowed and session is not None and hmac_compare(session.remote_ip, client_ip)
-        if not allowed:
-            await send(  # type: ignore[operator]
-                {
-                    "type": "websocket.close",
-                    "code": 1008,
-                    "reason": "DcmGet WebSocket trust check failed",
-                }
-            )
-            return
-        await self.app(scope, receive, send)  # type: ignore[misc]
 
 
 @runtime_checkable
@@ -371,13 +310,6 @@ def _snapshot_section(snapshot: Mapping[str, Any], key: str, default: object) ->
     return jsonable_encoder(value)
 
 
-def _default_login_html() -> str:
-    return """<!doctype html>
-<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">
-<title>DcmGet</title></head><body><main><h1>DcmGet Web</h1>
-<p>Web 前端资源尚未安装。请检查安装包完整性。</p></main></body></html>"""
-
-
 def _release_note_entries(markdown: str, *, limit: int = 12) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
     current: dict[str, object] | None = None
@@ -413,9 +345,15 @@ def _validated_static_root(value: str | Path | None) -> tuple[Path | None, Path 
     root = source.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Web 静态资源目录无效")
+    required = tuple(
+        root / name for name in ("index.html", "app.css", "app.js", "theme.js")
+    )
+    missing = [
+        path.name for path in required if not path.is_file() or path.is_symlink()
+    ]
+    if missing:
+        raise ValueError(f"Web 静态资源缺失：{'、'.join(missing)}")
     index = root / "index.html"
-    if not index.is_file() or index.is_symlink():
-        raise ValueError("Web 静态资源缺少 index.html")
     return root, index
 
 
@@ -457,7 +395,7 @@ def create_web_app(
     server_host: str = "0.0.0.0",
     server_port: int = 8787,
     trusted_hosts: Iterable[str] = (),
-    static_root: str | Path | None = None,
+    react_static_root: str | Path | None = None,
     directory_roots: Mapping[str, str | Path] | Iterable[DirectoryRoot] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
     config_path: str | Path | None = None,
@@ -469,7 +407,6 @@ def create_web_app(
     profile_api_proxy: Callable[..., object] | None = None,
     update_service: object | None = None,
     management_mode: bool = False,
-    nicegui_mount_path: str | None = None,
 ) -> FastAPI:
     """Create the offline, LAN-capable DcmGet HTTP application.
 
@@ -489,12 +426,11 @@ def create_web_app(
             raise ValueError("Web 绑定地址必须是本机 IP") from exc
     host_policy = HostPolicy(server_port, trusted_hosts)
     session_cookie = session_cookie_name(server_port)
-    workspace_path = (
-        "/" + nicegui_mount_path.strip("/")
-        if nicegui_mount_path and nicegui_mount_path.strip("/")
-        else None
+    react_static_directory, react_index_path = _validated_static_root(
+        react_static_root
     )
-    static_directory, index_path = _validated_static_root(static_root)
+    if react_static_directory is None or react_index_path is None:
+        raise ValueError("React Web 离线资源目录未配置")
     browser = _directory_browser(directory_roots)
     metadata = dict(profile_metadata or {})
     if management_mode:
@@ -571,47 +507,17 @@ def create_web_app(
     app.state.session_cookie_name = session_cookie
     app.state.profile_api_proxy = profile_api_proxy
     app.state.update_service = update_service
-    app.state.nicegui_mount_path = workspace_path
-
-    if workspace_path is not None:
-        app.add_middleware(
-            NiceGuiSocketSecurityMiddleware,
-            mount_path=workspace_path,
-            host_policy=host_policy,
-            security=security,
-            session_cookie=session_cookie,
-            management_mode=management_mode,
-        )
+    app.state.react_static_root = react_static_directory
 
     @app.middleware("http")
     async def security_boundary(request: Request, call_next):
         if not host_policy.allows_host_header(request.headers.get("host", "")):
             return JSONResponse(status_code=421, content={"detail": "Host 不受信任"})
         request_path = request.url.path
-        nicegui_request = bool(
-            workspace_path
-            and (
-                request_path == workspace_path
-                or request_path.startswith(f"{workspace_path}/")
-            )
+        react_request = bool(
+            request_path in {"/", "/login", "/assets"}
+            or request_path.startswith("/assets/")
         )
-        nicegui_transport = bool(
-            workspace_path
-            and request_path.startswith(f"{workspace_path}/_nicegui_ws/")
-        )
-        workspace_session: WebSession | None = None
-        workspace_session_created = False
-        if nicegui_transport:
-            if not host_policy.allows_origin(request.headers.get("origin")):
-                return JSONResponse(status_code=403, content={"detail": "Origin 不受信任"})
-            workspace_session, _ = request_session(request)
-            if workspace_session is None:
-                return JSONResponse(status_code=401, content={"detail": "会话已失效，请刷新页面"})
-        elif nicegui_request:
-            workspace_session, workspace_session_created = request_session(
-                request,
-                create=True,
-            )
         if request.method.upper() in _MUTATING_HTTP_METHODS:
             if management_mode and not is_management_peer_address(_client_ip(request)):
                 return JSONResponse(
@@ -621,18 +527,13 @@ def create_web_app(
             if not host_policy.allows_origin(request.headers.get("origin")):
                 return JSONResponse(status_code=403, content={"detail": "Origin 不受信任"})
         response = await call_next(request)
-        if workspace_session_created and workspace_session is not None:
-            attach_session_cookie(response, workspace_session)
         response.headers["Cache-Control"] = "no-store"
-        if nicegui_request:
-            websocket_origin = request.headers.get("host", "").strip()
+        if react_request:
             response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                f"connect-src 'self' ws://{websocket_origin} wss://{websocket_origin}; "
-                "img-src 'self' data:; font-src 'self' data:; "
-                "style-src 'self' 'unsafe-inline'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; object-src 'none'; "
-                "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+                "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+                "font-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                "script-src 'self'; object-src 'none'; base-uri 'self'; "
+                "frame-ancestors 'none'; form-action 'self'"
             )
         else:
             response.headers["Content-Security-Policy"] = (
@@ -700,16 +601,12 @@ def create_web_app(
     @app.get("/", include_in_schema=False)
     @app.get("/login", include_in_schema=False)
     async def index(request: Request) -> Response:
-        if workspace_path is not None:
-            session, created = request_session(request, create=True)
-            assert session is not None
-            response = RedirectResponse(f"{workspace_path}/", status_code=307)
-            if created:
-                attach_session_cookie(response, session)
-            return response
-        if index_path is None:
-            return HTMLResponse(_default_login_html())
-        return FileResponse(index_path, media_type="text/html")
+        session, created = request_session(request, create=True)
+        assert session is not None
+        response = FileResponse(react_index_path, media_type="text/html")
+        if created:
+            attach_session_cookie(response, session)
+        return response
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
@@ -1700,14 +1597,15 @@ def create_web_app(
             },
         )
 
-    if static_directory is not None:
-        # Frontend assets are a flat, bundled directory; StaticFiles rejects
-        # traversal and does not follow symlinks by default.
-        app.mount(
-            "/assets",
-            StaticFiles(directory=str(static_directory), html=False, follow_symlink=False),
-            name="assets",
-        )
+    app.mount(
+        "/assets",
+        StaticFiles(
+            directory=str(react_static_directory),
+            html=False,
+            follow_symlink=False,
+        ),
+        name="assets",
+    )
 
     return app
 
@@ -1732,7 +1630,7 @@ class DcmGetWebServer:
         host: str = "0.0.0.0",
         port: int = 8787,
         trusted_hosts: Iterable[str] = (),
-        static_root: str | Path | None = None,
+        react_static_root: str | Path | None = None,
         directory_roots: Mapping[str, str | Path] | Iterable[DirectoryRoot] | None = None,
         config_path: str | Path | None = None,
         project_root: str | Path | None = None,
@@ -1745,14 +1643,12 @@ class DcmGetWebServer:
         profile_api_proxy: Callable[..., object] | None = None,
         update_service: object | None = None,
         management_mode: bool = False,
-        nicegui_enabled: bool = False,
         log_level: str = "info",
     ):
         self.service = service
         self.host = host
         self.port = int(port)
         self.management_mode = bool(management_mode)
-        self.nicegui_enabled = bool(nicegui_enabled)
         effective_ttl = (
             int(session_timeout_minutes) * 60
             if session_timeout_minutes is not None
@@ -1766,10 +1662,9 @@ class DcmGetWebServer:
         self._server: Any = None
         self._thread: threading.Thread | None = None
         self._stop_lock = threading.Lock()
-        if static_root is None:
-            bundled_webui = Path(__file__).with_name("webui")
-            if bundled_webui.is_dir():
-                static_root = bundled_webui
+        if react_static_root is None:
+            bundled_react_webui = Path(__file__).with_name("webui-react")
+            react_static_root = bundled_react_webui
         if directory_roots is None:
             directory_roots = default_directory_roots()
         self.app = create_web_app(
@@ -1778,7 +1673,7 @@ class DcmGetWebServer:
             server_host=host,
             server_port=self.port,
             trusted_hosts=trusted_hosts,
-            static_root=static_root,
+            react_static_root=react_static_root,
             directory_roots=directory_roots,
             shutdown_callback=self.request_shutdown,
             config_path=config_path,
@@ -1790,17 +1685,7 @@ class DcmGetWebServer:
             profile_api_proxy=profile_api_proxy,
             update_service=update_service,
             management_mode=self.management_mode,
-            nicegui_mount_path="/workspace" if self.nicegui_enabled else None,
         )
-        if self.nicegui_enabled:
-            try:
-                from .nicegui_ui import install_nicegui
-            except ImportError as exc:
-                raise RuntimeError(
-                    "NiceGUI 界面组件未安装，请先执行 pip install -r requirements.txt"
-                ) from exc
-
-            install_nicegui(self.app, mount_path="/workspace")
 
     @property
     def bootstrap_password(self) -> str | None:

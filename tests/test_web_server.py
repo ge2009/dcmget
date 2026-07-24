@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import sys
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from dcmget import web_server as web_server_module
 from dcmget.config import AppConfig, save_config
@@ -20,6 +18,21 @@ from dcmget.web_server import DcmGetWebServer, create_web_app
 PORT = 8787
 LOCAL_URL = f"http://127.0.0.1:{PORT}"
 LOCAL_ORIGIN = {"Origin": LOCAL_URL}
+
+
+def _react_root(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "index.html").write_text(
+        '<!doctype html><title>DcmGet React</title><script src="/assets/app.js"></script>',
+        encoding="utf-8",
+    )
+    (path / "app.js").write_text(
+        "document.body.dataset.ready = 'true';",
+        encoding="utf-8",
+    )
+    (path / "app.css").write_text("body{}", encoding="utf-8")
+    (path / "theme.js").write_text("void 0;", encoding="utf-8")
+    return path
 
 
 class FakeService:
@@ -168,7 +181,7 @@ def web(tmp_path: Path) -> WebFixture:
         security=security,
         server_port=PORT,
         trusted_hosts=("127.0.0.1", "192.168.1.50"),
-        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+        react_static_root=_react_root(tmp_path / "webui-react"),
         directory_roots={"data": allowed},
         config_path=config_path,
         project_root=tmp_path,
@@ -231,129 +244,52 @@ def test_anonymous_bootstrap_creates_ip_bound_session_and_loads_app(web: WebFixt
     assert web.client.get("/assets/theme.js").status_code == 200
 
 
-def test_nicegui_workspace_uses_scoped_csp_and_secures_websocket_session(
-    tmp_path: Path,
-):
+def test_react_frontend_uses_shared_session_and_scoped_csp(tmp_path: Path):
+    react = _react_root(tmp_path / "webui-react")
     security = bootstrap_web_security(tmp_path / "state")
     app = create_web_app(
         FakeService(),
         security=security,
-        server_host="127.0.0.1",
         server_port=PORT,
         trusted_hosts=("127.0.0.1",),
-        nicegui_mount_path="/workspace",
+        react_static_root=react,
     )
+    client = TestClient(app, base_url=LOCAL_URL, client=("127.0.0.1", 50123))
 
-    @app.websocket("/workspace/_nicegui_ws/socket.io/")
-    async def test_socket(socket: WebSocket):
-        await socket.accept()
-        await socket.send_text("ready")
-        await socket.close()
-
-    client = TestClient(
-        app,
-        base_url=LOCAL_URL,
-        client=("127.0.0.1", 50126),
-    )
-    root = client.get("/", follow_redirects=False)
-    assert root.status_code == 307
-    assert root.headers["location"] == "/workspace/"
-    assert client.cookies.get("dcmget_session")
-
-    workspace = client.get("/workspace/missing")
-    assert workspace.status_code == 404
-    workspace_csp = workspace.headers["content-security-policy"]
-    assert "style-src 'self' 'unsafe-inline'" in workspace_csp
-    assert "script-src 'self' 'unsafe-inline' 'unsafe-eval'" in workspace_csp
-    assert f"connect-src 'self' ws://127.0.0.1:{PORT} wss://127.0.0.1:{PORT}" in workspace_csp
-    assert "connect-src 'self' ws: wss:" not in workspace_csp
-
-    api = client.get("/api/bootstrap")
-    api_csp = api.headers["content-security-policy"]
+    for path in ("/", "/login"):
+        page = client.get(path)
+        assert page.status_code == 200
+        assert "DcmGet React" in page.text
+        csp = page.headers["content-security-policy"]
+        assert "style-src 'self' 'unsafe-inline'" in csp
+        assert "script-src 'self'" in csp
+        assert "unsafe-eval" not in csp
+    assert client.cookies.get(app.state.session_cookie_name)
+    bootstrap = client.get("/api/bootstrap")
+    assert bootstrap.json()["csrf_token"]
+    api_csp = bootstrap.headers["content-security-policy"]
     assert "'unsafe-inline'" not in api_csp
     assert "'unsafe-eval'" not in api_csp
-    assert "ws:" not in api_csp
 
-    with client.websocket_connect(
-        "/workspace/_nicegui_ws/socket.io/",
-        headers={
-            "Host": f"127.0.0.1:{PORT}",
-            "Origin": LOCAL_URL,
-            "Cookie": f"dcmget_session={client.cookies.get('dcmget_session')}",
-        },
-    ) as socket:
-        assert socket.receive_text() == "ready"
-
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(
-            "/workspace/_nicegui_ws/socket.io/",
-            headers={
-                "Host": f"127.0.0.1:{PORT}",
-                "Origin": "http://attacker.invalid",
-                "Cookie": f"dcmget_session={client.cookies.get('dcmget_session')}",
-            },
-        ):
-            pass
-
-    no_session = TestClient(
-        app,
-        base_url=LOCAL_URL,
-        client=("127.0.0.1", 50127),
-    )
-    with pytest.raises(WebSocketDisconnect):
-        with no_session.websocket_connect(
-            "/workspace/_nicegui_ws/socket.io/",
-            headers={"Host": f"127.0.0.1:{PORT}", "Origin": LOCAL_URL},
-        ):
-            pass
+    asset = client.get("/assets/app.js")
+    assert asset.status_code == 200
+    assert "dataset.ready" in asset.text
+    assert asset.headers["cache-control"] == "no-store"
+    assert "style-src 'self' 'unsafe-inline'" in asset.headers[
+        "content-security-policy"
+    ]
+    assert client.get("/workspace/").status_code == 404
+    assert client.get("/", headers={"Host": "attacker.example"}).status_code == 421
 
 
-def test_nicegui_workspace_mounts_in_an_isolated_runtime(tmp_path: Path):
-    root = Path(__file__).resolve().parents[1]
-    code = f"""
-from pathlib import Path
-from fastapi.testclient import TestClient
-from nicegui import run as nicegui_run
-from dcmget.management_server import WindowsManagementService
-from dcmget.nicegui_ui import install_nicegui
-from dcmget.web_security import bootstrap_web_security
-from dcmget.web_server import create_web_app
-
-state = Path({str(tmp_path / 'nicegui-state')!r})
-security = bootstrap_web_security(state)
-app = create_web_app(
-    WindowsManagementService(),
-    security=security,
-    server_host='127.0.0.1',
-    server_port={PORT},
-    trusted_hosts=('127.0.0.1',),
-    nicegui_mount_path='/workspace',
-)
-install_nicegui(app, mount_path='/workspace')
-nicegui_run.setup = lambda: None
-with TestClient(
-    app,
-    base_url='http://127.0.0.1:{PORT}',
-    client=('127.0.0.1', 50128),
-) as client:
-    root_response = client.get('/', follow_redirects=False)
-    assert root_response.status_code == 307
-    page = client.get('/workspace/')
-    assert page.status_code == 200
-    assert 'DcmGet DICOM 影像下载' in page.text
-    assert 'data-dcmget-theme-bootstrap' in page.text
-    assert '/workspace/_nicegui/' in page.text
-    assert client.get('/workspace/favicon.ico').status_code == 200
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+def test_react_frontend_is_required(tmp_path: Path):
+    with pytest.raises(ValueError, match="React Web 离线资源目录未配置"):
+        create_web_app(
+            FakeService(),
+            security=bootstrap_web_security(tmp_path / "state"),
+            server_port=PORT,
+            trusted_hosts=("127.0.0.1",),
+        )
 
 
 def test_windowed_runtime_builds_uvicorn_server_without_console_streams(
@@ -367,7 +303,7 @@ def test_windowed_runtime_builds_uvicorn_server_without_console_streams(
         state_directory=tmp_path / "state",
         host="127.0.0.1",
         port=18787,
-        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+        react_static_root=_react_root(tmp_path / "webui-react"),
     )
 
     uvicorn_server = server._make_uvicorn_server()
@@ -573,7 +509,7 @@ def test_default_web_preflight_still_reports_external_receiver_port_conflicts(
         security=security,
         server_port=PORT,
         trusted_hosts=("127.0.0.1",),
-        static_root=Path(__file__).resolve().parents[1] / "dcmget" / "webui",
+        react_static_root=_react_root(tmp_path / "webui-react"),
         directory_roots={"data": destination},
         config_path=config_path,
         project_root=tmp_path,

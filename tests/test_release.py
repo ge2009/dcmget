@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from DICOM_download_ui import build_parser, validate_frozen_pdi_resources
+from DICOM_download_ui import (
+    build_parser,
+    validate_frozen_pdi_resources,
+    validate_web_resources,
+)
 from dcmget import __version__
 from dcmget.architecture import (
     ArchitectureError,
@@ -126,8 +130,13 @@ def test_source_deploy_contains_transitive_requirement_files():
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
     assert "dcmget/architecture.py" in bundled
-    assert "dcmget/nicegui_ui.py" in bundled
+    assert "dcmget/nicegui_ui.py" not in bundled
+    assert not any(name.startswith("dcmget/webui/") for name in bundled)
     assert "dcmget/storage_scp.py" in bundled
+    assert "frontend/package.json" in bundled
+    assert "frontend/package-lock.json" in bundled
+    assert not any("node_modules" in Path(name).parts for name in bundled)
+    assert not any(name.endswith(".tsbuildinfo") for name in bundled)
 
 
 def test_pynetdicom_is_a_runtime_and_frozen_build_dependency():
@@ -161,6 +170,19 @@ def test_brand_assets_are_real_hidpi_images_and_windows_icon_has_256px():
         "logo.png",
         "assets/branding/dcmget-icon-image2-source.png",
     } <= bundled
+
+
+def test_react_theme_defaults_to_light_without_overriding_saved_dark_choice():
+    root = Path(__file__).resolve().parents[1]
+    bootstrap = (root / "frontend" / "public" / "theme.js").read_text(
+        encoding="utf-8"
+    )
+    index = (root / "frontend" / "index.html").read_text(encoding="utf-8")
+
+    assert "saved === 'dark'" in bootstrap
+    assert "saved !== 'light'" not in bootstrap
+    assert "dataset.theme = 'light'" in bootstrap
+    assert 'name="theme-color" content="#edf3f3"' in index
 
 
 def test_release_version_sources_and_web_self_test_flags_stay_in_sync():
@@ -231,6 +253,7 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     assert "actions/upload-artifact" not in ci
     assert '"fastapi>=0.139.2,<0.140"' in project
     assert '"uvicorn>=0.51,<0.52"' in project
+    assert 'dcmget = ["CHANGELOG.md", "webui-react/*"]' in project
 
 
 def test_offline_web_runtime_and_static_frontend_are_packaged():
@@ -244,152 +267,84 @@ def test_offline_web_runtime_and_static_frontend_are_packaged():
     readme = (root / "README.md").read_text(encoding="utf-8")
 
     assert "fastapi>=0.139.2,<0.140" in requirements
-    assert "nicegui>=3.14,<3.15" in requirements
+    assert "nicegui" not in requirements.casefold()
     assert 'pywebview>=6.2.1,<6.3; sys_platform == "win32"' in requirements
     assert "uvicorn>=0.51,<0.52" in requirements
     assert '"fastapi>=0.139.2,<0.140"' in project
-    assert '"nicegui>=3.14,<3.15"' in project
+    assert "nicegui" not in project.casefold()
     assert '"pywebview>=6.2.1,<6.3; sys_platform == \'win32\'"' in project
     assert '"uvicorn>=0.51,<0.52"' in project
-    assert "f\"{ROOT / 'dcmget' / 'webui'}:dcmget/webui\"" in build
+    assert 'f"{react_webui_root()}:dcmget/webui-react"' in build
     assert '"--collect-submodules",\n        "uvicorn"' in build
-    assert '"--collect-all",\n        "nicegui"' in build
+    assert '"--collect-all",\n        "nicegui"' not in build
     assert '"--collect-all",\n        "webview"' in build
-    assert '"--hidden-import",\n        "dcmget.nicegui_ui"' in build
+    assert '"--hidden-import",\n        "dcmget.nicegui_ui"' not in build
     assert "Assert-WebResources $unpackedResourceRoot" in workflow
-    assert "Portable EXE is missing DcmGet Web index" in workflow
+    assert "actions/setup-node@v4" in workflow
+    assert "npm --prefix frontend ci" in workflow
+    assert "npm --prefix frontend run typecheck" in workflow
+    assert "npm --prefix frontend test" in workflow
+    assert "npm --prefix frontend run build" in workflow
+    assert "Portable EXE is missing DcmGet React Web index" in workflow
     assert "Portable EXE is missing FastAPI" in workflow
     assert "Portable EXE is missing Uvicorn" in workflow
     assert "0.0.0.0:8787" in readme
     assert "HTTP 未加密" in readme
 
 
-def test_nicegui_manager_dialog_survives_profile_grid_refresh():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
-    manager = source[
-        source.index("async def _build_manager") : source.index("def _topbar")
-    ]
-
-    assert 'dialog_host = ui.element("div").classes("dialog-host")' in manager
-    assert "with dialog_host:" in manager
-    grid_position = manager.index('grid = ui.element("section")')
-    host_position = manager.index('dialog_host = ui.element("div")')
-    initial_refresh_position = manager.index("await refresh_profiles()", host_position)
-    assert grid_position < host_position < initial_refresh_position
-
-
-def test_nicegui_manager_exposes_safe_incremental_update_controls():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
-    manager = source[
-        source.index("async def _build_manager") : source.index("def _topbar")
-    ]
-
-    assert '"/api/update/status"' in manager
-    assert '"/api/update/check"' in manager
-    assert '"/api/update/download"' in manager
-    assert '"/api/update/apply"' in manager
-    assert '"/api/update/policy"' in manager
-    assert "组件增量包" in manager
-    assert "没有可用增量包时才回退完整安装包" in manager
-    assert "远程页面仅可查看状态" in manager
-    assert "confirm_apply_update" in manager
-
-
-def test_nicegui_typography_uses_offline_platform_fonts_and_readable_sizes():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
-
-    assert '"Segoe UI Variable Text"' in source
-    assert '"Microsoft YaHei UI"' in source
-    assert '"PingFang SC"' in source
-    assert '"Cascadia Mono"' in source
-    assert "body {\n  font-size:14px;" in source
-    assert "font-size:clamp(28px,2.3vw,36px)" in source
-
-
-def test_nicegui_workspace_has_persistent_theme_and_accessibility_fallbacks():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
-
-    assert "THEME_BOOTSTRAP" in source
-    assert "THEME_TOGGLE_HANDLER" in source
-    assert "data-dcmget-theme-bootstrap" in source
-    assert "window.localStorage.getItem(key)" in source
-    assert "window.localStorage.setItem('dcmget-theme', next)" in source
-    assert ':root[data-theme="dark"]' in source
-    assert "@media(prefers-reduced-motion:reduce)" in source
-    assert "@media(forced-colors:active)" in source
-    assert 'ui.add_head_html(THEME_BOOTSTRAP)' in source
-    assert 'js_handler=THEME_TOGGLE_HANDLER' in source
-    assert 'aria-label="切换浅色或深色主题"' in source
-
-
-def test_nicegui_baseui_style_layer_stays_offline_and_styles_quasar_components():
-    from dcmget.nicegui_ui import CSS
-
-    normalized = CSS.lower()
-    assert "@import" not in normalized
-    assert "http://" not in normalized
-    assert "https://" not in normalized
-    for token in (
-        "--base-color-primary:",
-        "--base-color-content-primary:",
-        "--base-color-background:",
-        "--base-color-surface:",
-        "--base-color-border:",
-        "--base-radius-control:",
-        "--base-control-height:",
-    ):
-        assert token in CSS
-    assert ".q-btn {" in CSS
-    assert ".q-field--outlined .q-field__control {" in CSS
-    assert ".surface {" in CSS
-    assert ".settings-dialog {" in CSS
-
-
-def test_nicegui_baseui_style_keeps_keyboard_and_platform_accessibility():
-    from dcmget.nicegui_ui import CSS
-
-    assert ".q-btn:focus-visible" in CSS
-    assert "--base-focus-ring:" in CSS
-    assert ".q-btn.q-btn--disabled" in CSS
-    assert ".q-field--disabled .q-field__control" in CSS
-    assert "@media(prefers-reduced-motion:reduce)" in CSS
-    assert "@media(forced-colors:active)" in CSS
-    assert "@media(max-width:900px)" in CSS
-    assert "@media(max-width:520px)" in CSS
-
-
-def test_nicegui_primary_action_is_high_and_runtime_buttons_remain_legible():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
-    workspace = source[source.index('with ui.element("section").classes("hero")') :]
-
-    assert workspace.index('classes("launch-bar")') < workspace.index(
-        'classes("grid-main")'
+def test_react_resource_validation_rejects_external_runtime_references(
+    tmp_path: Path,
+):
+    webui = tmp_path / "dcmget" / "webui-react"
+    webui.mkdir(parents=True)
+    (webui / "index.html").write_text(
+        '<!doctype html><link rel="stylesheet" href="/assets/app.css">'
+        '<script src="/assets/app.js"></script>',
+        encoding="utf-8",
     )
-    assert 'refs["start"] = ui.button(' in workspace
-    assert 'refs["resume"] = ui.button("继续"' in workspace
-    resume = workspace[workspace.index('refs["resume"] = ui.button("继续"') :]
-    assert '.props("unelevated no-caps").classes("button-primary")' in resume[:300]
-    assert "async def request_edit_profile" in source
-    assert "停止并修改" in source
+    (webui / "app.css").write_text("body{}", encoding="utf-8")
+    (webui / "app.js").write_text(
+        'const svgNamespace = "http://www.w3.org/2000/svg";',
+        encoding="utf-8",
+    )
+    (webui / "theme.js").write_text("void 0;", encoding="utf-8")
 
+    assert validate_web_resources(tmp_path) == webui
 
-def test_nicegui_exposes_irreversible_end_task_with_confirmation():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "dcmget" / "nicegui_ui.py").read_text(encoding="utf-8")
+    (webui / "index.html").write_text(
+        '<!doctype html><script src="https://cdn.example.invalid/app.js"></script>',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="index.html"):
+        validate_web_resources(tmp_path)
 
-    assert 'refs["end_task"] = ui.button(' in source
-    assert '"结束任务"' in source
-    assert "def confirm_end_task()" in source
-    assert "已经下载的 DICOM 文件和任务日志会保留" in source
-    assert "此操作不可撤销" in source
-    assert 'task_action("end")' in source
-    assert '"取消任务"' in source
-    assert 'task_action("cancel")' in source
+    (webui / "index.html").write_text(
+        '<!doctype html><link rel="stylesheet" href="/assets/app.css">'
+        '<script src="/assets/app.js"></script>',
+        encoding="utf-8",
+    )
+    (webui / "app.css").write_text(
+        '@import url("https://cdn.example.invalid/app.css");',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="app.css"):
+        validate_web_resources(tmp_path)
+
+    (webui / "app.css").write_text("body{}", encoding="utf-8")
+    (webui / "app.js").write_text(
+        'fetch("https://api.example.invalid/task")',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="app.js"):
+        validate_web_resources(tmp_path)
+
+    (webui / "app.js").write_text("void 0;", encoding="utf-8")
+    (webui / "theme.js").write_text(
+        'navigator.sendBeacon("https://telemetry.example.invalid/event")',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="theme.js"):
+        validate_web_resources(tmp_path)
 
 
 def test_windows_release_packages_only_the_required_dcmtk_runtime():

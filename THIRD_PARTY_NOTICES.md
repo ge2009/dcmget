@@ -5,8 +5,14 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [DCMTK](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)：Copyright OFFIS e.V.，遵循 DCMTK 自带许可。
 - [cryptography](https://github.com/pyca/cryptography)：Apache License 2.0 / BSD 3-Clause 双许可。
 - [FastAPI](https://github.com/fastapi/fastapi)：MIT License。
-- [NiceGUI](https://github.com/zauberzeug/nicegui)：MIT License。DcmGet 使用其离线内置的 Vue、Quasar 与 Socket.IO Web 资源构建本地操作工作台，不加载 CDN。
-- [pywebview](https://github.com/r0x0r/pywebview)：BSD 3-Clause License。Windows 交互入口使用 pywebview 调用系统 WebView2 Runtime 承载本地 NiceGUI 工作台。
+- [React](https://github.com/facebook/react) 与 [React DOM](https://www.npmjs.com/package/react-dom)：MIT License。DcmGet 使用 React 构建唯一的本地 Web 工作台并渲染到浏览器或 WebView2。
+- [Base UI for React](https://github.com/mui/base-ui)：MIT License。DcmGet 使用 `@base-ui/react` 提供无样式、可访问的交互组件基础，并由本项目样式统一呈现医疗工作台界面。
+- [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss)：MIT License。仅在构建阶段生成工作台样式，运行时不加载 Tailwind、Node.js 或外部 CDN。
+- [Motion](https://github.com/motiondivision/motion)：MIT License。用于工作台中克制的状态与界面过渡，并遵循系统的减少动态效果设置。
+- [Zod](https://github.com/colinhacks/zod)：MIT License。用于校验前端接收的 API 数据和用户输入边界。
+- [Lucide](https://github.com/lucide-icons/lucide)：ISC License。DcmGet 使用 `lucide-react` 提供随前端一起编译的本地图标，不从图标服务或 CDN 加载资源。
+- [Vite](https://github.com/vitejs/vite)：MIT License；[TypeScript](https://github.com/microsoft/TypeScript)：Apache License 2.0。两者只用于开发和发布阶段生成固定文件名的离线前端资源，不作为客户端运行时依赖。
+- [pywebview](https://github.com/r0x0r/pywebview)：BSD 3-Clause License。Windows 交互入口使用 pywebview 调用系统 WebView2 Runtime 承载本地 React 工作台。
 - [pythonnet](https://github.com/pythonnet/pythonnet)：MIT License。由 pywebview 在 Windows 上用于 .NET 互操作。
 - [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)：遵循 Microsoft 软件许可条款；DcmGet 不内置该运行时，Windows 交互入口使用系统现有的 WebView2 Runtime。
 - [Starlette](https://github.com/Kludex/starlette)：BSD 3-Clause License。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "3.6.1"
+version = "3.7.0"
 description = "Offline LAN Web workstation for DCMTK C-MOVE downloads"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,6 @@ dependencies = [
   "cryptography>=44,<47",
   "fastapi>=0.139.2,<0.140",
   "filelock>=3.16,<4",
-  "nicegui>=3.14,<3.15",
   "pywebview>=6.2.1,<6.3; sys_platform == 'win32'",
   "pydicom>=3.0,<4",
   "pynetdicom>=3.0,<4",
@@ -29,7 +28,7 @@ packages = ["dcmget"]
 py-modules = ["DICOM_download_script", "DICOM_download_ui"]
 
 [tool.setuptools.package-data]
-dcmget = ["CHANGELOG.md", "webui/*"]
+dcmget = ["CHANGELOG.md", "webui-react/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -75,6 +75,15 @@ WINDOWS_DCMTK_DATA_FILES = (
     "share/doc/dcmtk-3.7.0/COPYRIGHT",
     "share/doc/dcmtk-3.7.0/VERSION",
 )
+REACT_WEBUI_FILES = ("index.html", "app.css", "app.js", "theme.js")
+
+
+def react_webui_root() -> Path:
+    root = ROOT / "dcmget" / "webui-react"
+    missing = [name for name in REACT_WEBUI_FILES if not (root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"React Web 离线资源缺失：{'、'.join(missing)}")
+    return root
 
 
 def source_version() -> str:
@@ -302,11 +311,7 @@ def pyinstaller_args(
         "--collect-submodules",
         "uvicorn",
         "--collect-all",
-        "nicegui",
-        "--collect-all",
         "webview",
-        "--hidden-import",
-        "dcmget.nicegui_ui",
         "--add-data",
         f"{ROOT / 'logo.png'}:.",
         "--add-data",
@@ -324,11 +329,15 @@ def pyinstaller_args(
         "--add-data",
         f"{ROOT / 'dcmget' / 'architecture.py'}:dcmget",
         "--add-data",
-        f"{ROOT / 'dcmget' / 'webui'}:dcmget/webui",
-        "--add-data",
         f"{runtime_root}:.runtime/dcmtk/windows-x86_64",
         "--noupx",
     ]
+    arguments.extend(
+        [
+            "--add-data",
+            f"{react_webui_root()}:dcmget/webui-react",
+        ]
+    )
     if ohif_root is not None:
         arguments.extend(
             [

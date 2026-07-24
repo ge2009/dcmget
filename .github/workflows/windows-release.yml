@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.6.1
+        default: 3.7.0
       publish_release:
         description: Publish the verified build to GitHub Releases
         required: true
@@ -56,6 +56,19 @@ jobs:
           python-version: "3.12"
           architecture: x64
           cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify and build React workspace
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run typecheck
+          npm --prefix frontend test
+          npm --prefix frontend run build
 
       - name: Verify AMD64 Python build host
         shell: pwsh
@@ -184,28 +197,21 @@ jobs:
           $content = Get-Content $link -Raw
           if ($content -notmatch '(?m)^URL=http://127\.0\.0\.1:8787/$') { throw "Profile URL shortcut target is incorrect: $content" }
 
-      - name: Verify embedded NiceGUI, WebView, OHIF and PDI resources
+      - name: Verify embedded React, WebView, OHIF and PDI resources
         shell: pwsh
         run: |
           function Assert-WebResources([string]$resourceRoot) {
-            $nicegui = Join-Path $resourceRoot "nicegui"
-            @("static", "templates") | ForEach-Object {
-              $asset = Join-Path $nicegui $_
-              if (-not (Test-Path $asset -PathType Container)) {
-                throw "Missing offline NiceGUI resource directory: $asset"
-              }
-            }
             if (-not (Test-Path (Join-Path $resourceRoot "webview") -PathType Container)) {
               throw "Missing embedded pywebview modules"
             }
-            $webui = Join-Path $resourceRoot "dcmget\webui"
-            @("index.html", "app.css", "app.js") | ForEach-Object {
+            $webui = Join-Path $resourceRoot "dcmget\webui-react"
+            @("index.html", "app.css", "app.js", "theme.js") | ForEach-Object {
               $asset = Join-Path $webui $_
               if (-not (Test-Path $asset -PathType Leaf)) {
-                throw "Missing offline DcmGet Web resource: $asset"
+                throw "Missing offline DcmGet React Web resource: $asset"
               }
               if ((Get-Item $asset).Length -eq 0) {
-                throw "Offline DcmGet Web resource is empty: $asset"
+                throw "Offline DcmGet React Web resource is empty: $asset"
               }
             }
           }
@@ -252,13 +258,12 @@ jobs:
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*pdi_server\.py" -Quiet)) { throw "Portable EXE is missing portable PDI server script" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*architecture\.py" -Quiet)) { throw "Portable EXE is missing PDI architecture guard" }
           if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*instance_shortcut" -Quiet)) { throw "Portable EXE is missing profile shortcut support" }
-          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*index\.html" -Quiet)) { throw "Portable EXE is missing DcmGet Web index" }
-          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.css" -Quiet)) { throw "Portable EXE is missing DcmGet Web styles" }
-          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui.*app\.js" -Quiet)) { throw "Portable EXE is missing DcmGet Web application" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui-react.*index\.html" -Quiet)) { throw "Portable EXE is missing DcmGet React Web index" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui-react.*app\.css" -Quiet)) { throw "Portable EXE is missing DcmGet React Web styles" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui-react.*app\.js" -Quiet)) { throw "Portable EXE is missing DcmGet React Web application" }
+          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*webui-react.*theme\.js" -Quiet)) { throw "Portable EXE is missing DcmGet React Web theme bootstrap" }
           if (-not (Select-String -Path $archiveListing -Pattern "fastapi" -Quiet)) { throw "Portable EXE is missing FastAPI" }
-          if (-not (Select-String -Path $archiveListing -Pattern "dcmget.*nicegui_ui" -Quiet)) { throw "Portable EXE is missing DcmGet NiceGUI workspace" }
-          if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*templates.*index\.html" -Quiet)) { throw "Portable EXE is missing NiceGUI templates" }
-          if (-not (Select-String -Path $archiveListing -Pattern "nicegui.*static" -Quiet)) { throw "Portable EXE is missing NiceGUI static assets" }
+          if (Select-String -Path $archiveListing -Pattern "nicegui" -Quiet) { throw "Portable EXE still contains removed NiceGUI runtime" }
           if (-not (Select-String -Path $archiveListing -Pattern "webview" -Quiet)) { throw "Portable EXE is missing pywebview" }
           if (-not (Select-String -Path $archiveListing -Pattern "uvicorn" -Quiet)) { throw "Portable EXE is missing Uvicorn" }
           if (-not (Select-String -Path $archiveListing -Pattern "ohif-3\.12\.6.*index\.html" -Quiet)) { throw "Portable EXE is missing OHIF index" }
@@ -650,12 +655,9 @@ jobs:
             throw "Installed DCMTK bin allowlist mismatch: $($installedDcmtkDifference | Out-String)"
           }
           $resourceRoot = Join-Path $installDir "_internal"
-          @("static", "templates") | ForEach-Object {
-            if (-not (Test-Path (Join-Path "$resourceRoot/nicegui" $_) -PathType Container)) { throw "Installed NiceGUI resource is missing: $_" }
-          }
-          $webui = Join-Path $resourceRoot "dcmget\webui"
-          @("index.html", "app.css", "app.js") | ForEach-Object {
-            if (-not (Test-Path (Join-Path $webui $_) -PathType Leaf)) { throw "Installed DcmGet Web resource is missing: $_" }
+          $webui = Join-Path $resourceRoot "dcmget\webui-react"
+          @("index.html", "app.css", "app.js", "theme.js") | ForEach-Object {
+            if (-not (Test-Path (Join-Path $webui $_) -PathType Leaf)) { throw "Installed DcmGet React Web resource is missing: $_" }
           }
           $ohif = Join-Path $resourceRoot ".runtime\ohif\ohif-3.12.6"
           if (-not (Test-Path (Join-Path $resourceRoot "DcmGetPdiServer.exe") -PathType Leaf)) { throw "Installed PDI local server is missing" }

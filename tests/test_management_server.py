@@ -270,7 +270,7 @@ def test_management_hub_uses_fixed_listener_and_survives_broken_profile_config(
         project_root=PROJECT_ROOT,
         state_directory=tmp_path / "manager-state",
         trusted_hosts=("127.0.0.1",),
-        static_root=PROJECT_ROOT / "dcmget" / "webui",
+        react_static_root=PROJECT_ROOT / "dcmget" / "webui-react",
     )
 
     assert server.host == WINDOWS_MANAGEMENT_HOST == "0.0.0.0"
@@ -343,7 +343,7 @@ def test_private_manager_peer_keeps_host_origin_session_and_csrf_controls(
         project_root=PROJECT_ROOT,
         state_directory=tmp_path / "manager-state",
         trusted_hosts=("192.168.1.50",),
-        static_root=PROJECT_ROOT / "dcmget" / "webui",
+        react_static_root=PROJECT_ROOT / "dcmget" / "webui-react",
     )
     client = TestClient(
         server.app,
@@ -430,10 +430,19 @@ def test_management_hub_exposes_same_origin_profile_proxy(
         headers={"Origin": MANAGER_URL, "X-CSRF-Token": csrf},
     )
     assert allowed.status_code == 200
+    ended = client.post(
+        "/api/management/profiles/2/task/end",
+        json={},
+        headers={"Origin": MANAGER_URL, "X-CSRF-Token": csrf},
+    )
+    assert ended.status_code == 200
+    assert calls[-1]["api_path"] == "task/end"
 
 
 def test_profile_proxy_allowlist_blocks_shutdown_and_arbitrary_paths():
     assert _profile_proxy_route_allowed("GET", "snapshot")
+    assert _profile_proxy_route_allowed("POST", "task/end")
+    assert _profile_proxy_route_allowed("POST", "tasks/end")
     assert _profile_proxy_route_allowed("POST", "operations/open-destination")
     assert _profile_proxy_route_allowed("POST", "operations/profile-backup")
     assert _profile_proxy_route_allowed("POST", "operations/support-bundle")
@@ -802,7 +811,7 @@ def test_hidden_cli_manager_mode_skips_profile_and_dcmtk_startup(
     monkeypatch.setattr(
         entry,
         "validate_web_resources",
-        lambda _root=entry.PROJECT_ROOT: entry.PROJECT_ROOT / "dcmget" / "webui",
+        lambda _root=entry.PROJECT_ROOT: entry.PROJECT_ROOT / "dcmget" / "webui-react",
     )
     monkeypatch.setattr(
         entry,

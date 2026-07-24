@@ -64,6 +64,8 @@ _PROFILE_PROXY_ROUTES = frozenset(
         ("POST", "tasks/resume"),
         ("POST", "task/cancel"),
         ("POST", "tasks/cancel"),
+        ("POST", "task/end"),
+        ("POST", "tasks/end"),
         ("POST", "task/retry"),
         ("POST", "tasks/retry-failed"),
         ("POST", "task/accept-partial"),
@@ -382,9 +384,8 @@ def create_windows_management_server(
     project_root: str | Path | None = None,
     state_directory: str | Path | None = None,
     trusted_hosts: Iterable[str] = (),
-    static_root: str | Path | None = None,
+    react_static_root: str | Path | None = None,
     update_service: object | None = None,
-    nicegui_enabled: bool = False,
     log_level: str = "info",
 ) -> DcmGetWebServer:
     """Build the fixed management hub without claiming or validating a Profile."""
@@ -438,7 +439,7 @@ def create_windows_management_server(
         host=WINDOWS_MANAGEMENT_HOST,
         port=WINDOWS_MANAGEMENT_PORT,
         trusted_hosts=trusted_hosts,
-        static_root=static_root,
+        react_static_root=react_static_root,
         directory_roots=(),
         project_root=root,
         profile_metadata={
@@ -451,7 +452,6 @@ def create_windows_management_server(
         profile_api_proxy=profile_proxy.request,
         update_service=update_service,
         management_mode=True,
-        nicegui_enabled=nicegui_enabled,
         log_level=log_level,
     )
 
@@ -462,7 +462,7 @@ def run_windows_management_server(
     project_root: str | Path | None = None,
     state_directory: str | Path | None = None,
     trusted_hosts: Iterable[str] = (),
-    static_root: str | Path | None = None,
+    react_static_root: str | Path | None = None,
     update_service: object | None = None,
     log_level: str = "info",
 ) -> int:
@@ -473,9 +473,8 @@ def run_windows_management_server(
         project_root=project_root,
         state_directory=state_directory,
         trusted_hosts=trusted_hosts,
-        static_root=static_root,
+        react_static_root=react_static_root,
         update_service=update_service,
-        nicegui_enabled=True,
         log_level=log_level,
     )
     try:
