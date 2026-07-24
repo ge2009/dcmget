@@ -214,6 +214,7 @@ class ProfileManager:
                 AppConfig(),
                 storage_port=storage_port,
                 web_port=web_port,
+                web_bind_address="127.0.0.1",
             )
             name = _display_name(
                 display_name if display_name is not None else f"实例 {target_number}"
@@ -280,6 +281,7 @@ class ProfileManager:
                 source_config,
                 storage_port=recommended_port,
                 web_port=recommended_web_port,
+                web_bind_address="127.0.0.1",
             )
             name = _display_name(
                 display_name if display_name is not None else f"实例 {target_number}"
@@ -453,6 +455,83 @@ class ProfileManager:
             )
         finally:
             allocation_lock.release()
+
+    def ensure_internal_web_endpoint(
+        self,
+        profile_number: int | str,
+        *,
+        check_system_port: bool = True,
+    ) -> ProfileInfo:
+        """Keep a stopped Profile's private Web endpoint loopback-only and usable."""
+
+        number = _profile_number(profile_number)
+        allocation_lock = self._acquire_allocation_lock()
+        profile_lock: FileLock | None = None
+        try:
+            try:
+                profile_lock = self._acquire_profile_lock(number)
+            except ProfileInUseError:
+                raise ProfileInUseError(
+                    f"实例 {number} 正在运行，不能调整内部 Web 端口"
+                ) from None
+
+            config = self._load_profile_config(number)
+            web_port = config.web_port
+            try:
+                web_port_number = int(web_port)
+            except (TypeError, ValueError):
+                web_port_number = 0
+            needs_port = (
+                isinstance(web_port, bool)
+                or not 1 <= web_port_number <= 65535
+                or web_port_number in RESERVED_PROFILE_PORTS
+                or web_port_number == int(config.storage_port)
+            )
+            if not needs_port:
+                for profile in self.list_profiles():
+                    if profile.number == number:
+                        continue
+                    if web_port_number in {profile.storage_port, profile.web_port}:
+                        needs_port = True
+                        break
+            if not needs_port and check_system_port:
+                try:
+                    needs_port = not bool(
+                        self._port_probe("127.0.0.1", web_port_number)
+                    )
+                except OSError:
+                    needs_port = True
+
+            updated_port = (
+                self.recommend_available_port(
+                    8787,
+                    excluded_ports=(config.storage_port,),
+                )
+                if needs_port
+                else web_port_number
+            )
+            if (
+                config.web_bind_address != "127.0.0.1"
+                or config.web_port != updated_port
+            ):
+                updated = replace(
+                    config,
+                    web_bind_address="127.0.0.1",
+                    web_port=updated_port,
+                )
+                save_config(self._config_path(number), updated)
+                _make_private(self._config_path(number))
+        except Exception as exc:
+            if isinstance(exc, ProfileManagerError):
+                raise
+            raise ProfileManagerError(
+                f"实例 {number} 的内部 Web 端点自动配置失败：{exc}"
+            ) from exc
+        finally:
+            if profile_lock is not None and profile_lock.is_locked:
+                profile_lock.release()
+            allocation_lock.release()
+        return self.get_profile(number)
 
     def profile_stop_blockers(self, profile_number: int | str) -> tuple[str, ...]:
         """Return processes or ports that prove a Profile is not fully stopped."""

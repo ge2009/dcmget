@@ -1,7 +1,8 @@
-import { Download, Globe2, RefreshCw, ShieldCheck, Sparkles } from 'lucide-react';
+import { Globe2, ShieldCheck, Sparkles } from 'lucide-react';
 import { formatBytes, normalizeStatus } from '../domain';
 import type { UpdateState } from '../schemas';
 import { Button, Sheet, StatusBadge, SwitchRow } from './Primitives';
+import { AnimatedIcon, semanticIconMap } from './icons';
 
 export function UpdateSheet({
   open,
@@ -36,8 +37,8 @@ export function UpdateSheet({
       <SwitchRow checked={update.policy === 'automatic'} onCheckedChange={(checked) => onAction('policy', { policy: checked ? 'automatic' : 'disabled' })} disabled={!localSession || Boolean(busy)} label="自动检查稳定通道" description="外网不可达时静默跳过；关闭后不访问更新服务器。" />
       {!localSession && <div className="inline-warning"><Globe2 size={16} />下载和安装只允许在运行 DcmGet 的本机操作。</div>}
       <div className="update-actions">
-        <Button onClick={() => onAction('check')} disabled={Boolean(busy) || !localSession}><RefreshCw size={17} className={busy === 'check' ? 'spin' : ''} />立即检查</Button>
-        {update.available && !downloaded && <Button variant="primary" onClick={() => onAction('download')} disabled={Boolean(busy) || !localSession}><Download size={17} />下载更新</Button>}
+        <Button onClick={() => onAction('check')} disabled={Boolean(busy) || !localSession}><AnimatedIcon {...semanticIconMap.refresh} size={17} className={busy === 'check' ? 'spin' : ''} />立即检查</Button>
+        {update.available && !downloaded && <Button variant="primary" onClick={() => onAction('download')} disabled={Boolean(busy) || !localSession}><AnimatedIcon {...semanticIconMap.startDownload} size={17} />下载更新</Button>}
         {downloaded && <Button variant="primary" onClick={() => onAction('apply')} disabled={Boolean(busy) || !localSession}><ShieldCheck size={17} />安装更新</Button>}
       </div>
     </>}

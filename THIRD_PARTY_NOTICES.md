@@ -11,6 +11,7 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [Motion](https://github.com/motiondivision/motion)：MIT License。用于工作台中克制的状态与界面过渡，并遵循系统的减少动态效果设置。
 - [Zod](https://github.com/colinhacks/zod)：MIT License。用于校验前端接收的 API 数据和用户输入边界。
 - [Lucide](https://github.com/lucide-icons/lucide)：ISC License。DcmGet 使用 `lucide-react` 提供随前端一起编译的本地图标，不从图标服务或 CDN 加载资源。
+- [lucide-animated](https://github.com/pqoqubbw/icons)：MIT License。DcmGet 参考其公开的 Lucide + Motion 动效参数，并在本项目统一的 `AnimatedIcon` 封装中进行适配；运行时不访问其网站、注册表或 CDN。
 - [Vite](https://github.com/vitejs/vite)：MIT License；[TypeScript](https://github.com/microsoft/TypeScript)：Apache License 2.0。两者只用于开发和发布阶段生成固定文件名的离线前端资源，不作为客户端运行时依赖。
 - [pywebview](https://github.com/r0x0r/pywebview)：BSD 3-Clause License。Windows 交互入口使用 pywebview 调用系统 WebView2 Runtime 承载本地 React 工作台。
 - [pythonnet](https://github.com/pythonnet/pythonnet)：MIT License。由 pywebview 在 Windows 上用于 .NET 互操作。

@@ -3,7 +3,7 @@ import { Progress } from '@base-ui/react/progress';
 import {
   ChevronDown, FileText, RotateCcw, ShieldCheck,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useCallback, useRef } from 'react';
 import {
   DETAIL_LIMIT, formatDuration, formatRate, normalizeStatus,
@@ -32,6 +32,7 @@ type Props = {
   onDestinationChange: (value: string) => void;
   onPdiEnabledChange: (value: boolean) => void;
   onPdiFolderChange: (value: string) => void;
+  onOpenPdiDirectory: () => void;
   onImport: (file: File) => void;
   onBrowse: () => void;
   onPreflight: () => void;
@@ -67,6 +68,7 @@ function isActiveRuntime(status: string): boolean {
 }
 
 export function TaskWorkspace(props: Props) {
+  const reduceMotion = useReducedMotion();
   const status = normalizeStatus(props.task?.status);
   const hasTask = Boolean(props.task?.id) || status !== 'idle';
   const previousHasTask = useRef(hasTask);
@@ -90,10 +92,10 @@ export function TaskWorkspace(props: Props) {
   return <div className="task-stack" data-state={hasTask ? 'runtime' : 'composer'}>
     <AnimatePresence mode="wait">
       {!hasTask
-        ? <motion.section key="editor" className="task-card task-composer" data-state="editing" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+        ? <motion.section key="editor" className="task-card task-composer" data-state="editing" initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <TaskComposer {...props} headingRef={focusComposerHeading} />
           </motion.section>
-        : <motion.section key="runtime" className="task-card task-runtime" data-state={status} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+        : <motion.section key="runtime" className="task-card task-runtime" data-state={status} initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <TaskRuntime {...props} task={props.task!} headingRef={focusRuntimeHeading} />
           </motion.section>}
     </AnimatePresence>
@@ -185,7 +187,10 @@ function TaskComposer(props: Props & { headingRef: (node: HTMLHeadingElement | n
           </div>
           <div className="pdi-option">
             <SwitchRow checked={props.pdiEnabled} onCheckedChange={props.onPdiEnabledChange} label="任务完成后导出 PDI" description="可选；生成可复制到 U 盘的便携目录。" />
-            {props.pdiEnabled && <input className="sub-input" aria-label="PDI 输出目录" value={props.pdiFolder} onChange={(event) => props.onPdiFolderChange(event.target.value)} placeholder="PDI 输出目录（留空使用默认值）" />}
+            {props.pdiEnabled && <div className="input-action">
+              <input aria-label="PDI 输出目录" value={props.pdiFolder} onChange={(event) => props.onPdiFolderChange(event.target.value)} placeholder="PDI 输出目录（留空使用默认值）" />
+              <Button type="button" onClick={props.onOpenPdiDirectory}><AnimatedIcon {...semanticIconMap.openDirectory} size={16} />打开目录</Button>
+            </div>}
           </div>
         </section>
       </div>
@@ -344,7 +349,7 @@ function PdiRuntime({ task, onAction }: { task: Task; onAction: Props['onPdiActi
       <div className="pdi-section__content">
         <p>{String(raw.message || raw.detail || raw.output_folder || raw.output_directory || '导出状态已更新')}</p>
         <div>
-          {finished && <Button size="small" onClick={() => onAction('open')}><AnimatedIcon {...semanticIconMap.openDirectory} size={15} />打开 PDI</Button>}
+          {finished && <Button size="small" onClick={() => onAction('open')}><AnimatedIcon {...semanticIconMap.openDirectory} size={15} />打开 PDI 目录</Button>}
           {finished && canVerify && <Button size="small" onClick={() => onAction('verify')}><ShieldCheck size={15} />校验</Button>}
           {canRetry && <Button size="small" onClick={() => onAction('retry')}><RotateCcw size={15} />重试导出</Button>}
         </div>

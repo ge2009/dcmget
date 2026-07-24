@@ -93,6 +93,27 @@ describe('AnimatedIcon', () => {
     expect(motionState.start).toHaveBeenCalledTimes(3);
   });
 
+  it.each([
+    ['download', 'y', 2, { type: 'spring', stiffness: 200, damping: 10, mass: 1 }],
+    ['upload', 'y', -2, { type: 'spring', stiffness: 200, damping: 10, mass: 1 }],
+    ['folder', 'rotate', [0, -8, 6, -4, 0], { duration: 0.6, ease: 'easeInOut' }],
+    ['refresh', 'rotate', 50, { type: 'spring', stiffness: 250, damping: 25 }],
+    ['rotate', 'rotate', 180, { type: 'spring', stiffness: 50, damping: 10 }],
+  ] as const)('adapts the lucide-animated %s motion signature', (animation, property, target, transition) => {
+    render(
+      <button type="button">
+        <AnimatedIcon animation={animation} icon={Download} />
+        操作
+      </button>,
+    );
+
+    fireEvent.focus(screen.getByRole('button', { name: '操作' }));
+    expect(motionState.start).toHaveBeenCalledWith(expect.objectContaining({
+      [property]: target,
+      transition: expect.objectContaining(transition),
+    }));
+  });
+
   it('plays only when statusKey changes, using the status animation', () => {
     const { rerender } = render(
       <AnimatedIcon

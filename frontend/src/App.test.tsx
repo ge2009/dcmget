@@ -9,6 +9,9 @@ function json(data: unknown) {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  window.history.replaceState({}, '', '/');
+  Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
 });
 
 describe('bootstrap modes', () => {
@@ -24,9 +27,11 @@ describe('bootstrap modes', () => {
   });
 
   it('renders manager mode and loads the selected running profile', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const path = String(input);
-      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {}, update: { supported: true, state: 'idle' } });
+      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {}, web: { lan_url: 'http://192.168.1.50:8786/' }, update: { supported: true, state: 'idle' } });
       if (path === '/api/management/profiles') return json({ profiles: [{ number: 2, display_name: 'CT 接收', is_running: true, storage_ae_title: 'DCMGET2', storage_port: 6662 }] });
       if (path === '/api/management/profiles/2/bootstrap') return json({ csrf_token: 'token2', profile: { number: 2, display_name: 'CT 接收', is_running: true }, config: { dicom_destination_folder: 'D:\\ct' }, task: { status: 'idle', actions: { can_start: true } } });
       if (path.startsWith('/api/management/profiles/2/events')) return json({ events: [] });
@@ -35,6 +40,85 @@ describe('bootstrap modes', () => {
     render(<App />);
     expect(await screen.findByRole('heading', { name: '接收实例' })).toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: 'CT 接收' })).toBeInTheDocument();
+    expect(screen.getByText('http://192.168.1.50:8786/')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '复制远程访问 URL' }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('http://192.168.1.50:8786/'));
+  });
+
+  it('opens the profile requested by the SPA path and keeps the path in sync', async () => {
+    window.history.replaceState({}, '', '/profiles/3');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {} });
+      if (path === '/api/management/profiles') return json({ profiles: [
+        { number: 1, display_name: 'CT 一号', is_running: true, storage_ae_title: 'DCMGET1', storage_port: 6661 },
+        { number: 3, display_name: 'MR 三号', is_running: true, storage_ae_title: 'DCMGET3', storage_port: 6663 },
+      ] });
+      if (path === '/api/management/profiles/1/bootstrap') return json({ csrf_token: 'token1', profile: { number: 1, display_name: 'CT 一号', is_running: true }, task: { status: 'idle', actions: { can_start: true } } });
+      if (path === '/api/management/profiles/3/bootstrap') return json({ csrf_token: 'token3', profile: { number: 3, display_name: 'MR 三号', is_running: true }, task: { status: 'idle', actions: { can_start: true } } });
+      if (path.includes('/events')) return json({ events: [] });
+      return json({});
+    });
+
+    render(<App />);
+    expect(await screen.findByRole('heading', { name: 'MR 三号', level: 1 })).toBeInTheDocument();
+    expect(window.location.pathname).toBe('/profiles/3');
+
+    fireEvent.click(screen.getByRole('button', { name: /CT 一号/ }));
+    expect(await screen.findByRole('heading', { name: 'CT 一号', level: 1 })).toBeInTheDocument();
+    expect(window.location.pathname).toBe('/profiles/1');
+  });
+
+  it('shows the total speed of running profiles and refreshes when the page becomes visible', async () => {
+    let speedPoll: (() => void) | null = null;
+    let taskRequests = 0;
+    const nativeSetInterval = window.setInterval;
+    vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler, timeout?: number) => {
+      if (timeout === 2500 && typeof handler === 'function') {
+        speedPoll = () => handler();
+        return 2501;
+      }
+      return nativeSetInterval(handler, timeout);
+    });
+    const clearIntervalSpy = vi.spyOn(window, 'clearInterval');
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {} });
+      if (path === '/api/management/profiles') return json({ profiles: [
+        { number: 1, display_name: 'CT 一号', is_running: true },
+        { number: 2, display_name: 'MR 二号', is_running: true },
+        { number: 3, display_name: '失败实例', is_running: true },
+      ] });
+      if (path === '/api/management/profiles/1/bootstrap') return json({ csrf_token: 'token1', profile: { number: 1, display_name: 'CT 一号', is_running: true }, task: { status: 'idle', actions: { can_start: true } } });
+      if (path.includes('/events')) return json({ events: [] });
+      if (path.endsWith('/task')) {
+        taskRequests += 1;
+        if (path.includes('/profiles/1/')) return json({ task: { speed_bytes_per_second: 1024 } });
+        if (path.includes('/profiles/2/')) return json({ task: { speed_bps: 2048 } });
+        throw new Error('profile offline');
+      }
+      return json({});
+    });
+
+    const { unmount } = render(<App />);
+    expect(await screen.findByText('总速度 3.00 KB/s')).toBeInTheDocument();
+    expect(screen.getByLabelText('全部运行实例总速度：3.00 KB/s')).toBeInTheDocument();
+    expect(taskRequests).toBe(3);
+
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    await act(async () => { speedPoll?.(); await Promise.resolve(); });
+    expect(taskRequests).toBe(3);
+
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(taskRequests).toBe(6));
+
+    unmount();
+    expect(clearIntervalSpy).toHaveBeenCalledWith(2501);
   });
 
   it('keeps the authoritative manager task while a progress delta is being refreshed', async () => {
@@ -53,6 +137,7 @@ describe('bootstrap modes', () => {
       if (path.startsWith('/api/management/profiles/2/events')) return await new Promise<Response>((resolve) => { resolveEvents = resolve; });
       if (path === '/api/management/profiles/2/task') {
         taskRequests += 1;
+        if (taskRequests === 1) return json({ task: { speed_bytes_per_second: 0 } });
         return await new Promise<Response>((resolve) => { resolveTask = resolve; });
       }
       return json({});
@@ -67,7 +152,7 @@ describe('bootstrap modes', () => {
         last_id: 1,
       }));
     });
-    await waitFor(() => expect(taskRequests).toBe(1));
+    await waitFor(() => expect(taskRequests).toBe(2));
     expect(screen.getByRole('button', { name: '暂停' })).toHaveFocus();
 
     await act(async () => { resolveTask?.(json({ task: { ...runningTask, processed: 2 } })); });

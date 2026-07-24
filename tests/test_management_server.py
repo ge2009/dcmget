@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 import DICOM_download_ui as entry
 import dcmget
 import dcmget.management_server as management_server_module
-from dcmget.config import AppConfig, save_config
+from dcmget.config import AppConfig, load_config, save_config
 from dcmget.management_server import (
     ProfileApiProxy,
     WINDOWS_MANAGEMENT_HOST,
@@ -269,7 +269,7 @@ def test_management_hub_uses_fixed_listener_and_survives_broken_profile_config(
         profile_manager=_profile_manager(tmp_path),
         project_root=PROJECT_ROOT,
         state_directory=tmp_path / "manager-state",
-        trusted_hosts=("127.0.0.1",),
+        trusted_hosts=("127.0.0.1", "192.168.1.50"),
         react_static_root=PROJECT_ROOT / "dcmget" / "webui-react",
     )
 
@@ -290,6 +290,7 @@ def test_management_hub_uses_fixed_listener_and_survives_broken_profile_config(
         assert bootstrap["profile"]["mode"] == "manager"
         assert bootstrap["profile"]["server_port"] == WINDOWS_MANAGEMENT_PORT
         assert bootstrap["config"]["web_port"] == WINDOWS_MANAGEMENT_PORT
+        assert bootstrap["web"]["lan_url"] == "http://192.168.1.50:8786/"
 
         failed_list = client.post(
             "/api/operations/profile-list",
@@ -303,6 +304,39 @@ def test_management_hub_uses_fixed_listener_and_survives_broken_profile_config(
         assert client.get("/api/bootstrap").status_code == 200
 
     assert broken.read_bytes() == original
+
+
+def test_management_remote_url_never_advertises_a_public_address():
+    assert management_server_module._management_remote_url(
+        ("8.8.8.8", "192.168.1.50")
+    ) == "http://192.168.1.50:8786/"
+
+
+def test_management_hub_serves_profile_workspace_spa_paths(tmp_path: Path):
+    server = create_windows_management_server(
+        profile_manager=_profile_manager(tmp_path),
+        project_root=PROJECT_ROOT,
+        state_directory=tmp_path / "manager-state",
+        trusted_hosts=("127.0.0.1",),
+        react_static_root=PROJECT_ROOT / "dcmget" / "webui-react",
+    )
+
+    with TestClient(
+        server.app,
+        base_url=f"http://127.0.0.1:{WINDOWS_MANAGEMENT_PORT}",
+        client=("127.0.0.1", 50123),
+    ) as client:
+        response = client.get("/profiles/2")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert "style-src 'self' 'unsafe-inline'" in response.headers[
+            "content-security-policy"
+        ]
+        assert "DcmGet" in response.text
+        assert client.cookies.get(session_cookie_name(WINDOWS_MANAGEMENT_PORT))
+        assert client.get("/profiles/0").status_code == 404
+        assert client.get("/profiles/10000").status_code == 404
 
 
 def test_first_management_start_creates_one_stopped_default_profile(tmp_path: Path):
@@ -332,6 +366,26 @@ def test_first_management_start_creates_one_stopped_default_profile(tmp_path: Pa
         response = client.get("/api/management/profiles")
     assert response.status_code == 200
     assert response.json()["profiles"][0]["desired_running"] is False
+
+
+def test_management_start_repairs_hidden_profile_web_endpoint(tmp_path: Path):
+    config_path = _write_profile(tmp_path)
+    manager = ProfileManager(
+        config_root=tmp_path / "config",
+        state_root=tmp_path / "state",
+        port_probe=lambda _host, port: port != 8787,
+    )
+
+    create_windows_management_server(
+        profile_manager=manager,
+        project_root=PROJECT_ROOT,
+        state_directory=tmp_path / "manager-state",
+        trusted_hosts=("127.0.0.1",),
+    )
+
+    repaired = load_config(config_path)
+    assert repaired.web_bind_address == "127.0.0.1"
+    assert repaired.web_port == 8788
 
 
 def test_private_manager_peer_keeps_host_origin_session_and_csrf_controls(
@@ -438,12 +492,38 @@ def test_management_hub_exposes_same_origin_profile_proxy(
     assert ended.status_code == 200
     assert calls[-1]["api_path"] == "task/end"
 
+    local_only = client.post(
+        "/api/management/profiles/2/operations/open-pdi-directory",
+        json={"path": "D:\\PDI"},
+        headers={"Origin": MANAGER_URL, "X-CSRF-Token": csrf},
+    )
+    assert local_only.status_code == 403
+    assert "只能在 DcmGet 所在电脑执行" in local_only.json()["detail"]
+
+    with TestClient(
+        server.app,
+        base_url=f"http://127.0.0.1:{WINDOWS_MANAGEMENT_PORT}",
+        client=("127.0.0.1", 50125),
+    ) as local_client:
+        local_csrf = _csrf(local_client)
+        allowed_local = local_client.post(
+            "/api/management/profiles/2/operations/open-pdi-directory",
+            json={"path": "D:\\PDI"},
+            headers={
+                "Origin": f"http://127.0.0.1:{WINDOWS_MANAGEMENT_PORT}",
+                "X-CSRF-Token": local_csrf,
+            },
+        )
+    assert allowed_local.status_code == 200
+    assert calls[-1]["api_path"] == "operations/open-pdi-directory"
+
 
 def test_profile_proxy_allowlist_blocks_shutdown_and_arbitrary_paths():
     assert _profile_proxy_route_allowed("GET", "snapshot")
     assert _profile_proxy_route_allowed("POST", "task/end")
     assert _profile_proxy_route_allowed("POST", "tasks/end")
     assert _profile_proxy_route_allowed("POST", "operations/open-destination")
+    assert _profile_proxy_route_allowed("POST", "operations/open-pdi-directory")
     assert _profile_proxy_route_allowed("POST", "operations/profile-backup")
     assert _profile_proxy_route_allowed("POST", "operations/support-bundle")
     assert not _profile_proxy_route_allowed("POST", "ops/shutdown")

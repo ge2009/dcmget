@@ -8,7 +8,7 @@ const STRING_FIELDS = [
   'storage_port', 'dicom_destination_folder', 'dcmtk_bin_dir', 'directory_template',
   'minimum_free_space_gb', 'auto_retry_attempts', 'auto_retry_backoff_seconds', 'circuit_breaker_failures',
   'max_log_file_size_mb', 'anonymization_profile', 'pdi_institution_name', 'pdi_output_folder',
-  'pdi_volume_size_gb', 'web_port', 'web_session_timeout_minutes',
+  'pdi_volume_size_gb',
 ] as const;
 
 export function SettingsSheet({
@@ -35,7 +35,6 @@ export function SettingsSheet({
       minimum_free_space_gb: config.minimum_free_space_gb ?? Number(config.minimum_free_space_bytes || 0) / 1024 ** 3,
       max_log_file_size_mb: config.max_log_file_size_mb ?? Number(config.max_log_file_size_bytes || 0) / 1024 ** 2,
       pdi_volume_size_gb: config.pdi_volume_size_gb ?? Number(config.pdi_volume_size_bytes || 0) / 1024 ** 3,
-      web_lan_enabled: !['127.0.0.1', '::1'].includes(String(config.web_bind_address || '127.0.0.1')),
     };
     setDraft(derived);
   }, [config, open]);
@@ -47,17 +46,20 @@ export function SettingsSheet({
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     const payload = { ...draft };
-    for (const key of ['pacs_server_port', 'storage_port', 'auto_retry_attempts', 'auto_retry_backoff_seconds', 'circuit_breaker_failures', 'web_port', 'web_session_timeout_minutes']) {
+    for (const key of ['pacs_server_port', 'storage_port', 'auto_retry_attempts', 'auto_retry_backoff_seconds', 'circuit_breaker_failures']) {
       if (payload[key] !== '') payload[key] = Number.parseInt(String(payload[key]), 10);
     }
     payload.minimum_free_space_bytes = Math.round(Number(payload.minimum_free_space_gb || 0) * 1024 ** 3);
     payload.max_log_file_size_bytes = Math.round(Number(payload.max_log_file_size_mb || 0) * 1024 ** 2);
     payload.pdi_volume_size_bytes = Math.round(Number(payload.pdi_volume_size_gb || 0) * 1024 ** 3);
-    payload.web_bind_address = payload.web_lan_enabled ? '0.0.0.0' : '127.0.0.1';
+    payload.pdi_export_enabled = false;
     delete payload.minimum_free_space_gb;
     delete payload.max_log_file_size_mb;
     delete payload.pdi_volume_size_gb;
-    delete payload.web_lan_enabled;
+    delete payload.web_port;
+    delete payload.web_bind_address;
+    delete payload.web_open_browser;
+    delete payload.web_session_timeout_minutes;
     onSave(payload);
   };
   return <Sheet open={open} onOpenChange={onOpenChange} title="当前 Profile 设置" description="技术参数按用途分组；保存后新任务使用新配置。" footer={<><span className="sheet-status">{status}</span><Button form="settings-form" type="submit" variant="primary" disabled={busy}><Save size={17} />{busy ? '保存中…' : '保存设置'}</Button></>}>
@@ -86,18 +88,12 @@ export function SettingsSheet({
       <fieldset><legend><span>04</span><div><strong>隐私与 PDI</strong><small>下载后的处理策略</small></div></legend>
         <SwitchRow checked={Boolean(draft.anonymization_enabled)} onCheckedChange={toggle('anonymization_enabled')} label="启用匿名化" description="不能清除烧录在像素中的文字或面部特征。" />
         <SelectField label="匿名方案" {...text('anonymization_profile')}><option value="basic">基础脱敏（院内）</option><option value="research">研究匿名（推荐）</option><option value="strict">严格元数据匿名</option></SelectField>
-        <SwitchRow checked={Boolean(draft.pdi_export_enabled)} onCheckedChange={toggle('pdi_export_enabled')} label="新任务默认生成 PDI" description="默认关闭；未匿名数据可能包含患者隐私。" />
-        {Boolean(draft.pdi_export_enabled) && <div className="form-grid">
+        <div className="inline-warning">新任务默认不生成 PDI；需要时请在任务页按需开启。未匿名数据可能包含患者隐私。</div>
+        <div className="form-grid">
           <TextField label="机构名称" {...text('pdi_institution_name')} /><TextField label="PDI 输出目录" {...text('pdi_output_folder')} />
           <TextField label="单卷容量（GB）" inputMode="decimal" {...text('pdi_volume_size_gb')} />
           <SwitchRow checked={Boolean(draft.pdi_include_ohif_viewer)} onCheckedChange={toggle('pdi_include_ohif_viewer')} label="包含离线中文 OHIF" />
-        </div>}
-      </fieldset>
-      <fieldset><legend><span>05</span><div><strong>Web 访问</strong><small>仅用于可信院内网络</small></div></legend>
-        <div className="inline-warning">HTTP 流量未加密，请勿将端口映射到公网。</div>
-        <SwitchRow checked={Boolean(draft.web_lan_enabled)} onCheckedChange={toggle('web_lan_enabled')} label="允许局域网访问" />
-        <SwitchRow checked={Boolean(draft.web_open_browser)} onCheckedChange={toggle('web_open_browser')} label="启动后自动打开本机工作台" />
-        <div className="form-grid"><TextField label="Web 端口" inputMode="numeric" disabled={topologyLocked} hint={topologyLocked ? '请从“启动参数”入口停止后修改。' : undefined} {...text('web_port')} /><TextField label="会话时长（分钟）" inputMode="numeric" {...text('web_session_timeout_minutes')} /></div>
+        </div>
       </fieldset>
     </form>
   </Sheet>;

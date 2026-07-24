@@ -1,9 +1,9 @@
 import { Dialog } from '@base-ui/react/dialog';
 import { Menu } from '@base-ui/react/menu';
 import {
-  Moon, Sun, MonitorCog, Wrench, MoreHorizontal, Plus,
+  Copy, Moon, Sun, MonitorCog, Wrench, MoreHorizontal, Plus,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiClient, ApiError, managedApiPath } from './api';
 import { BrandMark } from './components/BrandMark';
@@ -16,7 +16,7 @@ import { ProfileRail } from './components/ProfileRail';
 import { SettingsSheet } from './components/SettingsSheet';
 import { TaskWorkspace } from './components/TaskWorkspace';
 import { UpdateSheet } from './components/UpdateSheet';
-import { normalizeStatus, parseAccessions, TERMINAL_STATUSES } from './domain';
+import { formatRate, normalizeStatus, parseAccessions, TERMINAL_STATUSES } from './domain';
 import {
   BootstrapSchema, EventPageSchema, LogSchema, PreflightSchema, ProfileSchema,
   ProfilesResponseSchema, TaskSchema, UnknownRecordSchema, UpdateSchema,
@@ -38,9 +38,23 @@ function profileConfig(profile: Profile): UnknownRecord {
     pacs_server_ip: profile.pacs_server_ip || '', pacs_server_port: profile.pacs_server_port || 104,
     calling_ae_title: profile.calling_ae_title || 'DCMGET', pacs_ae_title: profile.pacs_ae_title || 'PACS',
     storage_ae_title: profile.storage_ae_title || 'DCMGET', storage_port: profile.storage_port || 6666,
-    web_port: profile.web_port || 8787,
     dicom_destination_folder: profile.destination_directory || profile.dicom_destination_folder || '',
   };
+}
+
+function requestedProfileNumber(): number | null {
+  const match = window.location.pathname.match(/^\/profiles\/([1-9][0-9]{0,3})\/?$/);
+  return match ? Number(match[1]) : null;
+}
+
+function replaceProfilePath(profileNumber: number): void {
+  const pathname = `/profiles/${profileNumber}`;
+  if (window.location.pathname === pathname) return;
+  window.history.replaceState(
+    window.history.state,
+    '',
+    `${pathname}${window.location.search}${window.location.hash}`,
+  );
 }
 
 function extractTask(payload: UnknownRecord): Task | null {
@@ -50,12 +64,37 @@ function extractTask(payload: UnknownRecord): Task | null {
   return parsed.success ? parsed.data : null;
 }
 
+function taskSpeed(payload: UnknownRecord): number {
+  const task = asRecord(payload.task || payload.active_task || payload);
+  const speed = Number(task.speed_bytes_per_second ?? task.speed_bps ?? task.current_speed ?? 0);
+  return Number.isFinite(speed) && speed > 0 ? speed : 0;
+}
+
+async function copyText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  textarea.remove();
+  if (!copied) throw new Error('当前浏览器不支持复制，请手动选择 URL');
+}
+
 export default function App() {
+  const reduceMotion = useReducedMotion();
   const [loading, setLoading] = useState(true);
   const [bootstrap, setBootstrap] = useState<Bootstrap>({});
   const [managerMode, setManagerMode] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profilesBusy, setProfilesBusy] = useState(false);
+  const [aggregateSpeed, setAggregateSpeed] = useState(0);
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [profileBootstrap, setProfileBootstrap] = useState<Bootstrap>({});
   const [config, setConfig] = useState<UnknownRecord>({});
@@ -115,6 +154,10 @@ export default function App() {
   const localSession = (profileBootstrap.web as UnknownRecord | undefined)?.local_session !== false
     && (bootstrap.web as UnknownRecord | undefined)?.local_session !== false;
   const version = profileBootstrap.version || profileBootstrap.app_version || bootstrap.version || bootstrap.app_version || '—';
+  const managerWeb = asRecord(bootstrap.web);
+  const remoteAccessUrl = managerMode
+    ? String(managerWeb.lan_url || managerWeb.url || '').trim()
+    : '';
 
   const notify = useCallback((message: string) => {
     setToast(message);
@@ -170,7 +213,9 @@ export default function App() {
     const nextConfig = payload.config || profileConfig(mergedProfile);
     setConfig(nextConfig);
     setDestination(String(nextConfig.dicom_destination_folder || mergedProfile.destination_directory || mergedProfile.dicom_destination_folder || ''));
-    setPdiEnabled(Boolean(nextConfig.pdi_export_enabled));
+    // PDI is an explicit per-task choice. Profile settings only provide the
+    // export destination and options; they never silently enable a new task.
+    setPdiEnabled(false);
     setPdiFolder(String(nextConfig.pdi_output_folder || ''));
     const nextTask = payload.task || payload.active_task || null;
     newTaskBaseId.current = '';
@@ -190,6 +235,7 @@ export default function App() {
   const selectProfile = useCallback(async (profile: Profile) => {
     const number = profileNumber(profile);
     if (number == null) return;
+    if (managerMode) replaceProfilePath(number);
     profileAbort.current?.abort();
     profileAbort.current = new AbortController();
     const currentGeneration = ++generation.current;
@@ -227,7 +273,7 @@ export default function App() {
       setConnectionLabel('Profile 载入失败');
       setGlobalError((error as Error).message);
     }
-  }, [applyProfilePayload]);
+  }, [applyProfilePayload, managerMode]);
 
   const refreshProfiles = useCallback(async (selectIfNeeded = true) => {
     if (!managerMode && !selectIfNeeded) return;
@@ -270,8 +316,16 @@ export default function App() {
           const list = Array.isArray(result) ? result : result.profiles || result.items || [];
           if (!mounted.current) return;
           setProfiles(list);
-          const first = list.find((profile) => profile.is_running) || list.find((profile) => profile.desired_running) || list[0];
-          if (first) await selectProfile(first);
+          const requested = requestedProfileNumber();
+          const first = list.find((profile) => profileNumber(profile) === requested)
+            || list.find((profile) => profile.is_running)
+            || list.find((profile) => profile.desired_running)
+            || list[0];
+          if (first) {
+            const number = profileNumber(first);
+            if (number != null) replaceProfilePath(number);
+            await selectProfile(first);
+          }
         } else {
           applyProfilePayload(payload, payload.profile);
         }
@@ -377,6 +431,55 @@ export default function App() {
     }, 15000);
     return () => window.clearInterval(timer);
   }, [activeRunning, managerMode, refreshProfiles, refreshSnapshot]);
+
+  useEffect(() => {
+    if (!managerMode) {
+      setAggregateSpeed(0);
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const refreshAggregateSpeed = async () => {
+      if (document.hidden || inFlight) return;
+      const running = profiles.filter((profile) => profile.is_running && profileNumber(profile) != null);
+      if (!running.length) {
+        setAggregateSpeed(0);
+        return;
+      }
+      inFlight = true;
+      try {
+        const speeds = await Promise.all(running.map(async (profile) => {
+          const number = profileNumber(profile);
+          if (number == null) return 0;
+          try {
+            const result = await apiClient.request(
+              managedApiPath(number, '/api/task'),
+              UnknownRecordSchema,
+            );
+            return taskSpeed(result);
+          } catch {
+            return 0;
+          }
+        }));
+        if (!cancelled) {
+          setAggregateSpeed(speeds.reduce((total, speed) => total + speed, 0));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (!document.hidden) void refreshAggregateSpeed();
+    };
+    void refreshAggregateSpeed();
+    const timer = window.setInterval(refreshAggregateSpeed, 2500);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [managerMode, profiles]);
 
   useEffect(() => {
     setPreflight(null); setPreflightSignature('');
@@ -620,10 +723,10 @@ export default function App() {
     await loadOperations();
   }
 
-  async function runOperation(name: string) {
+  async function runOperation(name: string, body: UnknownRecord = {}) {
     try {
       const path = managerMode && activeNumber != null ? managedApiPath(activeNumber, `/api/operations/${name}`) : `/api/operations/${name}`;
-      const result = await apiClient.request(path, UnknownRecordSchema, { method: 'POST', body: {} });
+      const result = await apiClient.request(path, UnknownRecordSchema, { method: 'POST', body });
       notify(String(result.message || '操作已完成'));
       if (typeof result.download_url === 'string') window.location.assign(result.download_url);
     } catch (error) { setGlobalError((error as Error).message); }
@@ -644,7 +747,7 @@ export default function App() {
   function resetTask() {
     newTaskBaseId.current = task?.id == null ? '' : String(task.id);
     setNewTaskDraftOpen(true); setAccessionText('');
-    setPdiEnabled(Boolean(config.pdi_export_enabled));
+    setPdiEnabled(false);
     setPdiFolder(String(config.pdi_output_folder || ''));
     setPreflight(null); setPreflightSignature('');
   }
@@ -652,6 +755,16 @@ export default function App() {
   function toggleTheme() {
     const next = !dark; setDark(next); document.documentElement.dataset.theme = next ? 'dark' : 'light';
     try { localStorage.setItem('dcmget-theme', next ? 'dark' : 'light'); } catch { /* session-only */ }
+  }
+
+  async function copyRemoteAccessUrl() {
+    if (!remoteAccessUrl) return;
+    try {
+      await copyText(remoteAccessUrl);
+      notify('远程访问 URL 已复制');
+    } catch (error) {
+      setGlobalError(error instanceof Error ? error.message : '复制远程访问 URL 失败');
+    }
   }
 
   if (loading) return <div className="boot-screen"><BrandMark className="boot-mark" /><strong>正在启动 DcmGet</strong><span>正在读取实例与任务状态…</span></div>;
@@ -677,7 +790,24 @@ export default function App() {
           </div>
         </div>
         <div className="app-header__actions">
-          <span className="connection-state" data-state={connection} title={connectionLabel} role="status" aria-live="polite">
+          {managerMode && <span
+            className="connection-state"
+            data-state="speed"
+            data-mobile-label={formatRate(aggregateSpeed)}
+            aria-label={`全部运行实例总速度：${formatRate(aggregateSpeed)}`}
+          >
+            <AnimatedIcon {...semanticIconMap.startDownload} statusKey={aggregateSpeed} size={15} />
+            <span>总速度 {formatRate(aggregateSpeed)}</span>
+          </span>}
+          <span
+            className="connection-state"
+            data-state={connection}
+            data-mobile-label={connection === 'connected' ? '已连接' : connection === 'disconnected' ? '已断开' : '连接中'}
+            aria-label={connectionLabel}
+            title={connectionLabel}
+            role="status"
+            aria-live="polite"
+          >
             {connection === 'connected'
               ? <AnimatedIcon {...semanticIconMap.connected} statusKey={connection} size={15} />
               : connection === 'disconnected'
@@ -711,17 +841,23 @@ export default function App() {
           <div><span>PACS</span><strong>{configuredPacs}</strong></div>
           <div><span>接收端</span><strong>{receiver}</strong></div>
           <div><span>版本</span><strong>{version}</strong></div>
-          {issues.length > 0 && <button type="button" onClick={() => activeProfile && openProfileEditor(activeProfile)}><AnimatedIcon {...semanticIconMap.globalError} size={15} />{issues[0]}</button>}
+          {remoteAccessUrl && <div className="context-strip__remote">
+            <span>远程访问</span>
+            <button type="button" onClick={copyRemoteAccessUrl} aria-label="复制远程访问 URL" title="复制远程访问 URL">
+              <strong>{remoteAccessUrl}</strong><Copy size={13} aria-hidden="true" />
+            </button>
+          </div>}
+          {issues.length > 0 && <button className="context-strip__issue" type="button" onClick={() => activeProfile && openProfileEditor(activeProfile)}><AnimatedIcon {...semanticIconMap.globalError} size={15} />{issues[0]}</button>}
         </section>}
 
-        <AnimatePresence>{globalError && <motion.div className="global-alert" role="alert" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}><AnimatedIcon {...semanticIconMap.globalError} size={18} /><div><strong>需要处理</strong><p>{globalError}</p></div><button onClick={() => setGlobalError('')} aria-label="关闭">×</button></motion.div>}</AnimatePresence>
+        <AnimatePresence>{globalError && <motion.div className="global-alert" role="alert" initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}><AnimatedIcon {...semanticIconMap.globalError} size={18} /><div><strong>需要处理</strong><p>{globalError}</p></div><button onClick={() => setGlobalError('')} aria-label="关闭">×</button></motion.div>}</AnimatePresence>
 
         {!activeProfile && managerMode
           ? <section className="workspace-empty"><BrandMark className="workspace-empty__brand" /><h2>创建第一个接收实例</h2><p>每个实例拥有独立的 PACS、AE、接收端口和保存目录。</p><Button variant="primary" onClick={createProfile}><Plus size={17} />新建 Profile</Button></section>
           : !activeRunning
             ? <section className="workspace-empty"><span><AnimatedIcon {...semanticIconMap.stopTask} size={26} /></span><h2>{activeProfile?.desired_running ? '实例正在启动' : '当前实例未启动'}</h2><p>启动实例后，DICOM 接收端和任务控制将在这里就绪。</p>{activeProfile && <div><Button variant="primary" onClick={() => profileStart(activeProfile)}><AnimatedIcon {...semanticIconMap.resumeTask} size={17} />启动当前实例</Button><Button onClick={() => openProfileEditor(activeProfile)}><AnimatedIcon {...semanticIconMap.settings} size={17} />启动参数</Button></div>}</section>
             : <>
-                <TaskWorkspace available={activeRunning} task={newTaskDraftOpen ? null : task} accessionText={accessionText} parsed={parsed} destination={destination} pdiEnabled={pdiEnabled} pdiFolder={pdiFolder} preflight={preflight} preflightSignatureMatches={preflightSignature === draftSignature} preflightBusy={preflightBusy} actionBusy={actionBusy} onAccessionTextChange={setAccessionText} onDestinationChange={setDestination} onPdiEnabledChange={setPdiEnabled} onPdiFolderChange={setPdiFolder} onImport={importFile} onBrowse={() => browseDirectory()} onPreflight={() => runPreflight()} onStart={startTask} onTaskAction={executeTaskAction} onPdiAction={pdiAction} onNewTask={resetTask} onOpenDestination={() => runOperation('open-destination')} />
+                <TaskWorkspace available={activeRunning} task={newTaskDraftOpen ? null : task} accessionText={accessionText} parsed={parsed} destination={destination} pdiEnabled={pdiEnabled} pdiFolder={pdiFolder} preflight={preflight} preflightSignatureMatches={preflightSignature === draftSignature} preflightBusy={preflightBusy} actionBusy={actionBusy} onAccessionTextChange={setAccessionText} onDestinationChange={setDestination} onPdiEnabledChange={setPdiEnabled} onPdiFolderChange={setPdiFolder} onImport={importFile} onBrowse={() => browseDirectory()} onPreflight={() => runPreflight()} onStart={startTask} onTaskAction={executeTaskAction} onPdiAction={pdiAction} onNewTask={resetTask} onOpenDestination={() => runOperation('open-destination')} onOpenPdiDirectory={() => runOperation('open-pdi-directory', { path: pdiFolder.trim(), destination: destination.trim() })} />
                 <LogPanel logs={logs} detailed={detailedLogs} onDetailedChange={setDetailedLogs} onClear={() => setLogs([])} onOpenDirectory={() => runOperation('open-log-directory')} />
               </>}
       </div>
@@ -760,6 +896,6 @@ export default function App() {
       </Dialog.Portal>
     </Dialog.Root>
     <Dialog.Root open={columnOpen} onOpenChange={setColumnOpen}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Viewport className="dialog-viewport dialog-viewport--center"><Dialog.Popup className="confirm-dialog"><Dialog.Title className="sheet__title">选择检查号所在列</Dialog.Title><Dialog.Description className="confirm-dialog__description">文件包含多个可用列，请明确选择后继续导入。</Dialog.Description><div className="column-options">{columnOptions.map((column, index) => <button key={String(column.index ?? index)} onClick={() => columnFile && uploadAccessionFile(columnFile, Number(column.index ?? index))}><strong>{String(column.name || column.label || `第 ${index + 1} 列`)}</strong><small>列序号 {String(column.index ?? index)}</small></button>)}</div><div className="confirm-dialog__actions"><Dialog.Close className="button button--secondary button--normal">取消</Dialog.Close></div></Dialog.Popup></Dialog.Viewport></Dialog.Portal></Dialog.Root>
-    <AnimatePresence>{toast && <motion.div className="toast" role="status" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}><AnimatedIcon {...semanticIconMap.toastSuccess} size={18} />{toast}</motion.div>}</AnimatePresence>
+    <AnimatePresence>{toast && <motion.div className="toast" role="status" initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}><AnimatedIcon {...semanticIconMap.toastSuccess} size={18} />{toast}</motion.div>}</AnimatePresence>
   </div>;
 }

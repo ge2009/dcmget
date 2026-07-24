@@ -1047,6 +1047,130 @@ def test_profile_web_ui_is_not_opened_when_service_never_starts():
     assert opened == []
 
 
+@pytest.mark.parametrize("configured_output", [False, True])
+def test_profile_pdi_directory_operation_opens_configured_or_default_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_output: bool,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    destination = tmp_path / "dicom"
+    configured = tmp_path / "portable"
+    save_config(
+        config_path,
+        AppConfig(
+            dicom_destination_folder=str(destination),
+            pdi_output_folder=str(configured) if configured_output else "",
+        ),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True, "path": str(path)},
+    )
+
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+    result = handlers["open-pdi-directory"]({})
+
+    expected = configured if configured_output else destination / "PDI"
+    assert expected.is_dir()
+    assert opened == [expected]
+    assert result["path"] == str(expected)
+
+
+@pytest.mark.parametrize("use_explicit_pdi", [False, True])
+def test_profile_pdi_directory_operation_uses_current_task_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_explicit_pdi: bool,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    save_config(
+        config_path,
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "configured-dicom"),
+            pdi_output_folder=str(tmp_path / "configured-pdi"),
+        ),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True},
+    )
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+    draft_destination = tmp_path / "draft-dicom"
+    draft_pdi = tmp_path / "draft-pdi"
+
+    handlers["open-pdi-directory"](
+        {
+            "path": str(draft_pdi) if use_explicit_pdi else "",
+            "destination": str(draft_destination),
+        }
+    )
+
+    expected = draft_pdi if use_explicit_pdi else draft_destination / "PDI"
+    assert expected.is_dir()
+    assert opened == [expected]
+
+
+def test_profile_pdi_directory_operation_rejects_empty_effective_root(
+    tmp_path: Path,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder="", pdi_output_folder=""),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+
+    with pytest.raises(RuntimeError, match="请先设置 PDI 输出目录"):
+        handlers["open-pdi-directory"]({"path": "", "destination": ""})
+
+
 def test_profile_web_launch_and_service_browser_flags_are_parsed():
     import DICOM_download_ui as entry
 

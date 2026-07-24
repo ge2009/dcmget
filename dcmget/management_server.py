@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import sys
@@ -84,6 +85,7 @@ _PROFILE_PROXY_OPERATIONS = frozenset(
     {
         "open-destination",
         "open-pdi",
+        "open-pdi-directory",
         "open-log-directory",
         "open-data-directory",
         "acceptance-report",
@@ -391,6 +393,14 @@ def create_windows_management_server(
     """Build the fixed management hub without claiming or validating a Profile."""
 
     manager = profile_manager or ProfileManager()
+    trusted_host_values = tuple(
+        dict.fromkeys(
+            value
+            for value in (str(host).strip() for host in trusted_hosts)
+            if value
+        )
+    )
+    remote_url = _management_remote_url(trusted_host_values)
     root = Path(project_root or resource_root()).expanduser().resolve()
     management_state = Path(
         state_directory or manager.state_root / "management"
@@ -418,6 +428,19 @@ def create_windows_management_server(
         profiles = None
     if profiles == ():
         manager.create_profile()
+        profiles = manager.list_profiles()
+    if profiles:
+        for profile in profiles:
+            if profile.is_running:
+                continue
+            try:
+                manager.ensure_internal_web_endpoint(profile.number)
+            except ProfileManagerError as exc:
+                LOGGER.warning(
+                    "实例 %s 的内部 Web 端点自动修复失败：%s",
+                    profile.number,
+                    exc,
+                )
     runtime_state = ProfileRuntimeState(
         management_state / PROFILE_RUNTIME_FILE_NAME
     )
@@ -438,7 +461,7 @@ def create_windows_management_server(
         state_directory=management_state,
         host=WINDOWS_MANAGEMENT_HOST,
         port=WINDOWS_MANAGEMENT_PORT,
-        trusted_hosts=trusted_hosts,
+        trusted_hosts=trusted_host_values,
         react_static_root=react_static_root,
         directory_roots=(),
         project_root=root,
@@ -447,6 +470,7 @@ def create_windows_management_server(
             "mode": "manager",
             "name": "Windows 管理中心",
             "data_dir": str(management_state),
+            "lan_url": remote_url,
         },
         operation_handlers=handlers,
         profile_api_proxy=profile_proxy.request,
@@ -454,6 +478,30 @@ def create_windows_management_server(
         management_mode=True,
         log_level=log_level,
     )
+
+
+def _management_remote_url(trusted_hosts: Iterable[str]) -> str:
+    """Choose one stable IPv4 LAN URL for the read-only workspace hint."""
+
+    candidates: list[str] = []
+    for value in trusted_hosts:
+        host = str(value).strip().split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if (
+            address.version != 4
+            or not address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+            or address.is_multicast
+        ):
+            continue
+        candidates.append(host)
+    selected = candidates[0] if candidates else "127.0.0.1"
+    return f"http://{selected}:{WINDOWS_MANAGEMENT_PORT}/"
 
 
 def run_windows_management_server(

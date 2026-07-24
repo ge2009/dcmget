@@ -99,6 +99,7 @@ def test_create_profile_allocates_safe_defaults_without_starting(tmp_path):
     assert profile.web_port == 8788
     assert not profile.is_running
     assert profile.config_path.is_file()
+    assert load_config(profile.config_path).web_bind_address == "127.0.0.1"
     assert checked == [6666, 6667, 8787, 8788]
 
 
@@ -149,7 +150,9 @@ def test_clone_allocates_new_number_and_changes_only_new_profile_port(tmp_path):
         **cloned.to_dict(),
         "storage_port": source.storage_port,
         "web_port": source.web_port,
+        "web_bind_address": source.web_bind_address,
     } == source.to_dict()
+    assert cloned.web_bind_address == "127.0.0.1"
 
 
 def test_recommend_port_skips_profile_ports_and_failed_local_bind(tmp_path):
@@ -175,6 +178,61 @@ def test_recommend_port_always_skips_windows_management_port(tmp_path):
 
     assert manager.recommend_available_port(WINDOWS_MANAGEMENT_PORT) == 8787
     assert checked == [8787]
+
+
+def test_ensure_internal_web_endpoint_uses_loopback_and_keeps_free_port(tmp_path):
+    config_path = _write_profile(tmp_path, 1, web_port=8899)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+
+    profile = manager.ensure_internal_web_endpoint(1)
+
+    saved = load_config(config_path)
+    assert profile.web_port == 8899
+    assert saved.web_port == 8899
+    assert saved.web_bind_address == "127.0.0.1"
+
+
+def test_ensure_internal_web_endpoint_replaces_occupied_hidden_port(tmp_path):
+    config_path = _write_profile(tmp_path, 1, web_port=8787)
+    checked: list[tuple[str, int]] = []
+
+    def probe(host: str, port: int) -> bool:
+        checked.append((host, port))
+        return port == 8788
+
+    profile = _manager(tmp_path, port_probe=probe).ensure_internal_web_endpoint(1)
+
+    saved = load_config(config_path)
+    assert profile.web_port == 8788
+    assert saved.web_port == 8788
+    assert saved.web_bind_address == "127.0.0.1"
+    assert checked == [("127.0.0.1", 8787), ("0.0.0.0", 8788)]
+
+
+def test_ensure_internal_web_endpoint_refuses_running_profile(tmp_path):
+    _write_profile(tmp_path, 1)
+    lock_path = tmp_path / "state" / "instances" / "i1.lock"
+    lock_path.parent.mkdir(parents=True)
+    running_lock = FileLock(str(lock_path))
+    running_lock.acquire(timeout=0)
+    try:
+        with pytest.raises(ProfileInUseError, match="不能调整内部 Web 端口"):
+            _manager(tmp_path).ensure_internal_web_endpoint(1)
+    finally:
+        running_lock.release()
+
+
+def test_ensure_internal_web_endpoint_wraps_persistence_errors(tmp_path, monkeypatch):
+    _write_profile(tmp_path, 1)
+    manager = _manager(tmp_path, port_probe=lambda _host, _port: True)
+    monkeypatch.setattr(
+        profile_manager_module,
+        "save_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(ProfileManagerError, match="内部 Web 端点自动配置失败"):
+        manager.ensure_internal_web_endpoint(1)
 
 
 def test_update_profile_saves_launch_fields_before_start(tmp_path):

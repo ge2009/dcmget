@@ -517,6 +517,7 @@ def create_web_app(
         react_request = bool(
             request_path in {"/", "/login", "/assets"}
             or request_path.startswith("/assets/")
+            or request_path.startswith("/profiles/")
         )
         if request.method.upper() in _MUTATING_HTTP_METHODS:
             if management_mode and not is_management_peer_address(_client_ip(request)):
@@ -598,15 +599,24 @@ def create_web_app(
             raise HTTPException(status_code=403, detail="此操作只允许在服务器本机执行")
         return session
 
-    @app.get("/", include_in_schema=False)
-    @app.get("/login", include_in_schema=False)
-    async def index(request: Request) -> Response:
+    def react_index_response(request: Request) -> Response:
         session, created = request_session(request, create=True)
         assert session is not None
         response = FileResponse(react_index_path, media_type="text/html")
         if created:
             attach_session_cookie(response, session)
         return response
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/login", include_in_schema=False)
+    async def index(request: Request) -> Response:
+        return react_index_response(request)
+
+    @app.get("/profiles/{profile_number}", include_in_schema=False)
+    async def profile_workspace(profile_number: int, request: Request) -> Response:
+        if not management_mode or not 1 <= profile_number <= 9999:
+            raise HTTPException(status_code=404, detail="Profile 工作台不存在")
+        return react_index_response(request)
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
@@ -1272,6 +1282,7 @@ def create_web_app(
     local_operations = {
         "open-destination",
         "open-pdi",
+        "open-pdi-directory",
         "open-log-directory",
         "open-data-directory",
         "acceptance-report",
@@ -1450,6 +1461,18 @@ def create_web_app(
         if not 1 <= profile_number <= 9999:
             raise HTTPException(status_code=400, detail="Profile 编号无效")
         method = request.method.upper()
+        normalized_api_path = api_path.strip("/")
+        operation_prefix = "operations/"
+        if normalized_api_path.startswith(operation_prefix):
+            operation_name = normalized_api_path[len(operation_prefix) :]
+            if (
+                operation_name in local_operations
+                and not is_loopback_address(_client_ip(request))
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="打开主机目录等本机操作只能在 DcmGet 所在电脑执行",
+                )
         if method in _MUTATING_HTTP_METHODS:
             candidate = request.headers.get("x-csrf-token", "")
             if not hmac_compare(candidate, session.csrf_token):
@@ -1487,7 +1510,7 @@ def create_web_app(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=502, detail="Profile 代理状态码无效") from exc
         payload = result.get("payload", {})
-        if api_path.strip("/") == "bootstrap" and isinstance(payload, Mapping):
+        if normalized_api_path == "bootstrap" and isinstance(payload, Mapping):
             manager_url = str(request.base_url)
             upstream_web = payload.get("web")
             web = dict(upstream_web) if isinstance(upstream_web, Mapping) else {}

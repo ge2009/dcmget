@@ -1,7 +1,8 @@
-import { Activity, Archive, ClipboardCheck, FileArchive, FolderOpen, KeyRound, RefreshCw, ScrollText } from 'lucide-react';
+import { Activity, Archive, ClipboardCheck, FileArchive, KeyRound, ScrollText } from 'lucide-react';
 import { useState } from 'react';
 import type { UnknownRecord } from '../schemas';
 import { Button, Sheet, StatusBadge } from './Primitives';
+import { AnimatedIcon, semanticIconMap } from './icons';
 
 export function OperationsSheet({
   open,
@@ -31,7 +32,7 @@ export function OperationsSheet({
   return <Sheet open={open} onOpenChange={onOpenChange} title="运维与产品信息" description="低频诊断、授权、支持材料和版本说明集中在这里。">
     <div className="operations-sections">
       <section className="operation-section">
-        <header><div><p className="eyebrow">HEALTH</p><h3>运行健康</h3></div><Button size="small" onClick={onRefresh} disabled={busy}><RefreshCw size={15} className={busy ? 'spin' : ''} />重新检查</Button></header>
+        <header><div><p className="eyebrow">HEALTH</p><h3>运行健康</h3></div><Button size="small" onClick={onRefresh} disabled={busy}><AnimatedIcon {...semanticIconMap.refresh} size={15} className={busy ? 'spin' : ''} />重新检查</Button></header>
         <ul className="health-list">{checks.length ? checks.map((check, index) => {
           const ok = Boolean(check.ok ?? check.success ?? check.ready);
           const warning = check.severity === 'warning' || check.warning === true;
@@ -47,7 +48,7 @@ export function OperationsSheet({
       <section className="operation-section operation-section--wide">
         <header><div><p className="eyebrow">SUPPORT</p><h3>诊断与支持</h3></div></header>
         <div className="operation-grid">
-          <button onClick={() => onOperation('open-log-directory')}><FolderOpen /><strong>日志目录</strong><small>查看完整运行日志</small></button>
+          <button onClick={() => onOperation('open-log-directory')}><AnimatedIcon {...semanticIconMap.openDirectory} /><strong>日志目录</strong><small>查看完整运行日志</small></button>
           <button onClick={() => onOperation('profile-backup')}><Archive /><strong>备份 Profile</strong><small>保存当前实例配置</small></button>
           <button onClick={() => onOperation('support-bundle')}><FileArchive /><strong>脱敏支持包</strong><small>不包含 DICOM 文件</small></button>
           <button onClick={() => onOperation('acceptance-report')}><ClipboardCheck /><strong>验收报告</strong><small>导出环境与任务摘要</small></button>

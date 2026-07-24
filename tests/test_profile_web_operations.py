@@ -192,6 +192,29 @@ def test_launch_profile_uses_subprocess_popen_without_shell(tmp_path, monkeypatc
     assert operations.runtime_state.desired_profiles() == (3,)
 
 
+def test_launch_profile_repairs_occupied_internal_web_port(tmp_path):
+    config_path = _write_profile(tmp_path, 1, web_port=8787)
+
+    class _FakeProcess:
+        pid = 43210
+
+    operations = _operations(
+        tmp_path,
+        port_probe=lambda _host, port: port != 8787,
+        popen=lambda _command, **_kwargs: _FakeProcess(),
+    )
+
+    result = operations.launch_profile({"profile_number": 1})
+
+    assert result["ok"] is True
+    assert result["profile"]["web_port"] == 8788
+    assert result["url"] == "http://127.0.0.1:8788/"
+    config = operations.manager._load_profile_config(1)
+    assert config_path.is_file()
+    assert config.web_port == 8788
+    assert config.web_bind_address == "127.0.0.1"
+
+
 def test_launch_profile_does_not_recheck_ports_after_process_starts(tmp_path):
     _write_profile(tmp_path, 1)
     spawned = False
@@ -328,18 +351,22 @@ def test_launch_all_starts_idle_profiles_and_skips_running_profile(
     assert calls[0][-3:] == ["--profile", "2", "--no-open-browser"]
 
 
-def test_launch_all_returns_per_profile_port_errors(tmp_path):
+def test_launch_all_repairs_occupied_internal_web_ports(tmp_path):
     _write_profile(tmp_path, 1, port=6666, web_port=8787)
+
+    class _FakeProcess:
+        pid = 43210
 
     result = _operations(
         tmp_path,
         port_probe=lambda _host, port: port != 8787,
+        popen=lambda _command, **_kwargs: _FakeProcess(),
     ).launch_all_profiles()
 
-    assert not result["ok"]
-    assert result["started_count"] == 0
-    assert result["error_count"] == 1
-    assert "Web 端口 8787 已被其他程序占用" in result["errors"][0]["error"]
+    assert result["ok"]
+    assert result["started_count"] == 1
+    assert result["error_count"] == 0
+    assert result["started"][0]["url"] == "http://127.0.0.1:8788/"
 
 
 def test_launch_and_delete_same_profile_are_serialized(tmp_path):

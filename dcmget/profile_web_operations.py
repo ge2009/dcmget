@@ -175,6 +175,7 @@ class ProfileWebOperations:
                     "pid": None,
                     "url": _profile_url(profile),
                 }
+            profile = self.manager.ensure_internal_web_endpoint(profile.number)
             self.manager.validate_profile_ports(
                 profile.number,
                 check_system_ports=True,

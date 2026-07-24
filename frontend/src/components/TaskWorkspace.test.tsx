@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { LogPanel } from './LogPanel';
 import { SpeedSparkline } from './SpeedSparkline';
@@ -16,7 +16,7 @@ const base = {
   preflightBusy: false,
   actionBusy: false,
   onAccessionTextChange: vi.fn(), onDestinationChange: vi.fn(), onPdiEnabledChange: vi.fn(),
-  onPdiFolderChange: vi.fn(), onImport: vi.fn(), onBrowse: vi.fn(), onPreflight: vi.fn(),
+  onPdiFolderChange: vi.fn(), onOpenPdiDirectory: vi.fn(), onImport: vi.fn(), onBrowse: vi.fn(), onPreflight: vi.fn(),
   onStart: vi.fn(), onTaskAction: vi.fn(), onPdiAction: vi.fn(), onNewTask: vi.fn(), onOpenDestination: vi.fn(),
 };
 
@@ -66,9 +66,16 @@ describe('task workspace', () => {
       id: 'pdi', status: 'pdi_retryable', actions: { can_retry_pdi: true, can_verify_pdi: false },
       pdi: { status: 'partial', output_directory: 'D:\\pdi' },
     }} />);
-    expect(screen.getByRole('button', { name: '打开 PDI' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '打开 PDI 目录' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '重试导出' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '校验' })).not.toBeInTheDocument();
+  });
+
+  it('opens the configured PDI root from the task composer', () => {
+    const onOpenPdiDirectory = vi.fn();
+    render(<TaskWorkspace {...base} task={null} pdiEnabled pdiFolder="D:\\pdi" onOpenPdiDirectory={onOpenPdiDirectory} />);
+    fireEvent.click(screen.getByRole('button', { name: '打开目录' }));
+    expect(onOpenPdiDirectory).toHaveBeenCalledOnce();
   });
 
   it('keeps focused runtime controls stable during high-frequency refreshes', () => {

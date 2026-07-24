@@ -182,7 +182,7 @@ def test_react_theme_defaults_to_light_without_overriding_saved_dark_choice():
     assert "saved === 'dark'" in bootstrap
     assert "saved !== 'light'" not in bootstrap
     assert "dataset.theme = 'light'" in bootstrap
-    assert 'name="theme-color" content="#edf3f3"' in index
+    assert 'name="theme-color" content="#fafafa"' in index
 
 
 def test_release_version_sources_and_web_self_test_flags_stay_in_sync():

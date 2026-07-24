@@ -77,14 +77,42 @@ const MOTION_TRANSITION = {
   ease: [0.16, 1, 0.3, 1],
 } as const;
 
+// The interaction signatures below adapt the public lucide-animated motion
+// parameters to this shared wrapper. Repeating once in reverse preserves the
+// wrapper's short, self-resetting feedback for focus, press, and status events.
+const TRANSFER_SPRING = {
+  type: 'spring',
+  stiffness: 200,
+  damping: 10,
+  mass: 1,
+  repeat: 1,
+  repeatType: 'reverse',
+} as const;
+
+const REFRESH_SPRING = {
+  type: 'spring',
+  stiffness: 250,
+  damping: 25,
+  repeat: 1,
+  repeatType: 'reverse',
+} as const;
+
+const SETTINGS_SPRING = {
+  type: 'spring',
+  stiffness: 50,
+  damping: 10,
+  repeat: 1,
+  repeatType: 'reverse',
+} as const;
+
 const MOTION_KEYFRAMES: Record<AnimatedIconMotion, TargetAndTransition> = {
   attention: {
     x: [0, -1.5, 1.5, 0],
     transition: MOTION_TRANSITION,
   },
   download: {
-    y: [0, 2, -0.5, 0],
-    transition: MOTION_TRANSITION,
+    y: 2,
+    transition: TRANSFER_SPRING,
   },
   draw: {
     opacity: [0.35, 1, 1],
@@ -92,9 +120,11 @@ const MOTION_KEYFRAMES: Record<AnimatedIconMotion, TargetAndTransition> = {
     transition: MOTION_TRANSITION,
   },
   folder: {
-    rotate: [0, -4, 3, 0],
-    scale: [1, 1.04, 1],
-    transition: MOTION_TRANSITION,
+    rotate: [0, -8, 6, -4, 0],
+    transition: {
+      duration: 0.6,
+      ease: 'easeInOut',
+    },
   },
   pause: {
     scale: [1, 0.88, 1],
@@ -110,20 +140,20 @@ const MOTION_KEYFRAMES: Record<AnimatedIconMotion, TargetAndTransition> = {
     transition: MOTION_TRANSITION,
   },
   refresh: {
-    rotate: [0, 180, 360],
-    transition: MOTION_TRANSITION,
+    rotate: 50,
+    transition: REFRESH_SPRING,
   },
   rotate: {
-    rotate: [0, -22, 18, 0],
-    transition: MOTION_TRANSITION,
+    rotate: 180,
+    transition: SETTINGS_SPRING,
   },
   stop: {
     scale: [1, 0.82, 1],
     transition: MOTION_TRANSITION,
   },
   upload: {
-    y: [0, -2, 0.5, 0],
-    transition: MOTION_TRANSITION,
+    y: -2,
+    transition: TRANSFER_SPRING,
   },
   wifi: {
     opacity: [0.45, 1, 1],

@@ -44,7 +44,11 @@ from dcmget.instance_profile import (
 )
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
 from dcmget.management_server import run_windows_management_server
-from dcmget.profile_manager import ProfileManager
+from dcmget.profile_manager import (
+    ProfileInUseError as ManagedProfileInUseError,
+    ProfileManager,
+    ProfileNotFoundError,
+)
 from dcmget.profile_web_operations import ProfileWebOperations
 from dcmget.release_notes import load_release_notes
 from dcmget.runtime import (
@@ -409,8 +413,11 @@ def _profile_web_config(profile: InstanceProfile) -> AppConfig:
         config_root=profile.config_path.parents[2],
         state_root=profile.state_directory.parents[1],
     )
-    manager.validate_profile_ports(profile.number, check_system_ports=True)
     config = load_config(profile.config_path)
+    if config.web_bind_address != "127.0.0.1":
+        config.web_bind_address = "127.0.0.1"
+        save_config(profile.config_path, config)
+    manager.validate_profile_ports(profile.number, check_system_ports=True)
     web_errors = {
         field: message
         for field, message in config.validate().items()
@@ -595,6 +602,38 @@ def _operation_handlers(
             raise RuntimeError("当前任务没有可打开的 PDI 目录")
         return _open_host_path(str(output))
 
+    def open_pdi_directory(payload: object = None) -> dict[str, object]:
+        config = current_config()
+        body = payload if isinstance(payload, dict) else {}
+
+        def path_value(name: str) -> str:
+            raw = body.get(name, "")
+            if raw is None:
+                return ""
+            if not isinstance(raw, str):
+                raise RuntimeError(f"{name} 必须是目录路径")
+            value = raw.strip()
+            if len(value) > 4096 or "\0" in value:
+                raise RuntimeError(f"{name} 目录路径无效")
+            return value
+
+        requested = path_value("path")
+        draft_destination = path_value("destination")
+        configured = str(config.pdi_output_folder).strip()
+        destination = draft_destination or str(config.dicom_destination_folder).strip()
+        if requested:
+            output = Path(requested).expanduser()
+        elif draft_destination:
+            output = Path(destination).expanduser() / "PDI"
+        elif configured:
+            output = Path(configured).expanduser()
+        elif destination:
+            output = Path(destination).expanduser() / "PDI"
+        else:
+            raise RuntimeError("请先设置 PDI 输出目录或任务保存目录")
+        output.mkdir(parents=True, exist_ok=True)
+        return _open_host_path(output)
+
     def acceptance_report(_payload: object = None) -> dict[str, object]:
         snapshot = service.snapshot()
         task = snapshot.get("task")
@@ -646,6 +685,7 @@ def _operation_handlers(
         "open-log-directory": open_logs,
         "open-data-directory": open_data,
         "open-pdi": open_pdi,
+        "open-pdi-directory": open_pdi_directory,
         "acceptance-report": acceptance_report,
         "profile-backup": profile_backup,
         "support-bundle": support_bundle,
@@ -762,6 +802,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         if updates:
             ProfileManager().update_profile(args.profile, **updates)
+        if args.profile is not None:
+            profile_manager = ProfileManager()
+            try:
+                if not profile_manager.get_profile(args.profile).is_running:
+                    profile_manager.ensure_internal_web_endpoint(args.profile)
+            except ManagedProfileInUseError:
+                # A concurrent start won the lock; the normal activation path
+                # below will notify that already-running Profile.
+                pass
+            except ProfileNotFoundError:
+                # acquire_instance_profile may create an explicitly selected
+                # Profile from the initialization template.
+                pass
         if args.no_open_browser:
             activation_action = "ensure-running"
         elif args.open_profile_web:
