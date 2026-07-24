@@ -453,7 +453,6 @@ jobs:
           $baselineRoot = (Resolve-Path "upgrade-baseline").Path
           $baselineRuntime = Join-Path $baselineRoot ".runtime"
           New-Item -ItemType Directory -Force $baselineRuntime | Out-Null
-          Copy-Item -LiteralPath ".runtime\dcmtk" -Destination $baselineRuntime -Recurse -Force
           Copy-Item -LiteralPath ".runtime\downloads" -Destination $baselineRuntime -Recurse -Force
           $baselineOhif = Join-Path $baselineRuntime "ohif"
           New-Item -ItemType Directory -Force $baselineOhif | Out-Null
@@ -464,6 +463,8 @@ jobs:
           & $baselinePython -m pip install -r (Join-Path $baselineRoot "requirements-build.txt")
           Push-Location $baselineRoot
           try {
+            & $baselinePython scripts/download_dcmtk.py --platform windows-x86_64
+            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.9.1 DCMTK preparation failed with exit code $LASTEXITCODE" }
             & $baselinePython scripts/prepare_ohif.py --offline
             if ($LASTEXITCODE -ne 0) { throw "Pinned 2.9.1 OHIF preparation failed with exit code $LASTEXITCODE" }
             & $baselinePython scripts/build_windows.py --version 2.9.1

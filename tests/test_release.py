@@ -448,6 +448,8 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert 'Copy-Item -LiteralPath ".runtime\\ohif\\cache"' in workflow
     assert 'python -m venv (Join-Path $baselineRoot ".venv")' in workflow
     assert '& $baselinePython -m pip install -r (Join-Path $baselineRoot "requirements-build.txt")' in workflow
+    assert "& $baselinePython scripts/download_dcmtk.py --platform windows-x86_64" in workflow
+    assert "Pinned 2.9.1 DCMTK preparation failed" in workflow
     assert "& $baselinePython scripts/prepare_ohif.py --offline" in workflow
     assert 'Copy-Item -LiteralPath ".runtime\\ohif" -Destination' not in workflow
     assert "& $baselinePython scripts/build_windows.py --version 2.9.1" in workflow
