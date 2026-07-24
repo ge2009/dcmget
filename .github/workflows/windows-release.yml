@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.7.0
+        default: 3.7.1
       publish_release:
         description: Publish the verified build to GitHub Releases
         required: true
@@ -45,10 +45,10 @@ jobs:
         shell: pwsh
         run: throw "component_update requires publish_release"
 
-      - name: Check out 2.6.1 upgrade baseline
+      - name: Check out 2.9.1 upgrade baseline
         uses: actions/checkout@v4
         with:
-          ref: c01c83a1963a55457bef15917ddd4cfdbab81fd1
+          ref: dc5547ee4bb7884867ecc97d64e1c11d63bed5d3
           path: upgrade-baseline
 
       - uses: actions/setup-python@v5
@@ -97,6 +97,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
+
+      - name: Download and verify offline x64 WebView2 Runtime
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2124701" -OutFile $target
+          if (-not (Test-Path $target -PathType Leaf)) { throw "WebView2 Runtime installer was not downloaded" }
+          if ((Get-Item $target).Length -lt 50MB) { throw "WebView2 Runtime installer is unexpectedly small" }
+          $signature = Get-AuthenticodeSignature $target
+          if ($signature.Status -ne "Valid") {
+            throw "WebView2 Runtime Authenticode signature is $($signature.Status): $($signature.StatusMessage)"
+          }
+          if ($null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch "CN=Microsoft Corporation(?:,|$)") {
+            throw "WebView2 Runtime signer is not Microsoft Corporation"
+          }
+          Write-Host "Verified WebView2 Runtime $((Get-Item $target).VersionInfo.FileVersion) signed by $($signature.SignerCertificate.Subject)"
+          "DCMGET_WEBVIEW2_RUNTIME_PATH=$target" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore DCMTK cache
         uses: actions/cache@v4
@@ -429,7 +446,7 @@ jobs:
           $actual = (Get-FileHash $language -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) { throw "Chinese language file checksum mismatch: $actual" }
 
-      - name: Build pinned 2.6.1 upgrade baseline installer
+      - name: Build pinned 2.9.1 upgrade baseline installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -440,12 +457,16 @@ jobs:
           $baselineOhif = Join-Path $baselineRuntime "ohif"
           New-Item -ItemType Directory -Force $baselineOhif | Out-Null
           Copy-Item -LiteralPath ".runtime\ohif\cache" -Destination (Join-Path $baselineOhif "cache") -Recurse -Force
+          $baselinePython = Join-Path $baselineRoot ".venv\Scripts\python.exe"
+          python -m venv (Join-Path $baselineRoot ".venv")
+          & $baselinePython -m pip install --upgrade pip
+          & $baselinePython -m pip install -r (Join-Path $baselineRoot "requirements-build.txt")
           Push-Location $baselineRoot
           try {
-            python scripts/prepare_ohif.py --offline
-            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 OHIF preparation failed with exit code $LASTEXITCODE" }
-            python scripts/build_windows.py --version 2.6.1
-            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 application build failed with exit code $LASTEXITCODE" }
+            & $baselinePython scripts/prepare_ohif.py --offline
+            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.9.1 OHIF preparation failed with exit code $LASTEXITCODE" }
+            & $baselinePython scripts/build_windows.py --version 2.9.1
+            if ($LASTEXITCODE -ne 0) { throw "Pinned 2.9.1 application build failed with exit code $LASTEXITCODE" }
           } finally {
             Pop-Location
           }
@@ -457,9 +478,9 @@ jobs:
           $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
           $fixture = (New-Item -ItemType Directory -Force "build/windows/upgrade-fixture").FullName
           $installerScript = Join-Path $baselineRoot "packaging\windows\dcmget.iss"
-          & $iscc "/DAppVersion=2.6.1" "/DSourceDir=$source" "/DReleaseDir=$fixture" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" $installerScript
-          if ($LASTEXITCODE -ne 0) { throw "Pinned 2.6.1 installer compilation failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path (Join-Path $fixture "DcmGet-2.6.1-Setup-x64.exe") -PathType Leaf)) { throw "Pinned 2.6.1 installer is missing" }
+          & $iscc "/DAppVersion=2.9.1" "/DSourceDir=$source" "/DReleaseDir=$fixture" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" $installerScript
+          if ($LASTEXITCODE -ne 0) { throw "Pinned 2.9.1 installer compilation failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path (Join-Path $fixture "DcmGet-2.9.1-Setup-x64.exe") -PathType Leaf)) { throw "Pinned 2.9.1 installer is missing" }
           Remove-Item (Join-Path $baselineRoot "build") -Recurse -Force
           Remove-Item (Join-Path $baselineRoot "release") -Recurse -Force
           Remove-Item $baselineRuntime -Recurse -Force
@@ -475,7 +496,8 @@ jobs:
           $redist = (Resolve-Path "build/windows/vc_redist.x64.exe").Path
           $language = (Resolve-Path "build/windows/ChineseSimplified.isl").Path
           $winsw = (Resolve-Path ".runtime/winsw/v2.12.0/WinSW-x64.exe").Path
-          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "/DWinSWPath=$winsw" "packaging/windows/dcmget.iss"
+          $webview2 = (Resolve-Path $env:DCMGET_WEBVIEW2_RUNTIME_PATH).Path
+          & $iscc "/DAppVersion=${{ inputs.version }}" "/DSourceDir=$source" "/DReleaseDir=$release" "/DBuildIcon=$icon" "/DLicenseFile=$license" "/DVCRedistPath=$redist" "/DChineseLanguageFile=$language" "/DWinSWPath=$winsw" "/DWebView2RuntimePath=$webview2" "packaging/windows/dcmget.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 
       - name: Sign installer before testing exact release artifact
@@ -487,13 +509,14 @@ jobs:
       - name: Silent install, in-place upgrade and uninstall test
         shell: pwsh
         run: |
-          $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.6.1-Setup-x64.exe").Path
+          $baseline = (Resolve-Path "build/windows/upgrade-fixture/DcmGet-2.9.1-Setup-x64.exe").Path
           $setup = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           $installDir = Join-Path $env:RUNNER_TEMP "DcmGetInstalled"
           $upgradeDicomDir = Join-Path $env:RUNNER_TEMP "DcmGetUpgradeDicom"
           $downloadSentinelPath = Join-Path $upgradeDicomDir "keep-download.dcm"
           $configDir = Join-Path $env:APPDATA "DcmGet"
           $configPath = Join-Path $configDir "config.json"
+          $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
           $licensePath = Join-Path $configDir "license.lic"
           $trialPath = Join-Path $configDir "trial.json"
           $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
@@ -562,26 +585,35 @@ jobs:
           $install = Start-Process $baseline -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Baseline installer failed with exit code $($install.ExitCode)" }
           $baselineRecords = @(Get-ChildItem $uninstallRoot | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "DcmGet" })
-          if ($baselineRecords.Count -ne 1) { throw "Expected one 2.6.1 uninstall record, found $($baselineRecords.Count)" }
-          if ($baselineRecords[0].DisplayVersion -ne "2.6.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.6.1" }
+          if ($baselineRecords.Count -ne 1) { throw "Expected one 2.9.1 uninstall record, found $($baselineRecords.Count)" }
+          if ($baselineRecords[0].DisplayVersion -ne "2.9.1") { throw "Baseline installed version is $($baselineRecords[0].DisplayVersion), expected 2.9.1" }
           if ($baselineRecords[0].InstallLocation.TrimEnd('\') -ne $installDir.TrimEnd('\')) { throw "Baseline installation directory is incorrect" }
           New-Item -ItemType Directory -Force $configDir | Out-Null
           New-Item -ItemType Directory -Force $upgradeDicomDir | Out-Null
           $upgradeWebPort = 8787
           $upgradeConfig = [ordered]@{
-            config_version = 2
+            config_version = 6
             pacs_server_ip = "upgrade-preserve.invalid"
+            pacs_server_port = 104
+            calling_ae_title = "DCMGET"
+            pacs_ae_title = "PACS01"
+            storage_ae_title = "DCMGET"
             storage_port = 16666
             web_port = $upgradeWebPort
             dicom_destination_folder = $upgradeDicomDir
           }
           [IO.File]::WriteAllText($configPath, ($upgradeConfig | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+          New-Item -ItemType Directory -Force (Split-Path -Parent $profile1ConfigPath) | Out-Null
+          [IO.File]::WriteAllText($profile1ConfigPath, ($upgradeConfig | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+          $baselineUi = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--ui-self-test", "--config", "`"$configPath`"") -Wait -PassThru
+          if ($baselineUi.ExitCode -ne 0) { throw "Installed 2.9.1 UI self-test failed with code $($baselineUi.ExitCode)" }
           [IO.File]::WriteAllText($downloadSentinelPath, "download-result-sentinel", [Text.UTF8Encoding]::new($false))
           Set-Content $licensePath "upgrade-license-sentinel"
           python -c "from dcmget.licensing import consume_trial; consume_trial()"
           if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
           Set-Content "$installDir/_internal/obsolete-upgrade-marker.txt" "remove-me"
           $configHash = (Get-FileHash $configPath -Algorithm SHA256).Hash
+          $profile1ConfigHash = (Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash
           $licenseHash = (Get-FileHash $licensePath -Algorithm SHA256).Hash
           $trialHash = (Get-FileHash $trialPath -Algorithm SHA256).Hash
           $trialAnchorHash = (Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash
@@ -624,6 +656,15 @@ jobs:
 
           $upgrade = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=desktopicon") -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { throw "Upgrade installer failed with exit code $($upgrade.ExitCode)" }
+          $webview2ClientKey = "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          $webview2Versions = @(
+            Get-ItemProperty "HKLM:\$webview2ClientKey" -Name pv -ErrorAction SilentlyContinue
+            Get-ItemProperty "HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -Name pv -ErrorAction SilentlyContinue
+          ) | ForEach-Object { [string]$_.pv } | Where-Object { $_ -and $_ -ne "0.0.0.0" }
+          if ($webview2Versions.Count -lt 1) { throw "Upgrade did not install the bundled WebView2 Runtime" }
+          if (-not ($webview2Versions | Where-Object { [int]($_.Split('.')[0]) -ge 111 })) {
+            throw "Installed WebView2 Runtime is older than Edge 111: $($webview2Versions -join ', ')"
+          }
           foreach ($managedProcess in $managedProcesses) {
             $managedProcess.Refresh()
             if (-not $managedProcess.HasExited) { throw "Installer did not stop managed process $($managedProcess.Id)" }
@@ -668,6 +709,7 @@ jobs:
           }
           if (Test-Path "$installDir/_internal/obsolete-upgrade-marker.txt") { throw "Upgrade did not remove obsolete runtime files" }
           if ((Get-FileHash $configPath -Algorithm SHA256).Hash -ne $configHash) { throw "Upgrade changed the existing user configuration" }
+          if ((Get-FileHash $profile1ConfigPath -Algorithm SHA256).Hash -ne $profile1ConfigHash) { throw "Upgrade changed the existing 2.9.1 Profile 1 configuration" }
           if ((Get-FileHash $licensePath -Algorithm SHA256).Hash -ne $licenseHash) { throw "Upgrade changed the existing license" }
           if ((Get-FileHash $trialPath -Algorithm SHA256).Hash -ne $trialHash) { throw "Upgrade changed the existing trial state" }
           if ((Get-FileHash $trialAnchorPath -Algorithm SHA256).Hash -ne $trialAnchorHash) { throw "Upgrade changed the machine trial anchor" }
@@ -707,6 +749,34 @@ jobs:
           $expectedWeb = (Resolve-Path -LiteralPath (Join-Path $installDir "DcmGet.exe") -ErrorAction Stop).ProviderPath
           Assert-DcmGetFirewallRule "DcmGet Receiver TCP" $expectedReceiver
           Assert-DcmGetFirewallRule "DcmGet Web TCP" $expectedWeb
+
+          $existingWebView2Ids = @(
+            Get-Process -Name "msedgewebview2" -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Id }
+          )
+          $nativeShell = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--native-shell-url", "http://127.0.0.1:8786/") -PassThru
+          $nativeWebViewStarted = $false
+          try {
+            for ($attempt = 0; $attempt -lt 120; $attempt++) {
+              $nativeShell.Refresh()
+              if ($nativeShell.HasExited) {
+                throw "Installed native WebView2 shell exited early with code $($nativeShell.ExitCode)"
+              }
+              $newWebView2 = @(
+                Get-Process -Name "msedgewebview2" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Id -notin $existingWebView2Ids }
+              )
+              if ($newWebView2.Count -gt 0) {
+                $nativeWebViewStarted = $true
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not $nativeWebViewStarted) { throw "Installed native shell did not start a WebView2 process" }
+          } finally {
+            & "$env:SystemRoot\System32\taskkill.exe" /PID $nativeShell.Id /T /F | Out-Null
+            $nativeShell.WaitForExit(10000) | Out-Null
+          }
 
       - name: Windows service dynamic Profile adoption test
         shell: pwsh

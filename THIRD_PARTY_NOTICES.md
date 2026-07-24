@@ -15,7 +15,7 @@ DcmGet 在部署、构建或运行时使用以下独立组件。源码部署 ZIP
 - [Vite](https://github.com/vitejs/vite)：MIT License；[TypeScript](https://github.com/microsoft/TypeScript)：Apache License 2.0。两者只用于开发和发布阶段生成固定文件名的离线前端资源，不作为客户端运行时依赖。
 - [pywebview](https://github.com/r0x0r/pywebview)：BSD 3-Clause License。Windows 交互入口使用 pywebview 调用系统 WebView2 Runtime 承载本地 React 工作台。
 - [pythonnet](https://github.com/pythonnet/pythonnet)：MIT License。由 pywebview 在 Windows 上用于 .NET 互操作。
-- [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)：遵循 Microsoft 软件许可条款；DcmGet 不内置该运行时，Windows 交互入口使用系统现有的 WebView2 Runtime。
+- [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)：遵循 Microsoft 软件许可条款；Windows 一键安装器内置经过 Authenticode 校验的 x64 Evergreen Standalone Installer，并在安装或升级时以系统级方式安装/修复运行时。便携版和 ZIP 仍使用系统现有的 WebView2 Runtime。
 - [Starlette](https://github.com/Kludex/starlette)：BSD 3-Clause License。
 - [Uvicorn](https://github.com/Kludex/uvicorn)：BSD 3-Clause License。
 - [Pydantic](https://github.com/pydantic/pydantic)：MIT License。

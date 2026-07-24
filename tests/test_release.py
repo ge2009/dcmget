@@ -442,18 +442,52 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
         encoding="utf-8"
     )
 
-    assert "ref: c01c83a1963a55457bef15917ddd4cfdbab81fd1" in workflow
+    assert "ref: dc5547ee4bb7884867ecc97d64e1c11d63bed5d3" in workflow
     assert "path: upgrade-baseline" in workflow
     assert 'Copy-Item -LiteralPath ".runtime\\ohif\\cache"' in workflow
-    assert "python scripts/prepare_ohif.py --offline" in workflow
+    assert 'python -m venv (Join-Path $baselineRoot ".venv")' in workflow
+    assert '& $baselinePython -m pip install -r (Join-Path $baselineRoot "requirements-build.txt")' in workflow
+    assert "& $baselinePython scripts/prepare_ohif.py --offline" in workflow
     assert 'Copy-Item -LiteralPath ".runtime\\ohif" -Destination' not in workflow
-    assert "python scripts/build_windows.py --version 2.6.1" in workflow
+    assert "& $baselinePython scripts/build_windows.py --version 2.9.1" in workflow
     assert 'Join-Path $baselineRoot "packaging\\windows\\dcmget.iss"' in workflow
-    assert "DcmGet-2.6.1-Setup-x64.exe" in workflow
-    assert '$baselineRecords[0].DisplayVersion -ne "2.6.1"' in workflow
+    assert "DcmGet-2.9.1-Setup-x64.exe" in workflow
+    assert '$baselineRecords[0].DisplayVersion -ne "2.9.1"' in workflow
+    assert "config_version = 6" in workflow
+    assert 'Join-Path $configDir "instances\\i1\\config.json"' in workflow
+    assert "Installed 2.9.1 UI self-test failed" in workflow
+    assert "Upgrade changed the existing 2.9.1 Profile 1 configuration" in workflow
     assert '$upgradeWeb = Start-Process "$installDir/DcmGet.exe"' in workflow
     assert "Installed Web self-test failed" in workflow
     assert "/DAppVersion=2.0.0" not in workflow
+
+
+def test_windows_installer_repairs_offline_webview2_for_native_react_shell():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    vite = (root / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+    index = (root / "frontend" / "index.html").read_text(encoding="utf-8")
+
+    assert '#define MinimumWebView2MajorVersion 111' in installer
+    assert "MicrosoftEdgeWebView2RuntimeInstallerX64.exe" in installer
+    assert "AfterInstall: InstallWebView2Runtime" in installer
+    assert "procedure InstallWebView2Runtime();" in installer
+    assert "'/silent /install'" in installer
+    assert "WebView2RuntimeIsSupported()" in installer
+    assert "https://go.microsoft.com/fwlink/?linkid=2124701" in workflow
+    assert "WebView2 Runtime installer is unexpectedly small" in workflow
+    assert "Get-AuthenticodeSignature" in workflow
+    assert 'Subject -notmatch "CN=Microsoft Corporation(?:,|$)"' in workflow
+    assert '"/DWebView2RuntimePath=$webview2"' in workflow
+    assert "Upgrade did not install the bundled WebView2 Runtime" in workflow
+    assert 'Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--native-shell-url", "http://127.0.0.1:8786/")' in workflow
+    assert "Installed native shell did not start a WebView2 process" in workflow
+    assert "target: 'edge111'" in vite
+    assert "DcmGet 界面正在加载" in index
+    assert "修复 Microsoft Edge WebView2 Runtime" in index
 
 
 def test_windows_installer_stops_only_dcmget_processes_from_install_directory():

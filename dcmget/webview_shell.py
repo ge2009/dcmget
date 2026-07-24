@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import time
@@ -8,6 +9,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+
+LOGGER = logging.getLogger("dcmget.diagnostics")
 
 
 class WebViewShellError(RuntimeError):
@@ -77,6 +80,10 @@ def run_webview_shell(
         except ImportError as exc:
             raise WebViewShellError("缺少 Windows WebView 组件，请重新安装 DcmGet") from exc
     try:
+        LOGGER.info(
+            "Starting WebView2 shell url=%s",
+            target,
+        )
         webview_module.create_window(
             "DcmGet DICOM 影像下载",
             target,
@@ -88,6 +95,7 @@ def run_webview_shell(
         )
         webview_module.start(gui="edgechromium", debug=False)
     except Exception as exc:
+        LOGGER.exception("WebView2 shell startup failed")
         raise WebViewShellError(
             "无法启动 Windows WebView2，请修复或安装 Microsoft Edge WebView2 Runtime"
         ) from exc

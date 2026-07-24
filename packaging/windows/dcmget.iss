@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.7.0"
+  #define AppVersion "3.7.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -37,6 +37,8 @@
 #define ServiceTemplateName "kayisoft-dcmget.xml.template"
 #define ServiceHostName "kayisoft-dcmget-host.ps1"
 #define ServiceStateRegistryKey "Software\DcmGet\WindowsService"
+#define WebView2RuntimeClientKey "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+#define MinimumWebView2MajorVersion 111
 #define ManagementUrl "http://127.0.0.1:8786/"
 #define FirewallRule "DcmGet Receiver TCP"
 #define WebFirewallRule "DcmGet Web TCP"
@@ -111,6 +113,9 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Source: "{#WinSWPath}"; DestDir: "{app}"; DestName: "{#ServiceWrapperName}"; Flags: ignoreversion
 Source: "{#WinSWLicenseFile}"; DestDir: "{app}"; DestName: "LICENSE-WINSW.txt"; Flags: ignoreversion
 Source: "{#ServiceHostFile}"; DestDir: "{app}"; DestName: "{#ServiceHostName}"; Flags: ignoreversion
+#ifdef WebView2RuntimePath
+Source: "{#WebView2RuntimePath}"; DestDir: "{tmp}"; DestName: "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; Flags: deleteafterinstall; AfterInstall: InstallWebView2Runtime
+#endif
 Source: "{#ServiceTemplateFile}"; DestDir: "{app}"; DestName: "{#ServiceTemplateName}"; Flags: ignoreversion; AfterInstall: ConfigureAndInstallDcmGetService
 #ifdef VCRedistPath
 Source: "{#VCRedistPath}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flags: deleteafterinstall
@@ -257,6 +262,83 @@ end;
 function ShouldStartDcmGetService(): Boolean;
 begin
   Result := (not ServiceExistedBeforeInstall) or ServiceWasActiveBeforeInstall;
+end;
+
+function WebView2VersionIsSupported(Version: String): Boolean;
+var
+  DelimiterPosition: Integer;
+  MajorVersion: Integer;
+begin
+  Version := Trim(Version);
+  if (Version = '') or (Version = '0.0.0.0') then
+  begin
+    Result := False;
+    Exit;
+  end;
+  DelimiterPosition := Pos('.', Version);
+  if DelimiterPosition > 0 then
+    Version := Copy(Version, 1, DelimiterPosition - 1);
+  MajorVersion := StrToIntDef(Version, 0);
+  Result := MajorVersion >= {#MinimumWebView2MajorVersion};
+end;
+
+function WebView2RuntimeIsSupported(): Boolean;
+var
+  Version: String;
+begin
+  Result := False;
+  Version := '';
+  if RegQueryStringValue(
+    HKLM32,
+    '{#WebView2RuntimeClientKey}',
+    'pv',
+    Version
+  ) and WebView2VersionIsSupported(Version) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Version := '';
+  if RegQueryStringValue(
+    HKCU,
+    '{#WebView2RuntimeClientKey}',
+    'pv',
+    Version
+  ) then
+    Result := WebView2VersionIsSupported(Version);
+end;
+
+procedure InstallWebView2Runtime();
+var
+  ResultCode: Integer;
+  Attempt: Integer;
+begin
+  if WebView2RuntimeIsSupported() then
+    Exit;
+  if not Exec(
+    ExpandConstant('{tmp}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'),
+    '/silent /install',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+    RaiseException('无法启动 Microsoft Edge WebView2 Runtime 安装程序。');
+  if ResultCode <> 0 then
+    RaiseException(
+      'Microsoft Edge WebView2 Runtime 安装失败，退出码 ' +
+      IntToStr(ResultCode) + '。'
+    );
+  for Attempt := 0 to 239 do
+  begin
+    if WebView2RuntimeIsSupported() then
+      Exit;
+    Sleep(500);
+  end;
+  RaiseException(
+    'Microsoft Edge WebView2 Runtime 未正确安装或版本低于 ' +
+    IntToStr({#MinimumWebView2MajorVersion}) + '，请重新运行安装程序。'
+  );
 end;
 
 procedure RequestExistingServiceStop();

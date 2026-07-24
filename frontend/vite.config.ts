@@ -8,6 +8,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   publicDir: 'public',
   build: {
+    target: 'edge111',
     outDir: resolve(__dirname, '../dcmget/webui-react'),
     emptyOutDir: true,
     cssCodeSplit: false,
