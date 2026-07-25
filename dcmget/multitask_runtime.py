@@ -23,6 +23,8 @@ TaskLogCallback = Callable[[str, str, str, str], None]
 TaskProgressCallback = Callable[[str, AccessionResult], None]
 TaskProcessCallback = Callable[[str, str, int, str, bool], None]
 
+_LEGACY_RUNTIME_CONCURRENCY = 2
+
 
 def recover_orphaned_shared_staging(
     state_root: str | Path | None = None,
@@ -144,7 +146,7 @@ class SharedDcmtkRuntime:
             self.start,
             self.stop,
             self.run_accession,
-            max_concurrent_moves=self.config.max_concurrent_moves,
+            max_concurrent_moves=_LEGACY_RUNTIME_CONCURRENCY,
         )
 
     def validate_download_config(self, config: AppConfig) -> None:
@@ -248,13 +250,8 @@ class SharedDcmtkRuntime:
                     / f"receiver-{safe_ae}-{key[1]}-{session}"
                 ),
                 log_callback=receiver_logger._emit,
-                maximum_associations=max(
-                    16,
-                    self.config.max_concurrent_moves * 4,
-                ),
-                allow_single_route_fallback=(
-                    self.config.max_concurrent_moves == 1
-                ),
+                maximum_associations=16,
+                allow_single_route_fallback=False,
             )
             try:
                 receiver.start()

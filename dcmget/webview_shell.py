@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -8,9 +9,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+
+from . import __version__
 
 LOGGER = logging.getLogger("dcmget.diagnostics")
+MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024
 
 
 class WebViewShellError(RuntimeError):
@@ -43,21 +47,51 @@ def wait_until_ready(
     poll_interval: float = 0.1,
     urlopen: Callable[..., Any] | None = None,
 ) -> bool:
+    """Wait for the same-version DcmGet bootstrap API, not just an open port."""
+
     target = validate_loopback_url(url)
+    parsed = urlsplit(target)
+    bootstrap_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, "/api/bootstrap", "", "")
+    )
     probe = urlopen or urllib.request.urlopen
     deadline = time.monotonic() + max(0.0, float(timeout))
-    while time.monotonic() <= deadline:
+    attempted = False
+    while not attempted or time.monotonic() <= deadline:
+        attempted = True
         try:
-            response = probe(target, timeout=min(0.5, max(0.05, timeout)))
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
-            return True
-        except urllib.error.HTTPError:
-            return True
-        except (OSError, urllib.error.URLError, TimeoutError):
-            if time.monotonic() >= deadline:
-                break
+            response = probe(
+                bootstrap_url,
+                timeout=min(0.5, max(0.05, timeout)),
+            )
+            try:
+                status = int(getattr(response, "status", 200))
+                raw = response.read(MAX_BOOTSTRAP_BYTES + 1)
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            if status == 200 and len(raw) <= MAX_BOOTSTRAP_BYTES:
+                payload = json.loads(raw.decode("utf-8"))
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("version") == __version__
+                    and payload.get("mode") in {"manager", "profile"}
+                    and isinstance(payload.get("csrf_token"), str)
+                    and bool(payload["csrf_token"])
+                ):
+                    return True
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ValueError,
+            OSError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+        ):
+            pass
+        if time.monotonic() <= deadline:
             time.sleep(max(0.0, poll_interval))
     return False
 
@@ -72,7 +106,8 @@ def run_webview_shell(
     target = validate_loopback_url(url)
     if not wait_until_ready(target, timeout=timeout, urlopen=urlopen):
         raise WebViewShellError(
-            "DcmGet 后台服务尚未就绪，请确认 kayisoft-dcmget 服务已启动"
+            "DcmGet 后台服务尚未就绪，或目标端口不是当前版本的 DcmGet；"
+            "请确认 kayisoft-dcmget 服务已启动"
         )
     if webview_module is None:
         try:

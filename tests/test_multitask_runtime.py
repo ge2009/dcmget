@@ -154,7 +154,9 @@ def test_shared_runtime_reuses_one_receiver_and_separates_task_logs(
     assert not receiver.is_running
 
 
-def test_serial_runtime_allows_single_route_fallback(tmp_path, monkeypatch):
+def test_obsolete_concurrency_value_cannot_reenable_parallel_moves(
+    tmp_path, monkeypatch
+):
     from dcmget import multitask_runtime
 
     _Runner.instances = []
@@ -171,15 +173,16 @@ def test_serial_runtime_allows_single_route_fallback(tmp_path, monkeypatch):
         lambda: tmp_path,
     )
     runtime = SharedDcmtkRuntime(
-        AppConfig(max_concurrent_moves=1),
+        AppConfig(max_concurrent_moves=8),
         _tools(tmp_path),
     )
     receiver = runtime.receiver_service()
 
     receiver.ensure_started()
-    receiver.run_accession("task-a", AppConfig(max_concurrent_moves=1), "A001")
+    receiver.run_accession("task-a", AppConfig(max_concurrent_moves=8), "A001")
 
-    assert _StorageReceiver.instances[0].kwargs["allow_single_route_fallback"]
+    assert receiver.max_concurrent_moves == 2
+    assert not _StorageReceiver.instances[0].kwargs["allow_single_route_fallback"]
     receiver.shutdown()
 
 

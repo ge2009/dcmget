@@ -254,4 +254,100 @@ describe('bootstrap modes', () => {
     await waitFor(() => expect(taskRequests).toBe(2));
     expect(await screen.findByRole('heading', { name: '下载中' })).toBeInTheDocument();
   });
+
+  it('keeps clone failures in the dialog, then closes and refreshes after success', async () => {
+    const sourceProfile = {
+      number: 4,
+      display_name: 'CT 接收',
+      is_running: false,
+      desired_running: false,
+      pacs_server_ip: '127.0.0.1',
+      pacs_server_port: 104,
+      calling_ae_title: 'DCMGET',
+      pacs_ae_title: 'PACS',
+      storage_ae_title: 'DCMGET4',
+      storage_port: 6664,
+      dicom_destination_folder: 'D:\\ct',
+    };
+    let cloneRequests = 0;
+    let profileRequests = 0;
+    const cloneBodies: unknown[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {} });
+      if (path === '/api/management/profiles') {
+        profileRequests += 1;
+        return json({ profiles: cloneRequests > 1
+          ? [sourceProfile, { ...sourceProfile, number: 5, display_name: 'CT 夜班' }]
+          : [sourceProfile] });
+      }
+      if (path === '/api/operations/profile-clone') {
+        cloneRequests += 1;
+        cloneBodies.push(JSON.parse(String(init?.body)));
+        if (cloneRequests === 1) {
+          return new Response(JSON.stringify({ message: '名称已经存在' }), {
+            status: 409,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return json({});
+      }
+      return json({});
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '复制当前实例' }));
+    const name = await screen.findByRole('textbox', { name: '新 Profile 名称' });
+    expect(name).toHaveValue('CT 接收 副本');
+
+    fireEvent.click(screen.getByRole('button', { name: '复制 Profile' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('名称已经存在');
+    expect(screen.getByRole('dialog', { name: '复制 Profile' })).toBeInTheDocument();
+
+    fireEvent.change(name, { target: { value: 'CT 夜班' } });
+    fireEvent.click(screen.getByRole('button', { name: '复制 Profile' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '复制 Profile' })).not.toBeInTheDocument());
+    expect(await screen.findByText('Profile 已复制')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('2 个 Profile')).toBeInTheDocument());
+    expect(profileRequests).toBe(2);
+    expect(cloneBodies).toEqual([
+      { source_profile_number: 4, display_name: 'CT 接收 副本' },
+      { source_profile_number: 4, display_name: 'CT 夜班' },
+    ]);
+  });
+
+  it('reports a clone that succeeded when the profile list cannot refresh', async () => {
+    const sourceProfile = {
+      number: 4,
+      display_name: 'CT 接收',
+      is_running: false,
+      desired_running: false,
+      storage_ae_title: 'DCMGET4',
+      storage_port: 6664,
+    };
+    let profileRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({ csrf_token: 'token', mode: 'manager', profile: {} });
+      if (path === '/api/management/profiles') {
+        profileRequests += 1;
+        if (profileRequests === 1) return json({ profiles: [sourceProfile] });
+        return new Response(JSON.stringify({ message: '服务暂时不可用' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (path === '/api/operations/profile-clone') return json({});
+      return json({});
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '复制当前实例' }));
+    fireEvent.click(await screen.findByRole('button', { name: '复制 Profile' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '复制 Profile' })).not.toBeInTheDocument());
+    expect(await screen.findByText('Profile 已复制；列表刷新失败，请手动刷新')).toBeInTheDocument();
+    expect(await screen.findByText(/Profile 列表读取失败：服务暂时不可用/)).toBeInTheDocument();
+  });
 });

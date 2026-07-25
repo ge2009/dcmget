@@ -1224,7 +1224,7 @@ def test_task_receiver_configuration_is_snapshotted_per_active_task(tmp_path):
         storage_port=6666,
     )
     fourth = store.create_task(different_concurrency, ["F001"])
-    assert store.get_config(fourth.task_id).max_concurrent_moves == 3
+    assert store.get_config(fourth.task_id).max_concurrent_moves == 2
 
     different_dcmtk = AppConfig(
         dicom_destination_folder=str(tmp_path / "four"),

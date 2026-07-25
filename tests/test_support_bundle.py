@@ -226,3 +226,36 @@ def test_support_bundle_limits_logs_and_ignores_symlinks(tmp_path):
 
     assert result.omitted_log_count == 2
     assert sum(name.startswith("logs/") for name in result.included_files) == 1
+
+
+def test_support_bundle_combines_startup_and_task_logs(tmp_path):
+    diagnostics = tmp_path / "diagnostics"
+    task_logs = tmp_path / "task-logs"
+    diagnostics.mkdir()
+    task_logs.mkdir()
+    (diagnostics / "dcmget-diagnostics-10.log").write_text(
+        "ERROR startup failed", encoding="utf-8"
+    )
+    (task_logs / "task-abc.log").write_text(
+        "检查号 202601261643：失败", encoding="utf-8"
+    )
+    (task_logs / "image.dcm").write_bytes(b"DICM secret")
+
+    result = create_support_bundle(
+        tmp_path / "support.zip",
+        AppConfig(),
+        diagnostic_directory=diagnostics,
+        additional_log_directories=(task_logs, diagnostics),
+        health_report={"status": "ok"},
+    )
+
+    with zipfile.ZipFile(result.path) as archive:
+        names = set(archive.namelist())
+        combined = b"\n".join(
+            archive.read(name) for name in names if name.startswith("logs/")
+        ).decode("utf-8")
+    assert sum(name.startswith("logs/") for name in names) == 2
+    assert "startup failed" in combined
+    assert "<ACCESSION>" in combined
+    assert "202601261643" not in combined
+    assert "DICM secret" not in combined

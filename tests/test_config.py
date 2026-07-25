@@ -217,7 +217,7 @@ def test_version_five_configuration_parses_ohif_boolean():
     assert config.max_concurrent_moves == 2
 
 
-def test_version_five_configuration_adds_default_concurrency_without_overwriting():
+def test_version_five_configuration_normalizes_obsolete_concurrency():
     migrated = AppConfig.from_dict(
         {"config_version": 5, "pacs_server_ip": "10.1.2.3"}
     )
@@ -228,7 +228,7 @@ def test_version_five_configuration_adds_default_concurrency_without_overwriting
     assert migrated.config_version == 8
     assert migrated.max_concurrent_moves == 2
     assert migrated.pacs_server_ip == "10.1.2.3"
-    assert configured.max_concurrent_moves == 4
+    assert configured.max_concurrent_moves == 2
 
 
 def test_version_six_configuration_adds_delivery_safety_defaults_without_overwriting():
@@ -319,7 +319,6 @@ def test_validation_reports_required_and_invalid_values():
         "calling_ae_title",
         "pacs_server_port",
         "storage_port",
-        "max_concurrent_moves",
         "web_bind_address",
         "web_port",
         "web_session_timeout_minutes",
@@ -329,6 +328,17 @@ def test_validation_reports_required_and_invalid_values():
         "pdi_volume_size_bytes",
         "max_log_file_size_bytes",
     }
+    assert "max_concurrent_moves" not in errors
+
+
+@pytest.mark.parametrize("legacy_value", [0, -1, 9, 999])
+def test_obsolete_concurrency_value_does_not_block_current_profiles(legacy_value):
+    config = AppConfig.from_dict(
+        {"config_version": 6, "max_concurrent_moves": legacy_value}
+    )
+
+    assert config.max_concurrent_moves == 2
+    assert "max_concurrent_moves" not in config.validate()
 
 
 def test_web_configuration_round_trip_and_validation():

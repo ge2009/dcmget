@@ -153,9 +153,10 @@ class AppConfig:
         values["config_version"] = 8
         values["pacs_server_port"] = _as_int(values["pacs_server_port"], 8104)
         values["storage_port"] = _as_int(values["storage_port"], 6666)
-        values["max_concurrent_moves"] = _as_int(
-            values["max_concurrent_moves"], 2
-        )
+        # Kept in the serialized schema only so older configuration files still
+        # load. Profile runtimes no longer use configurable C-MOVE concurrency,
+        # so legacy values must not leak back into dormant multi-task paths.
+        values["max_concurrent_moves"] = 2
         values["web_port"] = _as_int(values["web_port"], 8787)
         values["web_session_timeout_minutes"] = _as_int(
             values["web_session_timeout_minutes"], 480
@@ -221,8 +222,9 @@ class AppConfig:
             errors["pacs_server_port"] = "端口必须在 1 到 65535 之间"
         if not 1 <= self.storage_port <= 65535:
             errors["storage_port"] = "端口必须在 1 到 65535 之间"
-        if not 1 <= self.max_concurrent_moves <= 8:
-            errors["max_concurrent_moves"] = "并发下载数必须在 1 到 8 之间"
+        # Kept only so 2.8.x configuration files can still be read.  Since
+        # 2.9.0 every Profile runs one C-MOVE at a time, so a stale legacy
+        # value must not block an otherwise valid current configuration.
         try:
             bind_address = ipaddress.ip_address(self.web_bind_address.strip())
         except ValueError:

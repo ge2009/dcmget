@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from . import __version__
 from .config import AppConfig
@@ -24,6 +24,8 @@ DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024
 _DIAGNOSTIC_PATTERNS = (
     "dcmget-diagnostics*.log*",
     "dcmget-crash*.log*",
+    "task-*.log*",
+    "receiver-*.log*",
 )
 _SENSITIVE_LABEL_TOKEN = (
     r"(?:Accession(?:\s*(?:Number|No\.?))?|"
@@ -120,6 +122,7 @@ def create_support_bundle(
     *,
     project_root: str | Path | None = None,
     diagnostic_directory: str | Path | None = None,
+    additional_log_directories: Iterable[str | Path] = (),
     health_report: HealthReport | Mapping[str, Any] | None = None,
     max_log_files: int = DEFAULT_MAX_LOG_FILES,
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
@@ -157,12 +160,26 @@ def create_support_bundle(
         "config-summary.json": _json_bytes(config_summary(config)),
     }
 
-    log_directory = Path(
+    primary_log_directory = Path(
         diagnostic_directory
         if diagnostic_directory is not None
         else diagnostic_log_directory()
     ).expanduser()
-    candidates = _diagnostic_files(log_directory)
+    log_directories = [
+        primary_log_directory,
+        *(Path(value).expanduser() for value in additional_log_directories),
+    ]
+    candidate_map: dict[Path, Path] = {}
+    for log_directory in log_directories:
+        for candidate in _diagnostic_files(log_directory):
+            try:
+                candidate_map[candidate.resolve()] = candidate
+            except OSError:
+                continue
+    candidates = sorted(
+        candidate_map.values(),
+        key=lambda path: (-_safe_mtime(path), path.name.casefold()),
+    )
     selected = candidates[:max_log_files]
     for index, source in enumerate(selected, 1):
         try:

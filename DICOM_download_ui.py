@@ -12,8 +12,6 @@ import re
 import socket
 import sys
 import threading
-import time
-import urllib.error
 import urllib.request
 import uuid
 import webbrowser
@@ -22,6 +20,7 @@ from pathlib import Path
 
 from dcmget import __version__
 from dcmget.diagnostics import (
+    diagnostic_log_directory,
     diagnostic_log_path,
     install_diagnostics,
     record_exception,
@@ -33,7 +32,7 @@ install_diagnostics(__version__)
 from dcmget.app_service import DcmGetAppService
 from dcmget.architecture import ensure_supported_runtime
 from dcmget.config import AppConfig, load_config, save_config
-from dcmget.core import DcmtkResolver
+from dcmget.core import DcmtkResolver, log_directory as task_log_directory
 from dcmget.instance_profile import (
     InstanceProfile,
     ProfileInUseError,
@@ -64,7 +63,11 @@ from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
 from dcmget.windows_service_control import windows_service_operation_handlers
 from dcmget.web_security import DirectoryRoot, discover_local_hosts
 from dcmget.web_server import DcmGetWebServer
-from dcmget.webview_shell import run_webview_shell, spawn_webview_shell
+from dcmget.webview_shell import (
+    run_webview_shell,
+    spawn_webview_shell,
+    wait_until_ready,
+)
 
 
 PROJECT_ROOT = resource_root()
@@ -437,29 +440,19 @@ def _open_ui_when_ready(
     opener=None,
     urlopen=None,
 ) -> bool:
-    """Open the local UI only after the profile Web service answers HTTP."""
+    """Open the UI only after the matching DcmGet bootstrap API is ready."""
 
     open_url = opener or (
         spawn_webview_shell
         if sys.platform == "win32"
         else lambda target: webbrowser.open(target, new=1)
     )
-    probe = urlopen or urllib.request.urlopen
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    while time.monotonic() <= deadline:
-        try:
-            response = probe(url, timeout=min(0.5, max(0.05, timeout)))
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
-        except urllib.error.HTTPError:
-            # An HTTP response proves that the intended service is listening.
-            pass
-        except (OSError, urllib.error.URLError, TimeoutError):
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(max(0.0, poll_interval))
-            continue
+    if wait_until_ready(
+        url,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        urlopen=urlopen,
+    ):
         try:
             result = open_url(url)
             return bool(result is None or result)
@@ -588,8 +581,28 @@ def _operation_handlers(
         return _open_host_path(current_config().dicom_destination_folder)
 
     def open_logs(_payload: object = None) -> dict[str, object]:
-        profile.log_directory.mkdir(parents=True, exist_ok=True)
-        return _open_host_path(profile.log_directory)
+        primary = task_log_directory(current_config())
+        fallback = profile.log_directory
+
+        def latest_log_mtime(directory: Path) -> float:
+            try:
+                return max(
+                    (path.stat().st_mtime for path in directory.glob("*.log*")),
+                    default=0.0,
+                )
+            except OSError:
+                return 0.0
+
+        if latest_log_mtime(fallback) > latest_log_mtime(primary):
+            directory = fallback
+        else:
+            directory = primary
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            fallback.mkdir(parents=True, exist_ok=True)
+            directory = fallback
+        return _open_host_path(directory)
 
     def open_data(_payload: object = None) -> dict[str, object]:
         return _open_host_path(profile.state_directory)
@@ -669,7 +682,11 @@ def _operation_handlers(
             output,
             current_config(),
             project_root=PROJECT_ROOT,
-            diagnostic_directory=profile.log_directory,
+            diagnostic_directory=diagnostic_log_directory(),
+            additional_log_directories=(
+                task_log_directory(current_config()),
+                profile.log_directory,
+            ),
         )
         return {"ok": True, "message": "脱敏支持包已生成", "path": str(result.path)}
 

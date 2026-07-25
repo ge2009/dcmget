@@ -1005,18 +1005,33 @@ def test_explicit_profile_number_is_validated(tmp_path, value):
 
 
 def test_profile_web_ui_waits_until_http_service_is_ready():
+    import json
+
     import DICOM_download_ui as entry
+    from dcmget import __version__
 
     attempts = 0
     opened: list[str] = []
 
     class _Response:
+        status = 200
+
+        def read(self, _limit: int = -1) -> bytes:
+            return json.dumps(
+                {
+                    "version": __version__,
+                    "mode": "profile",
+                    "csrf_token": "test-token",
+                }
+            ).encode("utf-8")
+
         def close(self) -> None:
             return None
 
-    def probe(_url: str, **_kwargs: object):
+    def probe(url: str, **_kwargs: object):
         nonlocal attempts
         attempts += 1
+        assert url == "http://127.0.0.1:8787/api/bootstrap"
         if attempts == 1:
             raise OSError("service is still starting")
         return _Response()
@@ -1169,6 +1184,134 @@ def test_profile_pdi_directory_operation_rejects_empty_effective_root(
 
     with pytest.raises(RuntimeError, match="请先设置 PDI 输出目录"):
         handlers["open-pdi-directory"]({"path": "", "destination": ""})
+
+
+def test_profile_log_operation_opens_the_task_log_next_to_downloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    destination = tmp_path / "dicom"
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(destination)),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "fallback-logs" / "i1",
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True},
+    )
+
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+    handlers["open-log-directory"]({})
+
+    expected = destination / "_DcmGetLogs"
+    assert expected.is_dir()
+    assert opened == [expected]
+
+
+def test_profile_log_operation_opens_fallback_when_task_logs_fell_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    destination = tmp_path / "dicom"
+    fallback = tmp_path / "fallback-logs" / "i1"
+    fallback.mkdir(parents=True)
+    (fallback / "task-recovered.log").write_text("fallback", encoding="utf-8")
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(destination)),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": fallback,
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True},
+    )
+
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+    handlers["open-log-directory"]({})
+
+    assert opened == [fallback]
+
+
+def test_profile_log_operation_prefers_newer_fallback_over_stale_primary_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    destination = tmp_path / "dicom"
+    primary = destination / "_DcmGetLogs"
+    fallback = tmp_path / "fallback-logs" / "i1"
+    primary.mkdir(parents=True)
+    fallback.mkdir(parents=True)
+    stale = primary / "task-old.log"
+    current = fallback / "task-current.log"
+    stale.write_text("old", encoding="utf-8")
+    current.write_text("current", encoding="utf-8")
+    stale.touch()
+    current.touch()
+    stale_mtime = stale.stat().st_mtime - 60
+    os.utime(stale, (stale_mtime, stale_mtime))
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(destination)),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": fallback,
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True},
+    )
+
+    handlers = entry._operation_handlers(
+        profile,
+        type("Service", (), {"snapshot": lambda _self: {}})(),
+    )
+    handlers["open-log-directory"]({})
+
+    assert opened == [fallback]
 
 
 def test_profile_web_launch_and_service_browser_flags_are_parsed():

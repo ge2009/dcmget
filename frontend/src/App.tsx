@@ -7,6 +7,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiClient, ApiError, managedApiPath } from './api';
 import { BrandMark } from './components/BrandMark';
+import { CloneProfileDialog } from './components/CloneProfileDialog';
 import { Button, ConfirmDialog, StatusBadge } from './components/Primitives';
 import { AnimatedIcon, semanticIconMap } from './components/icons';
 import { LogPanel, normalizeLog, type NormalizedLog } from './components/LogPanel';
@@ -126,6 +127,9 @@ export default function App() {
   const [editorLaunch, setEditorLaunch] = useState(false);
   const [editorBusy, setEditorBusy] = useState(false);
   const [editorError, setEditorError] = useState('');
+  const [cloneSource, setCloneSource] = useState<Profile | null>(null);
+  const [cloneBusy, setCloneBusy] = useState(false);
+  const [cloneError, setCloneError] = useState('');
   const [operationsOpen, setOperationsOpen] = useState(false);
   const [operationsBusy, setOperationsBusy] = useState(false);
   const [health, setHealth] = useState<UnknownRecord>({});
@@ -276,7 +280,7 @@ export default function App() {
   }, [applyProfilePayload, managerMode]);
 
   const refreshProfiles = useCallback(async (selectIfNeeded = true) => {
-    if (!managerMode && !selectIfNeeded) return;
+    if (!managerMode && !selectIfNeeded) return false;
     setProfilesBusy(true);
     try {
       const result = await apiClient.request('/api/management/profiles', ProfilesResponseSchema);
@@ -292,8 +296,10 @@ export default function App() {
       } else if (!list.length) {
         setActiveProfile(null); setTask(null); newTaskBaseId.current = ''; setNewTaskDraftOpen(false); setConfig({});
       }
+      return true;
     } catch (error) {
       setGlobalError(`Profile 列表读取失败：${(error as Error).message}`);
+      return false;
     } finally {
       setProfilesBusy(false);
     }
@@ -630,12 +636,26 @@ export default function App() {
     finally { setEditorBusy(false); }
   }
 
-  async function cloneProfile(profile: Profile) {
-    const name = window.prompt('新 Profile 显示名称', `${profileName(profile)} 副本`); if (name == null) return;
+  function openCloneProfile(profile: Profile) {
+    setCloneError('');
+    setCloneSource(profile);
+  }
+
+  async function cloneProfile(displayName: string) {
+    if (!cloneSource) return;
+    const sourceProfileNumber = profileNumber(cloneSource);
+    if (sourceProfileNumber == null) {
+      setCloneError('当前 Profile 缺少有效编号，无法复制。');
+      return;
+    }
+    setCloneBusy(true); setCloneError('');
     try {
-      await apiClient.request('/api/operations/profile-clone', UnknownRecordSchema, { method: 'POST', body: { source_profile_number: profileNumber(profile), display_name: name } });
-      notify('Profile 已复制'); await refreshProfiles(false);
-    } catch (error) { setGlobalError((error as Error).message); }
+      await apiClient.request('/api/operations/profile-clone', UnknownRecordSchema, { method: 'POST', body: { source_profile_number: sourceProfileNumber, display_name: displayName } });
+      const refreshed = await refreshProfiles(false);
+      setCloneSource(null);
+      notify(refreshed ? 'Profile 已复制' : 'Profile 已复制；列表刷新失败，请手动刷新');
+    } catch (error) { setCloneError((error as Error).message); }
+    finally { setCloneBusy(false); }
   }
 
   function deleteProfile(profile: Profile) {
@@ -779,7 +799,7 @@ export default function App() {
   const runtimeLabel = issues.length ? '配置异常' : activeRunning ? '实例运行中' : activeProfile?.desired_running ? '正在启动' : '实例未启动';
 
   return <div className={`app-shell ${managerMode ? 'is-manager' : 'is-profile'}`}>
-    {managerMode && <ProfileRail profiles={profiles} selectedNumber={activeNumber} loading={profilesBusy} onRefresh={() => refreshProfiles(false)} onCreate={createProfile} onSelect={selectProfile} onStart={profileStart} onStop={profileStop} onEdit={(profile) => openProfileEditor(profile)} onClone={cloneProfile} onDelete={deleteProfile} />}
+    {managerMode && <ProfileRail profiles={profiles} selectedNumber={activeNumber} loading={profilesBusy} onRefresh={() => refreshProfiles(false)} onCreate={createProfile} onSelect={selectProfile} onStart={profileStart} onStop={profileStop} onEdit={(profile) => openProfileEditor(profile)} onClone={openCloneProfile} onDelete={deleteProfile} />}
     <main className="workspace">
       <header className="app-header">
         <div className="app-header__identity">
@@ -867,6 +887,7 @@ export default function App() {
     <UpdateSheet open={updateOpen} onOpenChange={setUpdateOpen} update={update} busy={updateBusy} localSession={localSession} onAction={updateAction} />
     <OperationsSheet open={operationsOpen} onOpenChange={setOperationsOpen} health={health} license={license} releases={releases} busy={operationsBusy} onRefresh={loadOperations} onActivate={activateLicense} onOperation={runOperation} />
     <ProfileEditor open={editorOpen} onOpenChange={setEditorOpen} profile={editorProfile} launchAfterSave={editorLaunch} busy={editorBusy} error={editorError} onSave={saveProfile} />
+    <CloneProfileDialog open={Boolean(cloneSource)} sourceName={cloneSource ? profileName(cloneSource) : ''} busy={cloneBusy} error={cloneError} onOpenChange={(open) => { if (!open && !cloneBusy) { setCloneSource(null); setCloneError(''); } }} onSubmit={cloneProfile} />
     <ConfirmDialog open={Boolean(confirm)} onOpenChange={(open) => !open && setConfirm(null)} title={confirm?.title || ''} description={confirm?.description || ''} confirmLabel={confirm?.label} danger={confirm?.danger !== false} busy={confirmBusy || actionBusy} onConfirm={async () => { if (!confirm) return; setConfirmBusy(true); try { await confirm.action(); } finally { setConfirmBusy(false); } }} />
 
     <Dialog.Root open={directoryOpen} onOpenChange={setDirectoryOpen}>
