@@ -75,7 +75,11 @@ class FakeService:
             "results": [],
             "pdi": None,
             "verification": None,
-            "actions": {"can_start": not active, "can_cancel": active},
+            "actions": {
+                "can_start": not active and self.status != "recovery_error",
+                "can_cancel": active,
+                "can_discard_recovery": self.status == "recovery_error",
+            },
             "authorization": {"registered": False, "trial_remaining": 30},
             "error_logs": [],
         }
@@ -110,7 +114,9 @@ class FakeService:
 
     def end_task(self):
         self.calls.append("end_task")
-        self.status = "ended"
+        self.status = "idle" if self.status == "recovery_error" else "ended"
+        if self.status == "idle":
+            self.task_id = ""
         return self.snapshot()
 
     def retry_failed(self, tools: ToolPaths):
@@ -242,6 +248,31 @@ def test_anonymous_bootstrap_creates_ip_bound_session_and_loads_app(web: WebFixt
     assert web.client.get("/favicon.ico").status_code == 204
     assert web.client.get("/assets/app.js").status_code == 200
     assert web.client.get("/assets/theme.js").status_code == 200
+
+
+def test_large_task_bootstrap_keeps_intentionally_omitted_detail_as_null(
+    web: WebFixture, monkeypatch: pytest.MonkeyPatch
+):
+    original_snapshot = web.service.snapshot
+
+    def large_snapshot():
+        value = original_snapshot()
+        value["task"].update(
+            {"id": "large-task", "total": 9_338, "large_batch": True, "accessions": None}
+        )
+        value["progress"].update({"processed": 28, "total": 9_338})
+        value["results"] = None
+        return value
+
+    monkeypatch.setattr(web.service, "snapshot", large_snapshot)
+
+    task = web.client.get("/api/bootstrap").json()["task"]
+
+    assert task["id"] == "large-task"
+    assert task["total"] == 9_338
+    assert task["processed"] == 28
+    assert task["accessions"] is None
+    assert task["results"] is None
 
 
 def test_react_frontend_uses_shared_session_and_scoped_csp(tmp_path: Path):
@@ -464,6 +495,26 @@ def test_end_task_route_is_distinct_from_recoverable_cancel(web: WebFixture):
     assert response.status_code == 200
     assert web.service.calls == ["end_task"]
     assert response.json()["task"]["status"] == "ended"
+
+
+def test_end_route_clears_a_recovery_error_via_the_explicit_action(
+    web: WebFixture,
+):
+    csrf = web.setup()
+    web.service.status = "recovery_error"
+
+    before = web.client.get("/api/task").json()["task"]
+    assert before["actions"]["can_discard_recovery"] is True
+
+    response = web.client.post(
+        "/api/task/end",
+        json={},
+        headers={**LOCAL_ORIGIN, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200
+    assert web.service.calls == ["end_task"]
+    assert response.json()["task"]["status"] == "idle"
 
 
 def test_default_web_preflight_still_reports_external_receiver_port_conflicts(

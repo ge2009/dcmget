@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -87,6 +88,23 @@ class AppEvent:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _serialized_lifecycle(
+    method: Callable[..., dict[str, object]],
+) -> Callable[..., dict[str, object]]:
+    """Serialize foreground operations that publish or retire workers."""
+
+    @wraps(method)
+    def wrapper(self: "DcmGetAppService", *args: object, **kwargs: object):
+        if not self._lifecycle_gate.acquire(blocking=False):
+            raise AppServiceError("另一个任务操作正在处理，请稍后重试")
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._lifecycle_gate.release()
+
+    return wrapper
 
 
 def _json_safe(value: object) -> object:
@@ -167,6 +185,7 @@ class DcmGetAppService:
         self._consume_trial = consume_trial_fn
         self._trial_task_consumed = trial_task_consumed_fn
 
+        self._lifecycle_gate = threading.RLock()
         self._lock = threading.RLock()
         self._events: deque[AppEvent] = deque(maxlen=event_limit)
         self._event_id = 0
@@ -197,6 +216,8 @@ class DcmGetAppService:
         self._end_requested = False
         self._pause_requested = False
         self._shutting_down = False
+        self._maintenance_idle = threading.Event()
+        self._maintenance_idle.set()
         self._restore_checkpoint()
 
     # ------------------------------------------------------------------ events
@@ -351,7 +372,10 @@ class DcmGetAppService:
                 pass
         return {
             "can_start": not busy
+            and not self._end_requested
             and not self._shutting_down
+            and self._status
+            not in {"ending", "shutting_down", "shutdown_failed", "stopped"}
             and not self.task_store.path.is_file(),
             "can_pause": busy
             and self._operation == "download"
@@ -368,7 +392,13 @@ class DcmGetAppService:
             "can_end": has_checkpoint
             and not self._end_requested
             and not self._shutting_down
-            and self._status not in {"locked", "recovery_error", "stopped"},
+            and self._status
+            not in {"locked", "recovery_error", "ledger_error", "stopped"},
+            "can_discard_recovery": has_checkpoint
+            and not busy
+            and not self._end_requested
+            and not self._shutting_down
+            and self._status == "recovery_error",
             "can_retry_failed": not busy and download_retryable,
             "can_accept_partial": can_accept,
             "can_retry_pdi": not busy and pdi_retryable,
@@ -396,6 +426,7 @@ class DcmGetAppService:
         }
 
     # --------------------------------------------------------------- lifecycle
+    @_serialized_lifecycle
     def start_task(
         self,
         config: AppConfig,
@@ -434,6 +465,7 @@ class DcmGetAppService:
         self._launch_download(checkpoint, tools, values, trial_required)
         return self.snapshot()
 
+    @_serialized_lifecycle
     def resume_task(self, tools: ToolPaths | None = None) -> dict[str, object]:
         with self._lock:
             self._ensure_available_locked()
@@ -473,12 +505,14 @@ class DcmGetAppService:
                 self.task_store.release_lease()
             raise
 
+    @_serialized_lifecycle
     def retry_failed(self, tools: ToolPaths | None = None) -> dict[str, object]:
         checkpoint = self.task_store.load(include_archived_files=False)
         if checkpoint is None or checkpoint.phase != "download_retryable":
             raise AppServiceError("当前任务没有可重试的失败项")
         return self.resume_task(tools)
 
+    @_serialized_lifecycle
     def pause(self) -> dict[str, object]:
         with self._lock:
             worker = self._worker
@@ -495,6 +529,7 @@ class DcmGetAppService:
         self._emit_event("state", status="pause_pending")
         return self.snapshot()
 
+    @_serialized_lifecycle
     def resume(self) -> dict[str, object]:
         with self._lock:
             worker = self._worker
@@ -508,6 +543,7 @@ class DcmGetAppService:
             callback()
         return self.snapshot()
 
+    @_serialized_lifecycle
     def cancel(self) -> dict[str, object]:
         with self._lock:
             worker = self._worker
@@ -526,6 +562,7 @@ class DcmGetAppService:
         self._emit_event("state", status="stopping")
         return self.snapshot()
 
+    @_serialized_lifecycle
     def end_task(self) -> dict[str, object]:
         """Permanently end the current task while preserving received files.
 
@@ -537,6 +574,8 @@ class DcmGetAppService:
         with self._lock:
             if self._shutting_down or self._status == "stopped":
                 raise AppServiceError("DcmGet 服务正在停止或已经停止")
+            if self._status == "ledger_error":
+                raise AppServiceError("任务验收台账无法读取，请先查看诊断日志并修复台账")
             if self._end_requested:
                 raise AppServiceError("当前任务正在结束")
             busy = bool(self._thread and self._thread.is_alive())
@@ -544,6 +583,74 @@ class DcmGetAppService:
                 raise AppServiceError("当前后台操作不属于可结束的任务")
             worker = self._worker
             task_id = self._task_id
+            recovery_error = self._status == "recovery_error"
+            recovery_message = self._status_message
+            if recovery_error:
+                self._end_requested = True
+                self._status = "ending"
+                self._status_message = "正在备份并清理旧任务恢复记录"
+                self._maintenance_idle.clear()
+
+        if recovery_error:
+            try:
+                self._emit_event(
+                    "state", status="ending", message="正在备份并清理旧任务恢复记录"
+                )
+                if not self.task_store.try_acquire_lease():
+                    with self._lock:
+                        self._end_requested = False
+                        if not self._shutting_down and self._status not in {
+                            "shutdown_failed",
+                            "stopped",
+                        }:
+                            self._status = "recovery_error"
+                            self._status_message = recovery_message
+                    raise AppServiceError("旧任务正在被另一个 DcmGet 进程使用")
+                try:
+                    try:
+                        backup = self.task_store.quarantine_incompatible()
+                    except TaskStateError as exc:
+                        with self._lock:
+                            self._end_requested = False
+                            if not self._shutting_down and self._status not in {
+                                "shutdown_failed",
+                                "stopped",
+                            }:
+                                self._status = "recovery_error"
+                                self._status_message = recovery_message
+                        raise AppServiceError(f"清理旧任务失败：{exc}") from exc
+                    message = f"旧任务恢复记录已备份到 {backup}；已下载图像未删除"
+                    with self._lock:
+                        self._task_id = ""
+                        self._config = None
+                        self._accessions = []
+                        self._results = {}
+                        self._partial_results = {}
+                        self._current_accession = ""
+                        self._current_file_count = 0
+                        self._current_speed = 0.0
+                        self._last_summary = None
+                        self._last_pdi_result = None
+                        self._verification_result = None
+                        self._end_requested = False
+                        publish_idle = (
+                            not self._shutting_down
+                            and self._status
+                            not in {"shutting_down", "shutdown_failed", "stopped"}
+                        )
+                        if publish_idle:
+                            self._status = "idle"
+                            self._status_message = message
+                finally:
+                    self.task_store.release_lease()
+                self._emit_event(
+                    "recovery_quarantined", backup_path=str(backup), message=message
+                )
+                if publish_idle:
+                    self._emit_event("state", status="idle", message=message)
+                return self.snapshot()
+            finally:
+                self._maintenance_idle.set()
 
         if not task_id or not self.task_store.path.is_file():
             raise AppServiceError("当前没有可结束的任务")
@@ -583,6 +690,7 @@ class DcmGetAppService:
             self.task_store.release_lease()
             raise
 
+    @_serialized_lifecycle
     def accept_partial(
         self, tools: ToolPaths | None = None
     ) -> dict[str, object]:
@@ -621,6 +729,7 @@ class DcmGetAppService:
                 self.task_store.release_lease()
             raise
 
+    @_serialized_lifecycle
     def retry_pdi(self, tools: ToolPaths | None = None) -> dict[str, object]:
         checkpoint = self.task_store.load(include_archived_files=False)
         if checkpoint is None or checkpoint.phase not in {
@@ -631,6 +740,7 @@ class DcmGetAppService:
             raise AppServiceError("当前没有可重试的 PDI 任务")
         return self.resume_task(tools)
 
+    @_serialized_lifecycle
     def verify_pdi(self, root: str | Path) -> dict[str, object]:
         with self._lock:
             self._ensure_available_locked()
@@ -669,6 +779,38 @@ class DcmGetAppService:
                 return False
 
     def shutdown(self, *, timeout: float = 15.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            if self._status == "stopped":
+                return True
+            self._shutting_down = True
+            self._cancel_requested = True
+            self._verification_cancel.set()
+            self._status = "shutting_down"
+            self._status_message = "正在等待前台操作并停止后台进程"
+        self._emit_event("state", status="shutting_down")
+        if not self._lifecycle_gate.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            with self._lock:
+                self._status = "shutdown_failed"
+                self._status_message = "前台操作未能在限定时间内结束"
+                self._shutting_down = False
+            message = "前台操作未能在限定时间内结束"
+            self._emit_event(
+                "state", status="shutdown_failed", message=message
+            )
+            return False
+        try:
+            return self._shutdown_after_lifecycle_gate(deadline, timeout)
+        finally:
+            self._lifecycle_gate.release()
+
+    def _shutdown_after_lifecycle_gate(
+        self,
+        deadline: float,
+        timeout: float,
+    ) -> bool:
         with self._lock:
             if self._status == "stopped":
                 return True
@@ -679,14 +821,20 @@ class DcmGetAppService:
             thread = self._thread
             self._status = "shutting_down"
             self._status_message = "正在停止后台进程"
-        self._emit_event("state", status="shutting_down")
+        maintenance_stopped = self._maintenance_idle.wait(
+            max(0.0, deadline - time.monotonic())
+        )
         if worker is not None:
             callback = getattr(worker, "request_cancel", None) or getattr(
                 worker, "cancel", None
             )
             if callable(callback):
                 callback()
-        stopped = self.wait(timeout) if thread is not None else True
+        stopped = maintenance_stopped and (
+            self.wait(max(0.0, deadline - time.monotonic()))
+            if thread is not None
+            else True
+        )
         if self._task_id and self.task_store.path.is_file():
             try:
                 for message in self.task_store.cleanup_recorded_processes(
@@ -696,7 +844,7 @@ class DcmGetAppService:
             except TaskStateError as exc:
                 self._log("恢复", str(exc), "error")
                 stopped = False
-        if not stopped:
+        if not stopped and maintenance_stopped and thread is not None:
             # Process cleanup can unblock a runner that was waiting on DCMTK.
             stopped = self.wait(min(2.0, max(0.0, timeout)))
         if stopped:
@@ -725,7 +873,8 @@ class DcmGetAppService:
     ) -> None:
         with self._lock:
             self._operation = "download"
-            self._cancel_requested = False
+            if not self._shutting_down:
+                self._cancel_requested = False
             self._pause_requested = False
             self._status = "starting_receiver"
             self._status_message = "正在启动 DICOM 接收器"
@@ -924,7 +1073,27 @@ class DcmGetAppService:
         if checkpoint.config.pdi_export_enabled and archived_files:
             self.task_store.set_phase(checkpoint.task_id, "pdi_pending")
             stored.phase = "pdi_pending"
-            self._launch_pdi(stored, tools, archived_files)
+            with self._lock:
+                defer_pdi = self._shutting_down or self._cancel_requested
+                shutting_down = self._shutting_down
+            if defer_pdi:
+                self.task_store.release_lease()
+                self._log(
+                    "PDI",
+                    "已保存 PDI 待生成状态；停止完成后可从恢复任务继续",
+                    "warning",
+                )
+                if not shutting_down:
+                    self._set_status(
+                        "cancelled", "下载已完成，PDI 导出已保留为待恢复"
+                    )
+                return
+            self._launch_pdi(
+                stored,
+                tools,
+                archived_files,
+                respect_pending_cancel=True,
+            )
             return
         self.task_store.clear(checkpoint.task_id)
         self._complete_ledger(checkpoint.task_id, "completed")
@@ -957,27 +1126,56 @@ class DcmGetAppService:
         checkpoint: TaskCheckpoint,
         tools: ToolPaths,
         files: list[str] | None = None,
+        *,
+        respect_pending_cancel: bool = False,
     ) -> None:
         source_files = list(files or self.task_store.load_archived_files(checkpoint.task_id))
         if not source_files:
             raise AppServiceError("当前任务没有可导出的 DICOM 文件")
-        attempt_id, reuse_existing = self.task_store.begin_pdi_attempt(
-            checkpoint.task_id,
-            reuse_existing=checkpoint.phase == "pdi_running",
-        )
         with self._lock:
-            self._operation = "pdi"
-            self._cancel_requested = False
-            self._status = "pdi_running"
-            self._status_message = "正在生成 PDI 便携目录"
-            thread = threading.Thread(
-                target=self._pdi_main,
-                args=(checkpoint, tools, source_files, attempt_id, reuse_existing),
-                name=f"dcmget-pdi-{checkpoint.task_id[:8]}",
-                daemon=False,
+            defer_pdi = self._shutting_down or (
+                respect_pending_cancel and self._cancel_requested
             )
-            self._thread = thread
-            thread.start()
+            if defer_pdi:
+                shutting_down = self._shutting_down
+            else:
+                # Keep attempt publication and thread publication in the same
+                # service lock critical section. Shutdown/cancel cannot land
+                # between pdi_running persistence and worker registration.
+                attempt_id, reuse_existing = self.task_store.begin_pdi_attempt(
+                    checkpoint.task_id,
+                    reuse_existing=checkpoint.phase == "pdi_running",
+                )
+                self._cancel_requested = False
+                self._operation = "pdi"
+                self._status = "pdi_running"
+                self._status_message = "正在生成 PDI 便携目录"
+                thread = threading.Thread(
+                    target=self._pdi_main,
+                    args=(
+                        checkpoint,
+                        tools,
+                        source_files,
+                        attempt_id,
+                        reuse_existing,
+                    ),
+                    name=f"dcmget-pdi-{checkpoint.task_id[:8]}",
+                    daemon=False,
+                )
+                self._thread = thread
+                thread.start()
+        if defer_pdi:
+            self.task_store.release_lease()
+            self._log(
+                "PDI",
+                "已保存 PDI 待生成状态；停止完成后可从恢复任务继续",
+                "warning",
+            )
+            if not shutting_down:
+                self._set_status(
+                    "cancelled", "PDI 导出已保留为待恢复"
+                )
+            return
         self._emit_event(
             "state", status="pdi_running", source_count=len(source_files)
         )
@@ -1226,10 +1424,14 @@ class DcmGetAppService:
                 "pdi_retryable": "pdi_retryable",
             }[checkpoint.phase]
             self._status_message = "发现可继续的未完成任务"
-        except (TaskStateError, TaskLedgerError) as exc:
+        except TaskStateError as exc:
             self._status = "recovery_error"
             self._status_message = str(exc)
             self._log("恢复", str(exc), "error")
+        except TaskLedgerError as exc:
+            self._status = "ledger_error"
+            self._status_message = f"任务恢复点可读取，但验收台账无法读取：{exc}"
+            self._log("恢复", self._status_message, "error")
         finally:
             self.task_store.release_lease()
 
@@ -1350,6 +1552,8 @@ class DcmGetAppService:
     def _ensure_available_locked(self) -> None:
         if self._shutting_down or self._status == "stopped":
             raise AppServiceError("DcmGet 服务正在停止或已经停止")
+        if self._end_requested:
+            raise AppServiceError("当前任务正在结束")
         if self._thread is not None and self._thread.is_alive():
             raise AppServiceError("当前已有后台任务正在运行")
 

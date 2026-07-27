@@ -34,6 +34,17 @@ from dcmget.core import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_application_state(tmp_path, monkeypatch):
+    """Never let runner tests scan or mutate the developer's real DcmGet state."""
+
+    monkeypatch.setattr(
+        core,
+        "ensure_application_state_dir",
+        lambda: tmp_path / "application-state",
+    )
+
+
 def _publish_dicom_process(
     source: str,
     target: str,
@@ -180,7 +191,7 @@ def test_dcmtk_commands_use_storescp_move_destination_and_argument_arrays(tmp_pa
         Path("/tools/storescp"),
         Path("/tools"),
         version,
-        "--fork fork mode",
+        "--fork fork mode\n--max-associations",
     )
 
     store = build_storescp_command(config, tools, tmp_path)
@@ -200,9 +211,13 @@ def test_dcmtk_commands_use_storescp_move_destination_and_argument_arrays(tmp_pa
     ]
     assert store[-1] == "11112"
     assert "--fork" in store
+    assert store[store.index("--max-associations") + 1] == "16"
+    assert store[store.index("-ts") + 1] == "300"
+    assert store[store.index("-ta") + 1] == "60"
+    assert "-pm" in store
     assert move == [
         str(tools.movescu),
-        "-v",
+        "-d",
         "--no-port",
         "-to",
         "30",
@@ -227,7 +242,10 @@ def test_dcmtk_commands_use_storescp_move_destination_and_argument_arrays(tmp_pa
 def test_storescp_falls_back_to_single_process(tmp_path):
     config = AppConfig(storage_port=11112)
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0", "")
-    assert "--single-process" in build_storescp_command(config, tools, tmp_path)
+    command = build_storescp_command(config, tools, tmp_path)
+    assert "--single-process" in command
+    assert "--max-associations" not in command
+    assert "-pm" in command
 
 
 def test_dcmtk_commands_trim_insignificant_ae_title_padding(tmp_path):
@@ -883,6 +901,18 @@ def test_concurrent_processes_never_overwrite_conflicting_sop_content(tmp_path):
     assert remaining[0].read_bytes() != target.read_bytes()
 
 
+def test_archive_publish_uses_a_bounded_sharded_lock_pool(tmp_path):
+    with core._locked_archive_target(tmp_path / "archive" / "1.2.3.dcm"):
+        pass
+
+    locks = list(
+        (tmp_path / "application-state" / "archive-publish-locks").glob("*.lock")
+    )
+    assert len(locks) == 1
+    assert len(locks[0].stem) == core._ARCHIVE_LOCK_SHARD_HEX_LENGTH
+    int(locks[0].stem, 16)
+
+
 def test_cross_device_publish_copies_durably_before_removing_source(
     tmp_path, monkeypatch
 ):
@@ -1017,7 +1047,7 @@ def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
     assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
 
 
-def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkeypatch):
+def test_receive_staging_always_uses_private_application_state(tmp_path, monkeypatch):
     state = tmp_path / "state"
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
     anonymous = AppConfig(
@@ -1028,8 +1058,182 @@ def test_anonymized_runtime_files_use_private_application_state(tmp_path, monkey
 
     assert core.staging_directory_root(anonymous) == state / "staging"
     assert core.log_directory(anonymous) == state / "logs"
-    assert core.staging_directory_root(regular) == tmp_path / "dicom" / ".dcmget-staging"
+    assert core.staging_directory_root(regular) == state / "staging"
     assert core.log_directory(regular) == tmp_path / "dicom" / "_DcmGetLogs"
+
+
+def test_orphaned_receive_staging_is_quarantined_without_touching_active_session(
+    tmp_path,
+):
+    staging_root = tmp_path / "state" / "staging"
+    orphan = staging_root / "20260727-120000-000001-deadbeef"
+    active = staging_root / "20260727-120001-000002-cafebabe"
+    orphan.mkdir(parents=True)
+    active.mkdir()
+    (orphan / "orphan.dcm").write_bytes(b"orphan")
+    (active / "active.dcm").write_bytes(b"active")
+    active_lock_path = core._staging_session_lock_path(active)
+    active_lease = core.FileLock(str(active_lock_path))
+    active_lease.acquire(timeout=0)
+
+    try:
+        messages = core._recover_orphaned_receive_staging(staging_root)
+    finally:
+        active_lease.release()
+        active_lock_path.unlink(missing_ok=True)
+
+    assert len(messages) == 1
+    assert "已移入隔离目录" in messages[0]
+    quarantined = (
+        tmp_path
+        / "state"
+        / "quarantine"
+        / "receiver-staging"
+        / orphan.name
+        / "orphan.dcm"
+    )
+    assert quarantined.read_bytes() == b"orphan"
+    assert not orphan.exists()
+    assert (active / "active.dcm").read_bytes() == b"active"
+
+
+def test_recovery_removes_stale_uuid_session_locks_but_keeps_maintenance_lock(
+    tmp_path,
+):
+    staging_root = tmp_path / "state" / "staging"
+    staging_root.mkdir(parents=True)
+    stale_session = "20260727-120000-000001-deadbeef"
+    stale_lock = staging_root / f".{stale_session}.lock"
+    stale_lock.touch()
+
+    messages = core._recover_orphaned_receive_staging(staging_root)
+
+    assert messages == []
+    assert not stale_lock.exists()
+    assert core._staging_maintenance_lock_path(staging_root).is_file()
+
+
+def test_session_lock_and_directory_are_published_under_maintenance_lease(tmp_path):
+    staging_root = tmp_path / "state" / "staging"
+    staging_root.mkdir(parents=True)
+    session_name = "20260727-120000-000001-deadbeef"
+    staging = staging_root / session_name
+    session_lock = core._staging_session_lock_path(staging)
+    maintenance = core.FileLock(
+        str(core._staging_maintenance_lock_path(staging_root))
+    )
+    maintenance.acquire(timeout=0)
+    started = threading.Event()
+    outcome: list[tuple[Path, core.FileLock]] = []
+
+    def create_session() -> None:
+        started.set()
+        outcome.append(
+            core._create_receive_staging_session(staging_root, session_name)
+        )
+
+    creator = threading.Thread(target=create_session)
+    creator.start()
+    assert started.wait(1)
+    time.sleep(0.05)
+    assert not staging.exists()
+    assert not session_lock.exists()
+
+    maintenance.release()
+    creator.join(2)
+
+    assert not creator.is_alive()
+    assert len(outcome) == 1
+    assert outcome[0][0] == staging
+    assert staging.is_dir()
+    competing = core.FileLock(str(session_lock))
+    with pytest.raises(core.Timeout):
+        competing.acquire(timeout=0)
+    outcome[0][1].release()
+
+
+def test_legacy_unlocked_staging_is_never_moved_while_an_old_version_may_use_it(
+    tmp_path,
+):
+    staging_root = tmp_path / "state" / "staging"
+    legacy = staging_root / "20260727-120000-000001"
+    legacy.mkdir(parents=True)
+    (legacy / "receiving.dcm").write_bytes(b"still receiving")
+
+    messages = core._recover_orphaned_receive_staging(staging_root)
+
+    assert len(messages) == 1
+    assert "旧版无锁接收暂存目录" in messages[0]
+    assert "已保留未处理" in messages[0]
+    assert (legacy / "receiving.dcm").read_bytes() == b"still receiving"
+
+
+def test_broken_staging_lock_does_not_block_other_profile_startup(tmp_path):
+    staging_root = tmp_path / "state" / "staging"
+    orphan = staging_root / "20260727-120000-000001-deadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "orphan.dcm").write_bytes(b"orphan")
+    core._staging_session_lock_path(orphan).mkdir()
+
+    messages = core._recover_orphaned_receive_staging(staging_root)
+
+    assert len(messages) == 1
+    assert "无法锁定" in messages[0]
+    assert (orphan / "orphan.dcm").read_bytes() == b"orphan"
+
+
+def test_cleanup_quarantines_unarchived_receive_files(tmp_path):
+    staging = tmp_path / "state" / "staging" / "20260727-120000-000001-deadbeef"
+    staging.mkdir(parents=True)
+    (staging / "retained.dcm").write_bytes(b"retained")
+    logs: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda *entry: logs.append(entry),
+        log_directory=tmp_path / "logs",
+    )
+
+    runner._cleanup_staging(staging)
+    runner._close_file_logger()
+
+    retained = (
+        tmp_path
+        / "state"
+        / "quarantine"
+        / "receiver-staging"
+        / staging.name
+        / "retained.dcm"
+    )
+    assert retained.read_bytes() == b"retained"
+    assert not staging.exists()
+    assert any("已移入隔离目录" in message for _source, message, _level in logs)
+
+
+def test_windows_missing_drive_write_error_explains_smb_unc_path():
+    message = core._write_probe_error_message(
+        "保存目录",
+        Path(r"X:\abc"),
+        FileNotFoundError("path not found"),
+        windows=True,
+    )
+
+    assert "后台服务看不到 X:" in message
+    assert "SMB 映射盘" in message
+    assert r"\\服务器\共享名\目录" in message
+
+
+def test_windows_unc_permission_error_explains_share_and_ntfs_permissions():
+    message = core._write_probe_error_message(
+        "保存目录",
+        Path(r"\\server\share\abc"),
+        PermissionError("access denied"),
+        windows=True,
+    )
+
+    assert "UNC 共享拒绝访问" in message
+    assert "共享权限" in message
+    assert "NTFS 权限" in message
 
 
 def test_task_log_is_created_beside_dicom_results(tmp_path, monkeypatch):
@@ -1048,6 +1252,82 @@ def test_task_log_is_created_beside_dicom_results(tmp_path, monkeypatch):
     assert not (state / "logs" / "dcmget.log").exists()
     if os.name != "nt":
         assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_dcmtk_protocol_trace_is_parsed_without_writing_to_smb_task_log(tmp_path):
+    events: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda *entry: events.append(entry),
+        log_directory=tmp_path / "logs",
+    )
+    diagnostics = core._MoveDiagnostics()
+    process = SimpleNamespace(
+        stdout=iter(
+            [
+                "D: protocol trace\n",
+                "T: transport trace\n",
+                "I: Received Final Move Response (Success)\n",
+            ]
+        )
+    )
+
+    reader = runner._start_reader(process, "movescu", diagnostics)
+    reader.join(2)
+    runner._close_file_logger()
+
+    assert diagnostics.final_response_seen is True
+    assert events == [
+        ("movescu", "I: Received Final Move Response (Success)", "info")
+    ]
+    log_text = (tmp_path / "logs" / "dcmget.log").read_text(encoding="utf-8")
+    assert "Received Final Move Response" in log_text
+    assert "protocol trace" not in log_text
+    assert "transport trace" not in log_text
+
+
+def test_pending_move_responses_are_counted_without_synchronous_log_flood(tmp_path):
+    events: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda *entry: events.append(entry),
+        log_directory=tmp_path / "logs",
+    )
+    diagnostics = core._MoveDiagnostics()
+    lines: list[str] = []
+    for index in range(1000):
+        lines.extend(
+            [
+                f"I: Received Move Response {index + 1} (Pending)\n",
+                "I: DIMSE Status: 0xff00: Pending\n",
+                f"I: Number of Remaining Suboperations : {1000 - index}\n",
+                f"I: Number of Completed Suboperations : {index}\n",
+            ]
+        )
+    lines.extend(
+        [
+            "I: Received Final Move Response (Success)\n",
+            "I: DIMSE Status: 0x0000: Success\n",
+            "I: Number of Remaining Suboperations : 0\n",
+            "I: Number of Completed Suboperations : 1000\n",
+        ]
+    )
+    process = SimpleNamespace(stdout=iter(lines))
+
+    reader = runner._start_reader(process, "movescu", diagnostics)
+    reader.join(2)
+    runner._close_file_logger()
+
+    assert not reader.is_alive()
+    assert diagnostics.pending_responses == 1000
+    assert diagnostics.final_response_seen is True
+    assert diagnostics.max_reported_suboperations == 1000
+    assert all("Pending" not in message for _source, message, _level in events)
+    log_text = (tmp_path / "logs" / "dcmget.log").read_text(encoding="utf-8")
+    assert "(Pending)" not in log_text
+    assert "Received Final Move Response" in log_text
 
 
 def test_task_log_falls_back_to_instance_directory_with_visible_warning(tmp_path):
@@ -1647,6 +1927,284 @@ def test_transient_move_failure_is_retried_and_combined(tmp_path, monkeypatch):
     assert "第 2 次尝试" in result.message
 
 
+def test_final_failed_suboperations_are_retried_without_false_safety_pause(
+    tmp_path, monkeypatch
+):
+    logs: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=1,
+            auto_retry_backoff_seconds=0,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda *entry: logs.append(entry),
+    )
+    archived = tmp_path / "dicom" / "one.dcm"
+    second_archived = tmp_path / "dicom" / "two.dcm"
+    outcomes = iter(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.PARTIAL,
+                file_count=1,
+                message="PACS 报告 1 个失败子操作",
+                archived_files=[str(archived)],
+                transient_failure=True,
+                move_dimse_status=0xB000,
+                pacs_expected_suboperations=2,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                file_count=2,
+                message="重试完成",
+                archived_files=[str(archived), str(second_archived)],
+                move_dimse_status=0x0000,
+                pacs_expected_suboperations=2,
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_download_one", lambda *_args: next(outcomes))
+
+    result = runner._download_accession_with_retry("A001", tmp_path, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.attempt_count == 2
+    assert not result.safety_pause_reason
+    assert any(source == "重试" for source, _message, _level in logs)
+
+
+def test_retry_success_cannot_hide_an_earlier_expected_instance_gap():
+    archived = "/dicom/one.dcm"
+
+    result = core._combine_retry_attempts(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.PARTIAL,
+                file_count=1,
+                archived_files=[archived],
+                pacs_expected_suboperations=10,
+                transient_failure=True,
+                move_dimse_status=0xB000,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                file_count=1,
+                archived_files=[archived],
+                pacs_expected_suboperations=1,
+                move_dimse_status=0,
+            ),
+        ]
+    )
+
+    assert result.status == AccessionStatus.PARTIAL
+    assert result.file_count == 1
+    assert result.pacs_expected_suboperations == 10
+    assert "累计仅保留 1 个" in result.message
+    assert "不能确认收全" in result.message
+
+
+def test_retry_no_data_cannot_hide_an_earlier_zero_file_expected_gap():
+    result = core._combine_retry_attempts(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.FAILED,
+                file_count=0,
+                message="首次关联中断",
+                pacs_expected_suboperations=10,
+                transient_failure=True,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.NO_DATA,
+                file_count=0,
+                message="重试未返回数据",
+                pacs_expected_suboperations=0,
+            ),
+        ]
+    )
+
+    assert result.status == AccessionStatus.FAILED
+    assert result.file_count == 0
+    assert result.pacs_expected_suboperations == 10
+    assert "累计仅保留 0 个" in result.message
+    assert "不能确认收全" in result.message
+
+
+def test_single_no_data_attempt_with_expected_objects_is_failed():
+    result = core._combine_retry_attempts(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.NO_DATA,
+                file_count=0,
+                message="未收到文件",
+                pacs_expected_suboperations=3,
+            )
+        ]
+    )
+
+    assert result.status == AccessionStatus.FAILED
+    assert result.pacs_expected_suboperations == 3
+    assert "累计仅保留 0 个" in result.message
+
+
+def test_retry_success_completes_after_reaching_prior_expected_instance_count():
+    paths = [f"/dicom/{index}.dcm" for index in range(10)]
+
+    result = core._combine_retry_attempts(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.PARTIAL,
+                file_count=1,
+                archived_files=paths[:1],
+                pacs_expected_suboperations=10,
+                transient_failure=True,
+                move_dimse_status=0xB000,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.COMPLETED,
+                file_count=10,
+                archived_files=paths,
+                pacs_expected_suboperations=10,
+                move_dimse_status=0,
+            ),
+        ]
+    )
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.file_count == 10
+    assert result.pacs_expected_suboperations == 10
+
+
+def test_exhausted_confirmed_suboperation_failure_does_not_claim_missing_final(
+    tmp_path, monkeypatch
+):
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=1,
+            auto_retry_backoff_seconds=0,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    archived = tmp_path / "dicom" / "one.dcm"
+    outcomes = iter(
+        [
+            AccessionResult(
+                "A001",
+                AccessionStatus.PARTIAL,
+                file_count=1,
+                message="第一次有失败子操作",
+                archived_files=[str(archived)],
+                transient_failure=True,
+                move_dimse_status=0xB000,
+            ),
+            AccessionResult(
+                "A001",
+                AccessionStatus.PARTIAL,
+                file_count=1,
+                message="重试仍有失败子操作",
+                archived_files=[str(archived)],
+                transient_failure=True,
+                move_dimse_status=0xB000,
+            ),
+        ]
+    )
+    monkeypatch.setattr(runner, "_download_one", lambda *_args: next(outcomes))
+
+    result = runner._download_accession_with_retry("A001", tmp_path, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.PARTIAL
+    assert result.attempt_count == 2
+    assert not result.safety_pause_reason
+    assert "未返回最终响应" not in result.message
+
+
+def test_confirmed_partial_suboperations_do_not_trip_network_circuit_breaker(
+    tmp_path, monkeypatch
+):
+    states: list[str] = []
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=0,
+            circuit_breaker_failures=2,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        state_callback=states.append,
+    )
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    monkeypatch.setattr(runner, "_stop_storescp", lambda: None)
+    monkeypatch.setattr(runner, "_cleanup_staging", lambda _staging: None)
+    monkeypatch.setattr(runner, "_disk_space_issue", lambda _staging: "")
+    monkeypatch.setattr(
+        runner,
+        "_download_accession_with_retry",
+        lambda accession, *_args: AccessionResult(
+            accession,
+            AccessionStatus.PARTIAL,
+            file_count=1,
+            message="PACS 最终响应包含失败子操作",
+            transient_failure=True,
+            move_dimse_status=0xB000,
+        ),
+    )
+
+    summary = runner.run(["A001", "A002", "A003"])
+
+    assert [result.accession for result in summary.results] == [
+        "A001",
+        "A002",
+        "A003",
+    ]
+    assert not summary.interrupted_reason
+    assert "safety_paused" not in states
+
+
+def test_missing_final_responses_still_trip_network_circuit_breaker(
+    tmp_path, monkeypatch
+):
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=0,
+            circuit_breaker_failures=2,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(runner, "_start_storescp", lambda _staging: None)
+    monkeypatch.setattr(runner, "_stop_storescp", lambda: None)
+    monkeypatch.setattr(runner, "_cleanup_staging", lambda _staging: None)
+    monkeypatch.setattr(runner, "_disk_space_issue", lambda _staging: "")
+    monkeypatch.setattr(
+        runner,
+        "_download_accession_with_retry",
+        lambda accession, *_args: AccessionResult(
+            accession,
+            AccessionStatus.FAILED,
+            message="关联中断",
+            transient_failure=True,
+            move_dimse_status=None,
+        ),
+    )
+
+    summary = runner.run(["A001", "A002", "A003"])
+
+    assert [result.accession for result in summary.results] == ["A001", "A002"]
+    assert "连续 2 个检查号发生网络或关联故障" in summary.interrupted_reason
+
+
 @pytest.mark.parametrize(
     "final_status", [AccessionStatus.FAILED, AccessionStatus.NO_DATA]
 )
@@ -1791,6 +2349,58 @@ def test_final_move_response_labels_are_classified(response_status, has_problem)
     assert core._move_has_problem(diagnostics) is has_problem
 
 
+def test_debug_final_move_response_preserves_final_suboperation_counts():
+    diagnostics = core._MoveDiagnostics()
+    lines = [
+        "I: Received Move Response 2",
+        "D: Remaining Suboperations       : 0",
+        "D: Completed Suboperations       : 2",
+        "D: Failed Suboperations          : 0",
+        "D: Warning Suboperations         : 0",
+        "D: DIMSE Status                  : 0xff00: Pending: Sub-operations are continuing",
+        "I: Received Final Move Response",
+        "D: Remaining Suboperations       : 0",
+        "D: Completed Suboperations       : 2",
+        "D: Failed Suboperations          : 0",
+        "D: Warning Suboperations         : 0",
+        "D: DIMSE Status                  : 0x0000: Success: Sub-operations complete - No failures or warnings",
+    ]
+
+    for line in lines:
+        core._record_move_diagnostic(diagnostics, line)
+
+    assert core._move_has_final_response(diagnostics)
+    assert diagnostics.final_response_seen
+    assert diagnostics.dimse_status_code == 0x0000
+    assert diagnostics.remaining_suboperations == 0
+    assert diagnostics.completed_suboperations == 2
+    assert diagnostics.failed_suboperations == 0
+    assert diagnostics.warning_suboperations == 0
+
+
+def test_truncated_debug_pending_response_keeps_the_largest_known_total():
+    diagnostics = core._MoveDiagnostics()
+    lines = [
+        "I: Received Move Response 1",
+        "D: Remaining Suboperations       : 9",
+        "D: Completed Suboperations       : 1",
+        "I: Received Move Response 2",
+        "D: Remaining Suboperations       : 8",
+    ]
+
+    for line in lines:
+        core._record_move_diagnostic(diagnostics, line)
+
+    assert diagnostics.pending_responses == 2
+    assert diagnostics.remaining_suboperations == 8
+    assert diagnostics.completed_suboperations is None
+    assert core._move_expected_suboperations(diagnostics) == 10
+    core._record_move_diagnostic(diagnostics, "I: Received Final Move Response")
+    core._record_move_diagnostic(diagnostics, "D: Completed Suboperations : 8")
+    core._record_move_diagnostic(diagnostics, "D: DIMSE Status : 0x0000: Success")
+    assert "历史最大预期 10 个对象" in core._move_archive_mismatch(diagnostics, 8)
+
+
 def test_move_warning_with_failed_suboperations_is_partial(tmp_path, monkeypatch):
     staging = tmp_path / "staging"
     staging.mkdir()
@@ -1838,6 +2448,10 @@ def test_move_warning_with_failed_suboperations_is_partial(tmp_path, monkeypatch
     assert "完成 1" in result.message
     assert "失败 2" in result.message
     assert "警告 0" in result.message
+    assert result.transient_failure is True
+    assert result.move_dimse_status == 0xB000
+    assert result.pacs_expected_suboperations == 3
+    assert not result.safety_pause_reason
 
 
 def test_unable_to_process_with_received_file_is_partial(tmp_path, monkeypatch):
@@ -2118,6 +2732,10 @@ def test_late_store_write_after_movescu_exit_is_archived(tmp_path, monkeypatch):
         def wait():
             def write_late_file() -> None:
                 assert drain_started.wait(1)
+                # A busy/parallel receiver can have a visible gap after
+                # movescu disconnects. The previous one-second first-file
+                # deadline archived too early and then stopped storescp.
+                time.sleep(1.1)
                 _write_minimal_dicom(
                     staging / "late.dcm", "1.2.3.701", accession="LATE701"
                 )
@@ -2127,7 +2745,7 @@ def test_late_store_write_after_movescu_exit_is_archived(tmp_path, monkeypatch):
             thread.start()
             return 61
 
-    monkeypatch.setattr(core, "_RECEIVER_DRAIN_INITIAL_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(core, "_RECEIVER_DRAIN_INITIAL_WAIT_SECONDS", 1.5)
     monkeypatch.setattr(core, "_RECEIVER_DRAIN_QUIET_SECONDS", 0.05)
     monkeypatch.setattr(core, "_RECEIVER_DRAIN_MAX_SECONDS", 2.0)
     monkeypatch.setattr(core, "_RECEIVER_DRAIN_POLL_SECONDS", 0.01)
@@ -2217,6 +2835,8 @@ def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
         def wait():
             return 0
 
+    drain = Mock(return_value=None)
+    monkeypatch.setattr(core, "_wait_for_late_store_writes", drain)
     monkeypatch.setattr(runner, "_popen", lambda _command: Process())
 
     result = runner._download_one("MISSING001", staging, 1, 1)
@@ -2224,8 +2844,10 @@ def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
 
     assert result.status == AccessionStatus.FAILED
     assert result.file_count == 0
+    assert result.transient_failure is True
     assert "PACS 报告完成 2 个子操作" in result.message
     assert "成功归档 0 个文件" in result.message
+    drain.assert_called_once()
 
 
 def test_success_with_fewer_archived_files_than_completed_suboperations_is_partial(
@@ -2260,6 +2882,8 @@ def test_success_with_fewer_archived_files_than_completed_suboperations_is_parti
             )
             return 0
 
+    drain = Mock(return_value=True)
+    monkeypatch.setattr(core, "_wait_for_late_store_writes", drain)
     monkeypatch.setattr(runner, "_popen", lambda _command: Process())
 
     result = runner._download_one("PARTIAL002", staging, 1, 1)
@@ -2267,8 +2891,10 @@ def test_success_with_fewer_archived_files_than_completed_suboperations_is_parti
 
     assert result.status == AccessionStatus.PARTIAL
     assert result.file_count == 1
+    assert result.transient_failure is True
     assert "PACS 报告完成 2 个子操作" in result.message
     assert "成功归档 1 个文件" in result.message
+    drain.assert_called_once()
 
 
 def test_success_with_remaining_suboperations_is_partial(tmp_path, monkeypatch):

@@ -535,11 +535,15 @@ export default function App() {
   async function executeTaskAction(action: string) {
     const irreversible = ['cancel', 'end', 'accept-partial'].includes(action);
     if (irreversible) {
-      const copy = action === 'end'
-        ? ['结束当前任务', '将永久结束当前恢复点；已下载文件保留，但任务不能再继续。', '确认结束']
-        : action === 'cancel'
-          ? ['停止当前执行', '将停止当前 movescu；已收到文件和恢复点会保留。', '确认停止']
-          : ['接受已有文件', '将把当前任务作为部分结果结束，未完成检查号不会继续下载。', '确认接受'];
+      const discardingUnreadableRecovery = action === 'end'
+        && normalizeStatus(task?.status) === 'recovery_error';
+      const copy = discardingUnreadableRecovery
+        ? ['清理旧任务', '系统会先备份无法读取的旧任务恢复记录，再解除工作台阻塞；已下载的 DICOM 图像不会删除。', '备份并清理']
+        : action === 'end'
+          ? ['结束当前任务', '将永久结束当前恢复点；已下载文件保留，但任务不能再继续。', '确认结束']
+          : action === 'cancel'
+            ? ['停止当前执行', '将停止当前 movescu；已收到文件和恢复点会保留。', '确认停止']
+            : ['接受已有文件', '将把当前任务作为部分结果结束，未完成检查号不会继续下载。', '确认接受'];
       setConfirm({ title: copy[0], description: copy[1], label: copy[2], action: () => runTaskAction(action) });
       return;
     }
@@ -550,7 +554,11 @@ export default function App() {
     setActionBusy(true);
     try {
       const result = await profileRequest(`/api/task/${action}`, UnknownRecordSchema, { method: 'POST', body: {} });
-      applyTaskSnapshot(extractTask(result)); notify('任务状态已更新'); setConfirm(null);
+      applyTaskSnapshot(extractTask(result));
+      notify(action === 'end' && normalizeStatus(task?.status) === 'recovery_error'
+        ? '旧任务已备份并移出恢复队列'
+        : '任务状态已更新');
+      setConfirm(null);
     } catch (error) { setGlobalError((error as Error).message); }
     finally { setActionBusy(false); }
   }

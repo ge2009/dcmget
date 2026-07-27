@@ -465,6 +465,35 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert "/DAppVersion=2.0.0" not in workflow
 
 
+def test_windows_upgrade_gate_restores_a_real_large_291_checkpoint():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/windows-release.yml").read_text(
+        encoding="utf-8"
+    )
+    schemas = (root / "frontend" / "src" / "schemas.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert "from dcmget.task_state import TaskCheckpointStore" in workflow
+    assert '$fixturePath = Join-Path $baselineRoot ".dcmget-create-291-task.py"' in workflow
+    assert 'range(1, 202)' in workflow
+    assert "store.start(config, accessions, trial_required=False)" in workflow
+    assert "store.record_result(" in workflow
+    assert "Pinned 2.9.1 large-task checkpoint is missing" in workflow
+    assert 'Invoke-RestMethod "$profileUrl/api/bootstrap"' in workflow
+    assert 'desired_running_profiles = @(1)' in workflow
+    assert "$bootstrap.task.large_batch -ne $true" in workflow
+    assert 'Properties.Name -notcontains "accessions"' in workflow
+    assert 'Properties.Name -notcontains "results"' in workflow
+    assert "$null -ne $bootstrap.task.accessions" in workflow
+    assert "$null -ne $bootstrap.task.results" in workflow
+    assert 'Invoke-RestMethod "$profileUrl/api/task"' in workflow
+    assert 'Invoke-RestMethod "$profileUrl/api/task/end"' in workflow
+    assert "Ending the upgraded task deleted an existing DICOM result" in workflow
+    assert "accessions: z.array(z.unknown()).nullish()" in schemas
+    assert "results: z.array(TaskItemSchema).nullish()" in schemas
+
+
 def test_windows_installer_repairs_offline_webview2_for_native_react_shell():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")

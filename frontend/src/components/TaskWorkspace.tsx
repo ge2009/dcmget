@@ -178,7 +178,7 @@ function TaskComposer(props: Props & { headingRef: (node: HTMLHeadingElement | n
 
         <section className="form-section form-section--compact">
           <div className="form-section__heading">
-            <span>2</span><div><h3>保存位置</h3><p>文件将由运行 DcmGet 的主机写入此目录。</p></div>
+            <span>2</span><div><h3>保存位置</h3><p>Windows 服务无法识别 X: 映射盘；共享目录请填写 UNC（\\服务器\共享\目录）。</p></div>
           </div>
           <label className="field-label" htmlFor="destination">保存到 DcmGet 主机</label>
           <div className="input-action">
@@ -231,7 +231,11 @@ function TaskComposer(props: Props & { headingRef: (node: HTMLHeadingElement | n
 function TaskRuntime(props: Props & { task: Task; headingRef: (node: HTMLHeadingElement | null) => void }) {
   const task = props.task;
   const status = normalizeStatus(task.status);
-  const view = statusView(status);
+  const recoveryError = status === 'recovery_error';
+  const ledgerError = status === 'ledger_error';
+  const view = recoveryError
+    ? { label: '旧任务需要处理', tone: 'error' as const }
+    : statusView(status);
   const reportedTotal = taskCount(task, 'total', 'total_count', 'accession_count');
   const inlineItems = task.items?.length ? task.items : task.results;
   const total = reportedTotal || inlineItems?.length || task.accessions?.length || 0;
@@ -261,6 +265,19 @@ function TaskRuntime(props: Props & { task: Task; headingRef: (node: HTMLHeading
         {actionEnabled(task, 'can_cancel') && <Button variant="quiet" size="small" onClick={() => props.onTaskAction('cancel')}><AnimatedIcon {...semanticIconMap.stopTask} size={16} />取消</Button>}
       </div>
     </header>
+
+    {recoveryError && <div className="aggregate-panel" role="alert">
+      <strong className="aggregate-title">旧任务恢复记录无法读取</strong>
+      <p>{task.message || '可能来自较早版本或异常中断。'}</p>
+      <p>清理前会先备份恢复记录，已下载的 DICOM 图像不会被删除。</p>
+      {actionEnabled(task, 'can_discard_recovery') && <Button variant="danger" size="small" onClick={() => props.onTaskAction('end')}><AnimatedIcon {...semanticIconMap.stopTask} size={16} />清理旧任务</Button>}
+    </div>}
+
+    {ledgerError && <div className="aggregate-panel" role="alert">
+      <strong className="aggregate-title">验收台账无法读取</strong>
+      <p>{task.message || '任务恢复点仍保持原样，没有被清理。'}</p>
+      <p>请打开诊断日志处理台账文件；在修复前不会删除或覆盖原任务。</p>
+    </div>}
 
     <div className="task-progress-block" data-state={active ? 'active' : status}>
       <div className="task-progress-block__summary">

@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import Mock
 
@@ -87,6 +88,7 @@ def test_checkpoint_round_trips_delivery_verification_fields(tmp_path):
         sop_instance_count=2,
         local_verified_files=2,
         pacs_completed_suboperations=2,
+        pacs_expected_suboperations=3,
         move_return_code=0,
         move_dimse_status=0,
         attempt_count=2,
@@ -104,9 +106,118 @@ def test_checkpoint_round_trips_delivery_verification_fields(tmp_path):
     assert restored.sop_instance_count == 2
     assert restored.local_verified_files == 2
     assert restored.pacs_completed_suboperations == 2
+    assert restored.pacs_expected_suboperations == 3
     assert restored.move_return_code == 0
     assert restored.move_dimse_status == 0
     assert restored.attempt_count == 2
+
+
+def test_resume_cannot_hide_prior_pacs_expected_instance_gap(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    archived = str(tmp_path / "dicom" / "one.dcm")
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.CANCELLED,
+            file_count=1,
+            archived_files=[archived],
+            pacs_expected_suboperations=10,
+            move_dimse_status=0xB000,
+        ),
+    )
+    stored = store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[archived],
+            pacs_expected_suboperations=1,
+            move_dimse_status=0,
+        ),
+    )
+
+    assert stored.status == AccessionStatus.PARTIAL
+    assert stored.pacs_expected_suboperations == 10
+    assert "不能确认收全" in stored.message
+    assert store.load_required().results[0].status == AccessionStatus.PARTIAL
+
+
+def test_resume_preserves_expected_instance_gap_when_prior_attempt_kept_no_files(
+    tmp_path,
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.FAILED,
+            file_count=0,
+            pacs_expected_suboperations=10,
+            move_dimse_status=0xB000,
+        ),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+    retry = store.prepare_download_retry(checkpoint.task_id)
+    assert retry.partial_results["A001"].pacs_expected_suboperations == 10
+    assert retry.partial_results["A001"].file_count == 0
+
+    stored = store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[str(tmp_path / "dicom" / "one.dcm")],
+            pacs_expected_suboperations=1,
+            move_dimse_status=0,
+        ),
+    )
+
+    assert stored.status == AccessionStatus.PARTIAL
+    assert stored.pacs_expected_suboperations == 10
+    assert "累计仅保留 1 个" in stored.message
+    assert store.load_required().results[0].status == AccessionStatus.PARTIAL
+
+
+def test_resume_no_data_cannot_erase_prior_expected_gap_without_files(tmp_path):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.FAILED,
+            file_count=0,
+            pacs_expected_suboperations=10,
+            move_dimse_status=0xB000,
+        ),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+    store.prepare_download_retry(checkpoint.task_id)
+
+    stored = store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.NO_DATA,
+            file_count=0,
+            message="PACS 本次未返回数据",
+            pacs_expected_suboperations=0,
+            move_dimse_status=0,
+        ),
+    )
+
+    assert stored.status == AccessionStatus.FAILED
+    assert stored.file_count == 0
+    assert stored.pacs_expected_suboperations == 10
+    assert "PACS 历史最大预期 10 个对象" in stored.message
+    assert "累计仅保留 0 个，不能确认收全" in stored.message
+    assert stored.message.count("不能确认收全") == 1
+    assert store.load_required().results[0].status == AccessionStatus.FAILED
 
 
 def test_cancelled_item_stays_pending_and_retained_files_merge_on_resume(tmp_path):
@@ -216,6 +327,60 @@ def test_corrupt_checkpoint_is_reported_without_deleting_it(tmp_path):
     assert path.read_bytes() == b"not-a-sqlite-database"
 
 
+def test_incompatible_checkpoint_and_sidecars_are_quarantined_before_cleanup(
+    tmp_path,
+):
+    path = tmp_path / "active-task.sqlite3"
+    files = {
+        path: b"not-a-sqlite-database",
+        path.with_name(path.name + "-journal"): b"journal",
+        path.with_name(path.name + "-wal"): b"wal",
+        path.with_name(path.name + "-shm"): b"shm",
+    }
+    for source, content in files.items():
+        source.write_bytes(content)
+    store = TaskCheckpointStore(path)
+    assert store.try_acquire_lease()
+
+    backup = store.quarantine_incompatible()
+
+    assert backup.parent == tmp_path / "recovery-quarantine"
+    assert backup.name.startswith("active-task-")
+    for source, content in files.items():
+        assert not source.exists()
+        assert (backup / source.name).read_bytes() == content
+    assert path.with_name(path.name + ".lock").exists()
+    store.release_lease()
+
+
+def test_quarantine_failure_keeps_the_active_checkpoint(tmp_path, monkeypatch):
+    path = tmp_path / "active-task.sqlite3"
+    path.write_bytes(b"checkpoint")
+    path.with_name(path.name + "-journal").write_bytes(b"journal")
+    store = TaskCheckpointStore(path)
+    assert store.try_acquire_lease()
+    copy_count = 0
+    original_copy = task_state_module.shutil.copy2
+
+    def fail_second_copy(source, destination):
+        nonlocal copy_count
+        copy_count += 1
+        if copy_count == 2:
+            raise OSError("disk full")
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(task_state_module.shutil, "copy2", fail_second_copy)
+
+    with pytest.raises(TaskStateError, match="无法备份"):
+        store.quarantine_incompatible()
+
+    assert path.read_bytes() == b"checkpoint"
+    assert path.with_name(path.name + "-journal").read_bytes() == b"journal"
+    quarantine = tmp_path / "recovery-quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
+    store.release_lease()
+
+
 def test_task_lease_prevents_a_second_instance_from_modifying_progress(tmp_path):
     path = tmp_path / "active-task.sqlite3"
     first = TaskCheckpointStore(path)
@@ -227,6 +392,22 @@ def test_task_lease_prevents_a_second_instance_from_modifying_progress(tmp_path)
     first.release_lease()
     assert second.try_acquire_lease()
     second.release_lease()
+
+
+def test_task_lease_acquired_by_request_can_be_released_by_worker_thread(tmp_path):
+    path = tmp_path / "active-task.sqlite3"
+    request_store = TaskCheckpointStore(path)
+    competing_store = TaskCheckpointStore(path)
+    assert request_store.try_acquire_lease()
+    assert not competing_store.try_acquire_lease()
+
+    worker = threading.Thread(target=request_store.release_lease)
+    worker.start()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert competing_store.try_acquire_lease()
+    competing_store.release_lease()
 
 
 def test_pdi_phase_is_persisted_for_restart(tmp_path):

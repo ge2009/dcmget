@@ -58,7 +58,7 @@ from dcmget.runtime import (
     resource_root,
 )
 from dcmget.single_instance import SingleInstance
-from dcmget.task_state import TaskCheckpointStore
+from dcmget.task_state import TaskCheckpointStore, TaskStateError
 from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
 from dcmget.windows_service_control import windows_service_operation_handlers
 from dcmget.web_security import DirectoryRoot, discover_local_hosts
@@ -912,7 +912,14 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
         )
-        checkpoint = task_store.load(include_archived_files=False)
+        try:
+            checkpoint = task_store.load(include_archived_files=False)
+        except TaskStateError as exc:
+            # DcmGetAppService already exposes this as ``recovery_error`` so
+            # the browser can offer a safe, backed-up cleanup action.  A
+            # second unguarded read here must not terminate the Profile.
+            LOGGER.warning("未完成任务恢复点无法自动继续：%s", exc)
+            checkpoint = None
         if checkpoint is not None:
             try:
                 service.resume_task(tools_provider(checkpoint.config))

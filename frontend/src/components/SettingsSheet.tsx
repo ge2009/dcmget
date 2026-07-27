@@ -76,7 +76,7 @@ export function SettingsSheet({
         <TextField label="监听端口" inputMode="numeric" required disabled={topologyLocked} {...text('storage_port')} />
       </div></fieldset>
       <fieldset><legend><span>03</span><div><strong>保存与可靠性</strong><small>归档目录和断线恢复</small></div></legend><div className="form-grid">
-        <TextField label="默认 DICOM 目录" wide {...text('dicom_destination_folder')} />
+        <TextField label="默认 DICOM 目录" hint={String.raw`Windows SMB 请使用 \\服务器\共享名\目录；后台服务无法访问用户会话的 X: 映射盘。`} wide {...text('dicom_destination_folder')} />
         <TextField label="DCMTK bin 目录" wide {...text('dcmtk_bin_dir')} />
         <TextField label="目录模板" hint="{PatientID} / {AccessionNumber} / {StudyInstanceUID}" wide {...text('directory_template')} />
         <TextField label="磁盘保留（GB）" inputMode="decimal" {...text('minimum_free_space_gb')} />

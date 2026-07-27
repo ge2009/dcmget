@@ -47,6 +47,44 @@ describe('task workspace', () => {
     expect(map).not.toHaveBeenCalled();
   });
 
+  it('renders aggregate progress when large-task detail arrays are null', () => {
+    render(<TaskWorkspace {...base} task={{
+      id: 'large-null', status: 'interrupted', total: 9338, processed: 28,
+      accessions: null, items: null, results: null, actions: { can_resume: true },
+    }} />);
+    expect(screen.getByText('大批量任务仅显示聚合进度')).toBeInTheDocument();
+    expect(screen.getByText('28 / 9,338')).toBeInTheDocument();
+  });
+
+  it('offers a backed-up cleanup action for an unreadable old task', () => {
+    const onTaskAction = vi.fn();
+    render(<TaskWorkspace {...base} onTaskAction={onTaskAction} task={{
+      status: 'recovery_error', message: '任务恢复点已损坏',
+      actions: { can_start: false, can_discard_recovery: true },
+    }} />);
+    expect(screen.getByRole('heading', { name: '旧任务需要处理' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('已下载的 DICOM 图像不会被删除');
+    fireEvent.click(screen.getByRole('button', { name: '清理旧任务' }));
+    expect(onTaskAction).toHaveBeenCalledWith('end');
+  });
+
+  it('does not offer checkpoint cleanup when only the acceptance ledger is broken', () => {
+    render(<TaskWorkspace {...base} task={{
+      status: 'ledger_error', message: '任务恢复点可读取，但验收台账无法读取',
+      actions: { can_discard_recovery: false, can_end: false },
+    }} />);
+    expect(screen.getByRole('heading', { name: '验收台账异常' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('任务恢复点可读取');
+    expect(screen.queryByRole('button', { name: '清理旧任务' })).not.toBeInTheDocument();
+  });
+
+  it('explains that Windows services need UNC paths instead of mapped drives', () => {
+    render(<TaskWorkspace {...base} task={null} />);
+    expect(screen.getByText(/Windows 服务无法识别 X: 映射盘/)).toHaveTextContent(
+      '共享目录请填写 UNC（\\\\服务器\\共享\\目录）',
+    );
+  });
+
   it('shows visible text for critical transfer controls', () => {
     render(<TaskWorkspace {...base} task={{ id: 'one', status: 'running', total: 1, actions: { can_pause: true, can_cancel: true, can_end: true } }} />);
     expect(screen.getByRole('button', { name: '暂停' })).toHaveTextContent('暂停');

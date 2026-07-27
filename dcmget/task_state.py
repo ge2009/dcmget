@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import uuid
@@ -74,7 +75,10 @@ def default_task_state_path() -> Path:
 class TaskCheckpointStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path).expanduser() if path else default_task_state_path()
-        self._lease = FileLock(str(self.path) + ".lock")
+        # Foreground requests acquire the Profile lease, while download/PDI
+        # workers release it after finishing. FileLock's default thread-local
+        # context makes that worker release a silent no-op.
+        self._lease = FileLock(str(self.path) + ".lock", thread_local=False)
 
     @property
     def lease_held(self) -> bool:
@@ -427,6 +431,57 @@ class TaskCheckpointStore:
         except OSError as exc:
             raise TaskStateError(f"无法清除已完成任务恢复点：{exc}") from exc
 
+    def quarantine_incompatible(self) -> Path:
+        """Back up an unreadable checkpoint before removing it from recovery.
+
+        A complete copy is first published with one atomic directory rename.
+        Only then are the active checkpoint and SQLite sidecars removed.  This
+        keeps a recoverable copy even if removing the original files fails.
+        The lease must be held by the caller so no other instance can write
+        while the files are copied.
+        """
+
+        if not self.lease_held:
+            raise TaskStateError("隔离任务恢复点前必须取得任务锁")
+        if not self.path.is_file():
+            raise TaskStateError("任务恢复点不存在")
+
+        quarantine_root = self.path.parent / "recovery-quarantine"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        suffix = uuid.uuid4().hex[:8]
+        name = f"{self.path.stem}-{timestamp}-{suffix}"
+        staging = quarantine_root / f".{name}.tmp"
+        destination = quarantine_root / name
+        sources = [
+            candidate
+            for candidate in (
+                self.path,
+                self.path.with_name(self.path.name + "-journal"),
+                self.path.with_name(self.path.name + "-wal"),
+                self.path.with_name(self.path.name + "-shm"),
+            )
+            if candidate.is_file()
+        ]
+
+        try:
+            quarantine_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            staging.mkdir(mode=0o700)
+            for source in sources:
+                shutil.copy2(source, staging / source.name)
+            os.replace(staging, destination)
+        except OSError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise TaskStateError(f"无法备份旧任务恢复点：{exc}") from exc
+
+        try:
+            for source in reversed(sources):
+                source.unlink(missing_ok=True)
+        except OSError as exc:
+            raise TaskStateError(
+                f"旧任务已备份到 {destination}，但无法移出活动恢复点：{exc}"
+            ) from exc
+        return destination
+
     def set_phase(
         self,
         task_id: str,
@@ -490,22 +545,30 @@ class TaskCheckpointStore:
                             AccessionStatus.PARTIAL,
                         }:
                             continue
-                        has_retained_result = bool(
+                        has_retained_files = bool(
                             result.archived_files
                             or result.file_count
                             or result.new_file_count
                             or result.existing_skipped_count
                             or result.conflict_preserved_count
                         )
+                        has_retry_evidence = bool(
+                            has_retained_files
+                            or result.pacs_expected_suboperations is not None
+                        )
                         retained = (
                             _result_to_json(
                                 replace(
                                     result,
                                     status=AccessionStatus.CANCELLED,
-                                    message="重试前已保留收到的文件",
+                                    message=(
+                                        "重试前已保留收到的文件"
+                                        if has_retained_files
+                                        else "重试前已保留 PACS 子操作计数"
+                                    ),
                                 )
                             )
-                            if has_retained_result
+                            if has_retry_evidence
                             else None
                         )
                         connection.execute(
@@ -875,18 +938,19 @@ def _cleanup_recorded_process_group(
 def _merge_partial_result(
     prior: AccessionResult | None, current: AccessionResult
 ) -> AccessionResult:
-    if prior is None or not (
+    if prior is None:
+        return current
+    prior_has_retained_files = bool(
         prior.archived_files
         or prior.file_count
         or prior.new_file_count
         or prior.existing_skipped_count
         or prior.conflict_preserved_count
-    ):
+    )
+    if not prior_has_retained_files and prior.pacs_expected_suboperations is None:
         return current
     archived_files = list(dict.fromkeys([*prior.archived_files, *current.archived_files]))
     status = current.status
-    if status in {AccessionStatus.NO_DATA, AccessionStatus.FAILED}:
-        status = AccessionStatus.PARTIAL
     duration = prior.duration_seconds + current.duration_seconds
     received_bytes = prior.received_bytes + current.received_bytes
     new_file_count = min(
@@ -897,6 +961,25 @@ def _merge_partial_result(
     conflict_preserved_count = (
         prior.conflict_preserved_count + current.conflict_preserved_count
     )
+    retained_file_count = max(
+        len(archived_files) + conflict_preserved_count,
+        prior.file_count,
+        current.file_count,
+    )
+    if (
+        status in {AccessionStatus.NO_DATA, AccessionStatus.FAILED}
+        and retained_file_count
+    ):
+        status = AccessionStatus.PARTIAL
+    expected_values = [
+        value
+        for value in (
+            prior.pacs_expected_suboperations,
+            current.pacs_expected_suboperations,
+        )
+        if value is not None
+    ]
+    pacs_expected_suboperations = max(expected_values) if expected_values else None
     if conflict_preserved_count:
         status = AccessionStatus.PARTIAL
     message = current.message
@@ -907,14 +990,26 @@ def _merge_partial_result(
         message = (
             f"{message}；仍有 {conflict_preserved_count} 个冲突文件需人工核对"
         ).strip("；")
+    if (
+        current.status in {AccessionStatus.COMPLETED, AccessionStatus.NO_DATA}
+        and pacs_expected_suboperations is not None
+        and retained_file_count < pacs_expected_suboperations
+    ):
+        status = (
+            AccessionStatus.PARTIAL
+            if retained_file_count
+            else AccessionStatus.FAILED
+        )
+        diagnostic = (
+            f"PACS 历史最大预期 {pacs_expected_suboperations} 个对象，"
+            f"累计仅保留 {retained_file_count} 个，不能确认收全"
+        )
+        if diagnostic not in message:
+            message = f"{message}；{diagnostic}".strip("；")
     return replace(
         current,
         status=status,
-        file_count=max(
-            len(archived_files) + conflict_preserved_count,
-            prior.file_count,
-            current.file_count,
-        ),
+        file_count=retained_file_count,
         duration_seconds=duration,
         message=message,
         output_directory=current.output_directory or prior.output_directory,
@@ -954,6 +1049,7 @@ def _merge_partial_result(
             if current.pacs_completed_suboperations is not None
             else prior.pacs_completed_suboperations
         ),
+        pacs_expected_suboperations=pacs_expected_suboperations,
         move_return_code=(
             current.move_return_code
             if current.move_return_code is not None
@@ -990,6 +1086,7 @@ def _result_to_json(result: AccessionResult) -> str:
             "sop_instance_count": result.sop_instance_count,
             "local_verified_files": result.local_verified_files,
             "pacs_completed_suboperations": result.pacs_completed_suboperations,
+            "pacs_expected_suboperations": result.pacs_expected_suboperations,
             "move_return_code": result.move_return_code,
             "move_dimse_status": result.move_dimse_status,
             "attempt_count": result.attempt_count,
@@ -1072,6 +1169,9 @@ def _result_from_json(
         local_verified_files=max(0, int(raw.get("local_verified_files", 0))),
         pacs_completed_suboperations=_optional_int(
             raw.get("pacs_completed_suboperations")
+        ),
+        pacs_expected_suboperations=_optional_int(
+            raw.get("pacs_expected_suboperations")
         ),
         move_return_code=_optional_int(raw.get("move_return_code")),
         move_dimse_status=_optional_int(raw.get("move_dimse_status")),

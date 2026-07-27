@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.7.1
+        default: 3.7.2
       publish_release:
         description: Publish the verified build to GitHub Releases
         required: true
@@ -508,6 +508,53 @@ jobs:
           $env:DCMGET_SETUP_PATH = (Resolve-Path "release/windows/DcmGet-${{ inputs.version }}-Setup-x64.exe").Path
           python -c "import os; from pathlib import Path; from scripts.build_windows import sign_windows_payloads; sign_windows_payloads([Path(os.environ['DCMGET_SETUP_PATH'])])"
 
+      - name: Prepare pinned 2.9.1 large-task fixture script
+        shell: pwsh
+        run: |
+          $baselineRoot = (Resolve-Path "upgrade-baseline").Path
+          # Keep the script beside the pinned source tree so Python places that
+          # checkout on sys.path even though the baseline venv is not installed
+          # as a package.
+          $fixturePath = Join-Path $baselineRoot ".dcmget-create-291-task.py"
+          $fixtureSource = @'
+          import json
+          import os
+          from pathlib import Path
+
+          from dcmget.config import AppConfig
+          from dcmget.core import AccessionResult, AccessionStatus
+          from dcmget.task_state import TaskCheckpointStore
+
+          config_path = Path(os.environ["DCMGET_UPGRADE_CONFIG_PATH"])
+          task_path = Path(os.environ["DCMGET_UPGRADE_TASK_PATH"])
+          task_id_path = Path(os.environ["DCMGET_UPGRADE_TASK_ID_PATH"])
+          sentinel = Path(os.environ["DCMGET_UPGRADE_SENTINEL_PATH"])
+          config = AppConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+          accessions = [f"UPGRADE{index:04d}" for index in range(1, 202)]
+          store = TaskCheckpointStore(task_path)
+          if not store.try_acquire_lease():
+              raise RuntimeError("could not acquire the pinned 2.9.1 task lease")
+          try:
+              checkpoint = store.start(config, accessions, trial_required=False)
+              store.record_result(
+                  checkpoint.task_id,
+                  AccessionResult(
+                      accessions[0],
+                      AccessionStatus.COMPLETED,
+                      file_count=1,
+                      received_bytes=sentinel.stat().st_size,
+                      archived_files=[str(sentinel)],
+                  ),
+              )
+              restored = store.load_required(include_archived_files=False)
+              if len(restored.accessions) != 201 or len(restored.results) != 1:
+                  raise RuntimeError("pinned 2.9.1 large-task fixture did not round-trip")
+              task_id_path.write_text(restored.task_id, encoding="ascii")
+          finally:
+              store.release_lease()
+          '@
+          [IO.File]::WriteAllText($fixturePath, $fixtureSource, [Text.UTF8Encoding]::new($false))
+
       - name: Silent install, in-place upgrade and uninstall test
         shell: pwsh
         run: |
@@ -519,6 +566,8 @@ jobs:
           $configDir = Join-Path $env:APPDATA "DcmGet"
           $configPath = Join-Path $configDir "config.json"
           $profile1ConfigPath = Join-Path $configDir "instances\i1\config.json"
+          $profile1TaskPath = Join-Path $env:LOCALAPPDATA "DcmGet\instances\i1\active-task.sqlite3"
+          $upgradeTaskIdPath = Join-Path $env:RUNNER_TEMP "dcmget-291-upgrade-task-id.txt"
           $licensePath = Join-Path $configDir "license.lic"
           $trialPath = Join-Path $configDir "trial.json"
           $trialAnchorPath = Join-Path $env:ProgramData "DcmGet\.trial-anchor"
@@ -581,6 +630,8 @@ jobs:
 
           Remove-Item $configDir -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $upgradeDicomDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item (Split-Path -Parent $profile1TaskPath) -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $upgradeTaskIdPath -Force -ErrorAction SilentlyContinue
           Assert-FixedDcmGetPortAvailable 8786 "management"
           Assert-FixedDcmGetPortAvailable 8787 "Profile 1"
 
@@ -610,6 +661,23 @@ jobs:
           $baselineUi = Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--ui-self-test", "--config", "`"$configPath`"") -Wait -PassThru
           if ($baselineUi.ExitCode -ne 0) { throw "Installed 2.9.1 UI self-test failed with code $($baselineUi.ExitCode)" }
           [IO.File]::WriteAllText($downloadSentinelPath, "download-result-sentinel", [Text.UTF8Encoding]::new($false))
+          $baselineRoot = (Resolve-Path "upgrade-baseline").Path
+          $baselinePython = Join-Path $baselineRoot ".venv\Scripts\python.exe"
+          $fixturePath = Join-Path $baselineRoot ".dcmget-create-291-task.py"
+          $env:DCMGET_UPGRADE_CONFIG_PATH = $profile1ConfigPath
+          $env:DCMGET_UPGRADE_TASK_PATH = $profile1TaskPath
+          $env:DCMGET_UPGRADE_TASK_ID_PATH = $upgradeTaskIdPath
+          $env:DCMGET_UPGRADE_SENTINEL_PATH = $downloadSentinelPath
+          Push-Location $baselineRoot
+          try {
+            & $baselinePython $fixturePath
+            if ($LASTEXITCODE -ne 0) { throw "Could not create pinned 2.9.1 large-task checkpoint: $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          if (-not (Test-Path $profile1TaskPath -PathType Leaf)) { throw "Pinned 2.9.1 large-task checkpoint is missing" }
+          $upgradeTaskId = (Get-Content $upgradeTaskIdPath -Raw).Trim()
+          if ($upgradeTaskId -notmatch '^[0-9a-f]{32}$') { throw "Pinned 2.9.1 task id is invalid: $upgradeTaskId" }
           Set-Content $licensePath "upgrade-license-sentinel"
           python -c "from dcmget.licensing import consume_trial; consume_trial()"
           if ($LASTEXITCODE -ne 0) { throw "Could not create valid trial state" }
@@ -779,6 +847,60 @@ jobs:
             & "$env:SystemRoot\System32\taskkill.exe" /PID $nativeShell.Id /T /F | Out-Null
             $nativeShell.WaitForExit(10000) | Out-Null
           }
+
+      - name: Verify upgraded 2.9.1 large-task recovery contract
+        shell: pwsh
+        run: |
+          $profile1TaskPath = Join-Path $env:LOCALAPPDATA "DcmGet\instances\i1\active-task.sqlite3"
+          $upgradeTaskId = (Get-Content (Join-Path $env:RUNNER_TEMP "dcmget-291-upgrade-task-id.txt") -Raw).Trim()
+          $downloadSentinelPath = Join-Path (Join-Path $env:RUNNER_TEMP "DcmGetUpgradeDicom") "keep-download.dcm"
+          $profileUrl = "http://127.0.0.1:8787"
+          $runtimeStatePath = Join-Path $env:LOCALAPPDATA "DcmGet\management\profile-runtime.json"
+          New-Item -ItemType Directory -Force (Split-Path -Parent $runtimeStatePath) | Out-Null
+          $runtimeState = [ordered]@{
+            schema = "dcmget-profile-runtime"
+            version = 1
+            desired_running_profiles = @(1)
+          } | ConvertTo-Json -Compress
+          [IO.File]::WriteAllText("$runtimeStatePath.pending", "$runtimeState`n", [Text.UTF8Encoding]::new($false))
+          Move-Item -LiteralPath "$runtimeStatePath.pending" -Destination $runtimeStatePath -Force
+          $profileSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+          $bootstrap = $null
+          for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            try {
+              $bootstrap = Invoke-RestMethod "$profileUrl/api/bootstrap" -WebSession $profileSession -TimeoutSec 5
+              break
+            } catch {
+              Start-Sleep -Milliseconds 250
+            }
+          }
+          if ($null -eq $bootstrap) { throw "Upgraded Profile 1 did not expose its bootstrap API" }
+          if ([string]$bootstrap.task.id -ne $upgradeTaskId) { throw "Upgrade did not restore the pinned 2.9.1 task id" }
+          if ([int]$bootstrap.task.total -ne 201) { throw "Upgraded large task total is $($bootstrap.task.total), expected 201" }
+          if ($bootstrap.task.large_batch -ne $true) { throw "Upgraded 2.9.1 task is not marked as a large batch" }
+          if ($bootstrap.task.PSObject.Properties.Name -notcontains "accessions" -or $null -ne $bootstrap.task.accessions) {
+            throw "Large-task bootstrap must explicitly return null accessions"
+          }
+          if ($bootstrap.task.PSObject.Properties.Name -notcontains "results" -or $null -ne $bootstrap.task.results) {
+            throw "Large-task bootstrap must explicitly return null results"
+          }
+          if ([int]$bootstrap.task.processed -lt 1) { throw "Upgrade lost the completed 2.9.1 task row" }
+          $taskEndpoint = Invoke-RestMethod "$profileUrl/api/task" -WebSession $profileSession -TimeoutSec 20
+          if ([string]$taskEndpoint.task.id -ne $upgradeTaskId) { throw "Profile task endpoint is unavailable after the 2.9.1 upgrade" }
+
+          $csrfHeaders = @{ Origin = $profileUrl; "X-CSRF-Token" = [string]$bootstrap.csrf_token }
+          Invoke-RestMethod "$profileUrl/api/task/end" -Method Post -WebSession $profileSession -Headers $csrfHeaders -ContentType "application/json" -Body "{}" -TimeoutSec 20 | Out-Null
+          $largeTaskCleared = $false
+          for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            $currentTask = Invoke-RestMethod "$profileUrl/api/task" -WebSession $profileSession -TimeoutSec 20
+            if ($currentTask.task.actions.can_start -eq $true -and -not (Test-Path $profile1TaskPath)) {
+              $largeTaskCleared = $true
+              break
+            }
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not $largeTaskCleared) { throw "Upgraded 2.9.1 large task could not be ended cleanly" }
+          if (-not (Test-Path $downloadSentinelPath -PathType Leaf)) { throw "Ending the upgraded task deleted an existing DICOM result" }
 
       - name: Windows service dynamic Profile adoption test
         shell: pwsh

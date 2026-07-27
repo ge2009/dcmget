@@ -14,6 +14,7 @@ const STATUS: Record<string, [string, Tone]> = {
   running: ['下载中', 'working'], downloading: ['下载中', 'working'], pausing: ['暂停中', 'warning'],
   pause_pending: ['等待暂停', 'warning'], paused: ['已暂停', 'warning'], stopping: ['停止中', 'warning'],
   ending: ['正在结束任务', 'warning'], ended: ['任务已结束', 'neutral'], end_failed: ['结束失败', 'error'],
+  ledger_error: ['验收台账异常', 'error'],
   interrupted: ['下载已中断', 'warning'], download_retryable: ['可继续下载', 'warning'],
   pdi_pending: ['等待导出 PDI', 'working'], pdi_running: ['正在导出 PDI', 'working'],
   pdi_retryable: ['PDI 可重试', 'warning'], completed: ['已完成', 'success'],

@@ -4,6 +4,7 @@ import errno
 import hashlib
 import locale
 import logging
+import ntpath
 import os
 import platform
 import re
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -35,6 +37,17 @@ from .runtime import ensure_application_state_dir, portable_dcmtk_bin
 
 _archive_publish_lock = threading.Lock()
 _RECEIVER_BIND_ADDRESS = "0.0.0.0"
+_RECEIVE_STAGING_SESSION_RE = re.compile(
+    r"^\d{8}-\d{6}-\d{6}-[0-9a-f]{8}$",
+    re.IGNORECASE,
+)
+_LEGACY_RECEIVE_STAGING_SESSION_RE = re.compile(
+    r"^\d{8}-\d{6}-\d{6}$",
+    re.IGNORECASE,
+)
+_STAGING_MAINTENANCE_LOCK_NAME = ".receiver-staging-maintenance.lock"
+_STAGING_MAINTENANCE_TIMEOUT_SECONDS = 30.0
+_ARCHIVE_LOCK_SHARD_HEX_LENGTH = 3
 
 
 class AccessionStatus(str, Enum):
@@ -94,6 +107,7 @@ class AccessionResult:
     sop_instance_count: int = 0
     local_verified_files: int = 0
     pacs_completed_suboperations: int | None = None
+    pacs_expected_suboperations: int | None = None
     move_return_code: int | None = None
     move_dimse_status: int | None = None
     attempt_count: int = 1
@@ -210,6 +224,7 @@ class _MoveDiagnostics:
     association_request_failed: bool = False
     transport_timeout: bool = False
     pending_responses: int = 0
+    final_response_seen: bool = False
     final_response_status: str | None = None
     dimse_status_code: int | None = None
     dimse_status_text: str = ""
@@ -217,11 +232,20 @@ class _MoveDiagnostics:
     completed_suboperations: int | None = None
     failed_suboperations: int | None = None
     warning_suboperations: int | None = None
+    max_reported_suboperations: int | None = None
 
 
 _MOVE_RESPONSE_RE = re.compile(
     r"\bReceived\s+(?:Final\s+)?Move\s+Response(?:\s+\d+)?\s*"
     r"\((?P<status>[^)]*)\)",
+    re.IGNORECASE,
+)
+_MOVE_FINAL_RESPONSE_RE = re.compile(
+    r"\bReceived\s+Final\s+Move\s+Response\b",
+    re.IGNORECASE,
+)
+_MOVE_DEBUG_PENDING_RESPONSE_RE = re.compile(
+    r"\bReceived\s+Move\s+Response(?:\s+\d+)?\s*$",
     re.IGNORECASE,
 )
 _MOVE_DIMSE_STATUS_RE = re.compile(
@@ -253,10 +277,22 @@ def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
     if response:
         response_status = response.group("status").strip()
         if re.match(r"pending\b", response_status, re.IGNORECASE):
+            _reset_move_suboperation_counts(diagnostics)
             diagnostics.pending_responses += 1
         else:
             _reset_move_suboperation_counts(diagnostics)
+            diagnostics.final_response_seen = True
             diagnostics.final_response_status = response_status
+    elif _MOVE_DEBUG_PENDING_RESPONSE_RE.search(text):
+        _reset_move_suboperation_counts(diagnostics)
+        diagnostics.pending_responses += 1
+    elif _MOVE_FINAL_RESPONSE_RE.search(text):
+        # DCMTK debug output emits this marker before the final counters and
+        # DIMSE status, but does not include the parenthesized status used by
+        # verbose output. Reset the previous pending counters here, not after
+        # the final counters have already been parsed.
+        _reset_move_suboperation_counts(diagnostics)
+        diagnostics.final_response_seen = True
 
     dimse_status = _MOVE_DIMSE_STATUS_RE.search(text)
     if dimse_status:
@@ -264,7 +300,7 @@ def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
         if (
             status_code not in _PENDING_DIMSE_STATUSES
             and diagnostics.dimse_status_code in _PENDING_DIMSE_STATUSES
-            and diagnostics.final_response_status is None
+            and not diagnostics.final_response_seen
         ):
             _reset_move_suboperation_counts(diagnostics)
         diagnostics.dimse_status_code = status_code
@@ -278,6 +314,19 @@ def _record_move_diagnostic(diagnostics: _MoveDiagnostics, text: str) -> None:
             f"{kind}_suboperations",
             int(suboperation.group("count")),
         )
+        current_total = sum(
+            max(0, value or 0)
+            for value in (
+                diagnostics.remaining_suboperations,
+                diagnostics.completed_suboperations,
+                diagnostics.failed_suboperations,
+                diagnostics.warning_suboperations,
+            )
+        )
+        diagnostics.max_reported_suboperations = max(
+            diagnostics.max_reported_suboperations or 0,
+            current_total,
+        )
 
 
 def _reset_move_suboperation_counts(diagnostics: _MoveDiagnostics) -> None:
@@ -290,7 +339,7 @@ def _reset_move_suboperation_counts(diagnostics: _MoveDiagnostics) -> None:
 
 
 def _move_has_final_response(diagnostics: _MoveDiagnostics) -> bool:
-    if diagnostics.final_response_status is not None:
+    if diagnostics.final_response_seen or diagnostics.final_response_status is not None:
         return True
     return (
         diagnostics.dimse_status_code is not None
@@ -338,7 +387,34 @@ def _move_archive_mismatch(
         details.append(
             f"PACS 报告完成 {completed} 个子操作，本机成功归档 {archived_file_count} 个文件"
         )
+    expected = _move_expected_suboperations(diagnostics)
+    if expected is not None and archived_file_count < expected and (
+        completed is None or completed == archived_file_count
+    ):
+        details.append(
+            f"PACS 历史最大预期 {expected} 个对象，本机仅归档 {archived_file_count} 个"
+        )
     return "；".join(details)
+
+
+def _move_expected_suboperations(diagnostics: _MoveDiagnostics) -> int | None:
+    counts = (
+        diagnostics.remaining_suboperations,
+        diagnostics.completed_suboperations,
+        diagnostics.failed_suboperations,
+        diagnostics.warning_suboperations,
+    )
+    current = (
+        sum(max(0, value or 0) for value in counts)
+        if any(value is not None for value in counts)
+        else None
+    )
+    candidates = [
+        value
+        for value in (current, diagnostics.max_reported_suboperations)
+        if value is not None
+    ]
+    return max(candidates) if candidates else None
 
 
 def _move_diagnostic_summary(diagnostics: _MoveDiagnostics) -> str:
@@ -465,8 +541,8 @@ class _LiveStagingTracker:
             self._total_bytes -= previous
 
 
-_RECEIVER_DRAIN_INITIAL_WAIT_SECONDS = 1.0
-_RECEIVER_DRAIN_QUIET_SECONDS = 0.5
+_RECEIVER_DRAIN_INITIAL_WAIT_SECONDS = 5.0
+_RECEIVER_DRAIN_QUIET_SECONDS = 3.0
 _RECEIVER_DRAIN_MAX_SECONDS = 30.0
 _RECEIVER_DRAIN_POLL_SECONDS = 0.1
 
@@ -525,6 +601,44 @@ def _wait_for_late_store_writes(
             return False if observed_file else None
         cancel_event.wait(_RECEIVER_DRAIN_POLL_SECONDS)
     return None
+
+
+def _write_probe_error_message(
+    label: str,
+    path: Path,
+    error: OSError,
+    *,
+    windows: bool | None = None,
+) -> str:
+    """Return an actionable path error without pretending mapped drives are local.
+
+    Installed Windows builds run the profile backend as LocalSystem. Drive-letter
+    mappings belong to the interactive user's logon session, so an unavailable
+    ``X:`` path cannot be repaired by retrying ``mkdir`` in the service.
+    """
+
+    is_windows = os.name == "nt" if windows is None else windows
+    raw_path = str(path)
+    if is_windows:
+        drive, _tail = ntpath.splitdrive(raw_path)
+        winerror = getattr(error, "winerror", None)
+        if (
+            re.fullmatch(r"[A-Za-z]:", drive)
+            and (isinstance(error, FileNotFoundError) or winerror in {3, 15})
+        ):
+            return (
+                f"{label}不可访问：DcmGet 后台服务看不到 {drive}。"
+                "若这是 SMB 映射盘，请改用 UNC 路径（例如 "
+                r"\\服务器\共享名\目录），并为后台服务配置共享和 NTFS 写权限"
+            )
+        if raw_path.startswith((r"\\", "//")) and (
+            isinstance(error, PermissionError) or winerror == 5
+        ):
+            return (
+                f"{label}不可写：UNC 共享拒绝访问；请同时检查共享权限和 "
+                f"NTFS 权限（{error}）"
+            )
+    return f"{label}不可写：{error}"
 
 
 class DcmtkResolver:
@@ -645,8 +759,19 @@ def build_storescp_command(config: AppConfig, tools: ToolPaths, staging: Path) -
     ]
     if tools.supports_fork:
         command.append("--fork")
+        if "--max-associations" in tools.storescp_help:
+            command.extend(["--max-associations", "16"])
     else:
         command.append("--single-process")
+    command.extend(
+        [
+            "-ts",
+            "300",
+            "-ta",
+            "60",
+            "-pm",
+        ]
+    )
     command.append(str(config.storage_port))
     return command
 
@@ -654,7 +779,7 @@ def build_storescp_command(config: AppConfig, tools: ToolPaths, staging: Path) -
 def build_movescu_command(config: AppConfig, tools: ToolPaths, accession: str) -> list[str]:
     return [
         str(tools.movescu),
-        "-v",
+        "-d",
         "--no-port",
         "-to",
         "30",
@@ -728,7 +853,7 @@ def preflight(
             config.minimum_free_space_bytes,
         )
     except OSError as exc:
-        message = f"保存目录不可写：{exc}"
+        message = _write_probe_error_message("保存目录", destination, exc)
         errors["dicom_destination_folder"] = message
         checks.append(("保存目录", False, message))
 
@@ -755,7 +880,7 @@ def preflight(
                 config.minimum_free_space_bytes,
             )
         except OSError as exc:
-            message = f"PDI 输出目录不可写：{exc}"
+            message = _write_probe_error_message("PDI 输出目录", pdi_root, exc)
             errors["pdi_output_folder"] = message
             checks.append(("PDI 输出目录", False, message))
 
@@ -814,12 +939,40 @@ def _format_bytes(value: int) -> str:
     return f"{amount:.1f} TB"
 
 
+def _guard_expected_suboperation_gap(result: AccessionResult) -> AccessionResult:
+    expected = result.pacs_expected_suboperations
+    retained = max(
+        result.file_count,
+        len(result.archived_files) + result.conflict_preserved_count,
+    )
+    if (
+        expected is None
+        or retained >= expected
+        or result.status == AccessionStatus.CANCELLED
+    ):
+        return result
+
+    status = result.status
+    if status in {AccessionStatus.COMPLETED, AccessionStatus.NO_DATA}:
+        status = AccessionStatus.PARTIAL if retained else AccessionStatus.FAILED
+    gap_message = (
+        f"PACS 历史最大预期 {expected} 个对象，"
+        f"累计仅保留 {retained} 个，不能确认收全"
+    )
+    message = result.message
+    if gap_message not in message:
+        message = f"{message}；{gap_message}" if message else gap_message
+    return replace(result, status=status, file_count=retained, message=message)
+
+
 def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
     if not attempts:
         raise ValueError("至少需要一次下载尝试")
     final = attempts[-1]
     if len(attempts) == 1:
-        return replace(final, attempt_count=max(1, final.attempt_count))
+        return _guard_expected_suboperation_gap(
+            replace(final, attempt_count=max(1, final.attempt_count))
+        )
 
     archived_files = list(
         dict.fromkeys(path for result in attempts for path in result.archived_files)
@@ -873,6 +1026,12 @@ def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
         len(archived_files) + conflict_preserved_count,
         *(result.file_count for result in attempts),
     )
+    expected_values = [
+        result.pacs_expected_suboperations
+        for result in attempts
+        if result.pacs_expected_suboperations is not None
+    ]
+    pacs_expected_suboperations = max(expected_values) if expected_values else None
     output_directory = next(
         (
             result.output_directory
@@ -895,33 +1054,42 @@ def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
     if conflict_preserved_count and status != AccessionStatus.CANCELLED:
         status = AccessionStatus.PARTIAL
         message += f"；累计 {conflict_preserved_count} 个冲突文件需人工核对"
-    return replace(
-        final,
-        status=status,
-        file_count=retained_file_count,
-        duration_seconds=duration,
-        message=message,
-        output_directory=output_directory,
-        received_bytes=received_bytes,
-        speed_bytes_per_second=(received_bytes / duration if duration > 0 else 0.0),
-        archived_files=archived_files or list(final.archived_files),
-        new_file_count=sum(result.new_file_count for result in attempts),
-        existing_skipped_count=sum(
-            result.existing_skipped_count for result in attempts
-        ),
-        conflict_preserved_count=conflict_preserved_count,
-        verification_status=verification_status,
-        verification_message=verification_message,
-        actual_accessions=actual_accessions,
-        study_instance_uids=study_uids,
-        series_instance_count=max(
-            result.series_instance_count for result in attempts
-        ),
-        sop_instance_count=max(result.sop_instance_count for result in attempts),
-        local_verified_files=max(
-            result.local_verified_files for result in attempts
-        ),
-        attempt_count=sum(max(1, result.attempt_count) for result in attempts),
+    return _guard_expected_suboperation_gap(
+        replace(
+            final,
+            status=status,
+            file_count=retained_file_count,
+            duration_seconds=duration,
+            message=message,
+            output_directory=output_directory,
+            received_bytes=received_bytes,
+            speed_bytes_per_second=(
+                received_bytes / duration if duration > 0 else 0.0
+            ),
+            archived_files=archived_files or list(final.archived_files),
+            new_file_count=sum(result.new_file_count for result in attempts),
+            existing_skipped_count=sum(
+                result.existing_skipped_count for result in attempts
+            ),
+            conflict_preserved_count=conflict_preserved_count,
+            verification_status=verification_status,
+            verification_message=verification_message,
+            actual_accessions=actual_accessions,
+            study_instance_uids=study_uids,
+            series_instance_count=max(
+                result.series_instance_count for result in attempts
+            ),
+            sop_instance_count=max(
+                result.sop_instance_count for result in attempts
+            ),
+            local_verified_files=max(
+                result.local_verified_files for result in attempts
+            ),
+            pacs_expected_suboperations=pacs_expected_suboperations,
+            attempt_count=sum(
+                max(1, result.attempt_count) for result in attempts
+            ),
+        )
     )
 
 
@@ -929,6 +1097,16 @@ _UNCONFIRMED_MOVE_SAFETY_PAUSE = (
     "C-MOVE 未返回最终响应，已保留完整文件，但无法确认全部实例已到齐；"
     "任务已安全暂停，请重试当前检查号"
 )
+
+
+def _is_unconfirmed_transient_failure(result: AccessionResult) -> bool:
+    return bool(
+        result.transient_failure
+        and (
+            result.move_dimse_status is None
+            or result.move_dimse_status in _PENDING_DIMSE_STATUSES
+        )
+    )
 
 
 def _with_unconfirmed_move_safety_pause(
@@ -940,7 +1118,7 @@ def _with_unconfirmed_move_safety_pause(
         result.status != AccessionStatus.PARTIAL
         or result.file_count <= 0
         or not (
-            result.transient_failure
+            _is_unconfirmed_transient_failure(result)
             or retained_by_earlier_unconfirmed_attempt
         )
         or result.safety_pause_reason
@@ -1149,10 +1327,21 @@ class DownloadRunner:
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
-        staging = staging_directory_root(self.config) / datetime.now().strftime(
-            "%Y%m%d-%H%M%S-%f"
+        staging_root = staging_directory_root(self.config)
+        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for recovery_message in _recover_orphaned_receive_staging(staging_root):
+            self._emit(
+                "应用",
+                recovery_message,
+                "error" if recovery_message.startswith("无法") else "warning",
+            )
+        session_name = (
+            datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            + f"-{uuid.uuid4().hex[:8]}"
         )
-        staging.mkdir(parents=True, exist_ok=False)
+        staging, staging_lease = _create_receive_staging_session(
+            staging_root, session_name
+        )
         summary = BatchSummary(staging_directory=str(staging))
 
         try:
@@ -1197,7 +1386,7 @@ class DownloadRunner:
                     summary.interrupted_reason = result.safety_pause_reason
                     self.state_callback("safety_paused")
                     break
-                if result.transient_failure:
+                if _is_unconfirmed_transient_failure(result):
                     consecutive_transient_failures += 1
                 else:
                     consecutive_transient_failures = 0
@@ -1222,7 +1411,10 @@ class DownloadRunner:
                     try:
                         self._cleanup_staging(staging)
                     finally:
-                        self._close_file_logger()
+                        try:
+                            self._close_file_logger()
+                        finally:
+                            staging_lease.release()
 
         if self._cancel.is_set():
             summary.cancelled = True
@@ -1253,7 +1445,8 @@ class DownloadRunner:
             delay = self.config.auto_retry_backoff_seconds * attempt
             self._emit(
                 "重试",
-                f"{accession} 发生瞬时网络或关联故障，{delay} 秒后进行第 {attempt + 1} 次尝试",
+                f"{accession} 发生网络、关联或 C-STORE 子操作故障，"
+                f"{delay} 秒后进行第 {attempt + 1} 次尝试",
                 "warning",
             )
             if self._cancel.wait(delay):
@@ -1264,7 +1457,8 @@ class DownloadRunner:
         retained_by_earlier_unconfirmed_attempt = (
             final.status in {AccessionStatus.FAILED, AccessionStatus.NO_DATA}
             and any(
-                result.file_count > 0 and result.transient_failure
+                result.file_count > 0
+                and _is_unconfirmed_transient_failure(result)
                 for result in attempts[:-1]
             )
         )
@@ -1507,17 +1701,44 @@ class DownloadRunner:
                         "movescu", getattr(process, "pid", 0), command[0], False
                     )
 
+        expected_before_drain = _move_expected_suboperations(diagnostics)
+        final_success = bool(
+            diagnostics.dimse_status_code == 0x0000
+            or (
+                diagnostics.final_response_status is not None
+                and re.match(
+                    r"success\b",
+                    diagnostics.final_response_status,
+                    re.IGNORECASE,
+                )
+            )
+        )
+        missing_final_response = bool(
+            not _move_has_final_response(diagnostics)
+            and (diagnostics.association_accepted or diagnostics.pending_responses)
+        )
+        received_before_drain = (
+            len(_files_in(staging) - before)
+            if final_success and expected_before_drain is not None
+            else 0
+        )
+        confirmed_delivery_gap = bool(
+            final_success
+            and expected_before_drain is not None
+            and received_before_drain < expected_before_drain
+        )
         if (
             not self._cancel.is_set()
-            and not _move_has_final_response(diagnostics)
-            and (
-                diagnostics.association_accepted
-                or diagnostics.pending_responses
-            )
+            and (missing_final_response or confirmed_delivery_gap)
         ):
             self._emit(
                 "storescp",
-                "C-MOVE 连接已结束，正在等待接收中的文件写入完成",
+                (
+                    "C-MOVE 报告的对象数尚未全部出现在接收目录，"
+                    "正在等待接收中的文件写入完成"
+                    if confirmed_delivery_gap
+                    else "C-MOVE 连接已结束，正在等待接收中的文件写入完成"
+                ),
                 "info",
             )
             drain_result = _wait_for_late_store_writes(
@@ -1528,7 +1749,11 @@ class DownloadRunner:
                 environment=_dcmtk_environment(self.tools),
             )
             transfer_finished = time.monotonic()
-            if drain_result is False and not safety_pause_reason:
+            if (
+                drain_result is False
+                and missing_final_response
+                and not safety_pause_reason
+            ):
                 safety_pause_reason = (
                     "接收文件在等待期内仍未完整写入，任务已安全暂停；"
                     "请检查 PACS、网络和接收器日志后重试当前检查号"
@@ -1705,14 +1930,29 @@ class DownloadRunner:
         ):
             message += f"；归属核对：{verification_message}"
 
+        retryable_suboperation_failure = bool(
+            (diagnostics.failed_suboperations or 0) > 0
+            or (diagnostics.remaining_suboperations or 0) > 0
+        )
+        pacs_expected_suboperations = _move_expected_suboperations(diagnostics)
+        retryable_archive_gap = bool(
+            pacs_expected_suboperations is not None
+            and accepted_file_count < pacs_expected_suboperations
+        )
         transient_failure = bool(
             not safety_pause_reason
             and receiver_exit_code is None
-            and not _move_has_final_response(diagnostics)
             and (
-                return_code != 0
-                or diagnostics.association_accepted
-                or diagnostics.pending_responses > 0
+                retryable_suboperation_failure
+                or retryable_archive_gap
+                or (
+                    not _move_has_final_response(diagnostics)
+                    and (
+                        return_code != 0
+                        or diagnostics.association_accepted
+                        or diagnostics.pending_responses > 0
+                    )
+                )
             )
         )
 
@@ -1749,6 +1989,7 @@ class DownloadRunner:
             sop_instance_count=len(archive_stats.sop_instance_uids),
             local_verified_files=accepted_file_count,
             pacs_completed_suboperations=diagnostics.completed_suboperations,
+            pacs_expected_suboperations=pacs_expected_suboperations,
             move_return_code=return_code,
             move_dimse_status=diagnostics.dimse_status_code,
             transient_failure=transient_failure,
@@ -1826,6 +2067,7 @@ class DownloadRunner:
         def read_output() -> None:
             if process.stdout is None:
                 return
+            suppress_pending_block = False
             for line in process.stdout:
                 text = line.rstrip()
                 if text:
@@ -1834,13 +2076,50 @@ class DownloadRunner:
                             self._storescp_abort_count += 1
                         elif source == "movescu" and diagnostics is not None:
                             _record_move_diagnostic(diagnostics, text)
+                    if source == "movescu":
+                        response = _MOVE_RESPONSE_RE.search(text)
+                        if response:
+                            suppress_pending_block = bool(
+                                re.match(
+                                    r"pending\b",
+                                    response.group("status").strip(),
+                                    re.IGNORECASE,
+                                )
+                            )
+                        elif _MOVE_DEBUG_PENDING_RESPONSE_RE.search(text):
+                            suppress_pending_block = True
+                        elif _MOVE_FINAL_RESPONSE_RE.search(text):
+                            suppress_pending_block = False
+                        dimse_status = _MOVE_DIMSE_STATUS_RE.search(text)
+                        if dimse_status and (
+                            int(dimse_status.group("code"), 16)
+                            not in _PENDING_DIMSE_STATUSES
+                        ):
+                            suppress_pending_block = False
+                    # ``movescu -d`` is required to parse final DIMSE counters,
+                    # but protocol traces and one verbose block per pending
+                    # response can contain thousands of lines. Writing them
+                    # synchronously to a task log on UNC/SMB can back-pressure
+                    # stdout and stall the C-MOVE. The parser above has already
+                    # retained the useful counters, so keep final and warning/
+                    # error diagnostics only.
+                    if (
+                        text.startswith(("D:", "T:"))
+                        or suppress_pending_block
+                    ) and not text.startswith(("W:", "E:", "F:")):
+                        continue
+                    association_abort = "Association Aborted" in text
                     level = (
                         "warning"
-                        if source == "movescu" and text.startswith(("E:", "F:"))
+                        if association_abort
+                        or (
+                            source == "movescu"
+                            and text.startswith(("E:", "F:"))
+                        )
                         else "error"
                         if text.startswith(("E:", "F:"))
-                        else "warning"
-                        if "Association Aborted" in text
+                        else "debug"
+                        if text.startswith(("D:", "T:"))
                         else "info"
                     )
                     self._emit(
@@ -1876,13 +2155,33 @@ class DownloadRunner:
             self._release_receiver_lease()
 
     def _cleanup_staging(self, staging: Path) -> None:
-        remaining = _files_in(staging)
+        try:
+            remaining = _files_in(staging)
+        except OSError as exc:
+            self._emit(
+                "应用",
+                f"无法检查接收暂存目录，文件已保留供人工恢复：{staging}（{exc}）",
+                "error",
+            )
+            return
         if remaining:
-            self._emit("应用", f"暂存目录仍有 {len(remaining)} 个文件：{staging}", "warning")
+            try:
+                destination = _quarantine_receive_staging(staging)
+            except OSError as exc:
+                self._emit(
+                    "应用",
+                    f"无法隔离暂存目录中的 {len(remaining)} 个文件：{staging}（{exc}）",
+                    "error",
+                )
+                return
+            self._emit(
+                "应用",
+                f"暂存目录仍有 {len(remaining)} 个文件，已移入隔离目录：{destination}",
+                "warning",
+            )
             return
         try:
             staging.rmdir()
-            staging.parent.rmdir()
         except OSError:
             pass
 
@@ -1914,7 +2213,11 @@ class DownloadRunner:
         *,
         file_level: str | None = None,
     ) -> None:
-        self.log_callback(source, message, level)
+        # DCMTK ``-d`` is required for reliable final sub-operation counters,
+        # but forwarding every protocol trace line to SSE would flood the UI
+        # on large studies. Keep debug output in the rotating task log only.
+        if level != "debug":
+            self.log_callback(source, message, level)
         log_level = {
             "debug": logging.DEBUG,
             "info": logging.INFO,
@@ -1976,12 +2279,169 @@ def safe_accession_dir(accession: str) -> str:
 
 
 def staging_directory_root(config: AppConfig) -> Path:
-    if config.anonymization_enabled:
-        return ensure_application_state_dir() / "staging"
-    return (
-        Path(config.dicom_destination_folder).expanduser().resolve()
-        / ".dcmget-staging"
-    )
+    # Receive locally first. Writing storescp directly to SMB/removable media
+    # makes a transient share outage interrupt C-STORE and can leave a study
+    # incomplete. Archive publication already handles cross-volume copies using
+    # a durable temporary file beside the final target.
+    return ensure_application_state_dir() / "staging"
+
+
+def _staging_session_lock_path(staging: Path) -> Path:
+    return staging.parent / f".{staging.name}.lock"
+
+
+def _staging_maintenance_lock_path(staging_root: Path) -> Path:
+    return staging_root / _STAGING_MAINTENANCE_LOCK_NAME
+
+
+def _staging_session_name_from_lock(lock_path: Path) -> str | None:
+    name = lock_path.name
+    if not name.startswith(".") or not name.endswith(".lock"):
+        return None
+    session_name = name[1:-5]
+    if not _RECEIVE_STAGING_SESSION_RE.fullmatch(session_name):
+        return None
+    return session_name
+
+
+def _create_receive_staging_session(
+    staging_root: Path,
+    session_name: str,
+) -> tuple[Path, FileLock]:
+    """Publish a locked session atomically with respect to orphan recovery."""
+
+    if not _RECEIVE_STAGING_SESSION_RE.fullmatch(session_name):
+        raise ValueError("接收暂存会话名称无效")
+    maintenance = FileLock(str(_staging_maintenance_lock_path(staging_root)))
+    try:
+        maintenance.acquire(timeout=_STAGING_MAINTENANCE_TIMEOUT_SECONDS)
+    except Timeout as exc:
+        raise RuntimeError("接收暂存目录正在维护，请稍后重试") from exc
+    except OSError as exc:
+        raise RuntimeError(f"无法锁定接收暂存目录：{exc}") from exc
+
+    staging = staging_root / session_name
+    lock_path = _staging_session_lock_path(staging)
+    lease = FileLock(str(lock_path))
+    acquired = False
+    try:
+        lease.acquire(timeout=0)
+        acquired = True
+        staging.mkdir(parents=False, exist_ok=False, mode=0o700)
+        return staging, lease
+    except BaseException:
+        if acquired:
+            lease.release()
+        lock_path.unlink(missing_ok=True)
+        raise
+    finally:
+        maintenance.release()
+
+
+def _quarantine_receive_staging(staging: Path) -> Path:
+    quarantine_root = staging.parent.parent / "quarantine" / "receiver-staging"
+    quarantine_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = quarantine_root / staging.name
+    suffix = 1
+    while destination.exists():
+        destination = quarantine_root / f"{staging.name}-{suffix}"
+        suffix += 1
+    try:
+        staging.replace(destination)
+    except OSError:
+        shutil.move(str(staging), str(destination))
+    return destination
+
+
+def _recover_orphaned_receive_staging(staging_root: Path) -> list[str]:
+    """Quarantine crashed receive sessions without touching active profiles."""
+
+    if not staging_root.is_dir():
+        return []
+    messages: list[str] = []
+    maintenance = FileLock(str(_staging_maintenance_lock_path(staging_root)))
+    try:
+        maintenance.acquire(timeout=0)
+    except Timeout:
+        return ["其他实例正在检查接收暂存目录，本次已安全跳过"]
+    except OSError as exc:
+        return [f"无法锁定接收暂存目录进行恢复检查：{staging_root}（{exc}）"]
+    try:
+        try:
+            entries = list(staging_root.iterdir())
+        except OSError as exc:
+            return [f"无法扫描异常退出遗留的暂存目录：{staging_root}（{exc}）"]
+        sessions = sorted(entry for entry in entries if entry.is_dir())
+        for staging in sessions:
+            if _LEGACY_RECEIVE_STAGING_SESSION_RE.fullmatch(staging.name):
+                messages.append(
+                    f"检测到旧版无锁接收暂存目录，无法确认是否仍在使用，已保留未处理：{staging}"
+                )
+                continue
+            if not _RECEIVE_STAGING_SESSION_RE.fullmatch(staging.name):
+                continue
+            lock_path = _staging_session_lock_path(staging)
+            lease = FileLock(str(lock_path))
+            try:
+                lease.acquire(timeout=0)
+            except Timeout:
+                continue
+            except OSError as exc:
+                messages.append(
+                    f"无法锁定异常退出遗留的暂存目录：{staging}（{exc}）"
+                )
+                continue
+            remove_lock = False
+            try:
+                if not staging.is_dir():
+                    remove_lock = True
+                    continue
+                try:
+                    has_files = bool(_files_in(staging))
+                except OSError as exc:
+                    messages.append(
+                        f"无法检查异常退出遗留的暂存文件：{staging}（{exc}）"
+                    )
+                    continue
+                if has_files:
+                    try:
+                        destination = _quarantine_receive_staging(staging)
+                    except OSError as exc:
+                        messages.append(
+                            f"无法隔离异常退出遗留的暂存文件：{staging}（{exc}）"
+                        )
+                    else:
+                        remove_lock = True
+                        messages.append(
+                            f"异常退出遗留的暂存文件已移入隔离目录：{destination}"
+                        )
+                else:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    remove_lock = not staging.exists()
+            finally:
+                lease.release()
+                if remove_lock:
+                    lock_path.unlink(missing_ok=True)
+
+        # UUID session names are never reused. Once their directory is gone
+        # and their lease is free, the matching lock file is permanently stale.
+        # The maintenance lease serializes this cleanup across profiles and
+        # avoids unlinking a lock inode another recovery scanner is using.
+        for lock_path in entries:
+            session_name = _staging_session_name_from_lock(lock_path)
+            if session_name is None or (staging_root / session_name).exists():
+                continue
+            lease = FileLock(str(lock_path))
+            try:
+                lease.acquire(timeout=0)
+            except (OSError, Timeout):
+                continue
+            else:
+                lease.release()
+                lock_path.unlink(missing_ok=True)
+        return messages
+    finally:
+        maintenance.release()
 
 
 def log_directory(config: AppConfig) -> Path:
@@ -2822,7 +3282,10 @@ def _locked_archive_target(target: Path):
         lock_directory.chmod(0o700)
     except OSError:
         pass
-    lock_path = lock_directory / f"{digest}.lock"
+    # A fixed shard pool bounds metadata growth for 40k-accession batches.
+    # Hash collisions only serialize unrelated publications; the final target
+    # checks still provide the correctness guarantee inside the lease.
+    lock_path = lock_directory / f"{digest[:_ARCHIVE_LOCK_SHARD_HEX_LENGTH]}.lock"
     with _archive_publish_lock, FileLock(str(lock_path), timeout=300):
         yield
 

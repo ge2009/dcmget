@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +13,8 @@ from dcmget.config import AppConfig
 from dcmget.core import AccessionResult, AccessionStatus, BatchSummary, ToolPaths
 from dcmget.licensing import LicenseError, TrialInfo
 from dcmget.pdi import PdiExportResult, PdiStatus
-from dcmget.task_ledger import TaskLedger
-from dcmget.task_state import TaskCheckpointStore
+from dcmget.task_ledger import TaskLedger, TaskLedgerError
+from dcmget.task_state import TaskCheckpointStore, TaskStateError
 
 
 def _tools(tmp_path: Path) -> ToolPaths:
@@ -292,6 +293,149 @@ def test_pdi_runs_after_download_and_retry_keeps_checkpoint(tmp_path):
     assert exports == [["/A001.dcm"], ["/A001.dcm"]]
 
 
+def test_shutdown_during_download_to_pdi_handoff_keeps_pdi_pending(tmp_path):
+    runner_started = threading.Event()
+    finish_download = threading.Event()
+    exporter_calls: list[list[str]] = []
+
+    class Runner(_CompletingRunner):
+        def run(self, accessions):
+            values = list(accessions)
+            runner_started.set()
+            assert finish_download.wait(2)
+            results = []
+            for index, accession in enumerate(values, 1):
+                result = AccessionResult(
+                    accession,
+                    AccessionStatus.COMPLETED,
+                    file_count=1,
+                    archived_files=[str(tmp_path / f"{accession}.dcm")],
+                )
+                self.callbacks["progress_callback"](index, len(values), result)
+                results.append(result)
+            return BatchSummary(results)
+
+        def request_cancel(self):
+            super().request_cancel()
+            finish_download.set()
+
+    class Exporter:
+        def __init__(self, *_args, **_kwargs):
+            exporter_calls.append([])
+
+        def request_cancel(self):
+            pass
+
+        def export(self, files):
+            exporter_calls[-1].extend(files)
+            return PdiExportResult(PdiStatus.COMPLETED)
+
+    service = _service(
+        tmp_path,
+        runner_factory=Runner,
+        pdi_exporter_factory=Exporter,
+    )
+    service.start_task(
+        AppConfig(pdi_export_enabled=True, pdi_institution_name="测试医院"),
+        _tools(tmp_path),
+        ["A001"],
+    )
+    assert runner_started.wait(1)
+
+    assert service.shutdown(timeout=2) is True
+
+    assert Runner.instances[-1].cancelled is True
+    assert exporter_calls == []
+    checkpoint = service.task_store.load(include_archived_files=False)
+    assert checkpoint is not None
+    assert checkpoint.phase == "pdi_pending"
+    assert service.snapshot()["status"] == "stopped"
+
+
+@pytest.mark.parametrize("stop_action", ["shutdown", "cancel"])
+def test_stop_in_narrow_download_to_pdi_handoff_never_starts_exporter(
+    tmp_path, monkeypatch, stop_action
+):
+    handoff_started = threading.Event()
+    allow_handoff = threading.Event()
+    exporter_calls: list[str] = []
+
+    class Runner(_CompletingRunner):
+        def run(self, accessions):
+            values = list(accessions)
+            results = []
+            for index, accession in enumerate(values, 1):
+                result = AccessionResult(
+                    accession,
+                    AccessionStatus.COMPLETED,
+                    file_count=1,
+                    archived_files=[str(tmp_path / f"{accession}.dcm")],
+                )
+                self.callbacks["progress_callback"](index, len(values), result)
+                results.append(result)
+            return BatchSummary(results)
+
+    class Exporter:
+        def __init__(self, *_args, **_kwargs):
+            exporter_calls.append("init")
+
+        def request_cancel(self):
+            exporter_calls.append("cancel")
+
+        def export(self, _files):
+            exporter_calls.append("export")
+            return PdiExportResult(PdiStatus.COMPLETED)
+
+    service = _service(
+        tmp_path,
+        runner_factory=Runner,
+        pdi_exporter_factory=Exporter,
+    )
+    original_launch = service._launch_pdi
+
+    def blocking_launch(*args, **kwargs):
+        handoff_started.set()
+        assert allow_handoff.wait(2)
+        return original_launch(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_launch_pdi", blocking_launch)
+    service.start_task(
+        AppConfig(pdi_export_enabled=True, pdi_institution_name="测试医院"),
+        _tools(tmp_path),
+        ["A001"],
+    )
+    assert handoff_started.wait(1)
+
+    shutdown_result: list[bool] = []
+    if stop_action == "shutdown":
+        stop_thread = threading.Thread(
+            target=lambda: shutdown_result.append(service.shutdown(timeout=2))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1
+        while service.snapshot()["status"] != "shutting_down":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    else:
+        service.cancel()
+        stop_thread = None
+
+    allow_handoff.set()
+    if stop_thread is not None:
+        stop_thread.join(2)
+        assert shutdown_result == [True]
+    else:
+        assert service.wait(2)
+
+    assert exporter_calls == []
+    checkpoint = service.task_store.load(include_archived_files=False)
+    assert checkpoint is not None
+    assert checkpoint.phase == "pdi_pending"
+    assert service.snapshot()["status"] == (
+        "stopped" if stop_action == "shutdown" else "cancelled"
+    )
+
+
 def test_large_task_snapshot_is_aggregated_and_does_not_return_accession_list(
     tmp_path,
 ):
@@ -536,6 +680,330 @@ def test_locked_checkpoint_does_not_advertise_end_action(tmp_path):
         assert snapshot["actions"]["can_end"] is False
     finally:
         owner.release_lease()
+
+
+def test_recovery_error_can_quarantine_old_task_and_return_to_idle(tmp_path):
+    path = tmp_path / "active-task.sqlite3"
+    path.write_bytes(b"not-a-sqlite-database")
+    retained_image = tmp_path / "dicom" / "retained.dcm"
+    retained_image.parent.mkdir()
+    retained_image.write_bytes(b"DICM-retained")
+    service = DcmGetAppService(
+        task_store=TaskCheckpointStore(path),
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+
+    blocked = service.snapshot()
+    assert blocked["status"] == "recovery_error"
+    assert blocked["actions"]["can_start"] is False
+    assert blocked["actions"]["can_end"] is False
+    assert blocked["actions"]["can_discard_recovery"] is True
+
+    cleared = service.end_task()
+
+    assert cleared["status"] == "idle"
+    assert cleared["actions"]["can_start"] is True
+    assert cleared["actions"]["can_discard_recovery"] is False
+    assert not path.exists()
+    backups = list((tmp_path / "recovery-quarantine").glob("active-task-*"))
+    assert len(backups) == 1
+    assert (backups[0] / path.name).read_bytes() == b"not-a-sqlite-database"
+    assert retained_image.read_bytes() == b"DICM-retained"
+    assert "已下载图像未删除" in cleared["message"]
+
+
+def test_recovery_cleanup_blocks_a_concurrent_new_task_after_checkpoint_removal(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "active-task.sqlite3"
+    path.write_bytes(b"not-a-sqlite-database")
+    service = DcmGetAppService(
+        task_store=TaskCheckpointStore(path),
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+    checkpoint_removed = threading.Event()
+    allow_cleanup = threading.Event()
+    original_quarantine = service.task_store.quarantine_incompatible
+
+    def blocking_quarantine():
+        backup = original_quarantine()
+        checkpoint_removed.set()
+        assert allow_cleanup.wait(2)
+        return backup
+
+    monkeypatch.setattr(
+        service.task_store, "quarantine_incompatible", blocking_quarantine
+    )
+    cleanup_result: list[dict[str, object]] = []
+    thread = threading.Thread(target=lambda: cleanup_result.append(service.end_task()))
+    thread.start()
+    assert checkpoint_removed.wait(2)
+
+    with pytest.raises(AppServiceError, match="另一个任务操作正在处理"):
+        service.start_task(AppConfig(), _tools(tmp_path), ["NEW001"])
+
+    allow_cleanup.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert cleanup_result[0]["status"] == "idle"
+    assert service.snapshot()["task"]["id"] == ""
+
+
+def test_shutdown_waits_for_recovery_cleanup_and_remains_stopped(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "active-task.sqlite3"
+    path.write_bytes(b"not-a-sqlite-database")
+    service = DcmGetAppService(
+        task_store=TaskCheckpointStore(path),
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+    checkpoint_removed = threading.Event()
+    allow_cleanup = threading.Event()
+    original_quarantine = service.task_store.quarantine_incompatible
+
+    def blocking_quarantine():
+        backup = original_quarantine()
+        checkpoint_removed.set()
+        assert allow_cleanup.wait(2)
+        return backup
+
+    monkeypatch.setattr(
+        service.task_store, "quarantine_incompatible", blocking_quarantine
+    )
+    cleanup_thread = threading.Thread(target=service.end_task)
+    cleanup_thread.start()
+    assert checkpoint_removed.wait(2)
+    shutdown_result: list[bool] = []
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_result.append(service.shutdown(timeout=2))
+    )
+    shutdown_thread.start()
+    time.sleep(0.05)
+    assert shutdown_thread.is_alive()
+    assert service.snapshot()["status"] == "shutting_down"
+
+    allow_cleanup.set()
+    cleanup_thread.join(2)
+    shutdown_thread.join(2)
+
+    assert not cleanup_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert shutdown_result == [True]
+    snapshot = service.snapshot()
+    assert snapshot["status"] == "stopped"
+    assert snapshot["actions"]["can_start"] is False
+
+
+def test_shutdown_waits_for_start_publication_then_cancels_launched_worker(
+    tmp_path, monkeypatch
+):
+    authorization_started = threading.Event()
+    allow_authorization = threading.Event()
+    runner_started = threading.Event()
+    runner_stopped = threading.Event()
+
+    class Runner(_CompletingRunner):
+        def run(self, _accessions):
+            runner_started.set()
+            assert runner_stopped.wait(2)
+            return BatchSummary(cancelled=True)
+
+        def request_cancel(self):
+            super().request_cancel()
+            runner_stopped.set()
+
+    service = _service(tmp_path, runner_factory=Runner)
+
+    def authorize() -> bool:
+        authorization_started.set()
+        assert allow_authorization.wait(2)
+        return False
+
+    monkeypatch.setattr(service, "_authorize_new_task", authorize)
+    start_errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            service.start_task(AppConfig(), _tools(tmp_path), ["A001"])
+        except BaseException as exc:  # pragma: no cover - asserted below
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(target=start)
+    start_thread.start()
+    assert authorization_started.wait(1)
+    shutdown_result: list[bool] = []
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_result.append(service.shutdown(timeout=2))
+    )
+    shutdown_thread.start()
+    time.sleep(0.05)
+    assert shutdown_thread.is_alive()
+
+    allow_authorization.set()
+    start_thread.join(2)
+    shutdown_thread.join(2)
+
+    assert not start_errors
+    assert runner_started.is_set()
+    assert Runner.instances[-1].cancelled is True
+    assert shutdown_result == [True]
+    assert service.snapshot()["status"] == "stopped"
+
+
+def test_shutdown_waits_for_idle_task_end_cleanup_and_remains_stopped(
+    tmp_path, monkeypatch
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    service = DcmGetAppService(
+        task_store=store,
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+    cleanup_started = threading.Event()
+    allow_cleanup = threading.Event()
+
+    def blocking_cleanup(task_id):
+        assert task_id == checkpoint.task_id
+        cleanup_started.set()
+        assert allow_cleanup.wait(2)
+        return []
+
+    monkeypatch.setattr(store, "cleanup_recorded_processes", blocking_cleanup)
+    end_thread = threading.Thread(target=service.end_task)
+    end_thread.start()
+    assert cleanup_started.wait(1)
+    shutdown_result: list[bool] = []
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_result.append(service.shutdown(timeout=2))
+    )
+    shutdown_thread.start()
+    time.sleep(0.05)
+    assert shutdown_thread.is_alive()
+
+    allow_cleanup.set()
+    end_thread.join(2)
+    shutdown_thread.join(2)
+
+    assert shutdown_result == [True]
+    assert service.snapshot()["status"] == "stopped"
+
+
+def test_shutdown_waits_for_accept_partial_cleanup_and_remains_stopped(
+    tmp_path, monkeypatch
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult("A001", AccessionStatus.FAILED),
+    )
+    store.set_phase(checkpoint.task_id, "download_retryable")
+    service = DcmGetAppService(
+        task_store=store,
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+    clear_started = threading.Event()
+    allow_clear = threading.Event()
+    original_clear = store.clear
+
+    def blocking_clear(task_id):
+        clear_started.set()
+        assert allow_clear.wait(2)
+        return original_clear(task_id)
+
+    monkeypatch.setattr(store, "clear", blocking_clear)
+    accept_thread = threading.Thread(target=service.accept_partial)
+    accept_thread.start()
+    assert clear_started.wait(1)
+    shutdown_result: list[bool] = []
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_result.append(service.shutdown(timeout=2))
+    )
+    shutdown_thread.start()
+    time.sleep(0.05)
+    assert shutdown_thread.is_alive()
+
+    allow_clear.set()
+    accept_thread.join(2)
+    shutdown_thread.join(2)
+
+    assert shutdown_result == [True]
+    assert service.snapshot()["status"] == "stopped"
+
+
+def test_failed_recovery_cleanup_restores_state_and_releases_task_lease(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "active-task.sqlite3"
+    path.write_bytes(b"not-a-sqlite-database")
+    service = DcmGetAppService(
+        task_store=TaskCheckpointStore(path),
+        task_ledger=TaskLedger(tmp_path / "task-ledger.sqlite3"),
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+
+    def fail_cleanup():
+        raise TaskStateError("disk full")
+
+    monkeypatch.setattr(
+        service.task_store,
+        "quarantine_incompatible",
+        fail_cleanup,
+    )
+
+    with pytest.raises(AppServiceError, match="清理旧任务失败"):
+        service.end_task()
+
+    snapshot = service.snapshot()
+    assert snapshot["status"] == "recovery_error"
+    assert snapshot["actions"]["can_discard_recovery"] is True
+    assert service.task_store.lease_held is False
+
+
+def test_ledger_failure_is_not_misclassified_as_discardable_checkpoint_damage(
+    tmp_path, monkeypatch
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    store.release_lease()
+    ledger = TaskLedger(tmp_path / "task-ledger.sqlite3")
+
+    def fail_ledger_load(_batch_id):
+        raise TaskLedgerError("database is corrupt")
+
+    monkeypatch.setattr(
+        ledger,
+        "load_batch",
+        fail_ledger_load,
+    )
+
+    service = DcmGetAppService(
+        task_store=store,
+        task_ledger=ledger,
+        project_root=tmp_path,
+        load_license_fn=lambda: object(),
+    )
+
+    snapshot = service.snapshot()
+    assert snapshot["status"] == "ledger_error"
+    assert snapshot["actions"]["can_discard_recovery"] is False
+    assert snapshot["actions"]["can_end"] is False
+    assert store.path.is_file()
+    with pytest.raises(AppServiceError, match="验收台账无法读取"):
+        service.end_task()
+    assert store.load_required().task_id == checkpoint.task_id
 
 
 def test_end_keeps_checkpoint_when_recorded_process_cannot_be_stopped(
