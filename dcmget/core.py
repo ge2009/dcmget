@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -35,7 +36,6 @@ from .diagnostics import PrivateRotatingFileHandler
 from .runtime import ensure_application_state_dir, portable_dcmtk_bin
 
 
-_archive_publish_lock = threading.Lock()
 _RECEIVER_BIND_ADDRESS = "0.0.0.0"
 _RECEIVE_STAGING_SESSION_RE = re.compile(
     r"^\d{8}-\d{6}-\d{6}-[0-9a-f]{8}$",
@@ -48,6 +48,13 @@ _LEGACY_RECEIVE_STAGING_SESSION_RE = re.compile(
 _STAGING_MAINTENANCE_LOCK_NAME = ".receiver-staging-maintenance.lock"
 _STAGING_MAINTENANCE_TIMEOUT_SECONDS = 30.0
 _ARCHIVE_LOCK_SHARD_HEX_LENGTH = 3
+_ARCHIVE_THREAD_LOCKS = tuple(
+    threading.Lock()
+    for _ in range(1 << (4 * _ARCHIVE_LOCK_SHARD_HEX_LENGTH))
+)
+_WINDOWS_DRIVE_REMOTE = 4
+_REMOTE_ARCHIVE_WORKERS = 2
+_ARCHIVE_COPY_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 class AccessionStatus(str, Enum):
@@ -1327,21 +1334,52 @@ class DownloadRunner:
 
     def run(self, accessions: Iterable[str]) -> BatchSummary:
         values = list(accessions)
-        staging_root = staging_directory_root(self.config)
-        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for recovery_message in _recover_orphaned_receive_staging(staging_root):
-            self._emit(
-                "应用",
-                recovery_message,
-                "error" if recovery_message.startswith("无法") else "warning",
+        try:
+            staging_root = staging_directory_root(self.config)
+            staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination_root = Path(
+                self.config.dicom_destination_folder
+            ).expanduser()
+            if staging_root.name == ".dcmget-staging":
+                if _destination_is_remote(destination_root):
+                    message = (
+                        "网络共享使用目标目录高速暂存，不经过 C 盘；"
+                        f"元数据解析使用 {_REMOTE_ARCHIVE_WORKERS} 路有界并发，"
+                        "同一目标串行发布、不同目标可并发；"
+                        "共享中断时会记录缺口并按现有策略重试或安全暂停"
+                    )
+                else:
+                    message = "目标盘高速暂存已启用，归档时执行同卷原子移动"
+                self._emit("存储", message, "info")
+            elif _destination_is_remote(destination_root):
+                self._emit(
+                    "存储",
+                    "匿名任务先在本机私有目录接收原片，再串行匿名与归档",
+                    "info",
+                )
+            for recovery_root in _receive_staging_recovery_roots(
+                self.config, staging_root
+            ):
+                for recovery_message in _recover_orphaned_receive_staging(
+                    recovery_root
+                ):
+                    self._emit(
+                        "应用",
+                        recovery_message,
+                        "error"
+                        if recovery_message.startswith("无法")
+                        else "warning",
+                    )
+            session_name = (
+                datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                + f"-{uuid.uuid4().hex[:8]}"
             )
-        session_name = (
-            datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            + f"-{uuid.uuid4().hex[:8]}"
-        )
-        staging, staging_lease = _create_receive_staging_session(
-            staging_root, session_name
-        )
+            staging, staging_lease = _create_receive_staging_session(
+                staging_root, session_name
+            )
+        except BaseException:
+            self._close_file_logger()
+            raise
         summary = BatchSummary(staging_directory=str(staging))
 
         try:
@@ -1817,6 +1855,23 @@ class DownloadRunner:
             [*moved, *archive_stats.conflict_files], destination_root
         )
         duration = time.monotonic() - started
+        post_receive_seconds = max(0.0, duration - transfer_seconds)
+        if candidate_files:
+            archive_speed = (
+                received_bytes / post_receive_seconds
+                if post_receive_seconds > 0
+                else 0.0
+            )
+            self._emit(
+                "归档",
+                (
+                    f"{accession}：接收耗时 {transfer_seconds:.1f} 秒；"
+                    f"接收后校验与归档 {len(candidate_files)} 个文件耗时 "
+                    f"{post_receive_seconds:.1f} 秒，处理吞吐 "
+                    f"{_format_bytes(int(archive_speed))}/s"
+                ),
+                "info",
+            )
         with self._diagnostic_lock:
             receiver_aborts = self._storescp_abort_count - aborts_before
         move_problem = _move_has_problem(diagnostics)
@@ -2109,6 +2164,15 @@ class DownloadRunner:
                     ) and not text.startswith(("W:", "E:", "F:")):
                         continue
                     association_abort = "Association Aborted" in text
+                    if (
+                        source == "storescp"
+                        and not association_abort
+                        and not text.startswith(("W:", "E:", "F:"))
+                    ):
+                        # storescp -v is retained so association aborts remain
+                        # observable, but its per-object INFO stream must not
+                        # be written synchronously to a task log on SMB.
+                        continue
                     level = (
                         "warning"
                         if association_abort
@@ -2279,11 +2343,60 @@ def safe_accession_dir(accession: str) -> str:
 
 
 def staging_directory_root(config: AppConfig) -> Path:
-    # Receive locally first. Writing storescp directly to SMB/removable media
-    # makes a transient share outage interrupt C-STORE and can leave a study
-    # incomplete. Archive publication already handles cross-volume copies using
-    # a durable temporary file beside the final target.
-    return ensure_application_state_dir() / "staging"
+    # Performance-first receive path: non-anonymous files are staged beside the
+    # final destination and published with os.replace(), so local disks and SMB
+    # shares avoid a complete C: -> target copy. A share interruption can now
+    # fail the active C-STORE; the existing sub-operation gap/retry logic keeps
+    # completed files and retries the missing objects. Anonymous source files
+    # must remain in private application state until transformed and validated.
+    if config.anonymization_enabled:
+        return ensure_application_state_dir() / "staging"
+    return (
+        Path(config.dicom_destination_folder).expanduser().resolve()
+        / ".dcmget-staging"
+    )
+
+
+def _receive_staging_recovery_roots(
+    config: AppConfig,
+    primary: Path | None = None,
+) -> tuple[Path, ...]:
+    primary_root = primary or staging_directory_root(config)
+    legacy_private_root = ensure_application_state_dir() / "staging"
+    if legacy_private_root == primary_root:
+        return (primary_root,)
+    return primary_root, legacy_private_root
+
+
+def _running_on_windows() -> bool:
+    return os.name == "nt"
+
+
+def _windows_drive_type(path: Path) -> int | None:
+    """Return Win32 GetDriveTypeW without treating UNC shares as fixed disks."""
+
+    raw_path = str(path)
+    if raw_path.startswith((r"\\", "//")):
+        return _WINDOWS_DRIVE_REMOTE
+    drive, _tail = ntpath.splitdrive(raw_path)
+    if not re.fullmatch(r"[A-Za-z]:", drive):
+        return None
+    try:
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _destination_is_remote(path: Path) -> bool:
+    raw_path = str(path)
+    if raw_path.startswith((r"\\", "//")):
+        return True
+    return bool(
+        _running_on_windows()
+        and _windows_drive_type(path) == _WINDOWS_DRIVE_REMOTE
+    )
 
 
 def _staging_session_lock_path(staging: Path) -> Path:
@@ -2339,7 +2452,14 @@ def _create_receive_staging_session(
 
 
 def _quarantine_receive_staging(staging: Path) -> Path:
-    quarantine_root = staging.parent.parent / "quarantine" / "receiver-staging"
+    if staging.parent.name == ".dcmget-staging":
+        quarantine_root = (
+            staging.parent.parent
+            / ".dcmget-quarantine"
+            / "receiver-staging"
+        )
+    else:
+        quarantine_root = staging.parent.parent / "quarantine" / "receiver-staging"
     quarantine_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = quarantine_root / staging.name
     suffix = 1
@@ -2555,6 +2675,8 @@ def _archive_dicom_files(
     cancel_event: threading.Event | None = None,
     route_accession: str | None = None,
     stats: ArchiveStats | None = None,
+    archive_workers: int | None = None,
+    _validation_errors: dict[Path, str] | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
     from pydicom.uid import UID
@@ -2566,12 +2688,49 @@ def _archive_dicom_files(
     values = list(files)
     if not values:
         return moved, rejected
-    validation_errors = _validate_dicom_files(
-        values,
-        dcmdump=dcmdump,
-        environment=dcmtk_environment,
-        cancel_event=cancel_event,
+    validation_errors = (
+        _validation_errors
+        if _validation_errors is not None
+        else _validate_dicom_files(
+            values,
+            dcmdump=dcmdump,
+            environment=dcmtk_environment,
+            cancel_event=cancel_event,
+        )
     )
+    if archive_workers is None:
+        worker_count = (
+            _REMOTE_ARCHIVE_WORKERS
+            if _destination_is_remote(destination_root)
+            else 1
+        )
+    else:
+        worker_count = max(1, min(int(archive_workers), 4))
+    if cancel_event is not None and cancel_event.is_set():
+        return moved, rejected
+    if worker_count > 1 and anonymizer is None and len(values) > 1:
+        publication_keys = _archive_publication_order_keys(
+            values,
+            validation_errors,
+            cancel_event=cancel_event,
+        )
+        if publication_keys is None:
+            return moved, rejected
+        return _archive_dicom_files_in_parallel(
+            values,
+            destination_root,
+            directory_template,
+            fallback_accession,
+            error_callback=error_callback,
+            dcmdump=dcmdump,
+            dcmtk_environment=dcmtk_environment,
+            cancel_event=cancel_event,
+            route_accession=route_accession,
+            stats=archive_stats,
+            archive_workers=worker_count,
+            validation_errors=validation_errors,
+            publication_keys=publication_keys,
+        )
     for source in values:
         if cancel_event is not None and cancel_event.is_set():
             break
@@ -2739,6 +2898,170 @@ def _archive_dicom_files(
         if target not in moved:
             moved.append(target)
     return moved, rejected
+
+
+def _archive_dicom_files_in_parallel(
+    files: list[Path],
+    destination_root: Path,
+    directory_template: str,
+    fallback_accession: str,
+    *,
+    error_callback: ArchiveErrorCallback | None,
+    dcmdump: Path | None,
+    dcmtk_environment: dict[str, str] | None,
+    cancel_event: threading.Event | None,
+    route_accession: str | None,
+    stats: ArchiveStats,
+    archive_workers: int,
+    validation_errors: dict[Path, str],
+    publication_keys: list[str],
+) -> tuple[list[Path], list[Path]]:
+    """Publish validated files concurrently while preserving result order."""
+
+    def archive_one(
+        source: Path,
+    ) -> tuple[
+        list[Path],
+        list[Path],
+        ArchiveStats,
+        list[tuple[Path, str]],
+    ]:
+        local_stats = ArchiveStats()
+        local_errors: list[tuple[Path, str]] = []
+        local_moved, local_rejected = _archive_dicom_files(
+            [source],
+            destination_root,
+            directory_template,
+            fallback_accession,
+            error_callback=lambda path, message: local_errors.append(
+                (path, message)
+            ),
+            dcmdump=dcmdump,
+            dcmtk_environment=dcmtk_environment,
+            cancel_event=cancel_event,
+            route_accession=route_accession,
+            stats=local_stats,
+            archive_workers=1,
+            _validation_errors=validation_errors,
+        )
+        return local_moved, local_rejected, local_stats, local_errors
+
+    moved: list[Path] = []
+    rejected: list[Path] = []
+    outcomes: dict[
+        int,
+        tuple[
+            list[Path],
+            list[Path],
+            ArchiveStats,
+            list[tuple[Path, str]],
+        ],
+    ] = {}
+    with ThreadPoolExecutor(
+        max_workers=archive_workers,
+        thread_name_prefix="dcmget-archive",
+    ) as executor:
+        waiting_by_key: dict[str, deque[tuple[int, Path]]] = {}
+        ready_keys: deque[str] = deque()
+        for index, (source, key) in enumerate(zip(files, publication_keys)):
+            queue = waiting_by_key.get(key)
+            if queue is None:
+                queue = deque()
+                waiting_by_key[key] = queue
+                ready_keys.append(key)
+            queue.append((index, source))
+        pending = {}
+
+        def submit_next() -> bool:
+            if not ready_keys:
+                return False
+            key = ready_keys.popleft()
+            index, source = waiting_by_key[key].popleft()
+            future = executor.submit(archive_one, source)
+            pending[future] = index, key
+            return True
+
+        for _ in range(archive_workers):
+            if not submit_next():
+                break
+        while pending:
+            completed, _not_done = wait(
+                tuple(pending),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed:
+                index, key = pending.pop(future)
+                outcomes[index] = future.result()
+                queue = waiting_by_key[key]
+                if queue:
+                    ready_keys.append(key)
+                else:
+                    del waiting_by_key[key]
+                if cancel_event is None or not cancel_event.is_set():
+                    while len(pending) < archive_workers and submit_next():
+                        pass
+
+    for index in sorted(outcomes):
+        local_moved, local_rejected, local_stats, local_errors = outcomes[index]
+        for source, message in local_errors:
+            if error_callback is not None:
+                error_callback(source, message)
+        for path in local_moved:
+            if path not in moved:
+                moved.append(path)
+        rejected.extend(local_rejected)
+        _merge_archive_stats(stats, local_stats)
+    return moved, rejected
+
+
+def _archive_publication_order_keys(
+    files: list[Path],
+    validation_errors: dict[Path, str],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> list[str] | None:
+    """Serialize duplicate SOP publications while unrelated files stay parallel."""
+
+    from pydicom import dcmread
+
+    keys: list[str] = []
+    for index, source in enumerate(files):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if source in validation_errors:
+            keys.append(f"invalid:{index}")
+            continue
+        try:
+            dataset = dcmread(
+                source,
+                stop_before_pixels=True,
+                force=True,
+                specific_tags=["SOPInstanceUID"],
+            )
+            sop_instance_uid = str(
+                getattr(dataset, "SOPInstanceUID", "") or ""
+            ).strip()
+        except Exception:
+            sop_instance_uid = ""
+        keys.append(
+            f"sop:{sop_instance_uid}"
+            if sop_instance_uid
+            else f"source:{index}"
+        )
+    return keys
+
+
+def _merge_archive_stats(target: ArchiveStats, source: ArchiveStats) -> None:
+    target.new_file_count += source.new_file_count
+    target.existing_skipped_count += source.existing_skipped_count
+    target.conflict_preserved_count += source.conflict_preserved_count
+    target.conflict_files.extend(source.conflict_files)
+    target.source_accessions.update(source.source_accessions)
+    target.missing_accession_count += source.missing_accession_count
+    target.study_instance_uids.update(source.study_instance_uids)
+    target.series_instance_uids.update(source.series_instance_uids)
+    target.sop_instance_uids.update(source.sop_instance_uids)
+    target.observations.extend(source.observations)
 
 
 def _validate_dicom_files(
@@ -2922,12 +3245,12 @@ def _publish_or_deduplicate(
             if not _is_cross_device_error(exc):
                 raise
 
-    # Multi-task staging lives in the private application-state directory,
-    # which is commonly on C: while users save DICOM to D: or removable media.
-    # Copy into a temporary file beside the target, make the bytes durable, then
-    # perform the final same-volume rename under the publication lock.  The
-    # source is deliberately retained until a complete target is published or
-    # an identical target has been verified.
+    # Cross-volume fallback is still required for anonymous output and legacy
+    # private staging recovered after an upgrade. Copy into a temporary file
+    # beside the target, make the bytes durable, then perform the final
+    # same-volume rename under the publication lock. The source is deliberately
+    # retained until a complete target is published or an identical target has
+    # been verified.
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".dcmget-publish-",
         suffix=".part",
@@ -2936,7 +3259,11 @@ def _publish_or_deduplicate(
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
-            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            shutil.copyfileobj(
+                reader,
+                writer,
+                length=_ARCHIVE_COPY_BUFFER_BYTES,
+            )
             writer.flush()
             os.fsync(writer.fileno())
         with _locked_archive_target(target):
@@ -3251,7 +3578,11 @@ def _preserve_conflicting_source(
         )
         temporary = Path(temporary_name)
         with os.fdopen(descriptor, "wb") as writer, source.open("rb") as reader:
-            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            shutil.copyfileobj(
+                reader,
+                writer,
+                length=_ARCHIVE_COPY_BUFFER_BYTES,
+            )
             writer.flush()
             os.fsync(writer.fileno())
         os.replace(temporary, conflict)
@@ -3285,8 +3616,10 @@ def _locked_archive_target(target: Path):
     # A fixed shard pool bounds metadata growth for 40k-accession batches.
     # Hash collisions only serialize unrelated publications; the final target
     # checks still provide the correctness guarantee inside the lease.
-    lock_path = lock_directory / f"{digest[:_ARCHIVE_LOCK_SHARD_HEX_LENGTH]}.lock"
-    with _archive_publish_lock, FileLock(str(lock_path), timeout=300):
+    shard_hex = digest[:_ARCHIVE_LOCK_SHARD_HEX_LENGTH]
+    lock_path = lock_directory / f"{shard_hex}.lock"
+    thread_lock = _ARCHIVE_THREAD_LOCKS[int(shard_hex, 16)]
+    with thread_lock, FileLock(str(lock_path), timeout=300):
         yield
 
 

@@ -613,6 +613,48 @@ def test_run_cleanup_steps_do_not_block_later_cleanup(tmp_path, monkeypatch):
     close_logger.assert_called_once_with()
 
 
+def test_staging_directory_setup_failure_closes_task_log(tmp_path, monkeypatch):
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    handler = runner._logger.handlers[0]
+    monkeypatch.setattr(
+        core,
+        "staging_directory_root",
+        lambda _config: blocked_parent / "staging",
+    )
+
+    with pytest.raises(OSError):
+        runner.run(["ACC001"])
+
+    assert runner._logger.handlers == []
+    assert handler.stream is None
+
+
+def test_staging_session_setup_failure_closes_task_log(tmp_path, monkeypatch):
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_directory=tmp_path / "logs",
+    )
+    handler = runner._logger.handlers[0]
+    monkeypatch.setattr(
+        core,
+        "_create_receive_staging_session",
+        Mock(side_effect=OSError("simulated staging session failure")),
+    )
+
+    with pytest.raises(OSError, match="simulated staging session failure"):
+        runner.run(["ACC001"])
+
+    assert runner._logger.handlers == []
+    assert handler.stream is None
+
+
 def test_receiver_lease_is_held_until_cancel_cleanup_finishes(tmp_path, monkeypatch):
     state_directory = tmp_path / "state"
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state_directory)
@@ -913,6 +955,342 @@ def test_archive_publish_uses_a_bounded_sharded_lock_pool(tmp_path):
     int(locks[0].stem, 16)
 
 
+def test_archive_publish_allows_unrelated_lock_shards_to_rename_concurrently(
+    tmp_path, monkeypatch
+):
+    def shard_index(path: Path) -> int:
+        normalized = os.path.normcase(str(path.resolve(strict=False)))
+        digest = core.hashlib.sha256(os.fsencode(normalized)).hexdigest()
+        return int(digest[: core._ARCHIVE_LOCK_SHARD_HEX_LENGTH], 16)
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    first_target = archive / "first.dcm"
+    second_target = archive / "second.dcm"
+    suffix = 2
+    while shard_index(second_target) == shard_index(first_target):
+        second_target = archive / f"second-{suffix}.dcm"
+        suffix += 1
+
+    first_source = tmp_path / "first-source.dcm"
+    second_source = tmp_path / "second-source.dcm"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    real_replace = os.replace
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+    both_started = threading.Event()
+
+    def slow_replace(source, target):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                both_started.set()
+        try:
+            both_started.wait(1)
+            return real_replace(source, target)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(core.os, "replace", slow_replace)
+    errors: list[BaseException] = []
+
+    def publish(source: Path, target: Path) -> None:
+        try:
+            core._publish_or_deduplicate(source, target)
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [
+        threading.Thread(target=publish, args=(first_source, first_target)),
+        threading.Thread(target=publish, args=(second_source, second_target)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert max_active == 2
+    assert first_target.read_bytes() == b"first"
+    assert second_target.read_bytes() == b"second"
+
+
+def test_archive_without_anonymization_can_use_two_worker_threads_and_keep_stats(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "dicom"
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True)
+    files = []
+    for index in range(6):
+        source = staging / f"received-{index}.dcm"
+        _write_minimal_dicom(source, f"1.2.3.{index}", accession="ACC100")
+        files.append(source)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    original_publish = core._publish_or_deduplicate
+
+    def publish_with_load(
+        source: Path, target: Path, **kwargs: object
+    ) -> core._ArchivePublication:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            return original_publish(source, target, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(core, "_publish_or_deduplicate", publish_with_load)
+    stats = core.ArchiveStats()
+    moved, rejected = core._archive_dicom_files(
+        files,
+        destination,
+        "{AccessionNumber}",
+        "ACC100",
+        error_callback=lambda *args: None,
+        archive_workers=2,
+        stats=stats,
+    )
+
+    assert len(moved) == len(files)
+    assert rejected == []
+    assert stats.new_file_count == 6
+    assert stats.existing_skipped_count == 0
+    assert stats.conflict_preserved_count == 0
+    assert max_active == 2
+
+
+def test_parallel_archive_refills_worker_when_an_earlier_file_is_slow(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "dicom"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    files: list[Path] = []
+    for index in range(3):
+        source = staging / f"received-{index}.dcm"
+        _write_minimal_dicom(source, f"1.2.4.{index}", accession="ACC101")
+        files.append(source)
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    third_started = threading.Event()
+    original_publish = core._publish_or_deduplicate
+
+    def publish_with_slow_first(
+        source: Path, target: Path, **kwargs: object
+    ) -> core._ArchivePublication:
+        if source == files[0]:
+            first_started.set()
+            release_first.wait(3)
+        elif source == files[2]:
+            third_started.set()
+        return original_publish(source, target, **kwargs)
+
+    monkeypatch.setattr(core, "_publish_or_deduplicate", publish_with_slow_first)
+    outcome: list[tuple[list[Path], list[Path]]] = []
+    errors: list[BaseException] = []
+
+    def archive() -> None:
+        try:
+            outcome.append(
+                core._archive_dicom_files(
+                    files,
+                    destination,
+                    "{AccessionNumber}",
+                    "ACC101",
+                    archive_workers=2,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=archive)
+    worker.start()
+    try:
+        assert first_started.wait(1)
+        assert third_started.wait(1)
+    finally:
+        release_first.set()
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(outcome) == 1
+    moved, rejected = outcome[0]
+    assert len(moved) == 3
+    assert rejected == []
+
+
+def test_parallel_archive_preserves_input_order_for_duplicate_sop(tmp_path, monkeypatch):
+    destination = tmp_path / "dicom"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    first = staging / "first.dcm"
+    second = staging / "second.dcm"
+    sop_instance_uid = "1.2.4.100"
+    _write_minimal_dicom(
+        first,
+        sop_instance_uid,
+        accession="ACC102",
+        patient_name="Patient^First",
+    )
+    _write_minimal_dicom(
+        second,
+        sop_instance_uid,
+        accession="ACC102",
+        patient_name="Patient^Second",
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    original_publish = core._publish_or_deduplicate
+
+    def publish_with_slow_first(
+        source: Path, target: Path, **kwargs: object
+    ) -> core._ArchivePublication:
+        if source == first:
+            first_started.set()
+            release_first.wait(3)
+        elif source == second:
+            second_started.set()
+        return original_publish(source, target, **kwargs)
+
+    monkeypatch.setattr(core, "_publish_or_deduplicate", publish_with_slow_first)
+    outcome: list[tuple[list[Path], list[Path]]] = []
+
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            core._archive_dicom_files(
+                [first, second],
+                destination,
+                "{AccessionNumber}",
+                "ACC102",
+                archive_workers=2,
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert first_started.wait(1)
+        assert not second_started.wait(0.2)
+    finally:
+        release_first.set()
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert second_started.is_set()
+    moved, rejected = outcome[0]
+    assert len(moved) == 1
+    assert rejected == []
+    archived = dcmread(moved[0], stop_before_pixels=True)
+    assert str(archived.PatientName) == "Patient^First"
+
+
+def test_parallel_archive_does_not_scan_publication_keys_after_cancel(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    files = [staging / f"received-{index}.dcm" for index in range(8)]
+    cancel_event = threading.Event()
+    cancel_event.set()
+    key_scan = Mock(side_effect=AssertionError("cancelled batch must not be scanned"))
+    monkeypatch.setattr(core, "_archive_publication_order_keys", key_scan)
+
+    moved, rejected = core._archive_dicom_files(
+        files,
+        tmp_path / "dicom",
+        "{AccessionNumber}",
+        "ACC-CANCEL",
+        archive_workers=2,
+        cancel_event=cancel_event,
+        _validation_errors={},
+    )
+
+    assert moved == []
+    assert rejected == []
+    key_scan.assert_not_called()
+
+
+def test_archive_with_anonymization_is_serialized_even_with_multiple_worker_setting(
+    tmp_path, monkeypatch
+):
+    class _NoopAnonymizer:
+        def anonymize_dataset(self, _dataset) -> None:
+            from pydicom.dataset import Dataset
+            from pydicom.uid import ExplicitVRLittleEndian, UID
+
+            if not _dataset.file_meta:
+                _dataset.file_meta = Dataset()
+            _dataset.file_meta.MediaStorageSOPClassUID = str(
+                getattr(_dataset, "SOPClassUID", "1.2.840.10008.5.1.4.1.1.1")
+            )
+            _dataset.file_meta.MediaStorageSOPInstanceUID = str(
+                getattr(_dataset, "SOPInstanceUID", UID("1.2.3"))
+            )
+            _dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            return None
+
+    destination = tmp_path / "dicom"
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True)
+    files = []
+    for index in range(6):
+        source = staging / f"received-{index}.dcm"
+        _write_minimal_dicom(source, f"1.3.4.{index}", accession="ACC200")
+        files.append(source)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    original_publish = core._publish_or_deduplicate
+
+    def publish_with_load(
+        source: Path, target: Path, **kwargs: object
+    ) -> core._ArchivePublication:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            return original_publish(source, target, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(core, "_publish_or_deduplicate", publish_with_load)
+    stats = core.ArchiveStats()
+    moved, rejected = core._archive_dicom_files(
+        files,
+        destination,
+        "{AccessionNumber}",
+        "ACC200",
+        anonymizer=_NoopAnonymizer(),
+        error_callback=lambda *args: None,
+        archive_workers=2,
+        stats=stats,
+    )
+
+    assert len(moved) == len(files)
+    assert rejected == []
+    assert stats.new_file_count == 6
+    assert max_active == 1
+
+
 def test_cross_device_publish_copies_durably_before_removing_source(
     tmp_path, monkeypatch
 ):
@@ -935,6 +1313,26 @@ def test_cross_device_publish_copies_durably_before_removing_source(
     assert not source.exists()
     assert target.read_bytes() == b"complete-dicom-content"
     assert list(target.parent.glob(".dcmget-publish-*.part")) == []
+
+
+def test_same_volume_publish_uses_atomic_replace_without_copy(tmp_path, monkeypatch):
+    source = tmp_path / ".dcmget-staging" / "received.dcm"
+    target = tmp_path / "dicom" / "1.2.3.dcm"
+    source.parent.mkdir()
+    target.parent.mkdir()
+    source.write_bytes(b"complete-dicom-content")
+
+    def fail_copy(*_args, **_kwargs):
+        raise AssertionError("same-volume publication must not copy the payload")
+
+    monkeypatch.setattr(core.shutil, "copyfileobj", fail_copy)
+
+    publication = core._publish_or_deduplicate(source, target)
+
+    assert publication.disposition == core._ArchiveDisposition.PUBLISHED
+    assert publication.path == target
+    assert not source.exists()
+    assert target.read_bytes() == b"complete-dicom-content"
 
 
 def test_cross_device_copy_failure_keeps_source_and_removes_partial_target(
@@ -1047,19 +1445,41 @@ def test_archive_cancel_stops_before_subsequent_files_and_preserves_staging(
     assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
 
 
-def test_receive_staging_always_uses_private_application_state(tmp_path, monkeypatch):
+def test_receive_staging_uses_destination_volume_for_non_anonymous_files(
+    tmp_path, monkeypatch
+):
     state = tmp_path / "state"
+    destination = (tmp_path / "dicom").resolve()
+
     monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+
+    regular = AppConfig(dicom_destination_folder=str(destination))
+    primary = destination / ".dcmget-staging"
+    assert core.staging_directory_root(regular) == primary
+    assert core._receive_staging_recovery_roots(regular, primary) == (
+        primary,
+        state / "staging",
+    )
+    assert core.log_directory(regular) == destination / "_DcmGetLogs"
+
+
+def test_receive_staging_uses_private_state_when_anonymous(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    destination = (tmp_path / "dicom").resolve()
+
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+
     anonymous = AppConfig(
-        dicom_destination_folder=str(tmp_path / "dicom"),
+        dicom_destination_folder=str(destination),
         anonymization_enabled=True,
     )
-    regular = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
-
     assert core.staging_directory_root(anonymous) == state / "staging"
+    assert core._receive_staging_recovery_roots(anonymous) == (
+        state / "staging",
+    )
     assert core.log_directory(anonymous) == state / "logs"
-    assert core.staging_directory_root(regular) == state / "staging"
-    assert core.log_directory(regular) == tmp_path / "dicom" / "_DcmGetLogs"
 
 
 def test_orphaned_receive_staging_is_quarantined_without_touching_active_session(
@@ -1095,6 +1515,57 @@ def test_orphaned_receive_staging_is_quarantined_without_touching_active_session
     assert quarantined.read_bytes() == b"orphan"
     assert not orphan.exists()
     assert (active / "active.dcm").read_bytes() == b"active"
+
+
+def test_target_volume_orphaned_staging_stays_on_target_volume(tmp_path):
+    destination = tmp_path / "dicom"
+    staging_root = destination / ".dcmget-staging"
+    orphan = staging_root / "20260727-120000-000001-deadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "orphan.dcm").write_bytes(b"orphan")
+
+    messages = core._recover_orphaned_receive_staging(staging_root)
+
+    quarantined = (
+        destination
+        / ".dcmget-quarantine"
+        / "receiver-staging"
+        / orphan.name
+        / "orphan.dcm"
+    )
+    assert len(messages) == 1
+    assert quarantined.read_bytes() == b"orphan"
+    assert not orphan.exists()
+
+
+def test_target_staging_upgrade_still_recovers_legacy_private_session(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    destination = tmp_path / "dicom"
+    legacy_root = state / "staging"
+    orphan = legacy_root / "20260727-120000-000001-deadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "received.dcm").write_bytes(b"received")
+    monkeypatch.setattr(core, "ensure_application_state_dir", lambda: state)
+    config = AppConfig(dicom_destination_folder=str(destination))
+
+    messages = [
+        message
+        for root in core._receive_staging_recovery_roots(config)
+        for message in core._recover_orphaned_receive_staging(root)
+    ]
+
+    recovered = (
+        state
+        / "quarantine"
+        / "receiver-staging"
+        / orphan.name
+        / "received.dcm"
+    )
+    assert len(messages) == 1
+    assert recovered.read_bytes() == b"received"
+    assert not orphan.exists()
 
 
 def test_recovery_removes_stale_uuid_session_locks_but_keeps_maintenance_lock(
@@ -1285,6 +1756,39 @@ def test_dcmtk_protocol_trace_is_parsed_without_writing_to_smb_task_log(tmp_path
     assert "Received Final Move Response" in log_text
     assert "protocol trace" not in log_text
     assert "transport trace" not in log_text
+
+
+def test_storescp_verbose_output_keeps_aborts_but_suppresses_object_info(tmp_path):
+    events: list[tuple[str, str, str]] = []
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+        log_callback=lambda *entry: events.append(entry),
+        log_directory=tmp_path / "logs",
+    )
+    process = SimpleNamespace(
+        stdout=iter(
+            [
+                "I: storing DICOM file\n",
+                "I: Association Aborted\n",
+                "E: cannot write DICOM file\n",
+            ]
+        )
+    )
+
+    reader = runner._start_reader(process, "storescp")
+    reader.join(2)
+    runner._close_file_logger()
+
+    assert runner._storescp_abort_count == 1
+    assert events == [
+        ("storescp", "I: Association Aborted", "warning"),
+        ("storescp", "E: cannot write DICOM file", "error"),
+    ]
+    log_text = (tmp_path / "logs" / "dcmget.log").read_text(encoding="utf-8")
+    assert "Association Aborted" in log_text
+    assert "cannot write DICOM file" in log_text
+    assert "storing DICOM file" not in log_text
 
 
 def test_pending_move_responses_are_counted_without_synchronous_log_flood(tmp_path):
@@ -3700,6 +4204,7 @@ def _write_minimal_dicom(
     sop_instance_uid: str,
     *,
     accession: str = "",
+    patient_name: str = "",
 ) -> None:
     metadata = FileMetaDataset()
     metadata.TransferSyntaxUID = ExplicitVRLittleEndian
@@ -3707,4 +4212,6 @@ def _write_minimal_dicom(
     dataset.SOPInstanceUID = sop_instance_uid
     if accession:
         dataset.AccessionNumber = accession
+    if patient_name:
+        dataset.PatientName = patient_name
     dataset.save_as(path)
