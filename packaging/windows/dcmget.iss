@@ -315,6 +315,8 @@ function RunManagedProcessCleanup(AppDir: String; var FailureMessage: String): B
 var
   PowerShellPath: String;
   ScriptPath: String;
+  CleanupLogPath: String;
+  CleanupDetails: String;
   ScriptText: String;
   Parameters: String;
   ResultCode: Integer;
@@ -322,10 +324,13 @@ begin
   FailureMessage := '';
   PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
   ScriptPath := ExpandConstant('{tmp}\dcmget-stop-installed-processes.ps1');
+  CleanupLogPath := ExpandConstant('{tmp}\dcmget-stop-installed-processes.log');
+  DeleteFile(CleanupLogPath);
 
   ScriptText :=
-    'param([Parameter(Mandatory=$true)][string]$InstallRoot)' + #13#10 +
+    'param([Parameter(Mandatory=$true)][string]$InstallRoot, [Parameter(Mandatory=$true)][string]$ErrorLog)' + #13#10 +
     '$ErrorActionPreference = ''Stop''' + #13#10 +
+    'try {' + #13#10 +
     '$root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)' + #13#10 +
     '$rootPrefix = $root + [IO.Path]::DirectorySeparatorChar' + #13#10 +
     '$hostScript = [IO.Path]::Combine($root, ''{#ServiceHostName}'')' + #13#10 +
@@ -339,17 +344,27 @@ begin
     '      ($command -and $command.IndexOf($hostScript, [StringComparison]::OrdinalIgnoreCase) -ge 0)' + #13#10 +
     '  })' + #13#10 +
     '}' + #13#10 +
-    'for ($attempt = 0; $attempt -lt 3; $attempt++) {' + #13#10 +
+    'for ($attempt = 0; $attempt -lt 20; $attempt++) {' + #13#10 +
     '  $targets = @(Get-DcmGetInstalledProcess)' + #13#10 +
     '  if ($targets.Count -eq 0) { break }' + #13#10 +
     '  foreach ($target in $targets) {' + #13#10 +
-    '    & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$target.ProcessId) /T /F 2>$null | Out-Null' + #13#10 +
+    '    $savedPreference = $ErrorActionPreference' + #13#10 +
+    '    try {' + #13#10 +
+    '      $ErrorActionPreference = ''SilentlyContinue''' + #13#10 +
+    '      & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$target.ProcessId) /T /F 2>$null | Out-Null' + #13#10 +
+    '    } finally {' + #13#10 +
+    '      $ErrorActionPreference = $savedPreference' + #13#10 +
+    '    }' + #13#10 +
     '  }' + #13#10 +
-    '  Start-Sleep -Milliseconds 350' + #13#10 +
+    '  Start-Sleep -Milliseconds 500' + #13#10 +
     '}' + #13#10 +
     '$survivors = @(Get-DcmGetInstalledProcess)' + #13#10 +
     'if ($survivors.Count -ne 0) {' + #13#10 +
     '  throw (''DcmGet processes are still running: '' + (($survivors | ForEach-Object ProcessId) -join '', ''))' + #13#10 +
+    '}' + #13#10 +
+    '} catch {' + #13#10 +
+    '  try { ($_ | Format-List * -Force | Out-String) | Set-Content -LiteralPath $ErrorLog -Encoding UTF8 } catch {}' + #13#10 +
+    '  exit 1' + #13#10 +
     '}' + #13#10;
 
   if not SaveStringToFile(ScriptPath, ScriptText, False) then
@@ -360,7 +375,8 @@ begin
   end;
 
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ScriptPath) + ' -InstallRoot ' + AddQuotes(AppDir);
+    AddQuotes(ScriptPath) + ' -InstallRoot ' + AddQuotes(AppDir) +
+    ' -ErrorLog ' + AddQuotes(CleanupLogPath);
   if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
     FailureMessage := '无法启动 Windows PowerShell，因此不能安全结束旧版 DcmGet 进程。';
@@ -370,6 +386,8 @@ begin
   if ResultCode <> 0 then
   begin
     FailureMessage := '无法结束当前安装目录中的 DcmGet 相关进程，请稍后重新运行安装程序。';
+    if LoadStringFromFile(CleanupLogPath, CleanupDetails) then
+      FailureMessage := FailureMessage + #13#10 + Trim(CleanupDetails);
     Result := False;
     Exit;
   end;

@@ -571,6 +571,9 @@ def test_windows_installer_only_removes_an_owned_legacy_service():
     )[0]
     assert "'stop \"{#ServiceName}\"'" in stop
     assert "ServiceWrapperPath()," not in stop
+    assert "-ErrorLog " in installer
+    assert "dcmget-stop-installed-processes.log" in installer
+    assert "SilentlyContinue" in installer
 
 
 def test_windows_build_and_release_workflow_have_no_active_winsw_dependency():

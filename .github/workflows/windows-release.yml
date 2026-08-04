@@ -949,8 +949,13 @@ jobs:
               ForEach-Object ProcessId
           )
 
-          $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
-          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
+          $uninstallLog = Join-Path $env:RUNNER_TEMP "dcmget-uninstall.log"
+          Remove-Item $uninstallLog -Force -ErrorAction SilentlyContinue
+          $uninstall = Start-Process "$installDir/unins000.exe" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$uninstallLog") -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            if (Test-Path $uninstallLog -PathType Leaf) { Get-Content $uninstallLog | Write-Host }
+            throw "Uninstaller failed with exit code $($uninstall.ExitCode)"
+          }
           for ($attempt = 0; $attempt -lt 120 -and (Test-Path $installDir); $attempt++) {
             Start-Sleep -Milliseconds 250
           }
