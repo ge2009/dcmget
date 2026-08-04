@@ -6,7 +6,7 @@ on:
       version:
         description: Update version in X.Y.Z format
         required: true
-        default: 3.7.0
+        default: 3.7.5
       publish_update:
         description: Publish the verified component update to GitHub Releases
         required: true
@@ -203,9 +203,6 @@ jobs:
             "--patch-only",
             "--compatibility-root", ".",
             "--compatibility-file", "packaging/windows/dcmget.iss",
-            "--compatibility-file", "packaging/windows/LICENSE-WINSW.txt",
-            "--compatibility-file", "packaging/windows/kayisoft-dcmget-host.ps1",
-            "--compatibility-file", "packaging/windows/kayisoft-dcmget.xml.template",
             "--compatibility-file", "requirements.txt",
             "--compatibility-file", "requirements-build.txt",
             "--compatibility-file", "scripts/build_windows.py",

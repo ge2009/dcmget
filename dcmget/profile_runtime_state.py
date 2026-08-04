@@ -19,12 +19,12 @@ class ProfileRuntimeStateError(RuntimeError):
 
 
 class ProfileRuntimeState:
-    """Persist the Profiles the Windows service should keep running.
+    """Persist the Profiles the active management process should keep running.
 
     Configuration files describe *how* a Profile runs.  This separate state
     file describes whether the operator wants it running, so newly created
     Profiles remain stopped while an explicitly started Profile survives a
-    service or Windows restart.
+    management-process restart.
     """
 
     def __init__(self, path: str | Path, *, lock_timeout: float = 10.0) -> None:

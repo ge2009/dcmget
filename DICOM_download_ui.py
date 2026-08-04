@@ -42,7 +42,10 @@ from dcmget.instance_profile import (
     migrate_task_catalog_to_profiles,
 )
 from dcmget.licensing import PUBLIC_KEY_PEM, trial_status
-from dcmget.management_server import run_windows_management_server
+from dcmget.management_server import (
+    run_windows_desktop_manager,
+    run_windows_management_server,
+)
 from dcmget.profile_manager import (
     ProfileInUseError as ManagedProfileInUseError,
     ProfileManager,
@@ -60,7 +63,6 @@ from dcmget.runtime import (
 from dcmget.single_instance import SingleInstance
 from dcmget.task_state import TaskCheckpointStore, TaskStateError
 from dcmget.windows_portable_runtime import prepare_windows_portable_dcmtk
-from dcmget.windows_service_control import windows_service_operation_handlers
 from dcmget.web_security import DirectoryRoot, discover_local_hosts
 from dcmget.web_server import DcmGetWebServer
 from dcmget.webview_shell import (
@@ -126,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--windows-management",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--windows-desktop",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -729,7 +736,6 @@ def _operation_handlers(
         "acceptance-report": acceptance_report,
         "profile-backup": profile_backup,
         "support-bundle": support_bundle,
-        **windows_service_operation_handlers(),
         **profile_operations.handlers(),
     }
 
@@ -820,6 +826,13 @@ def main(argv: list[str] | None = None) -> int:
         args = build_parser().parse_args(arguments)
         if args.native_shell_url:
             return run_webview_shell(args.native_shell_url)
+        if args.windows_desktop:
+            return run_windows_desktop_manager(
+                project_root=PROJECT_ROOT,
+                react_static_root=validate_web_resources(PROJECT_ROOT),
+                trusted_hosts=_lan_hosts(),
+                open_ui=_schedule_ui_open,
+            )
         if args.windows_management:
             return run_windows_management_server(
                 project_root=PROJECT_ROOT,

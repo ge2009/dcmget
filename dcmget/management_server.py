@@ -26,12 +26,13 @@ from .profile_manager import (
 from .profile_runtime_state import PROFILE_RUNTIME_FILE_NAME, ProfileRuntimeState
 from .profile_web_operations import ProfileWebOperations
 from .runtime import is_frozen, resource_root
-from .windows_service_control import windows_service_operation_handlers
+from .single_instance import SingleInstance
 from .web_server import DcmGetWebServer
 
 
 LOGGER = logging.getLogger(__name__)
 WINDOWS_MANAGEMENT_HOST = "0.0.0.0"
+WINDOWS_DESKTOP_INSTANCE_FILE_NAME = "desktop-instance.json"
 PROFILE_PROXY_TIMEOUT_SECONDS = 40.0
 _PROFILE_TOPOLOGY_FIELDS = (
     "calling_ae_title",
@@ -327,7 +328,7 @@ def _proxy_json_response(status_code: int, body: bytes) -> dict[str, object]:
 
 
 class WindowsManagementService:
-    """Minimal task-free service boundary for the Windows management hub."""
+    """Minimal task-free application boundary for the Windows management hub."""
 
     def __init__(self) -> None:
         self._stopped = False
@@ -439,10 +440,7 @@ def create_windows_management_server(
         runtime_state=runtime_state,
         shutdown_profile=profile_proxy.shutdown_profile,
     )
-    handlers = {
-        **windows_service_operation_handlers(),
-        **profile_operations.handlers(),
-    }
+    handlers = profile_operations.handlers()
     service = WindowsManagementService()
     return DcmGetWebServer(
         service,
@@ -502,7 +500,7 @@ def run_windows_management_server(
     update_service: object | None = None,
     log_level: str = "info",
 ) -> int:
-    """Run the management hub until its supervising Windows process stops it."""
+    """Run the management hub until its owning process stops it."""
 
     server = create_windows_management_server(
         profile_manager=profile_manager,
@@ -528,3 +526,94 @@ def run_windows_management_server(
         if callable(close_update_service):
             close_update_service()
         server.stop(timeout=15)
+
+
+def run_windows_desktop_manager(
+    *,
+    profile_manager: ProfileManager | None = None,
+    project_root: str | Path | None = None,
+    state_directory: str | Path | None = None,
+    trusted_hosts: Iterable[str] = (),
+    react_static_root: str | Path | None = None,
+    update_service: object | None = None,
+    log_level: str = "info",
+    open_ui: Callable[[str], object] | None = None,
+    single_instance_factory: Callable[..., SingleInstance] = SingleInstance,
+) -> int:
+    """Run the management hub in the signed-in user's desktop session.
+
+    The process remains alive after its WebView window closes so Profiles can
+    continue downloading.  Starting DcmGet again only asks this primary
+    process to open another window.  Stale desired-running flags left by the
+    retired Windows service are cleared instead of auto-starting Profiles.
+    """
+
+    manager = profile_manager or ProfileManager()
+    management_state = Path(
+        state_directory or manager.state_root / "management"
+    ).expanduser().resolve()
+    activation = single_instance_factory(
+        management_state / WINDOWS_DESKTOP_INSTANCE_FILE_NAME
+    )
+    if not activation.start({"action": "activate"}):
+        activation.close()
+        return 0
+
+    server: DcmGetWebServer | None = None
+    try:
+        _clear_stale_desired_profiles(manager, management_state)
+        server = create_windows_management_server(
+            profile_manager=manager,
+            project_root=project_root,
+            state_directory=management_state,
+            trusted_hosts=trusted_hosts,
+            react_static_root=react_static_root,
+            update_service=update_service,
+            log_level=log_level,
+        )
+
+        def show_ui(_payload: dict[str, object] | None = None) -> None:
+            if open_ui is not None:
+                open_ui(server.url)
+
+        activation.set_activation_handler(show_ui)
+        show_ui()
+        LOGGER.info(
+            "DcmGet desktop management hub ready at %s:%s",
+            WINDOWS_MANAGEMENT_HOST,
+            WINDOWS_MANAGEMENT_PORT,
+        )
+        server.run()
+        return 0
+    finally:
+        activation.close()
+        if server is not None:
+            app_state = getattr(getattr(server, "app", None), "state", None)
+            active_update_service = getattr(app_state, "update_service", None)
+            close_update_service = getattr(active_update_service, "close", None)
+            if callable(close_update_service):
+                close_update_service()
+            server.stop(timeout=15)
+
+
+def _clear_stale_desired_profiles(
+    manager: ProfileManager,
+    management_state: Path,
+) -> tuple[int, ...]:
+    """Keep actual running Profiles and clear service-era auto-start intent."""
+
+    runtime_state = ProfileRuntimeState(
+        management_state / PROFILE_RUNTIME_FILE_NAME
+    )
+    remaining: list[int] = []
+    for profile_number in runtime_state.desired_profiles():
+        try:
+            profile = manager.get_profile(profile_number)
+        except ProfileManagerError:
+            runtime_state.remove(profile_number)
+            continue
+        if profile.is_running:
+            remaining.append(profile_number)
+        else:
+            runtime_state.remove(profile_number)
+    return tuple(remaining)

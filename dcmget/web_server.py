@@ -69,9 +69,6 @@ _MANAGEMENT_OPERATIONS = frozenset(
         "profile-stop",
         "profile-launch-all",
         "profile-shortcut",
-        "windows-service-status",
-        "windows-service-start",
-        "windows-service-stop",
     }
 )
 

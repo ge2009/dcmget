@@ -78,10 +78,10 @@ describe('task workspace', () => {
     expect(screen.queryByRole('button', { name: '清理旧任务' })).not.toBeInTheDocument();
   });
 
-  it('explains that Windows services need UNC paths instead of mapped drives', () => {
+  it('explains mapped-drive and UNC behavior for the signed-in user', () => {
     render(<TaskWorkspace {...base} task={null} />);
-    expect(screen.getByText(/Windows 服务无法识别 X: 映射盘/)).toHaveTextContent(
-      '共享目录请填写 UNC（\\\\服务器\\共享\\目录）',
+    expect(screen.getByText(/支持当前登录用户已连接的映射盘/)).toHaveTextContent(
+      '长期使用共享目录时建议填写 UNC（\\\\服务器\\共享\\目录）',
     );
   });
 

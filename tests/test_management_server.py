@@ -16,7 +16,9 @@ from dcmget.management_server import (
     ProfileApiProxy,
     WINDOWS_MANAGEMENT_HOST,
     WindowsManagementService,
+    _clear_stale_desired_profiles,
     create_windows_management_server,
+    run_windows_desktop_manager,
     _profile_proxy_route_allowed,
 )
 from dcmget.profile_manager import ProfileInfo, ProfileManager, WINDOWS_MANAGEMENT_PORT
@@ -919,6 +921,141 @@ def test_hidden_cli_manager_mode_skips_profile_and_dcmtk_startup(
     assert calls[0]["trusted_hosts"] == ("127.0.0.1", "192.168.1.50")
     assert entry.build_parser().parse_args(["--windows-management"]).windows_management
     assert "--windows-management" not in entry.build_parser().format_help()
+
+
+def test_hidden_cli_desktop_mode_dispatches_without_profile_or_dcmtk_startup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(entry, "ensure_supported_runtime", lambda: None)
+    monkeypatch.setattr(entry, "_lan_hosts", lambda: ("127.0.0.1",))
+    monkeypatch.setattr(
+        entry,
+        "validate_web_resources",
+        lambda _root=entry.PROJECT_ROOT: entry.PROJECT_ROOT / "dcmget" / "webui-react",
+    )
+    monkeypatch.setattr(
+        entry,
+        "run_windows_desktop_manager",
+        lambda **kwargs: calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        entry,
+        "prepare_windows_portable_dcmtk",
+        lambda *_args, **_kwargs: pytest.fail("桌面管理中心不应准备 DCMTK"),
+    )
+    monkeypatch.setattr(
+        entry,
+        "acquire_instance_profile",
+        lambda *_args, **_kwargs: pytest.fail("桌面管理中心不应获取 Profile"),
+    )
+
+    assert entry.main(["--windows-desktop"]) == 0
+    assert len(calls) == 1
+    assert calls[0]["open_ui"] is entry._schedule_ui_open
+    assert entry.build_parser().parse_args(["--windows-desktop"]).windows_desktop
+    assert "--windows-desktop" not in entry.build_parser().format_help()
+
+
+def test_desktop_manager_owns_one_hub_and_reopens_ui(tmp_path: Path, monkeypatch):
+    events: list[object] = []
+
+    class FakeActivation:
+        def __init__(self, path: Path) -> None:
+            events.append(("activation", Path(path)))
+            self.handler = None
+
+        def start(self, payload):
+            events.append(("start", payload))
+            return True
+
+        def set_activation_handler(self, handler):
+            self.handler = handler
+            events.append("set-handler")
+
+        def close(self):
+            events.append("close-activation")
+
+    class FakeUpdater:
+        def close(self):
+            events.append("close-updater")
+
+    class FakeServer:
+        url = "http://127.0.0.1:8786/"
+
+        def __init__(self):
+            self.app = SimpleNamespace(
+                state=SimpleNamespace(update_service=FakeUpdater())
+            )
+
+        def run(self):
+            events.append("run")
+
+        def stop(self, timeout: float):
+            events.append(("stop", timeout))
+
+    manager = _profile_manager(tmp_path)
+    monkeypatch.setattr(
+        management_server_module,
+        "create_windows_management_server",
+        lambda **_kwargs: FakeServer(),
+    )
+
+    assert run_windows_desktop_manager(
+        profile_manager=manager,
+        state_directory=tmp_path / "manager-state",
+        open_ui=lambda url: events.append(("open", url)),
+        single_instance_factory=FakeActivation,
+    ) == 0
+    assert events == [
+        ("activation", tmp_path / "manager-state" / "desktop-instance.json"),
+        ("start", {"action": "activate"}),
+        "set-handler",
+        ("open", "http://127.0.0.1:8786/"),
+        "run",
+        "close-activation",
+        "close-updater",
+        ("stop", 15),
+    ]
+
+
+def test_secondary_desktop_manager_only_notifies_primary(tmp_path: Path, monkeypatch):
+    events: list[object] = []
+
+    class SecondaryActivation:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def start(self, payload):
+            events.append(("start", payload))
+            return False
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(
+        management_server_module,
+        "create_windows_management_server",
+        lambda **_kwargs: pytest.fail("次实例不应创建管理服务"),
+    )
+    assert run_windows_desktop_manager(
+        profile_manager=_profile_manager(tmp_path),
+        state_directory=tmp_path / "manager-state",
+        open_ui=lambda _url: pytest.fail("次实例由主实例处理唤醒"),
+        single_instance_factory=SecondaryActivation,
+    ) == 0
+    assert events == [("start", {"action": "activate"}), "close"]
+
+
+def test_desktop_manager_clears_stale_service_autostart_state(tmp_path: Path):
+    manager = _profile_manager(tmp_path)
+    manager.create_profile()
+    management_state = tmp_path / "manager-state"
+    runtime = ProfileRuntimeState(management_state / "profile-runtime.json")
+    runtime.set_desired(1, True)
+
+    assert _clear_stale_desired_profiles(manager, management_state) == ()
+    assert runtime.desired_profiles() == ()
 
 
 def test_management_runner_always_stops_server(monkeypatch: pytest.MonkeyPatch):

@@ -626,12 +626,7 @@ def _write_probe_error_message(
     *,
     windows: bool | None = None,
 ) -> str:
-    """Return an actionable path error without pretending mapped drives are local.
-
-    Installed Windows builds run the profile backend as LocalSystem. Drive-letter
-    mappings belong to the interactive user's logon session, so an unavailable
-    ``X:`` path cannot be repaired by retrying ``mkdir`` in the service.
-    """
+    """Return an actionable path error for mapped drives and UNC shares."""
 
     is_windows = os.name == "nt" if windows is None else windows
     raw_path = str(path)
@@ -643,9 +638,9 @@ def _write_probe_error_message(
             and (isinstance(error, FileNotFoundError) or winerror in {3, 15})
         ):
             return (
-                f"{label}不可访问：DcmGet 后台服务看不到 {drive}。"
-                "若这是 SMB 映射盘，请改用 UNC 路径（例如 "
-                r"\\服务器\共享名\目录），并为后台服务配置共享和 NTFS 写权限"
+                f"{label}不可访问：当前登录用户尚未连接 {drive}。"
+                "请先在资源管理器中重新连接该映射盘，或改用 UNC 路径（例如 "
+                r"\\服务器\共享名\目录），并检查共享和 NTFS 写权限"
             )
         if raw_path.startswith((r"\\", "//")) and (
             isinstance(error, PermissionError) or winerror == 5

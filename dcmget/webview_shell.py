@@ -162,8 +162,8 @@ def run_webview_shell(
     target = validate_loopback_url(url)
     if not wait_until_ready(target, timeout=timeout, urlopen=urlopen):
         raise WebViewShellError(
-            "DcmGet 后台服务尚未就绪，或目标端口不是当前版本的 DcmGet；"
-            "请确认 kayisoft-dcmget 服务已启动"
+            "DcmGet 后台尚未就绪，或目标端口不是当前版本的 DcmGet；"
+            "请关闭窗口后重新启动 DcmGet"
         )
     if webview_module is None:
         try:

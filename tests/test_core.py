@@ -1689,8 +1689,8 @@ def test_windows_missing_drive_write_error_explains_smb_unc_path():
         windows=True,
     )
 
-    assert "后台服务看不到 X:" in message
-    assert "SMB 映射盘" in message
+    assert "当前登录用户尚未连接 X:" in message
+    assert "重新连接该映射盘" in message
     assert r"\\服务器\共享名\目录" in message
 
 

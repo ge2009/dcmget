@@ -1,6 +1,6 @@
-# DcmGet 3.7.4
+# DcmGet 3.7.5
 
-DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯一工作台使用 Vite、React 和 TypeScript 构建，继续复用现有 Python/FastAPI 服务、任务核心与 DCMTK：Windows 本机通过独立 WebView2 窗口操作，不再默认弹出系统浏览器；局域网电脑仍可使用浏览器访问。每个 Profile 进程只运行一个下载任务，并独立启动一个 DCMTK `storescp`；任务中的检查号按顺序执行 `movescu`。关闭、刷新或断开界面不会停止后台下载，重新打开即可查看实时状态。
+DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯一工作台使用 Vite、React 和 TypeScript 构建，继续复用现有 Python/FastAPI 服务、任务核心与 DCMTK：Windows 本机通过独立 WebView2 窗口操作，不再默认弹出系统浏览器；局域网电脑仍可使用浏览器访问。每个 Profile 进程只运行一个下载任务，并独立启动一个 DCMTK `storescp`；任务中的检查号按顺序执行 `movescu`。关闭、刷新或断开界面不会停止后台下载，重新打开即可查看实时状态；Windows 用户注销会结束该用户会话内的管理中心和 Profile 进程。
 
 应用仍支持多个持久 Profile（`i1`、`i2`……）。Windows 安装版使用固定端口 `8786` 的统一工作台，通过紧凑 Profile 卡片进入实例，并可在页面顶部快速切换 Profile；任务、设置、日志、PDI 和运维功能始终留在同一个管理页面。每个 Profile 仍是独立后台进程，配置、Web 端口、接收 AE/端口、任务恢复点和日志互相隔离。不同 Profile 必须使用不同的 Web 端口和接收端口，通常也应配置独立接收 AE，并在 PACS 中分别建立 Move Destination 映射。收到的文件按可配置的 DICOM 元数据目录归档，下载结束后可自动生成包含原始 DICOM、`DICOMDIR`、中文 OHIF 和本地只读 HTTP 启动器的 PDI 便携目录。
 
@@ -12,7 +12,7 @@ DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯�
 - 64 位 Python 3.10 或更高版本；Windows 源码运行必须使用 AMD64/x64 Python
 - 发布部署使用 DCMTK 3.7.0；代码兼容本机 DCMTK 3.6.9。Windows 成品仅携带运行所需的 `movescu`、`storescp`、`dcmmkdir`、`dcmdump` 及其 DLL、字符集和许可证数据
 - 当前自动发布只生成 Windows x64 一键安装器、便携版和 ZIP；macOS/Linux 仍可从源码运行，但暂不生成成品安装包
-- 主控制台、API、字体和图标均随程序本地提供，运行时不需要 Node.js，也不依赖 CDN 或云服务；仅当 Windows 管理中心启用自动更新时会访问固定的 HTTPS 发布源
+- 主控制台、API、字体和图标均随程序本地提供，运行时不需要 Node.js，也不依赖 CDN 或云服务；本文不将自动更新列为 3.7.5 已验证能力
 - 3.0.0 起不再包含或依赖 PyQt5；旧版 Qt 说明仅保留在历史版本记录中
 
 源码部署不携带第三方二进制，首次部署需要能访问 Python 包源、[OFFIS DCMTK 下载源](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)和 npm 官方源以下载经过固定 SHA-256 校验的 OHIF。Windows 成品发布物已内置 OHIF 与本地启动器；PDI 导出完成后的阅片不需要访问互联网。
@@ -21,9 +21,9 @@ DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯�
 
 Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
 
-- `DcmGet-3.7.4-Setup-x64.exe`：默认推荐的一键安装器，内置 x64 Python 运行时、FastAPI/Uvicorn、React/TypeScript 离线工作台、Windows WebView 外壳、Microsoft x64 WebView2 Evergreen 离线运行时、精简的 x64 DCMTK 3.7.0 运行集、离线中文 OHIF、PDI 本地只读 HTTP 启动器、Microsoft Visual C++ x64 Runtime 和 `kayisoft-dcmget` Windows 服务。服务随系统自动启动管理中心，并只恢复用户明确选择运行的 Profile；安装器创建 `DcmGet Web TCP` 与 `DcmGet Receiver TCP` 两条仅限域/专用网络的程序级入站规则。
-- `DcmGet-3.7.4-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动会把逐文件 SHA-256 校验通过的精简 x64 DCMTK 运行集发布到 `%LOCALAPPDATA%\DcmGet\runtime\dcmtk\<版本与清单哈希>\`，以后启动和软件升级会复用内容相同的稳定用户级路径。两个进程同时首次启动时也只会原子发布一份运行集。PDI 同样使用原始 DICOM 和离线 OHIF。便携版不注册 Windows 服务，也不自动常驻管理中心。
-- `DcmGet-3.7.4-windows-x64.zip`：解压后直接运行的独立目录版，包含与安装版一致的 React/TypeScript 离线工作台与 Windows WebView 外壳、精简 DCMTK 运行集、离线 OHIF 和 PDI 启动器，但不自动注册 Windows 服务或常驻管理中心。
+- `DcmGet-3.7.5-Setup-x64.exe`：默认推荐的一键安装器，内置 x64 Python 运行时、FastAPI/Uvicorn、React/TypeScript 离线工作台、Windows WebView 外壳、Microsoft x64 WebView2 Evergreen 离线运行时、精简的 x64 DCMTK 3.7.0 运行集、离线中文 OHIF、PDI 本地只读 HTTP 启动器和 Microsoft Visual C++ x64 Runtime。主入口使用 `--windows-desktop`，在当前已登录用户的桌面会话中运行管理中心；Profile 保持停止，直到用户在工作台中明确启动。安装器创建 `DcmGet Web TCP` 与 `DcmGet Receiver TCP` 两条仅限域/专用网络的程序级入站规则。
+- `DcmGet-3.7.5-windows-x64-portable.exe`：无需安装的单文件便携版；首次启动会把逐文件 SHA-256 校验通过的精简 x64 DCMTK 运行集发布到 `%LOCALAPPDATA%\DcmGet\runtime\dcmtk\<版本与清单哈希>\`，以后启动和软件升级会复用内容相同的稳定用户级路径。两个进程同时首次启动时也只会原子发布一份运行集。PDI 同样使用原始 DICOM 和离线 OHIF。便携版不注册 Windows 服务，也不自动常驻管理中心。
+- `DcmGet-3.7.5-windows-x64.zip`：解压后直接运行的独立目录版，包含与安装版一致的 React/TypeScript 离线工作台与 Windows WebView 外壳、精简 DCMTK 运行集、离线 OHIF 和 PDI 启动器，但不自动注册 Windows 服务或常驻管理中心。
 
 Windows 32 位系统、32 位 Python 和 x86 应用载荷均不受支持。安装器使用 `x64compatible` 限制目标架构：可在 x64 Windows 原生运行，也允许 Windows 11 ARM64 通过系统的 x64 兼容层运行；不需要也不接受原生 ARM64 Python。Inno Setup 6 的安装引导程序自身是 x86 兼容程序，但它会拒绝 32 位 Windows，且只安装经过校验的 AMD64 DcmGet、Python 和 DCMTK。构建脚本会同时验证构建 Python、`DcmGet.exe`、`DcmGetPdiServer.exe`、`storescp.exe` 和 `movescu.exe` 的 PE 架构，任何一项不是 AMD64 都会停止发布；PDI 的 Python 回退启动器也会拒绝 32 位运行时。
 
@@ -33,23 +33,18 @@ Windows 32 位系统、32 位 Python 和 x86 应用载荷均不受支持。安�
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。默认下载目录为“文档\DcmGet\Dicom”。
 
-### Windows 自动与增量更新
+### Windows 更新与 3.7.5 升级
 
-- 自动更新只在 Windows x64 安装版的 `8786` 统一管理中心启用。便携版、ZIP 和源码运行不会自动替换程序文件。
-- 默认策略为外网可用时后台检查。没有外网时只记录“离线”状态，不阻塞管理中心、Profile 或 DICOM 下载。专网环境可在“软件更新”中关闭自动检查；关闭后不会访问更新服务器。
-- 更新客户端只访问由 `bwg-snell` 提供的固定地址 `https://dcmget.v2ex.com.cn/updates/`，不依赖 GitHub Releases。地址不可达时显示离线状态并等待下次检查，不影响 DICOM 下载。
-- 管理中心优先选择与当前版本精确匹配的组件增量包，只下载并替换发生变化的 `DcmGet.exe` 或 `_internal/**` 文件。增量条件不成立时自动选择完整安装包。
-- 稳定通道使用单文件 `UPDATE-MANIFEST.signed.json`。客户端先使用内置的独立 Ed25519 更新公钥验证清单，再校验版本、下载地址边界、文件大小、SHA-256、允许替换路径和安装树哈希；更新私钥不放入客户端或更新服务器，也不与注册码私钥共用。
-- 组件更新在受限暂存目录中逐文件备份、替换和校验；失败时回滚，并按更新前状态恢复 `kayisoft-dcmget` 服务。Profile 配置、任务恢复点、日志、授权/试用数据和下载影像都不在可替换路径中。
-- 3.6.0 及更旧安装未内置新的 Ed25519 更新公钥，首次升级到 3.6.1 需要手动运行一次完整测试安装包。完成这次引导升级后，后续小版本即可通过管理中心下载组件更新；只有 Python/DCMTK、Windows 服务或安装布局变化时才需要完整安装包。
+- 3.7.5 将安装版从 LocalSystem Windows 服务改为已登录用户会话内的桌面进程，属于安装布局变更。升级必须运行完整的 `DcmGet-3.7.5-Setup-x64.exe`，不能使用组件增量包跨越该版本边界。
+- 本文不声明 3.7.5 的自动更新通道已经验证。只有对应发布物、签名更新清单和端到端升级检查均实际通过后，才能将该通道视为可用；否则应使用经过核验的完整安装包。便携版、ZIP 和源码运行不会自动替换程序文件。
 
-安装完成后，`kayisoft-dcmget` 以 LocalSystem 自动服务运行，但固定使用安装用户的 `%APPDATA%`、`%LOCALAPPDATA%` 和 `%USERPROFILE%`，因此会继续读取原有 Profile、恢复点和配置。桌面和开始菜单的“DcmGet”主入口会启动本机 WebView2 窗口并连接 `http://127.0.0.1:8786/`；关闭该窗口不停止后台服务或下载任务。开始菜单另提供“DcmGet 启动后台服务”和“DcmGet 停止后台服务”。内置服务权限允许普通本机用户查询、启动和停止服务，不需要应用密码或再次提升权限。注册、升级和卸载 Windows 服务本身仍属于系统级安装操作，首次运行安装器时需要管理员/UAC。
+安装完成后，桌面和开始菜单的“DcmGet”主入口使用 `--windows-desktop`，在当前已登录用户的桌面会话中运行管理中心和用户明确启动的 Profile。关闭 WebView2 窗口不会停止这些后台进程或下载任务，再次打开快捷方式会连接现有管理中心；用户注销会结束该会话内的管理中心、Profile 和下载进程。安装版不再注册或依赖 `kayisoft-dcmget` 服务。覆盖升级时，安装器会先确认旧服务属于当前安装目录，再停止并删除该旧服务；遇到同名但不属于当前安装目录的服务时会中止，而不是误删。安装、升级、卸载应用文件和配置防火墙仍需要管理员/UAC。
 
-Windows 用户会话中的 `X:`、`Y:` 等 SMB 映射盘不会自动出现在 LocalSystem 服务会话中。共享保存目录应填写 UNC 路径，例如 `\\影像服务器\共享名\DcmGet`，并同时授予运行服务的身份共享权限和 NTFS 写权限；工作组或 NAS 环境若不接受计算机账户，还需要由管理员把服务改为具备该共享凭据的专用 Windows 账户。非匿名任务会直接在该 UNC 目录下的 `.dcmget-staging` 接收 C-STORE，校验后同卷原子发布，从而避免系统盘到共享目录的完整二次复制；共享中断会直接影响当前 C-STORE，程序会保留已经完整接收的文件并按缺口重试或安全暂停，不会把未收全的数据误报为成功。
+因为管理中心和 Profile 使用当前登录用户的桌面会话，它们可以访问该会话中已连接的 `X:`、`Y:` 等 SMB 映射盘，并使用该用户已有的共享凭据。映射盘只在对应用户会话及映射有效期间可用；也可以继续填写 UNC 路径，例如 `\\影像服务器\共享名\DcmGet`。非匿名任务会直接在所选目标目录的 `.dcmget-staging` 接收 C-STORE，校验后同卷原子发布；共享中断会直接影响当前 C-STORE，程序会保留已经完整接收的文件并按缺口重试或安全暂停，不会把未收全的数据误报为成功。
 
 同一局域网的管理电脑可打开 `http://<DcmGet Windows 主机 IP>:8786/`。任务、设置、日志、PDI 和运维功能都在统一工作台内完成；管理中心只通过本机回环地址访问各 Profile 的独立 Web 端口，不会把浏览器跳转到其他端口。为避免与管理中心冲突，Profile 的 SCP 和 Web 端口均不能使用 `8786`。
 
-新建 Profile 默认保持停止。用户在统一工作台明确启动后，运行选择会写入独立的管理状态文件，`kayisoft-dcmget` 在 Windows 或服务重启后只恢复这些 Profile；用户明确停止后则保持停止。受监管的 Profile 异常退出时仍会自动拉起，删除 Profile 前必须先停止。切换当前 Profile 只改变右侧页面内容，不会停止其他正在执行的下载任务。
+新建 Profile 默认保持停止。3.7.5 管理中心启动时不会根据旧服务留下的运行意图自动启动 Profile；每个 Profile 都保持停止，直到用户在当前会话中明确启动。用户明确停止后则保持停止，删除 Profile 前也必须先停止。切换当前 Profile 只改变右侧页面内容，不会停止其他正在执行的下载任务。
 
 发布门禁会复核 Windows 运行时和应用载荷为 AMD64，核对精简 DCMTK 白名单，并输出 `RELEASE-MANIFEST.json` 和 `SHA256SUMS.txt`。GitHub Actions 配置 `DCMGET_SIGN_CERTIFICATE_BASE64` 与 `DCMGET_SIGN_CERTIFICATE_PASSWORD` 机密后，会对 EXE 载荷和最终发布物执行 Authenticode 签名、时间戳及签名复核。未配置证书时仍可生成内部测试包，但发布清单会明确标记 `UNSIGNED`，Windows SmartScreen 也可能显示未知发布者；对外商业交付应只发放清单为 `SIGNED` 的发布物。
 
@@ -58,7 +53,7 @@ Windows 用户会话中的 `X:`、`Y:` 等 SMB 映射盘不会自动出现在 Lo
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 3.7.4
+python scripts/build_windows.py --version 3.7.5
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
@@ -127,7 +122,7 @@ macOS/Linux 使用与 Windows 相同的离线 OHIF 静态资源；启动器只�
 
 ## 使用 Web 控制台
 
-1. 启动 DcmGet。Windows 安装版由 `kayisoft-dcmget` 服务自动启动统一管理中心，并恢复用户上次明确选择运行的 Profile；新 Profile 需要在工作台中手动启动。点击 DcmGet 快捷方式会打开统一工作台；源码版、便携版和 ZIP 版仍由程序进程启动 Web 服务。全程不要求应用密码，页面顶部始终提示当前为“仅限可信内网、HTTP 未加密”。
+1. 启动 DcmGet。Windows 安装版点击 DcmGet 快捷方式后，以 `--windows-desktop` 在当前已登录用户的会话中启动统一管理中心；Profile 不会自动启动，需要在工作台中手动启动。源码版、便携版和 ZIP 版仍由程序进程启动 Web 服务。全程不要求应用密码，页面顶部始终提示当前为“仅限可信内网、HTTP 未加密”。
 2. 打开“设置”，填写 PACS 地址、端口和 PACS AE。三类 AE Title 必须是 1-16 个可打印 ASCII 字符，非法字符会在对应字段直接提示。首个实例默认使用本机调用 AE `DCMGET`、接收 AE `DCMGET` 和接收端口 `6666`；如需下载后脱敏，可在同一页启用匿名处理并选择方案。
 3. 选择或拖入 TXT、CSV 或 XLSX，也可以直接粘贴多行检查号。CSV/XLSX 可选择表头列；空行会忽略，重复项会按首次出现顺序去重，公式单元格会被拒绝。选择服务器上的目标目录、目录模板和 PDI 快捷选项后开始任务。
 4. 开始前会检查配置、DCMTK、目标目录、磁盘保留空间和当前 Profile 的接收端口。`storescp` 就绪后，程序按检查号顺序执行 `movescu`。
@@ -285,8 +280,8 @@ DCMTK `storescp` 在 Windows、macOS 和 Linux 上接收 C-STORE association，�
 - “接收端口已占用”：关闭占用程序或在设置中更换端口，并同步 PACS 的 Move Destination。
 - 修改默认接收端口 `6666` 后：Windows 安装版和默认源码部署的 `storescp.exe` 程序规则会自动兼容所有自定义端口；如果在设置中改用另一套 DCMTK 路径，需要为那一份 `storescp.exe` 单独放行域/专用网络入站连接。
 - “C-MOVE 完成但未收到文件”：检查 PACS 中接收 AE、客户端 IP、接收端口及防火墙映射。
-- DCMTK 启动失败：下载需要同一套 `storescp` 和 `movescu`，PDI 还需要 `dcmmkdir`、`dcmdump`。Windows 3.7.4 成品已包含这四个程序及所需 DLL、字符集和许可证数据，不包含 `dcmj2pnm`、`dcmdjpeg` 等未使用工具；源码部署或自定义路径请选择同时包含这四个程序的 DCMTK 3.7.0 `bin` 目录。
-- Windows 本机界面启动失败：DcmGet 只使用 Edge Chromium WebView，不回退到旧版 IE 内核或默认浏览器。请安装或修复 Microsoft Edge WebView2 Runtime 后重新打开 DcmGet；后台服务和已经运行的下载不受窗口启动失败影响。
+- DCMTK 启动失败：下载需要同一套 `storescp` 和 `movescu`，PDI 还需要 `dcmmkdir`、`dcmdump`。Windows 3.7.5 成品已包含这四个程序及所需 DLL、字符集和许可证数据，不包含 `dcmj2pnm`、`dcmdjpeg` 等未使用工具；源码部署或自定义路径请选择同时包含这四个程序的 DCMTK 3.7.0 `bin` 目录。
+- Windows 本机界面启动失败：DcmGet 只使用 Edge Chromium WebView，不回退到旧版 IE 内核或默认浏览器。请安装或修复 Microsoft Edge WebView2 Runtime 后重新打开 DcmGet；同一用户会话内已经运行的管理中心、Profile 和下载不受单次窗口启动失败影响。
 - Windows 缺少 DLL：安装部署脚本提示的 Microsoft Visual C++ x64 Runtime。
 
 ## 开发与验证

@@ -259,7 +259,7 @@ def test_full_update_manifest_is_ed25519_signed_and_lists_exact_installer(
     assert manifest["product"] == "DcmGet"
     assert manifest["version"] == "3.6.0"
     assert manifest["platform"] == "windows-x64"
-    assert manifest["layout_version"] == 1
+    assert manifest["layout_version"] == 2
     assert manifest["install_tree_sha256"] == _install_tree_sha256(install)
     assert manifest["component_patches"] == []
     assert manifest["full_installer"] == {

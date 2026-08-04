@@ -63,7 +63,9 @@ from dcmget.update_trust import (
 
 
 UPDATE_SCHEMA_VERSION = 1
-UPDATE_LAYOUT_VERSION = 1
+# Layout 2 removes the WinSW service payload.  It intentionally cannot be
+# applied as a component patch on top of service-based 3.7.4 installations.
+UPDATE_LAYOUT_VERSION = 2
 UPDATE_MANIFEST_NAME = "UPDATE-MANIFEST.json"
 UPDATE_SIGNATURE_NAME = "UPDATE-MANIFEST.signed.json"
 PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
@@ -657,7 +659,7 @@ def _validate_compatible_base_manifest(
         != compatibility.get("full_install_inputs")
     ):
         raise WindowsUpdateBuildError(
-            "安装布局、Windows 服务、DCMTK 或依赖发生变化，"
+            "安装布局、DCMTK 或依赖发生变化，"
             "请改用完整安装包"
         )
     _validate_base_update_artifacts(

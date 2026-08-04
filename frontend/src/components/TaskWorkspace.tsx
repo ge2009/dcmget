@@ -178,7 +178,7 @@ function TaskComposer(props: Props & { headingRef: (node: HTMLHeadingElement | n
 
         <section className="form-section form-section--compact">
           <div className="form-section__heading">
-            <span>2</span><div><h3>保存位置</h3><p>Windows 服务无法识别 X: 映射盘；共享目录请填写 UNC（\\服务器\共享\目录）。</p></div>
+            <span>2</span><div><h3>保存位置</h3><p>支持当前登录用户已连接的映射盘；长期使用共享目录时建议填写 UNC（\\服务器\共享\目录）。</p></div>
           </div>
           <label className="field-label" htmlFor="destination">保存到 DcmGet 主机</label>
           <div className="input-action">

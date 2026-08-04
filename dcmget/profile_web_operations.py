@@ -245,8 +245,8 @@ class ProfileWebOperations:
                     except TaskStateError as exc:
                         shutdown_error = exc
 
-            # Tell the Windows supervisor to finish process-tree cleanup only
-            # after the graceful request had a chance to complete.
+            # Clear the operator's running intent only after the graceful
+            # request had a chance to complete.
             self.runtime_state.set_desired(profile.number, False)
             stopped, blockers = self.manager.wait_for_profile_stopped(
                 profile.number,

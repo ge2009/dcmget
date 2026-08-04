@@ -1484,8 +1484,8 @@ def test_scheduled_task_can_apply_allowlisted_component_patch_with_rollback(
     scripts = list(package_root.glob("apply-*.ps1"))
     assert len(scripts) == 1
     script = scripts[0].read_text(encoding="utf-8-sig")
-    assert "kayisoft-dcmget" in script
-    assert "$restartService" in script
+    assert "kayisoft-dcmget" not in script
+    assert "$restartService" not in script
     assert "Get-FileHash" in script
     assert "Get-DcmGetApplicationTreeDigest" in script
     assert "base_tree_sha256" in script

@@ -1030,7 +1030,7 @@ class WindowsDirectoryAcl:
 
 
 class WindowsScheduledTaskUpdater:
-    """Schedule the signed installer outside the WinSW service process tree."""
+    """Schedule a signed update outside the running desktop process tree."""
 
     def __init__(
         self,
@@ -1341,14 +1341,8 @@ function Get-DcmGetApplicationTreeDigest([string]$root) {{
     }}
 }}
 $plan = Get-Content -LiteralPath $planPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$service = Get-Service -Name 'kayisoft-dcmget' -ErrorAction SilentlyContinue
-$restartService = $null -ne $service -and $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running
 try {{
     $installFull = [IO.Path]::GetFullPath($installRoot)
-    if ($null -ne $service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {{
-        Stop-Service -Name 'kayisoft-dcmget' -Force -ErrorAction Stop
-        $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
-    }}
     Get-CimInstance -ClassName Win32_Process | Where-Object {{
         $null -ne $_.ExecutablePath -and
         [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith(
@@ -1437,9 +1431,6 @@ try {{
     }}
     throw $originalError
 }} finally {{
-    if ($restartService) {{
-        Start-Service -Name 'kayisoft-dcmget' -ErrorAction SilentlyContinue
-    }}
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }}
 """.strip() + "\n"
@@ -2211,7 +2202,7 @@ def create_windows_update_service(
     install_directory: str | Path,
     current_version: str,
 ) -> WindowsUpdateService:
-    """Build the production updater used by the Windows management service."""
+    """Build the production updater used by the Windows management center."""
 
     state_root = Path(state_directory).expanduser().resolve()
     install_root = Path(install_directory).expanduser().resolve()

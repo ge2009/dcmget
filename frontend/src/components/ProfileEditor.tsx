@@ -67,7 +67,7 @@ export function ProfileEditor({
         <legend>基本信息</legend>
         <p className="profile-editor__section-description">用于区分工作台中的接收实例，并指定该实例的影像保存位置。</p>
         <TextField label="Profile 名称" required maxLength={80} hint="显示在左侧实例列表中，不会发送给 PACS。" {...value('display_name')} />
-        <TextField label="影像目标目录" required hint={String.raw`接收到的 DICOM 和日志将保存在此目录；Windows SMB 请填写 \\服务器\共享名\目录，不要使用 X: 映射盘。`} {...value('dicom_destination_folder')} />
+        <TextField label="影像目标目录" required hint={String.raw`接收到的 DICOM 和日志将保存在此目录；支持当前用户已连接的映射盘，长期使用 SMB 时建议填写 \\服务器\共享名\目录。`} {...value('dicom_destination_folder')} />
       </fieldset>
 
       <fieldset className="profile-editor__section">

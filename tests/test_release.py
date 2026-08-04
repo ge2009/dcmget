@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import io
 import struct
 from pathlib import Path
 
@@ -26,8 +24,7 @@ from dcmget.architecture import (
 from dcmget.pdi_server import PdiRequestHandler
 from dcmget.release_notes import load_release_notes
 from scripts.build_deploy_bundle import VERSION as DEPLOY_VERSION, source_files
-import scripts.build_windows as windows_build
-from scripts.build_windows import prepare_winsw_service_wrapper, validate_release_version
+from scripts.build_windows import validate_release_version
 
 
 def _write_pe(path: Path, machine: int) -> Path:
@@ -85,43 +82,6 @@ def test_runtime_guard_rejects_32_bit_and_native_windows_arm64(tmp_path: Path):
         ensure_supported_runtime(
             platform_name="win32", executable=arm64, pointer_bits=64
         )
-
-
-def test_windows_build_downloads_only_pinned_amd64_winsw(
-    tmp_path: Path, monkeypatch
-):
-    payload_path = _write_pe(tmp_path / "source.exe", IMAGE_FILE_MACHINE_AMD64)
-    payload = payload_path.read_bytes()
-    expected = hashlib.sha256(payload).hexdigest()
-    target = tmp_path / "runtime" / "WinSW-x64.exe"
-    requests = []
-
-    def open_fixture(request, *, timeout):
-        requests.append((request.full_url, timeout))
-        return io.BytesIO(payload)
-
-    monkeypatch.setattr(windows_build, "WINSW_SHA256", expected)
-    assert prepare_winsw_service_wrapper(target, opener=open_fixture) == target.resolve()
-    assert target.read_bytes() == payload
-    assert requests == [(windows_build.WINSW_URL, 120)]
-
-    assert prepare_winsw_service_wrapper(
-        target,
-        opener=lambda *_args, **_kwargs: pytest.fail("verified WinSW was downloaded again"),
-    ) == target.resolve()
-
-
-def test_windows_build_rejects_winsw_checksum_mismatch(tmp_path: Path, monkeypatch):
-    payload = _write_pe(tmp_path / "source.exe", IMAGE_FILE_MACHINE_AMD64).read_bytes()
-    target = tmp_path / "WinSW-x64.exe"
-    monkeypatch.setattr(windows_build, "WINSW_SHA256", "0" * 64)
-
-    with pytest.raises(RuntimeError, match="WinSW v2.12.0 SHA-256"):
-        prepare_winsw_service_wrapper(
-            target,
-            opener=lambda *_args, **_kwargs: io.BytesIO(payload),
-        )
-    assert not target.exists()
 
 
 def test_source_deploy_contains_transitive_requirement_files():
@@ -391,35 +351,10 @@ def test_windows_release_tests_the_signed_installer_and_only_reverifies_it():
     )
 
     signing_step = workflow.index("Sign installer before testing exact release artifact")
-    install_test = workflow.index("Silent install, in-place upgrade and uninstall test")
+    install_test = workflow.index("Silent install and in-place upgrade test")
     assert signing_step < install_test
     assert "sign_windows_payloads([Path(os.environ['DCMGET_SETUP_PATH'])])" in workflow
     assert "--verify-existing-signatures" in workflow
-
-
-def test_windows_service_tree_fixture_uses_explicit_powershell_children():
-    root = Path(__file__).resolve().parents[1]
-    workflow = (root / ".github/workflows/windows-release.yml").read_text(
-        encoding="utf-8"
-    )
-    child = (root / ".github/scripts/windows-service-tree-child.ps1").read_text(
-        encoding="utf-8"
-    )
-    fixture_section = workflow[
-        workflow.index("$serviceTreeChild = Join-Path $serviceTreeFixture \"service-tree-child.ps1\"") :
-        workflow.index("Builtin Users receive only query/start/stop rights.")
-    ]
-
-    assert "service-tree-child.ps1" in fixture_section
-    assert "service-tree-identities.json" in fixture_section
-    assert 'WindowsPowerShell\\v1.0\\powershell.exe' in fixture_section
-    assert "CreationTicks = ([DateTime]$childCim.CreationDate)" in fixture_section
-    assert ".github\\scripts\\windows-service-tree-child.ps1" in fixture_section
-    assert '"$env:SystemRoot\\System32\\ping.exe"' in child
-    assert "OwnerProcessId = $PID" in child
-    assert '"ready-{0}.json" -f $Label' in child
-    assert 'Copy-Item "$env:SystemRoot\\System32\\cmd.exe"' not in fixture_section
-    assert '@("/d", "/c", "ping.exe -t 127.0.0.1 >NUL")' not in fixture_section
 
 
 def test_windows_pdi_smoke_uses_authenticated_directory_entry():
@@ -460,8 +395,9 @@ def test_windows_upgrade_uses_a_pinned_real_previous_release_build():
     assert 'Join-Path $configDir "instances\\i1\\config.json"' in workflow
     assert "Installed 2.9.1 UI self-test failed" in workflow
     assert "Upgrade changed the existing 2.9.1 Profile 1 configuration" in workflow
-    assert '$upgradeWeb = Start-Process "$installDir/DcmGet.exe"' in workflow
-    assert "Installed Web self-test failed" in workflow
+    assert '$desktopManager = Start-Process "$installDir/DcmGet.exe"' in workflow
+    assert 'ArgumentList "--windows-desktop"' in workflow
+    assert "Installed desktop manager did not expose the management API" in workflow
     assert "/DAppVersion=2.0.0" not in workflow
 
 
@@ -481,7 +417,7 @@ def test_windows_upgrade_gate_restores_a_real_large_291_checkpoint():
     assert "store.record_result(" in workflow
     assert "Pinned 2.9.1 large-task checkpoint is missing" in workflow
     assert 'Invoke-RestMethod "$profileUrl/api/bootstrap"' in workflow
-    assert 'desired_running_profiles = @(1)' in workflow
+    assert '"$managementUrl/api/management/profiles/1/start"' in workflow
     assert "$bootstrap.task.large_batch -ne $true" in workflow
     assert 'Properties.Name -notcontains "accessions"' in workflow
     assert 'Properties.Name -notcontains "results"' in workflow
@@ -494,7 +430,7 @@ def test_windows_upgrade_gate_restores_a_real_large_291_checkpoint():
     assert "results: z.array(TaskItemSchema).nullish()" in schemas
 
 
-def test_windows_installer_repairs_offline_webview2_for_native_react_shell():
+def test_windows_installer_repairs_offline_webview2_for_desktop_manager():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
@@ -515,14 +451,17 @@ def test_windows_installer_repairs_offline_webview2_for_native_react_shell():
     assert 'Subject -notmatch "CN=Microsoft Corporation(?:,|$)"' in workflow
     assert '"/DWebView2RuntimePath=$webview2"' in workflow
     assert "Upgrade did not install the bundled WebView2 Runtime" in workflow
-    assert 'Start-Process "$installDir/DcmGet.exe" -ArgumentList @("--native-shell-url", "http://127.0.0.1:8786/")' in workflow
-    assert "Installed native shell did not start a WebView2 process" in workflow
+    assert (
+        'Start-Process "$installDir/DcmGet.exe" '
+        '-ArgumentList "--windows-desktop"' in workflow
+    )
+    assert "did not start a WebView2 process" in workflow
     assert "target: 'edge111'" in vite
     assert "DcmGet 界面正在加载" in index
     assert "修复 Microsoft Edge WebView2 Runtime" in index
 
 
-def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
+def test_windows_installer_process_cleanup_is_limited_to_install_directory():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
@@ -536,14 +475,6 @@ def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
     assert "$path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)" in installer
     for name in ("DcmGet.exe", "DcmGetPdiServer.exe", "storescp.exe", "movescu.exe"):
         assert name in installer
-    assert (
-        "$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', "
-        "''movescu.exe'', ''{#ServiceWrapperName}'')" in installer
-    )
-    assert "$attempt -lt 140" in installer
-    assert installer.index("kayisoft-dcmget service did not stop") < installer.index(
-        "$names = @(''DcmGet.exe''"
-    )
     assert 'taskkill.exe" /PID ([string]$target.ProcessId) /T /F' in installer
     assert "Get-Process -Name" not in installer
 
@@ -553,227 +484,106 @@ def test_windows_installer_stops_only_dcmget_processes_from_install_directory():
     assert '$outsideTool = Join-Path $outsideRoot "storescp.exe"' in workflow
 
 
-def test_windows_installer_manages_passwordless_winsw_service_and_all_profiles():
+def test_windows_installer_uses_desktop_entrypoint_without_service_installation():
     root = Path(__file__).resolve().parents[1]
     installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
-    template = (root / "packaging/windows/kayisoft-dcmget.xml.template").read_text(
-        encoding="utf-8"
+    files_section = installer.split("[Files]", 1)[1].split("[Icons]", 1)[0]
+    icons_section = installer.split("[Icons]", 1)[1].split("[Run]", 1)[0]
+    run_section = installer.split("[Run]", 1)[1].split("[UninstallRun]", 1)[0]
+
+    assert build_parser().parse_args(["--windows-desktop"]).windows_desktop
+    assert icons_section.count('Parameters: "--windows-desktop"') == 2
+    assert (
+        'Filename: "{app}\\{#AppExeName}"; Parameters: "--windows-desktop"'
+        in run_section
     )
-    host = (root / "packaging/windows/kayisoft-dcmget-host.ps1").read_text(
-        encoding="utf-8"
+    assert "--native-shell-url" not in installer
+    assert 'Name: "{autoprograms}\\DcmGet 启动后台服务"' not in icons_section
+    assert 'Name: "{autoprograms}\\DcmGet 停止后台服务"' not in icons_section
+
+    for service_install_marker in (
+        "#ifndef WinSWPath",
+        'Source: "{#WinSWPath}"',
+        'DestName: "{#ServiceWrapperName}"',
+        "ConfigureAndInstallDcmGetService",
+        "RunServiceCommand('install')",
+        "Check: ShouldStartDcmGetService",
+        "ServiceExistedBeforeInstall",
+        "ServiceWasActiveBeforeInstall",
+        "New-Service",
+        "Start-Service",
+        "'create \"{#ServiceName}\"'",
+    ):
+        assert service_install_marker not in files_section
+        assert service_install_marker not in installer
+    assert 'Parameters: "start {#ServiceName}"' not in installer
+    assert "[Registry]" not in installer
+
+
+def test_windows_installer_only_removes_an_owned_legacy_service():
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "packaging/windows/dcmget.iss").read_text(encoding="utf-8")
+    install_delete = installer.split("[InstallDelete]", 1)[1].split("[Files]", 1)[0]
+    uninstall_delete = installer.split("[UninstallDelete]", 1)[1].split("[Code]", 1)[0]
+
+    assert "installed by DcmGet 3.1.0 through 3.7.4" in installer
+    for legacy_file in (
+        "{#ServiceWrapperName}",
+        "{#ServiceConfigName}",
+        "{#ServiceTemplateName}",
+        "{#ServiceHostName}",
+        "LICENSE-WINSW.txt",
+    ):
+        assert legacy_file in install_delete
+        assert legacy_file in uninstall_delete
+
+    assert "function RegisteredServiceWrapperPath(): String;" in installer
+    assert "'SYSTEM\\CurrentControlSet\\Services\\{#ServiceName}'" in installer
+    assert "'ImagePath'" in installer
+    assert (
+        "CompareText(RegisteredPath, ExpandFileName(ServiceWrapperPath())) = 0"
+        in installer
     )
+
+    prepare = installer.split(
+        "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+    )[1].split("procedure RemoveDcmGetServiceForUninstall();", 1)[0]
+    assert "DcmGetServiceExists() and not DcmGetServiceBelongsToApp()" in prepare
+    assert prepare.index("not DcmGetServiceBelongsToApp()") < prepare.index(
+        "RequestExistingServiceStop();"
+    ) < prepare.index("RemoveDcmGetServiceForUninstall();")
+    assert "RegDeleteKeyIncludingSubkeys(HKLM, '{#ServiceStateRegistryKey}')" in prepare
+
+    remove = installer.rsplit(
+        "procedure RemoveDcmGetServiceForUninstall();", 1
+    )[1].split(
+        "procedure CurUninstallStepChanged", 1
+    )[0]
+    assert "if not DcmGetServiceBelongsToApp() then" in remove
+    assert remove.index("if not DcmGetServiceBelongsToApp() then") < remove.index(
+        "'uninstall'"
+    ) < remove.index("'delete \"{#ServiceName}\"'")
+
+
+def test_windows_build_and_release_workflow_have_no_active_winsw_dependency():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
     workflow = (root / ".github/workflows/windows-release.yml").read_text(
         encoding="utf-8"
     )
 
-    assert windows_build.WINSW_URL.endswith("/v2.12.0/WinSW-x64.exe")
-    assert (
-        windows_build.WINSW_SHA256
-        == "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
-    )
-    assert "<id>kayisoft-dcmget</id>" in template
-    assert "<user>LocalSystem</user>" in template
-    assert "<domain>NT AUTHORITY</domain>" not in template
-    assert "<startmode>Automatic</startmode>" in template
-    assert "<stopparentprocessfirst>true</stopparentprocessfirst>" in template
-    assert "<securityDescriptor>" in template
-    assert ";;;BU)" in template
-    assert "@APPDATA@" in template and "@LOCALAPPDATA@" in template
-    assert "kayisoft-dcmget-host.ps1" in template
-    assert '$startInfo.Arguments = "--windows-management --no-open-browser"' in host
-    assert "function Start-DcmGetManagement" in host
-    assert "$managementProcess = $null" in host
-    assert "$managementRetryAfter = $null" in host
-    assert "function Test-CompleteProfileConfig" in host
-    assert "ConvertFrom-Json -InputObject $content -ErrorAction Stop" in host
-    assert "Get-ConfiguredProfileNumbers" in host
-    assert '$runtimeStatePath = Join-Path $env:LOCALAPPDATA "DcmGet\\management\\profile-runtime.json"' in host
-    assert "function Get-DesiredProfileNumbers" in host
-    assert '$parsed.schema -ne "dcmget-profile-runtime"' in host
-    assert "desired_running_profiles" in host
-    assert "$startupProfileNumbers = @(Get-ConfiguredProfileNumbers)" not in host
-    assert "$defaultProfilePending" not in host
-    assert "$managedProfiles = @{}" in host
-    assert "function Get-InstalledProfileProcesses" in host
-    assert "function Update-ManagedProfiles" in host
-    assert "[string]::Equals($path, $application, [StringComparison]::OrdinalIgnoreCase)" in host
-    assert "--profile(?:\\s+|=)([1-9][0-9]{0,3})" in host
-    assert "Adopted running DcmGet profile $number" in host
-    assert 'Stop-DcmGetProcess $script:processes[[int]$number] "deleted DcmGet profile $number"' in host
-    assert "Stopped supervising deleted DcmGet profile $number" in host
-    assert "Stopped supervising disabled DcmGet profile $number" in host
-    assert "return $true" in host
-    assert "return $false" in host
-    assert "Will retry stopping disabled DcmGet profile $number" in host
-    assert "Will retry stopping deleted DcmGet profile $number" in host
-    assert host.index("if (-not (Stop-DcmGetProcess") < host.index(
-        "Stopped supervising disabled DcmGet profile $number"
-    )
-    assert "[DateTime]::UtcNow.AddSeconds(4)" in host
-    assert "$lastDesiredProfileNumbers = @(Get-DesiredProfileNumbers)" in host
-    assert "$managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)" in host
-    update_managed_body = host.split(
-        "function Update-ManagedProfiles", 1
-    )[1].split(
-        'Write-Output "DcmGet service host started', 1
-    )[0]
-    assert "Write-Output" not in update_managed_body
-    assert update_managed_body.count("Write-Host") == 3
-    assert "foreach ($number in $managedProfileNumbers)" in host
-    assert "$managedProfileNumbers = @(Get-ConfiguredProfileNumbers)" not in host
-    assert "profile ${number}:" in host
-    assert "profile $number:" not in host
-    assert "while ($true)" in host
-    assert "Start-Sleep -Seconds 2" in host
-    assert host.index("if (-not (Test-RunningProcess $managementProcess))") < host.index(
-        "$managedProfileNumbers = @(Update-ManagedProfiles $lastDesiredProfileNumbers)"
-    ) < host.index("foreach ($number in $managedProfileNumbers)")
-    assert "function Stop-DcmGetProcesses" in host
-    assert 'Stop-DcmGetProcess $script:managementProcess "DcmGet management hub"' in host
-    assert 'Stop-DcmGetProcess $process "DcmGet profile $number"' in host
-    assert 'taskkill.exe" /PID ([string]$Process.Id) /T /F' in host
-    assert "} finally {\n    Stop-DcmGetProcesses\n}" in host
-
-    assert 'DestName: "{#ServiceWrapperName}"' in installer
-    assert "ConfigureAndInstallDcmGetService" in installer
-    configure_service = installer.split(
-        "procedure ConfigureAndInstallDcmGetService();", 1
-    )[1].split("\nend;", 1)[0]
-    assert "RunServiceCommand('refresh')" not in installer
-    assert "RemoveDcmGetServiceForUninstall();" in configure_service
-    assert configure_service.index("RemoveDcmGetServiceForUninstall();") < configure_service.index(
-        "RunServiceCommand('install')"
-    )
-    assert "  RequestExistingServiceStop();" in installer
-    assert "function RunManagedProcessCleanup(AppDir: String; var FailureMessage: String): Boolean;" in installer
-    assert installer.index("  RequestExistingServiceStop();") < installer.index(
-        "  if not RunManagedProcessCleanup(AppDir, FailureMessage) then"
-    )
-    assert "procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);" in installer
-    assert "if not RunManagedProcessCleanup(ExpandConstant('{app}'), FailureMessage) then" in installer
-    assert "procedure RemoveDcmGetServiceForUninstall();" in installer
-    assert "RemoveDcmGetServiceForUninstall();" in installer
-    assert 'Type: dirifempty; Name: "{app}\\Dicom"' in installer
-    assert "DcmGetServiceBelongsToApp" in installer
-    assert "RegisteredServiceWrapperPath" in installer
-    assert "RegQueryStringValue(" in installer
-    assert "'ImagePath'" in installer
-    assert "ServiceWasInstalled and not FileExists(ServiceWrapperPath())" not in installer
-    assert "ServiceWasInstalled and not DcmGetServiceBelongsToApp()" in installer
-    assert "'delete \"{#ServiceName}\"'" in installer
-    assert "''{#ServiceWrapperName}''" in installer
-    assert 'Parameters: "start"' in installer
-    assert "Check: ShouldStartDcmGetService" in installer
-    assert "ServiceExistedBeforeInstall" in installer
-    assert "ServiceWasActiveBeforeInstall" in installer
-    assert "$service.Status -ne ''Stopped''" in installer
-    assert 'Name: "{autoprograms}\\DcmGet 启动后台服务"' in installer
-    assert 'Name: "{autoprograms}\\DcmGet 停止后台服务"' in installer
-    assert installer.count(
-        'Type: files; Name: "{autoprograms}\\DcmGet 启动全部.lnk"'
-    ) == 2
-    assert installer.count(
-        'Type: files; Name: "{autoprograms}\\DcmGet 停止全部.lnk"'
-    ) == 2
-    assert 'Filename: "{sys}\\sc.exe"' in installer
-    assert 'Name: "{autoprograms}\\DcmGet"; Filename: "{app}\\{#AppExeName}"' in installer
-    assert '#define ManagementUrl "http://127.0.0.1:8786/"' in installer
-    assert installer.count('Parameters: "--native-shell-url ""{#ManagementUrl}"""') == 2
-    assert 'Type: files; Name: "{autoprograms}\\DcmGet.url"' in installer
-    assert 'Type: files; Name: "{autodesktop}\\DcmGet.url"' in installer
-    assert '[INI]' not in installer
-    assert "GetPrimaryWebUrl" not in installer
-    assert "ReadConfiguredWebPort" not in installer
-    assert "GetEnv('HOMEDRIVE') + GetEnv('HOMEPATH')" in installer
-    assert '#define ServiceStateRegistryKey "Software\\DcmGet\\WindowsService"' in installer
-    assert "procedure LoadPreservedServiceEnvironment();" in installer
-    assert "ServiceEnvironmentValue" in installer
-    assert "GetServiceAppDataRoot" in installer
-    assert "GetServiceLocalAppDataRoot" in installer
-    assert "GetServiceUserProfileRoot" in installer
-    assert installer.count("Flags: createvalueifdoesntexist uninsdeletevalue") == 3
-    assert "XmlEscape(GetServiceAppDataRoot(''))" in installer
-    assert "XmlEscape(GetServiceLocalAppDataRoot(''))" in installer
-    assert "XmlEscape(GetServiceUserProfileRoot(''))" in installer
-
-    assert "Verify pinned WinSW service wrapper" in workflow
-    assert "Verify Windows PowerShell service host syntax" in workflow
-    assert "WinSW checksum mismatch" in workflow
-    assert "kayisoft-dcmget" in workflow
-    assert "Windows service lifecycle, upgrade-state and uninstall test" in workflow
-    assert "Windows service dynamic Profile adoption test" in workflow
-    assert "Windows service controls, process-tree and uninstall test" in workflow
-    assert "Could not stop fixture process" in workflow
-    assert "CreationTicks = [long]$record.CreationTicks" in workflow
-    assert "$serviceTreeIdentities" in workflow
-    assert "$directServiceTreeIdentities" in workflow
-    assert "Service tree fixture did not maintain all helper processes" in workflow
-    assert "Service tree fixture direct process no longer running" in workflow
-    assert "-ne [long]$record.CreationTicks" in workflow
-    assert "Service tree fixture did not publish all verified children" in workflow
-    assert "Service tree fixture verified child no longer running" in workflow
-    assert "$owner[0].ProcessId -ne [int]$record.OwnerProcessId" in workflow
-    assert "Service tree process survived stop" in workflow
-    assert '$fixtureLabels = @("DcmGet", "storescp", "movescu", "DcmGetPdiServer")' in workflow
-    assert '[PSCustomObject]@{' in workflow and "Label = [string]$record.Label" in workflow
-    assert '$opsPasswordText = "Dg!" + [Guid]::NewGuid().ToString("N").Substring(0, 11)' in workflow
-    assert '$attempt -lt 120 -and (Test-Path $installDir)' in workflow
-    assert "--- Remaining installation directory contents ---" in workflow
-    assert 'dicom_destination_folder = $upgradeDicomDir' in workflow
-    assert "$upgradeWebPort = 8787" in workflow
-    assert 'Assert-FixedDcmGetPortAvailable 8786 "management"' in workflow
-    assert 'Assert-FixedDcmGetPortAvailable 8787 "Profile 1"' in workflow
-    assert "is occupied before installer testing" in workflow
-    assert "Profile 1 Web port changed from 8787" in workflow
-    assert "Service host adopted Profile 2 before config.json was complete" in workflow
-    assert "Service host auto-started a cloned Profile before explicit start" in workflow
-    assert "Start-AdoptAndRestartProfile" in workflow
-    assert "function Set-DesiredProfiles" in workflow
-    assert 'schema = "dcmget-profile-runtime"' in workflow
-    assert "desired_running_profiles" in workflow
-    assert "Service host did not restart adopted Profile 2" in workflow
-    assert "Deleted Profile $profileNumber remained running" in workflow
-    assert "Service host restarted a Profile after the operator stopped it" in workflow
-    assert "Service host adopted a newly cloned Profile before explicit startup configuration" not in workflow
-    assert "function Wait-DcmGetManagement" in workflow
-    assert 'http://127.0.0.1:$managementPort/' in workflow
-    assert '$_.LocalAddress -eq "0.0.0.0"' in workflow
-    assert "DcmGet management hub did not become ready on 0.0.0.0:$managementPort" in workflow
-    assert "Service-aware upgrade left old manager/profile process running" in workflow
-    assert "Service-aware upgrade changed the existing user configuration" in workflow
-    assert "Stopped-service upgrade changed Profile 1 configuration" in workflow
-    assert "Stopped-service upgrade changed Profile 2 configuration" in workflow
-    assert "Service stop left DcmGet manager/profile processes running" in workflow
-    assert "Assert-NoDcmGetServiceApplications" in workflow
-    assert "Installed management application is not AMD64" in workflow
-    assert '"/TASKS=desktopicon"' in workflow
-    assert "Installed DcmGet desktop shortcut is missing" in workflow
-    assert '--native-shell-url \"http://127.0.0.1:8786/\"' in workflow
-    assert "Uninstall removed or changed downloaded DICOM data" in workflow
-    assert "Stopped-service upgrade unexpectedly restarted the service" in workflow
-    assert "Stable service APPDATA was not registered" in workflow
-    assert "Missing-wrapper repair failed" in workflow
-    assert "Missing-wrapper repair unexpectedly restarted the service" in workflow
-    assert "Missing-wrapper repair changed the stable service user directories" in workflow
-    assert "missing-wrapper uninstall test" in workflow
-    assert "Uninstall left kayisoft-dcmget service behind" in workflow
-    assert "Uninstall left stable service state behind" in workflow
-
-    workflow_lines = workflow.splitlines(keepends=True)
-    run_block_lengths: list[int] = []
-    for index, line in enumerate(workflow_lines):
-        if line.strip() != "run: |":
-            continue
-        indentation = len(line) - len(line.lstrip())
-        body: list[str] = []
-        for candidate in workflow_lines[index + 1 :]:
-            candidate_indentation = len(candidate) - len(candidate.lstrip())
-            if candidate.strip() and candidate_indentation <= indentation:
-                break
-            body.append(candidate)
-        run_block_lengths.append(len("".join(body)))
-    assert run_block_lengths
-    assert max(run_block_lengths) < 21_000
+    assert "winsw" not in build.casefold()
+    for active_dependency in (
+        ".runtime/winsw",
+        ".runtime\\winsw",
+        "/DWinSWPath=",
+        "Verify pinned WinSW service wrapper",
+        "WinSW checksum mismatch",
+        "WinSW-x64.exe",
+    ):
+        assert active_dependency.casefold() not in workflow.casefold()
+    assert "--windows-desktop" in workflow
+    assert "Windows desktop lifecycle and uninstall test" in workflow
 
 
 def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
@@ -823,7 +633,7 @@ def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
     assert '$rule.Action.ToString() -ne "Allow"' in workflow
     assert '$rule.Enabled.ToString() -ne "True"' in workflow
     assert '$rule.EdgeTraversalPolicy.ToString() -ne "Block"' in workflow
-    assert 'Uninstall left the Web firewall rule behind' in workflow
+    assert 'RunOnceId: "RemoveDcmGetWebFirewallRule"' in installer
     assert "DCMGET_PAYLOAD.SHA256" in workflow
 
 
