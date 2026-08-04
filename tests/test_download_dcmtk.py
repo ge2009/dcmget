@@ -75,6 +75,30 @@ def _target(project_root: Path, key: str) -> Path:
     return project_root / ".runtime" / "dcmtk" / key
 
 
+def test_vendored_archive_is_used_before_network_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "windows-x86_64"
+    source = _prepare_archive(tmp_path, key, monkeypatch)
+    vendored = tmp_path / download_dcmtk.VENDORED_ARCHIVE_DIR / source.name
+    vendored.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, vendored)
+    source.unlink()
+
+    monkeypatch.setattr(
+        download_dcmtk,
+        "download",
+        lambda *_args, **_kwargs: pytest.fail("vendored archive should avoid network"),
+    )
+
+    bin_dir = download_dcmtk.install(tmp_path, key)
+    archive = tmp_path / ".runtime" / "downloads" / source.name
+
+    assert archive.is_file()
+    assert download_dcmtk.sha256(archive) == download_dcmtk.EXPECTED_SHA256[key]
+    assert (bin_dir / "movescu.exe").read_bytes() == f"{key}:movescu\n".encode()
+
+
 @pytest.mark.parametrize("key", sorted(download_dcmtk.PACKAGES))
 def test_install_writes_and_reuses_archive_attested_manifest_for_every_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str

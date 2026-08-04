@@ -97,6 +97,7 @@ def test_source_deploy_contains_transitive_requirement_files():
     assert "frontend/package-lock.json" in bundled
     assert not any("node_modules" in Path(name).parts for name in bundled)
     assert not any(name.endswith(".tsbuildinfo") for name in bundled)
+    assert "packaging/windows/vendor/dcmtk-3.7.0-win64-dynamic.zip" not in bundled
 
 
 def test_pynetdicom_is_a_runtime_and_frozen_build_dependency():

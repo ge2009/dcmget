@@ -40,6 +40,7 @@ REQUIRED_TOOLS = (
     "dcmmkdir",
     "dcmdump",
 )
+VENDORED_ARCHIVE_DIR = Path("packaging") / "windows" / "vendor"
 
 
 class IntegrityError(RuntimeError):
@@ -493,7 +494,12 @@ def find_bin(directory: Path, key: str) -> Path | None:
     return None
 
 
+def vendored_archive_path(project_root: Path, key: str) -> Path:
+    return project_root / VENDORED_ARCHIVE_DIR / PACKAGES[key]
+
+
 def acquire_archive(runtime: Path, key: str) -> tuple[Path, str]:
+    project_root = runtime.parent
     filename = PACKAGES[key]
     archive = runtime / "downloads" / filename
     expected_hash = EXPECTED_SHA256[key]
@@ -504,6 +510,18 @@ def acquire_archive(runtime: Path, key: str) -> tuple[Path, str]:
             return archive, actual_hash
         print(f"DCMTK 归档缓存校验失败，将重新下载：{archive}")
         archive.unlink()
+
+    vendored = vendored_archive_path(project_root, key)
+    if vendored.is_file():
+        actual_hash = sha256(vendored)
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"仓库内置 DCMTK 归档校验失败：期望 {expected_hash}，实际 {actual_hash}"
+            )
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(vendored, archive)
+        print(f"使用仓库内置的已校验 DCMTK 归档：{vendored}")
+        return archive, actual_hash
 
     partial = archive.with_suffix(archive.suffix + ".part")
     print(f"正在从 OFFIS 下载 DCMTK {VERSION}：{filename}")

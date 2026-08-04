@@ -26,12 +26,15 @@ ROOT_FILES = (
 )
 TREE_ROOTS = ("assets", "dcmget", "frontend", "scripts", "packaging", "tools")
 EXCLUDED_TREE_PARTS = frozenset({"__pycache__", "node_modules"})
+EXCLUDED_TREE_PREFIXES = (Path("packaging") / "windows" / "vendor",)
 
 
-def include_tree_file(path: Path) -> bool:
+def include_tree_file(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root)
     return (
         path.is_file()
         and EXCLUDED_TREE_PARTS.isdisjoint(path.parts)
+        and all(relative.parts[: len(prefix.parts)] != prefix.parts for prefix in EXCLUDED_TREE_PREFIXES)
         and path.suffix not in {".pyc", ".tsbuildinfo"}
     )
 
@@ -50,7 +53,7 @@ def source_files(root: Path) -> list[Path]:
         files.extend(
             path
             for path in (root / tree).rglob("*")
-            if include_tree_file(path)
+            if include_tree_file(root, path)
         )
     missing = [path.name for path in files if not path.is_file()]
     if missing:
