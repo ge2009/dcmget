@@ -40,6 +40,9 @@ FINAL_STATUSES = {
     AccessionStatus.FAILED,
 }
 
+_UNIQUE_SOP_FILE_COUNT_SEMANTICS = "unique_sop_v1"
+_PROCESSED_STORE_FILE_COUNT_SEMANTICS = "processed_store_v1"
+
 
 class TaskStateError(RuntimeError):
     pass
@@ -949,17 +952,18 @@ def _merge_partial_result(
     )
     if not prior_has_retained_files and prior.pacs_expected_suboperations is None:
         return current
-    archived_files = list(dict.fromkeys([*prior.archived_files, *current.archived_files]))
+    archived_files = list(
+        dict.fromkeys([*prior.archived_files, *current.archived_files])
+    )
     status = current.status
     duration = prior.duration_seconds + current.duration_seconds
     received_bytes = prior.received_bytes + current.received_bytes
-    new_file_count = min(
-        len(archived_files),
-        prior.new_file_count + current.new_file_count,
-    )
-    existing_skipped_count = max(0, len(archived_files) - new_file_count)
+    prior_deliveries = _archive_delivery_counts(prior)
+    current_deliveries = _archive_delivery_counts(current)
+    new_file_count = prior_deliveries[0] + current_deliveries[0]
+    existing_skipped_count = prior_deliveries[1] + current_deliveries[1]
     conflict_preserved_count = (
-        prior.conflict_preserved_count + current.conflict_preserved_count
+        prior_deliveries[2] + current_deliveries[2]
     )
     retained_file_count = max(
         len(archived_files) + conflict_preserved_count,
@@ -993,7 +997,12 @@ def _merge_partial_result(
     if (
         current.status in {AccessionStatus.COMPLETED, AccessionStatus.NO_DATA}
         and pacs_expected_suboperations is not None
-        and retained_file_count < pacs_expected_suboperations
+        and (
+            new_file_count
+            + existing_skipped_count
+            + conflict_preserved_count
+        )
+        < pacs_expected_suboperations
     ):
         status = (
             AccessionStatus.PARTIAL
@@ -1002,7 +1011,9 @@ def _merge_partial_result(
         )
         diagnostic = (
             f"PACS 历史最大预期 {pacs_expected_suboperations} 个对象，"
-            f"累计仅保留 {retained_file_count} 个，不能确认收全"
+            "累计仅处理 "
+            f"{new_file_count + existing_skipped_count + conflict_preserved_count} "
+            "个 C-STORE 投递，不能确认收全"
         )
         if diagnostic not in message:
             message = f"{message}；{diagnostic}".strip("；")
@@ -1068,13 +1079,36 @@ def _merge_partial_result(
     )
 
 
+def _archive_delivery_counts(result: AccessionResult) -> tuple[int, int, int]:
+    """Return processed C-STORE counts, with a fallback for legacy results."""
+
+    counts = (
+        max(0, result.new_file_count),
+        max(0, result.existing_skipped_count),
+        max(0, result.conflict_preserved_count),
+    )
+    if any(counts) or result.file_count <= 0:
+        return counts
+    # Older checkpoints only persisted ``file_count``. Before unique-SOP
+    # semantics it represented processed deliveries, so retain that evidence
+    # instead of turning a valid recovery point into an artificial gap.
+    return max(0, result.file_count), 0, 0
+
+
 def _result_to_json(result: AccessionResult) -> str:
+    processed_store_count = sum(_archive_delivery_counts(result))
     return json.dumps(
         {
             "accession": result.accession,
             "archived_files": list(result.archived_files),
             "duration_seconds": result.duration_seconds,
-            "file_count": result.file_count,
+            # Keep the legacy field as processed C-STORE deliveries so an
+            # older binary can safely read a checkpoint written by this
+            # version after a rollback.  New versions use unique_file_count
+            # for the number shown to users and for on-disk completeness.
+            "file_count": processed_store_count,
+            "file_count_semantics": _PROCESSED_STORE_FILE_COUNT_SEMANTICS,
+            "unique_file_count": result.file_count,
             "new_file_count": result.new_file_count,
             "existing_skipped_count": result.existing_skipped_count,
             "conflict_preserved_count": result.conflict_preserved_count,
@@ -1113,13 +1147,14 @@ def _result_from_json(
     archived_values = raw.get("archived_files", [])
     if not isinstance(archived_values, list):
         raise ValueError("invalid archived files")
+    archived_paths = list(dict.fromkeys(str(path) for path in archived_values))
     actual_accessions = raw.get("actual_accessions", [])
     study_instance_uids = raw.get("study_instance_uids", [])
     if not isinstance(actual_accessions, list) or not isinstance(
         study_instance_uids, list
     ):
         raise ValueError("invalid verification metadata")
-    file_count = max(int(raw.get("file_count", 0)), len(archived_values))
+    stored_file_count = max(0, int(raw.get("file_count", 0)))
     archive_stats_known = any(
         key in raw
         for key in (
@@ -1128,6 +1163,29 @@ def _result_from_json(
             "conflict_preserved_count",
         )
     )
+    conflict_preserved_count = max(
+        0, int(raw.get("conflict_preserved_count", 0))
+    )
+    if "unique_file_count" in raw:
+        file_count = max(
+            0,
+            int(raw.get("unique_file_count", 0)),
+            len(archived_paths) + conflict_preserved_count,
+        )
+    elif raw.get("file_count_semantics") == _UNIQUE_SOP_FILE_COUNT_SEMANTICS:
+        file_count = max(
+            stored_file_count,
+            len(archived_paths) + conflict_preserved_count,
+        )
+    elif archived_paths:
+        # Legacy ``file_count`` included duplicate deliveries. Archived target
+        # paths are already SOP-based, so they are the strongest available
+        # evidence for the number of unique files retained on disk.
+        file_count = len(archived_paths) + conflict_preserved_count
+    else:
+        # Some old/lightweight records have no paths. Keep their count rather
+        # than discarding recovery progress that cannot be reconstructed.
+        file_count = stored_file_count
     return AccessionResult(
         accession=str(raw["accession"]),
         status=AccessionStatus(str(raw["status"])),
@@ -1137,22 +1195,16 @@ def _result_from_json(
         output_directory=str(raw.get("output_directory", "")),
         received_bytes=int(raw.get("received_bytes", 0)),
         speed_bytes_per_second=float(raw.get("speed_bytes_per_second", 0.0)),
-        archived_files=(
-            [str(path) for path in archived_values]
-            if include_archived_files
-            else []
-        ),
+        archived_files=archived_paths if include_archived_files else [],
         new_file_count=(
             max(0, int(raw.get("new_file_count", 0)))
             if archive_stats_known
-            else file_count
+            else stored_file_count
         ),
         existing_skipped_count=max(
             0, int(raw.get("existing_skipped_count", 0))
         ),
-        conflict_preserved_count=max(
-            0, int(raw.get("conflict_preserved_count", 0))
-        ),
+        conflict_preserved_count=conflict_preserved_count,
         verification_status=ResultVerificationStatus(
             str(
                 raw.get(

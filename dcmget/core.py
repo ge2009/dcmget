@@ -12,6 +12,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -379,9 +380,14 @@ def _move_has_problem(diagnostics: _MoveDiagnostics) -> bool:
 
 
 def _move_archive_mismatch(
-    diagnostics: _MoveDiagnostics, archived_file_count: int
+    diagnostics: _MoveDiagnostics, processed_store_count: int
 ) -> str:
-    """Describe a final C-MOVE count that cannot match the usable local archive."""
+    """Describe C-STORE deliveries that were not processed by the receiver.
+
+    A C-MOVE completed-suboperation count is a delivery count, not a count of
+    unique SOP Instance UIDs.  Comparing it with the number of final files
+    incorrectly flags duplicate, identical SOP deliveries as missing data.
+    """
 
     if not _move_has_final_response(diagnostics):
         return ""
@@ -390,16 +396,18 @@ def _move_archive_mismatch(
     if remaining is not None and remaining > 0:
         details.append(f"最终响应仍有 {remaining} 个子操作未完成")
     completed = diagnostics.completed_suboperations
-    if completed is not None and completed != archived_file_count:
+    if completed is not None and completed != processed_store_count:
         details.append(
-            f"PACS 报告完成 {completed} 个子操作，本机成功归档 {archived_file_count} 个文件"
+            f"PACS 报告完成 {completed} 个 C-STORE 子操作，"
+            f"本机处理 {processed_store_count} 次完整接收"
         )
     expected = _move_expected_suboperations(diagnostics)
-    if expected is not None and archived_file_count < expected and (
-        completed is None or completed == archived_file_count
+    if expected is not None and processed_store_count < expected and (
+        completed is None or completed == processed_store_count
     ):
         details.append(
-            f"PACS 历史最大预期 {expected} 个对象，本机仅归档 {archived_file_count} 个"
+            f"PACS 历史最大预期 {expected} 次投递，"
+            f"本机仅处理 {processed_store_count} 次完整接收"
         )
     return "；".join(details)
 
@@ -561,6 +569,7 @@ def _wait_for_late_store_writes(
     *,
     dcmdump: Path | None = None,
     environment: dict[str, str] | None = None,
+    expect_files: bool = False,
 ) -> bool | None:
     """Wait briefly for a receiver child that outlives a broken C-MOVE socket."""
 
@@ -574,7 +583,7 @@ def _wait_for_late_store_writes(
 
     while not cancel_event.is_set():
         snapshot_items: list[tuple[str, int]] = []
-        for path in sorted(_files_in(directory) - baseline):
+        for path in sorted(_files_in_required(directory) - baseline):
             try:
                 snapshot_items.append((str(path), path.stat().st_size))
             except OSError:
@@ -601,11 +610,11 @@ def _wait_for_late_store_writes(
                 if not validation_errors:
                     return True
                 next_validation_at = now + _RECEIVER_DRAIN_QUIET_SECONDS
-        elif now >= first_file_deadline:
+        elif not expect_files and now >= first_file_deadline:
             return None
 
         if now >= hard_deadline:
-            return False if observed_file else None
+            return False if observed_file or expect_files else None
         cancel_event.wait(_RECEIVER_DRAIN_POLL_SECONDS)
     return None
 
@@ -946,30 +955,44 @@ def _format_bytes(value: int) -> str:
     return f"{amount:.1f} TB"
 
 
-def _guard_expected_suboperation_gap(result: AccessionResult) -> AccessionResult:
-    expected = result.pacs_expected_suboperations
-    retained = max(
+def _result_processed_store_count(result: AccessionResult) -> int:
+    """Return validated C-STORE deliveries, with a legacy-state fallback."""
+
+    processed = (
+        max(0, result.new_file_count)
+        + max(0, result.existing_skipped_count)
+        + max(0, result.conflict_preserved_count)
+    )
+    if processed:
+        return processed
+    return max(
+        0,
         result.file_count,
         len(result.archived_files) + result.conflict_preserved_count,
     )
+
+
+def _guard_expected_suboperation_gap(result: AccessionResult) -> AccessionResult:
+    expected = result.pacs_expected_suboperations
+    processed = _result_processed_store_count(result)
     if (
         expected is None
-        or retained >= expected
+        or processed >= expected
         or result.status == AccessionStatus.CANCELLED
     ):
         return result
 
     status = result.status
     if status in {AccessionStatus.COMPLETED, AccessionStatus.NO_DATA}:
-        status = AccessionStatus.PARTIAL if retained else AccessionStatus.FAILED
+        status = AccessionStatus.PARTIAL if result.file_count else AccessionStatus.FAILED
     gap_message = (
-        f"PACS 历史最大预期 {expected} 个对象，"
-        f"累计仅保留 {retained} 个，不能确认收全"
+        f"PACS 历史最大预期 {expected} 次投递，"
+        f"本机累计仅处理 {processed} 次完整接收，不能确认收全"
     )
     message = result.message
     if gap_message not in message:
         message = f"{message}；{gap_message}" if message else gap_message
-    return replace(result, status=status, file_count=retained, message=message)
+    return replace(result, status=status, message=message)
 
 
 def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
@@ -1048,7 +1071,9 @@ def _combine_retry_attempts(attempts: list[AccessionResult]) -> AccessionResult:
         "",
     )
     status = final.status
-    message = f"第 {len(attempts)} 次尝试完成；{final.message}"
+    message = f"第 {len(attempts)} 次尝试完成"
+    if final.message:
+        message += f"；{final.message}"
     if retained_file_count and final.status in {
         AccessionStatus.FAILED,
         AccessionStatus.NO_DATA,
@@ -1471,10 +1496,42 @@ class DownloadRunner:
         index: int,
         total: int,
     ) -> AccessionResult:
+        try:
+            accession_baseline = _files_in_required(staging)
+        except OSError as exc:
+            message = (
+                f"接收暂存目录不可访问，任务已安全暂停：{staging}（{exc}）"
+            )
+            self._emit("存储", message, "error")
+            return AccessionResult(
+                accession,
+                AccessionStatus.FAILED,
+                message=message,
+                safety_pause_reason=message,
+            )
         attempts: list[AccessionResult] = []
         maximum_attempts = 1 + self.config.auto_retry_attempts
         for attempt in range(1, maximum_attempts + 1):
-            result = self._download_one(accession, staging, index, total)
+            try:
+                result = self._download_one(
+                    accession,
+                    staging,
+                    index,
+                    total,
+                    accession_baseline,
+                )
+            except OSError as exc:
+                message = (
+                    f"接收暂存目录访问中断，任务已安全暂停："
+                    f"{staging}（{exc}）"
+                )
+                self._emit("存储", message, "error")
+                result = AccessionResult(
+                    accession,
+                    AccessionStatus.FAILED,
+                    message=message,
+                    safety_pause_reason=message,
+                )
             attempts.append(result)
             if not result.transient_failure or self._cancel.is_set():
                 break
@@ -1650,9 +1707,17 @@ class DownloadRunner:
             lease.release()
 
     def _download_one(
-        self, accession: str, staging: Path, index: int, total: int
+        self,
+        accession: str,
+        staging: Path,
+        index: int,
+        total: int,
+        accession_baseline: set[Path] | None = None,
     ) -> AccessionResult:
-        before = _files_in(staging)
+        before = _files_in_required(staging)
+        candidate_baseline = (
+            accession_baseline if accession_baseline is not None else before
+        )
         live_files = _LiveStagingTracker(staging, before)
         with self._diagnostic_lock:
             aborts_before = self._storescp_abort_count
@@ -1755,11 +1820,19 @@ class DownloadRunner:
             not _move_has_final_response(diagnostics)
             and (diagnostics.association_accepted or diagnostics.pending_responses)
         )
-        received_before_drain = (
-            len(_files_in(staging) - before)
-            if final_success and expected_before_drain is not None
-            else 0
-        )
+        try:
+            received_before_drain = (
+                len(_files_in_required(staging) - candidate_baseline)
+                if final_success and expected_before_drain is not None
+                else 0
+            )
+        except OSError as exc:
+            received_before_drain = 0
+            safety_pause_reason = (
+                f"接收暂存目录在下载结束后不可访问，任务已安全暂停："
+                f"{staging}（{exc}）"
+            )
+            self._emit("存储", safety_pause_reason, "error")
         confirmed_delivery_gap = bool(
             final_success
             and expected_before_drain is not None
@@ -1767,6 +1840,7 @@ class DownloadRunner:
         )
         if (
             not self._cancel.is_set()
+            and not safety_pause_reason
             and (missing_final_response or confirmed_delivery_gap)
         ):
             self._emit(
@@ -1779,27 +1853,48 @@ class DownloadRunner:
                 ),
                 "info",
             )
-            drain_result = _wait_for_late_store_writes(
-                staging,
-                before,
-                self._cancel,
-                dcmdump=self.tools.dcmdump,
-                environment=_dcmtk_environment(self.tools),
-            )
-            transfer_finished = time.monotonic()
-            if (
-                drain_result is False
-                and missing_final_response
-                and not safety_pause_reason
-            ):
-                safety_pause_reason = (
-                    "接收文件在等待期内仍未完整写入，任务已安全暂停；"
-                    "请检查 PACS、网络和接收器日志后重试当前检查号"
+            try:
+                drain_result = _wait_for_late_store_writes(
+                    staging,
+                    candidate_baseline,
+                    self._cancel,
+                    dcmdump=self.tools.dcmdump,
+                    environment=_dcmtk_environment(self.tools),
+                    expect_files=confirmed_delivery_gap,
                 )
+            except OSError as exc:
+                drain_result = False
+                if not safety_pause_reason:
+                    safety_pause_reason = (
+                        f"接收暂存目录在等待落盘时不可访问，任务已安全暂停："
+                        f"{staging}（{exc}）"
+                    )
+                    self._emit("存储", safety_pause_reason, "error")
+            transfer_finished = time.monotonic()
+            if drain_result is False and not safety_pause_reason:
+                if confirmed_delivery_gap:
+                    safety_pause_reason = (
+                        "PACS 已报告发送完成，但接收目录在等待期内仍未出现"
+                        "足够的完整文件；为避免整批重复下载，任务已安全暂停"
+                    )
+                else:
+                    safety_pause_reason = (
+                        "接收文件在等待期内仍未完整写入，任务已安全暂停；"
+                        "请检查 PACS、网络和接收器日志后重试当前检查号"
+                    )
                 self._emit("storescp", safety_pause_reason, "error")
 
-        all_files = _files_in(staging)
-        new_files = all_files - before
+        try:
+            all_files = _files_in_required(staging)
+        except OSError as exc:
+            all_files = set()
+            if not safety_pause_reason:
+                safety_pause_reason = (
+                    f"接收暂存目录在归档前不可访问，任务已安全暂停："
+                    f"{staging}（{exc}）"
+                )
+                self._emit("存储", safety_pause_reason, "error")
+        new_files = all_files - candidate_baseline
         # Each 2.9 instance owns one receiver and runs only one C-MOVE at a
         # time.  Therefore every file created in this move's receive window
         # belongs to the active request.  Do not reject useful PACS data just
@@ -1834,12 +1929,16 @@ class DownloadRunner:
             route_accession=accession,
             stats=archive_stats,
         )
-        accepted_file_count = (
+        processed_store_count = (
             archive_stats.new_file_count
             + archive_stats.existing_skipped_count
             + archive_stats.conflict_preserved_count
         )
-        if accepted_file_count:
+        unique_file_count = max(
+            len(archive_stats.sop_instance_uids),
+            len(set(moved)) + len(set(archive_stats.conflict_files)),
+        )
+        if processed_store_count:
             verification_status, verification_message = reconcile_archive_stats(
                 accession, archive_stats
             )
@@ -1882,7 +1981,9 @@ class DownloadRunner:
             move_detail = "；".join(
                 detail for detail in (association_failure, move_detail) if detail
             )
-        archive_mismatch = _move_archive_mismatch(diagnostics, accepted_file_count)
+        archive_mismatch = _move_archive_mismatch(
+            diagnostics, processed_store_count
+        )
         if archive_mismatch:
             move_problem = True
             move_detail = "；".join(
@@ -1904,13 +2005,13 @@ class DownloadRunner:
         elif safety_pause_reason:
             status = (
                 AccessionStatus.PARTIAL
-                if accepted_file_count
+                if processed_store_count
                 else AccessionStatus.FAILED
             )
             details = []
-            if accepted_file_count:
+            if processed_store_count:
                 details.append(
-                    _archive_result_message(accepted_file_count, archive_stats)
+                    _archive_result_message(unique_file_count, archive_stats)
                 )
             if move_detail:
                 details.append(move_detail)
@@ -1921,15 +2022,15 @@ class DownloadRunner:
         elif receiver_exit_code is not None:
             status = (
                 AccessionStatus.PARTIAL
-                if accepted_file_count
+                if processed_store_count
                 else AccessionStatus.FAILED
             )
             message = f"storescp 意外退出（退出码 {receiver_exit_code}）"
-            if accepted_file_count:
-                message += f"，已保留 {accepted_file_count} 个完整文件"
+            if processed_store_count:
+                message += f"，已保留 {unique_file_count} 个唯一完整文件"
             if rejected:
                 message += f"，{rejected_detail}"
-        elif return_code == 0 and accepted_file_count and (
+        elif return_code == 0 and processed_store_count and (
             move_problem or rejected or archive_stats.conflict_preserved_count
         ):
             status = AccessionStatus.PARTIAL
@@ -1943,13 +2044,13 @@ class DownloadRunner:
                     f"{archive_stats.conflict_preserved_count} 个冲突文件需人工核对"
                 )
             message = (
-                _archive_result_message(accepted_file_count, archive_stats)
+                _archive_result_message(unique_file_count, archive_stats)
                 + "，但"
                 + "；".join(details)
             )
-        elif return_code == 0 and accepted_file_count:
+        elif return_code == 0 and processed_store_count:
             status = AccessionStatus.COMPLETED
-            message = _archive_result_message(accepted_file_count, archive_stats)
+            message = _archive_result_message(unique_file_count, archive_stats)
         elif return_code == 0 and (move_problem or rejected):
             status = AccessionStatus.FAILED
             details = []
@@ -1961,11 +2062,11 @@ class DownloadRunner:
         elif return_code == 0:
             status = AccessionStatus.NO_DATA
             message = "C-MOVE 完成，但未收到文件"
-        elif accepted_file_count:
+        elif processed_store_count:
             status = AccessionStatus.PARTIAL
             message = (
                 f"movescu 退出码 {return_code}，"
-                f"已保留 {accepted_file_count} 个文件"
+                f"已保留 {unique_file_count} 个唯一文件"
             )
             if move_detail:
                 message += f"；{move_detail}"
@@ -1980,7 +2081,7 @@ class DownloadRunner:
                 message += f"，{rejected_detail}"
 
         if (
-            accepted_file_count
+            processed_store_count
             and verification_status != ResultVerificationStatus.MATCHED
         ):
             message += f"；归属核对：{verification_message}"
@@ -1990,16 +2091,11 @@ class DownloadRunner:
             or (diagnostics.remaining_suboperations or 0) > 0
         )
         pacs_expected_suboperations = _move_expected_suboperations(diagnostics)
-        retryable_archive_gap = bool(
-            pacs_expected_suboperations is not None
-            and accepted_file_count < pacs_expected_suboperations
-        )
         transient_failure = bool(
             not safety_pause_reason
             and receiver_exit_code is None
             and (
                 retryable_suboperation_failure
-                or retryable_archive_gap
                 or (
                     not _move_has_final_response(diagnostics)
                     and (
@@ -2026,10 +2122,10 @@ class DownloadRunner:
         result = AccessionResult(
             accession=accession,
             status=status,
-            file_count=accepted_file_count,
+            file_count=unique_file_count,
             duration_seconds=duration,
             message=message,
-            output_directory=str(output_directory) if accepted_file_count else "",
+            output_directory=str(output_directory) if processed_store_count else "",
             received_bytes=received_bytes,
             speed_bytes_per_second=average_speed,
             archived_files=[str(path) for path in moved],
@@ -2042,7 +2138,7 @@ class DownloadRunner:
             study_instance_uids=sorted(archive_stats.study_instance_uids),
             series_instance_count=len(archive_stats.series_instance_uids),
             sop_instance_count=len(archive_stats.sop_instance_uids),
-            local_verified_files=accepted_file_count,
+            local_verified_files=unique_file_count,
             pacs_completed_suboperations=diagnostics.completed_suboperations,
             pacs_expected_suboperations=pacs_expected_suboperations,
             move_return_code=return_code,
@@ -2346,8 +2442,9 @@ def staging_directory_root(config: AppConfig) -> Path:
     # Performance-first receive path: non-anonymous files are staged beside the
     # final destination and published with os.replace(), so local disks and SMB
     # shares avoid a complete C: -> target copy. A share interruption can now
-    # fail the active C-STORE; the existing sub-operation gap/retry logic keeps
-    # completed files and retries the missing objects. Anonymous source files
+    # fail the active C-STORE; completed files are retained and explicit failed
+    # suboperations may trigger a bounded full-study retry. Accession-level
+    # C-MOVE cannot request only missing SOP instances. Anonymous source files
     # must remain in private application state until transformed and validated.
     if config.anonymization_enabled:
         return ensure_application_state_dir() / "staging"
@@ -2618,6 +2715,15 @@ def _files_in(directory: Path) -> set[Path]:
     return {path for path in directory.rglob("*") if path.is_file()}
 
 
+def _files_in_required(directory: Path) -> set[Path]:
+    """Scan an active receive directory without treating I/O loss as empty."""
+
+    metadata = directory.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(str(directory))
+    return _files_in(directory)
+
+
 def _total_file_size(files: Iterable[Path]) -> int:
     total = 0
     for path in files:
@@ -2629,13 +2735,18 @@ def _total_file_size(files: Iterable[Path]) -> int:
 
 
 def _archive_result_message(file_count: int, stats: ArchiveStats) -> str:
-    message = f"收到 {file_count} 个文件"
+    processed = (
+        stats.new_file_count
+        + stats.existing_skipped_count
+        + stats.conflict_preserved_count
+    )
+    message = f"保留 {file_count} 个唯一 DICOM 文件"
     if not (stats.existing_skipped_count or stats.conflict_preserved_count):
         return message
     return (
-        f"{message}（新增 {stats.new_file_count}、"
-        f"已存在跳过 {stats.existing_skipped_count}、"
-        f"冲突保留 {stats.conflict_preserved_count}）"
+        f"{message}（处理 {processed} 次接收：新增 {stats.new_file_count}、"
+        f"已存在跳过 {stats.existing_skipped_count}（相同 SOP）、"
+        f"内容冲突保留 {stats.conflict_preserved_count}）"
     )
 
 

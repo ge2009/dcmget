@@ -112,6 +112,90 @@ def test_checkpoint_round_trips_delivery_verification_fields(tmp_path):
     assert restored.attempt_count == 2
 
 
+def test_legacy_result_json_recovers_unique_paths_and_delivery_count():
+    legacy = json.dumps(
+        {
+            "accession": "A001",
+            "status": AccessionStatus.PARTIAL.value,
+            # Legacy file_count included two deliveries of each SOP.
+            "file_count": 4,
+            "archived_files": ["/dicom/one.dcm", "/dicom/two.dcm"],
+            "pacs_expected_suboperations": 4,
+        }
+    )
+
+    restored = task_state_module._result_from_json(legacy)
+
+    assert restored.file_count == 2
+    assert restored.archived_files == ["/dicom/one.dcm", "/dicom/two.dcm"]
+    # A legacy record without archive statistics uses its old file_count as
+    # processed C-STORE evidence, while file_count itself becomes unique-SOP.
+    assert restored.new_file_count == 4
+    assert restored.existing_skipped_count == 0
+
+
+def test_new_result_json_keeps_rollback_safe_delivery_count_and_unique_count():
+    encoded = task_state_module._result_to_json(
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=["/dicom/one.dcm"],
+            new_file_count=1,
+            existing_skipped_count=1,
+        )
+    )
+
+    raw = json.loads(encoded)
+    restored = task_state_module._result_from_json(encoded)
+
+    assert raw["file_count_semantics"] == "processed_store_v1"
+    assert raw["file_count"] == 2
+    assert raw["unique_file_count"] == 1
+    assert restored.file_count == 1
+    assert restored.new_file_count == 1
+    assert restored.existing_skipped_count == 1
+
+
+def test_resume_counts_duplicate_sop_delivery_without_inflating_unique_files(
+    tmp_path,
+):
+    store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
+    checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
+    archived = str(tmp_path / "dicom" / "same-sop.dcm")
+    store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.CANCELLED,
+            file_count=1,
+            archived_files=[archived],
+            new_file_count=1,
+            pacs_expected_suboperations=2,
+        ),
+    )
+
+    stored = store.record_result(
+        checkpoint.task_id,
+        AccessionResult(
+            "A001",
+            AccessionStatus.COMPLETED,
+            file_count=1,
+            archived_files=[archived],
+            existing_skipped_count=1,
+            pacs_expected_suboperations=2,
+            move_dimse_status=0,
+        ),
+    )
+
+    assert stored.status == AccessionStatus.COMPLETED
+    assert stored.file_count == 1
+    assert stored.archived_files == [archived]
+    assert stored.new_file_count == 1
+    assert stored.existing_skipped_count == 1
+    assert "不能确认收全" not in stored.message
+
+
 def test_resume_cannot_hide_prior_pacs_expected_instance_gap(tmp_path):
     store = TaskCheckpointStore(tmp_path / "active-task.sqlite3")
     checkpoint = store.start(AppConfig(), ["A001"], trial_required=False)
@@ -179,7 +263,7 @@ def test_resume_preserves_expected_instance_gap_when_prior_attempt_kept_no_files
 
     assert stored.status == AccessionStatus.PARTIAL
     assert stored.pacs_expected_suboperations == 10
-    assert "累计仅保留 1 个" in stored.message
+    assert "累计仅处理 1 个 C-STORE 投递" in stored.message
     assert store.load_required().results[0].status == AccessionStatus.PARTIAL
 
 
@@ -215,7 +299,7 @@ def test_resume_no_data_cannot_erase_prior_expected_gap_without_files(tmp_path):
     assert stored.file_count == 0
     assert stored.pacs_expected_suboperations == 10
     assert "PACS 历史最大预期 10 个对象" in stored.message
-    assert "累计仅保留 0 个，不能确认收全" in stored.message
+    assert "累计仅处理 0 个 C-STORE 投递，不能确认收全" in stored.message
     assert stored.message.count("不能确认收全") == 1
     assert store.load_required().results[0].status == AccessionStatus.FAILED
 

@@ -27,6 +27,8 @@ import {
 
 type Connection = 'connecting' | 'connected' | 'disconnected';
 type ConfirmState = { title: string; description: string; label?: string; danger?: boolean; action: () => void | Promise<void> } | null;
+type NativeShellApi = { open_directory?: (path: string) => Promise<unknown> };
+type NativeShellWindow = Window & { pywebview?: { api?: NativeShellApi } };
 
 const EMPTY_UPDATE: UpdateState = { supported: false, state: 'unavailable', message: '当前安装未配置更新服务' };
 
@@ -760,6 +762,30 @@ export default function App() {
     } catch (error) { setGlobalError((error as Error).message); }
   }
 
+  async function openDestinationDirectory() {
+    const nativeApi = (window as NativeShellWindow).pywebview?.api;
+    if (typeof nativeApi?.open_directory !== 'function') {
+      await runOperation('open-destination');
+      return;
+    }
+    try {
+      const path = managerMode && activeNumber != null
+        ? managedApiPath(activeNumber, '/api/operations/open-destination')
+        : '/api/operations/open-destination';
+      const resolved = await apiClient.request(path, UnknownRecordSchema, {
+        method: 'POST', body: { resolve_only: true },
+      });
+      const directory = typeof resolved.path === 'string' ? resolved.path.trim() : '';
+      if (!directory) throw new Error('后台未返回可打开的目录');
+      const opened = asRecord(await nativeApi.open_directory(directory));
+      notify(String(opened.message || `已打开目录：${directory}`));
+    } catch {
+      // The bridge can fail while WebView2 is still initializing. Preserve
+      // the original backend opener as a best-effort desktop fallback.
+      await runOperation('open-destination');
+    }
+  }
+
   async function browseDirectory(path = destination) {
     setDirectoryOpen(true); setDirectoryBusy(true);
     const query = new URLSearchParams({ purpose: 'destination' }); if (path) query.set('path', path);
@@ -885,7 +911,7 @@ export default function App() {
           : !activeRunning
             ? <section className="workspace-empty"><span><AnimatedIcon {...semanticIconMap.stopTask} size={26} /></span><h2>{activeProfile?.desired_running ? '实例正在启动' : '当前实例未启动'}</h2><p>启动实例后，DICOM 接收端和任务控制将在这里就绪。</p>{activeProfile && <div><Button variant="primary" onClick={() => profileStart(activeProfile)}><AnimatedIcon {...semanticIconMap.resumeTask} size={17} />启动当前实例</Button><Button onClick={() => openProfileEditor(activeProfile)}><AnimatedIcon {...semanticIconMap.settings} size={17} />启动参数</Button></div>}</section>
             : <>
-                <TaskWorkspace available={activeRunning} task={newTaskDraftOpen ? null : task} accessionText={accessionText} parsed={parsed} destination={destination} pdiEnabled={pdiEnabled} pdiFolder={pdiFolder} preflight={preflight} preflightSignatureMatches={preflightSignature === draftSignature} preflightBusy={preflightBusy} actionBusy={actionBusy} onAccessionTextChange={setAccessionText} onDestinationChange={setDestination} onPdiEnabledChange={setPdiEnabled} onPdiFolderChange={setPdiFolder} onImport={importFile} onBrowse={() => browseDirectory()} onPreflight={() => runPreflight()} onStart={startTask} onTaskAction={executeTaskAction} onPdiAction={pdiAction} onNewTask={resetTask} onOpenDestination={() => runOperation('open-destination')} onOpenPdiDirectory={() => runOperation('open-pdi-directory', { path: pdiFolder.trim(), destination: destination.trim() })} />
+                <TaskWorkspace available={activeRunning} task={newTaskDraftOpen ? null : task} accessionText={accessionText} parsed={parsed} destination={destination} pdiEnabled={pdiEnabled} pdiFolder={pdiFolder} preflight={preflight} preflightSignatureMatches={preflightSignature === draftSignature} preflightBusy={preflightBusy} actionBusy={actionBusy} onAccessionTextChange={setAccessionText} onDestinationChange={setDestination} onPdiEnabledChange={setPdiEnabled} onPdiFolderChange={setPdiFolder} onImport={importFile} onBrowse={() => browseDirectory()} onPreflight={() => runPreflight()} onStart={startTask} onTaskAction={executeTaskAction} onPdiAction={pdiAction} onNewTask={resetTask} onOpenDestination={openDestinationDirectory} onOpenPdiDirectory={() => runOperation('open-pdi-directory', { path: pdiFolder.trim(), destination: destination.trim() })} />
                 <LogPanel logs={logs} detailed={detailedLogs} onDetailedChange={setDetailedLogs} onClear={() => setLogs([])} onOpenDirectory={() => runOperation('open-log-directory')} />
               </>}
       </div>

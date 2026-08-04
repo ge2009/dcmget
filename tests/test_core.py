@@ -2103,7 +2103,7 @@ def test_pause_waits_between_accessions_and_resume_continues(tmp_path, monkeypat
     monkeypatch.setattr(runner, "_start_storescp", start_receiver)
     monkeypatch.setattr(runner, "_stop_storescp", lambda: None)
 
-    def download_one(accession, _staging, _index, _total):
+    def download_one(accession, _staging, _index, _total, _baseline=None):
         assert runner._storescp_process is receiver
         if accession == "A001":
             first_started.set()
@@ -2508,7 +2508,7 @@ def test_retry_success_cannot_hide_an_earlier_expected_instance_gap():
     assert result.status == AccessionStatus.PARTIAL
     assert result.file_count == 1
     assert result.pacs_expected_suboperations == 10
-    assert "累计仅保留 1 个" in result.message
+    assert "累计仅处理 1 次完整接收" in result.message
     assert "不能确认收全" in result.message
 
 
@@ -2536,7 +2536,7 @@ def test_retry_no_data_cannot_hide_an_earlier_zero_file_expected_gap():
     assert result.status == AccessionStatus.FAILED
     assert result.file_count == 0
     assert result.pacs_expected_suboperations == 10
-    assert "累计仅保留 0 个" in result.message
+    assert "累计仅处理 0 次完整接收" in result.message
     assert "不能确认收全" in result.message
 
 
@@ -2555,7 +2555,7 @@ def test_single_no_data_attempt_with_expected_objects_is_failed():
 
     assert result.status == AccessionStatus.FAILED
     assert result.pacs_expected_suboperations == 3
-    assert "累计仅保留 0 个" in result.message
+    assert "累计仅处理 0 次完整接收" in result.message
 
 
 def test_retry_success_completes_after_reaching_prior_expected_instance_count():
@@ -2902,7 +2902,7 @@ def test_truncated_debug_pending_response_keeps_the_largest_known_total():
     core._record_move_diagnostic(diagnostics, "I: Received Final Move Response")
     core._record_move_diagnostic(diagnostics, "D: Completed Suboperations : 8")
     core._record_move_diagnostic(diagnostics, "D: DIMSE Status : 0x0000: Success")
-    assert "历史最大预期 10 个对象" in core._move_archive_mismatch(diagnostics, 8)
+    assert "历史最大预期 10 次投递" in core._move_archive_mismatch(diagnostics, 8)
 
 
 def test_move_warning_with_failed_suboperations_is_partial(tmp_path, monkeypatch):
@@ -3157,7 +3157,7 @@ def test_nonzero_movescu_with_received_file_is_retained_and_safely_paused(
     assert result.safety_pause_reason
     assert Path(result.archived_files[0]).is_file()
     assert not (staging / "received.dcm").exists()
-    assert "已保留 1 个文件" in result.message
+    assert "已保留 1 个唯一文件" in result.message
     errors = [entry for entry in logs if entry[2] == "error"]
     assert len(errors) == 1
     assert "无法确认全部实例已到齐" in errors[0][1]
@@ -3310,6 +3310,140 @@ def test_success_status_with_zero_failed_suboperations_remains_completed(
     assert result.file_count == 1
 
 
+def test_retry_archives_a_file_that_arrives_during_the_backoff(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=1,
+            auto_retry_backoff_seconds=0,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+
+    class FirstProcess:
+        stdout = iter(
+            [
+                "I: Association Accepted\n",
+                "I: Received Move Response 1 (Pending)\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 61
+
+        @staticmethod
+        def wait():
+            return 61
+
+    class SecondProcess:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Completed Suboperations : 1\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            return 0
+
+    class CancelEvent:
+        wrote_late_file = False
+
+        @staticmethod
+        def is_set():
+            return False
+
+        def wait(self, _seconds):
+            if not self.wrote_late_file:
+                _write_minimal_dicom(
+                    staging / "late.dcm",
+                    "1.2.3.711",
+                    accession="LATE711",
+                )
+                self.wrote_late_file = True
+            return False
+
+    processes = iter([FirstProcess(), SecondProcess()])
+    runner._cancel = CancelEvent()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        core, "_wait_for_late_store_writes", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(runner, "_popen", lambda _command: next(processes))
+
+    result = runner._download_accession_with_retry("LATE711", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.attempt_count == 2
+    assert result.file_count == 1
+    assert len(result.archived_files) == 1
+    assert Path(result.archived_files[0]).is_file()
+    assert not (staging / "late.dcm").exists()
+
+
+def test_duplicate_store_deliveries_count_once_in_the_final_directory(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+
+    class Process:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Completed Suboperations : 2\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            first = staging / "first.dcm"
+            _write_minimal_dicom(
+                first,
+                "1.2.3.712",
+                accession="DUP712",
+            )
+            (staging / "second.dcm").write_bytes(first.read_bytes())
+            return 0
+
+    monkeypatch.setattr(runner, "_popen", lambda _command: Process())
+
+    result = runner._download_one("DUP712", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert result.status == AccessionStatus.COMPLETED
+    assert result.transient_failure is False
+    assert result.pacs_completed_suboperations == 2
+    assert result.file_count == 1
+    assert result.sop_instance_count == 1
+    assert result.new_file_count == 1
+    assert result.existing_skipped_count == 1
+    assert "处理 2 次接收" in result.message
+    assert len(list((tmp_path / "dicom").rglob("*.dcm"))) == 1
+
+
 def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
     tmp_path, monkeypatch
 ):
@@ -3339,7 +3473,7 @@ def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
         def wait():
             return 0
 
-    drain = Mock(return_value=None)
+    drain = Mock(return_value=False)
     monkeypatch.setattr(core, "_wait_for_late_store_writes", drain)
     monkeypatch.setattr(runner, "_popen", lambda _command: Process())
 
@@ -3348,9 +3482,10 @@ def test_success_with_completed_suboperations_but_no_archived_files_is_failed(
 
     assert result.status == AccessionStatus.FAILED
     assert result.file_count == 0
-    assert result.transient_failure is True
-    assert "PACS 报告完成 2 个子操作" in result.message
-    assert "成功归档 0 个文件" in result.message
+    assert result.transient_failure is False
+    assert result.safety_pause_reason
+    assert "PACS 报告完成 2 个 C-STORE 子操作" in result.message
+    assert "本机处理 0 次完整接收" in result.message
     drain.assert_called_once()
 
 
@@ -3395,10 +3530,64 @@ def test_success_with_fewer_archived_files_than_completed_suboperations_is_parti
 
     assert result.status == AccessionStatus.PARTIAL
     assert result.file_count == 1
-    assert result.transient_failure is True
-    assert "PACS 报告完成 2 个子操作" in result.message
-    assert "成功归档 1 个文件" in result.message
+    assert result.transient_failure is False
+    assert "PACS 报告完成 2 个 C-STORE 子操作" in result.message
+    assert "本机处理 1 次完整接收" in result.message
     drain.assert_called_once()
+
+
+def test_success_count_gap_does_not_repeat_the_full_study_move(
+    tmp_path, monkeypatch
+):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    runner = DownloadRunner(
+        AppConfig(
+            dicom_destination_folder=str(tmp_path / "dicom"),
+            auto_retry_attempts=2,
+            auto_retry_backoff_seconds=0,
+        ),
+        ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
+    )
+    starts = 0
+
+    class Process:
+        stdout = iter(
+            [
+                "I: Received Final Move Response (Success)\n",
+                "I: DIMSE Status: 0x0000: Success\n",
+                "I: Number of Completed Suboperations : 2\n",
+                "I: Number of Failed Suboperations : 0\n",
+            ]
+        )
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait():
+            _write_minimal_dicom(
+                staging / "one.dcm", "1.2.3.713", accession="GAP713"
+            )
+            return 0
+
+    def popen(_command):
+        nonlocal starts
+        starts += 1
+        return Process()
+
+    monkeypatch.setattr(core, "_wait_for_late_store_writes", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner, "_popen", popen)
+
+    result = runner._download_accession_with_retry("GAP713", staging, 1, 1)
+    runner._close_file_logger()
+
+    assert starts == 1
+    assert result.attempt_count == 1
+    assert result.status == AccessionStatus.PARTIAL
+    assert result.file_count == 1
+    assert result.transient_failure is False
 
 
 def test_success_with_remaining_suboperations_is_partial(tmp_path, monkeypatch):

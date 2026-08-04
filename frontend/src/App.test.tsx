@@ -12,6 +12,7 @@ afterEach(() => {
   window.history.replaceState({}, '', '/');
   Object.defineProperty(document, 'hidden', { configurable: true, value: false });
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+  Reflect.deleteProperty(window, 'pywebview');
 });
 
 describe('bootstrap modes', () => {
@@ -213,6 +214,102 @@ describe('bootstrap modes', () => {
     expect(directory).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(directory);
     expect(directory).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('asks the backend to validate the task directory before the native shell opens it', async () => {
+    const openDirectory = vi.fn().mockResolvedValue({ message: '目录已打开' });
+    Object.defineProperty(window, 'pywebview', {
+      configurable: true,
+      value: { api: { open_directory: openDirectory } },
+    });
+    const operationBodies: unknown[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({
+        csrf_token: 'token',
+        profile: { number: 1, display_name: '院内下载', mode: 'profile', is_running: true },
+        config: { dicom_destination_folder: 'D:\\configured' },
+        task: {
+          id: 'task-1', status: 'completed', destination: '\\\\nas\\share\\task-1',
+          total: 1, processed: 1, actions: { can_start: true },
+        },
+      });
+      if (path === '/api/operations/open-destination') {
+        operationBodies.push(JSON.parse(String(init?.body)));
+        return json({ ok: true, path: '\\\\nas\\share\\task-1' });
+      }
+      return json({});
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '打开结果目录' }));
+
+    await waitFor(() => expect(openDirectory).toHaveBeenCalledWith('\\\\nas\\share\\task-1'));
+    expect(operationBodies).toEqual([{ resolve_only: true }]);
+    expect(await screen.findByText('目录已打开')).toBeInTheDocument();
+  });
+
+  it('keeps the server-side open operation when no native shell bridge exists', async () => {
+    const operationBodies: unknown[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({
+        csrf_token: 'token',
+        profile: { number: 1, display_name: '院内下载', mode: 'profile', is_running: true },
+        config: { dicom_destination_folder: 'D:\\configured' },
+        task: {
+          id: 'task-1', status: 'completed', destination: 'D:\\configured',
+          total: 1, processed: 1, actions: { can_start: true },
+        },
+      });
+      if (path === '/api/operations/open-destination') {
+        operationBodies.push(JSON.parse(String(init?.body)));
+        return json({ ok: true, message: '已在主机打开' });
+      }
+      return json({});
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '打开结果目录' }));
+
+    await waitFor(() => expect(operationBodies).toEqual([{}]));
+    expect(await screen.findByText('已在主机打开')).toBeInTheDocument();
+  });
+
+  it('falls back to the server-side opener when the native shell bridge fails', async () => {
+    const openDirectory = vi.fn().mockRejectedValue(new Error('bridge unavailable'));
+    Object.defineProperty(window, 'pywebview', {
+      configurable: true,
+      value: { api: { open_directory: openDirectory } },
+    });
+    const operationBodies: unknown[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === '/api/bootstrap') return json({
+        csrf_token: 'token',
+        profile: { number: 1, display_name: '院内下载', mode: 'profile', is_running: true },
+        config: { dicom_destination_folder: 'D:\\configured' },
+        task: {
+          id: 'task-1', status: 'completed', destination: 'D:\\configured',
+          total: 1, processed: 1, actions: { can_start: true },
+        },
+      });
+      if (path === '/api/operations/open-destination') {
+        const body = JSON.parse(String(init?.body));
+        operationBodies.push(body);
+        return body.resolve_only
+          ? json({ ok: true, path: 'D:\\configured' })
+          : json({ ok: true, message: '已通过后端打开' });
+      }
+      return json({});
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '打开结果目录' }));
+
+    await waitFor(() => expect(operationBodies).toEqual([{ resolve_only: true }, {}]));
+    expect(openDirectory).toHaveBeenCalledWith('D:\\configured');
+    expect(await screen.findByText('已通过后端打开')).toBeInTheDocument();
   });
 
   it('keeps a new-task draft open when polling returns the prior terminal task', async () => {

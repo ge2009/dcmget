@@ -1108,6 +1108,127 @@ def test_profile_pdi_directory_operation_opens_configured_or_default_root(
     assert result["path"] == str(expected)
 
 
+def test_profile_destination_operation_prefers_current_task_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    configured = tmp_path / "configured-dicom"
+    configured.mkdir()
+    task_destination = tmp_path / "task-dicom"
+    task_destination.mkdir()
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(configured)),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True, "path": str(path)},
+    )
+    service = type(
+        "Service",
+        (),
+        {"snapshot": lambda _self: {"task": {"destination": str(task_destination)}}},
+    )()
+
+    result = entry._operation_handlers(profile, service)["open-destination"]({})
+
+    assert opened == [task_destination.resolve()]
+    assert result["path"] == str(task_destination.resolve())
+
+
+def test_profile_destination_operation_falls_back_to_profile_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    configured = tmp_path / "configured-dicom"
+    configured.mkdir()
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(configured)),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda path: opened.append(Path(path)) or {"ok": True, "path": str(path)},
+    )
+    service = type("Service", (), {"snapshot": lambda _self: {"task": {}}})()
+
+    entry._operation_handlers(profile, service)["open-destination"]({})
+
+    assert opened == [configured.resolve()]
+
+
+def test_profile_destination_operation_can_only_resolve_for_native_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import DICOM_download_ui as entry
+
+    config_path = tmp_path / "config" / "instances" / "i1" / "config.json"
+    destination = tmp_path / "task-dicom"
+    destination.mkdir()
+    save_config(
+        config_path,
+        AppConfig(dicom_destination_folder=str(tmp_path / "configured-dicom")),
+    )
+    profile = type(
+        "Profile",
+        (),
+        {
+            "config_path": config_path,
+            "state_directory": tmp_path / "state" / "profiles" / "i1",
+            "log_directory": tmp_path / "logs" / "i1",
+        },
+    )()
+    monkeypatch.setattr(
+        entry,
+        "_open_host_path",
+        lambda _path: pytest.fail("resolve_only 不应在后台打开目录"),
+    )
+    service = type(
+        "Service",
+        (),
+        {"snapshot": lambda _self: {"task": {"destination": str(destination)}}},
+    )()
+
+    result = entry._operation_handlers(profile, service)["open-destination"](
+        {"resolve_only": True}
+    )
+
+    assert result == {
+        "ok": True,
+        "message": f"目录已验证：{destination.resolve()}",
+        "path": str(destination.resolve()),
+    }
+
+
 @pytest.mark.parametrize("use_explicit_pdi", [False, True])
 def test_profile_pdi_directory_operation_uses_current_task_draft(
     tmp_path: Path,

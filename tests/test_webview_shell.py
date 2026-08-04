@@ -8,6 +8,7 @@ import pytest
 
 from dcmget import __version__
 from dcmget.webview_shell import (
+    NativeShellApi,
     WebViewShellError,
     build_shell_command,
     run_webview_shell,
@@ -67,7 +68,44 @@ def test_webview_shell_waits_for_http_then_uses_edgechromium():
     ) == 0
     assert attempts == 2
     assert calls[0][0] == "window"
+    assert isinstance(calls[0][1][2]["js_api"], NativeShellApi)
     assert calls[1] == ("start", {"gui": "edgechromium", "debug": False})
+
+
+def test_native_shell_api_opens_only_an_existing_directory_without_shell(tmp_path: Path):
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def popen(command: list[str], **kwargs: object) -> object:
+        calls.append((command, kwargs))
+        return object()
+
+    directory = tmp_path / "SMB results"
+    directory.mkdir()
+    api = NativeShellApi(platform_name="win32", popen=popen)
+
+    result = api.open_directory(str(directory))
+
+    assert result["path"] == str(directory.resolve())
+    assert calls[0][0] == ["explorer.exe", str(directory.resolve())]
+    assert calls[0][1]["shell"] is False
+
+
+def test_native_shell_api_rejects_missing_paths_and_files(tmp_path: Path):
+    calls: list[list[str]] = []
+    api = NativeShellApi(
+        platform_name="win32",
+        popen=lambda command, **_kwargs: calls.append(command),
+    )
+    file_path = tmp_path / "image.dcm"
+    file_path.write_bytes(b"DICM")
+
+    with pytest.raises(WebViewShellError, match="不存在"):
+        api.open_directory(str(tmp_path / "missing"))
+    with pytest.raises(WebViewShellError, match="不是目录"):
+        api.open_directory(str(file_path))
+    with pytest.raises(WebViewShellError, match="路径无效"):
+        api.open_directory("bad\0path")
+    assert calls == []
 
 
 def test_webview_shell_reports_missing_runtime_without_browser_fallback():

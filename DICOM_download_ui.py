@@ -570,6 +570,13 @@ def _open_host_path(path: str | Path) -> dict[str, object]:
     return {"ok": True, "message": f"已在主机打开：{selected}", "path": str(selected)}
 
 
+def _validated_host_directory(path: str | Path) -> Path:
+    selected = Path(path).expanduser().resolve(strict=True)
+    if not selected.is_dir():
+        raise RuntimeError(f"目标不是目录：{selected}")
+    return selected
+
+
 def _operation_handlers(
     profile: InstanceProfile,
     service: DcmGetAppService,
@@ -577,8 +584,24 @@ def _operation_handlers(
     def current_config(_payload: object = None) -> AppConfig:
         return load_config(profile.config_path)
 
-    def open_destination(_payload: object = None) -> dict[str, object]:
-        return _open_host_path(current_config().dicom_destination_folder)
+    def open_destination(payload: object = None) -> dict[str, object]:
+        snapshot = service.snapshot()
+        task = snapshot.get("task") if isinstance(snapshot, dict) else None
+        task_destination = task.get("destination", "") if isinstance(task, dict) else ""
+        destination = (
+            str(task_destination).strip()
+            if isinstance(task_destination, str) and task_destination.strip()
+            else current_config().dicom_destination_folder
+        )
+        selected = _validated_host_directory(destination)
+        body = payload if isinstance(payload, dict) else {}
+        if body.get("resolve_only") is True:
+            return {
+                "ok": True,
+                "message": f"目录已验证：{selected}",
+                "path": str(selected),
+            }
+        return _open_host_path(selected)
 
     def open_logs(_payload: object = None) -> dict[str, object]:
         primary = task_log_directory(current_config())

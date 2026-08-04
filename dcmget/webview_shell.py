@@ -21,6 +21,62 @@ class WebViewShellError(RuntimeError):
     pass
 
 
+class NativeShellApi:
+    """Small, directory-only bridge executed in the interactive WebView process."""
+
+    def __init__(
+        self,
+        *,
+        platform_name: str | None = None,
+        popen: Callable[..., Any] | None = None,
+    ) -> None:
+        self._platform_name = platform_name or sys.platform
+        self._popen = popen or subprocess.Popen
+
+    def open_directory(self, value: str) -> dict[str, object]:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 4096
+            or "\0" in value
+        ):
+            raise WebViewShellError("目录路径无效")
+        try:
+            selected = Path(value).expanduser().resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise WebViewShellError(f"目录不存在：{value}") from exc
+        if not selected.is_dir():
+            raise WebViewShellError(f"目标不是目录：{selected}")
+
+        if self._platform_name == "win32":
+            command = ["explorer.exe", str(selected)]
+        elif self._platform_name == "darwin":
+            command = ["open", str(selected)]
+        else:
+            command = ["xdg-open", str(selected)]
+        try:
+            self._popen(
+                command,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=(self._platform_name != "win32"),
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if self._platform_name == "win32"
+                    else 0
+                ),
+            )
+        except OSError as exc:
+            raise WebViewShellError(f"无法打开目录：{selected}") from exc
+        return {
+            "ok": True,
+            "message": f"已打开目录：{selected}",
+            "path": str(selected),
+        }
+
+
 def validate_loopback_url(value: str) -> str:
     url = str(value or "").strip()
     try:
@@ -127,6 +183,7 @@ def run_webview_shell(
             min_size=(1024, 720),
             background_color="#f3f7f9",
             text_select=True,
+            js_api=NativeShellApi(),
         )
         webview_module.start(gui="edgechromium", debug=False)
     except Exception as exc:

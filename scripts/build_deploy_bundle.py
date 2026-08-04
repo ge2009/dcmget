@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "3.7.3"
+VERSION = "3.7.4"
 ARCHIVE_NAME = f"dcmget-{VERSION}-source-deploy.zip"
 ROOT_FILES = (
     "DICOM_download_script.py",
