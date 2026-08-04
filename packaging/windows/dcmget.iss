@@ -301,24 +301,14 @@ var
 begin
   if not DcmGetServiceExists() then
     Exit;
-  if FileExists(ServiceWrapperPath()) then
-    Exec(
-      ServiceWrapperPath(),
-      'stop',
-      ExpandConstant('{app}'),
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    )
-  else
-    Exec(
-      ExpandConstant('{sys}\sc.exe'),
-      'stop "{#ServiceName}"',
-      '',
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    );
+  Exec(
+    ExpandConstant('{sys}\sc.exe'),
+    'stop "{#ServiceName}"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
 end;
 
 function RunManagedProcessCleanup(AppDir: String; var FailureMessage: String): Boolean;
@@ -396,24 +386,14 @@ begin
   if not DcmGetServiceBelongsToApp() then
     RaiseException('无法卸载 kayisoft-dcmget：同名 Windows 服务不属于当前安装目录。');
 
-  if FileExists(ServiceWrapperPath()) then
-    Exec(
-      ServiceWrapperPath(),
-      'uninstall',
-      ExpandConstant('{app}'),
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    );
-  if DcmGetServiceExists() then
-    Exec(
-      ExpandConstant('{sys}\sc.exe'),
-      'delete "{#ServiceName}"',
-      '',
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    );
+  Exec(
+    ExpandConstant('{sys}\sc.exe'),
+    'delete "{#ServiceName}"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
   for Attempt := 0 to 99 do
   begin
     if not DcmGetServiceExists() then

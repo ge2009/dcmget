@@ -562,8 +562,15 @@ def test_windows_installer_only_removes_an_owned_legacy_service():
     )[0]
     assert "if not DcmGetServiceBelongsToApp() then" in remove
     assert remove.index("if not DcmGetServiceBelongsToApp() then") < remove.index(
-        "'uninstall'"
-    ) < remove.index("'delete \"{#ServiceName}\"'")
+        "'delete \"{#ServiceName}\"'"
+    )
+    assert "ServiceWrapperPath()," not in remove
+
+    stop = installer.split("procedure RequestExistingServiceStop();", 1)[1].split(
+        "function RunManagedProcessCleanup", 1
+    )[0]
+    assert "'stop \"{#ServiceName}\"'" in stop
+    assert "ServiceWrapperPath()," not in stop
 
 
 def test_windows_build_and_release_workflow_have_no_active_winsw_dependency():
