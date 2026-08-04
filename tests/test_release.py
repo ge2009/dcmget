@@ -365,7 +365,7 @@ def test_windows_pdi_smoke_uses_authenticated_directory_entry():
     )
 
     assert "secrets.token_urlsafe(32)" in workflow
-    assert '"--session-token", $token' in workflow
+    assert '"--session-token=$token"' in workflow
     assert '"http://127.0.0.1:$port/ready/$token"' in workflow
     assert '"http://127.0.0.1:$port/open/$token" -WebSession $session' in workflow
     assert '"dicomweb:/DICOM/I000001"' in workflow
@@ -595,6 +595,7 @@ def test_windows_build_and_release_workflow_have_no_active_winsw_dependency():
     assert "cache key only" in workflow
     assert "--windows-desktop" in workflow
     assert "Windows desktop lifecycle and uninstall test" in workflow
+    assert '"--session-token=$token"' in workflow
 
 
 def test_windows_firewall_is_limited_to_web_receiver_and_private_networks():
