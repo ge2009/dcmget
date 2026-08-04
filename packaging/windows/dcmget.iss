@@ -316,7 +316,8 @@ var
   PowerShellPath: String;
   ScriptPath: String;
   CleanupLogPath: String;
-  CleanupDetails: String;
+  CleanupLines: TArrayOfString;
+  CleanupIndex: Integer;
   ScriptText: String;
   Parameters: String;
   ResultCode: Integer;
@@ -386,8 +387,9 @@ begin
   if ResultCode <> 0 then
   begin
     FailureMessage := '无法结束当前安装目录中的 DcmGet 相关进程，请稍后重新运行安装程序。';
-    if LoadStringFromFile(CleanupLogPath, CleanupDetails) then
-      FailureMessage := FailureMessage + #13#10 + Trim(CleanupDetails);
+    if LoadStringsFromFile(CleanupLogPath, CleanupLines) then
+      for CleanupIndex := 0 to GetArrayLength(CleanupLines) - 1 do
+        FailureMessage := FailureMessage + #13#10 + CleanupLines[CleanupIndex];
     Result := False;
     Exit;
   end;
