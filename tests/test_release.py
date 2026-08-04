@@ -574,14 +574,14 @@ def test_windows_build_and_release_workflow_have_no_active_winsw_dependency():
 
     assert "winsw" not in build.casefold()
     for active_dependency in (
-        ".runtime/winsw",
-        ".runtime\\winsw",
         "/DWinSWPath=",
         "Verify pinned WinSW service wrapper",
         "WinSW checksum mismatch",
         "WinSW-x64.exe",
     ):
         assert active_dependency.casefold() not in workflow.casefold()
+    assert workflow.casefold().count(".runtime/winsw/v2.12.0") == 1
+    assert "cache key only" in workflow
     assert "--windows-desktop" in workflow
     assert "Windows desktop lifecycle and uninstall test" in workflow
 

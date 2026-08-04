@@ -116,11 +116,15 @@ jobs:
           "DCMGET_WEBVIEW2_RUNTIME_PATH=$target" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore DCMTK cache
+        # Keep the retired path in the cache key only so existing verified
+        # DCMTK caches remain reusable while OFFIS blocks hosted runners.
+        # WinSW is neither verified, packaged nor executed by this build.
         uses: actions/cache@v4
         with:
           path: |
             .runtime/dcmtk/windows-x86_64
             .runtime/downloads
+            .runtime/winsw/v2.12.0
           key: dcmtk-3.7.0-integrity-v2-windows-x86_64
 
       - name: Prepare DCMTK
