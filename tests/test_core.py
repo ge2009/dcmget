@@ -1460,6 +1460,11 @@ def test_receive_staging_uses_destination_volume_for_non_anonymous_files(
         primary,
         state / "staging",
     )
+    assert core._receive_staging_recovery_roots(
+        regular,
+        primary,
+        include_legacy=False,
+    ) == (primary,)
     assert core.log_directory(regular) == destination / "_DcmGetLogs"
 
 

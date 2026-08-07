@@ -26,15 +26,17 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from filelock import FileLock, Timeout
 
-from .anonymization import DicomAnonymizer
 from .architecture import ArchitectureError, require_amd64_pe
 from .config import AppConfig
 from .diagnostics import PrivateRotatingFileHandler
 from .runtime import ensure_application_state_dir, portable_dcmtk_bin
+
+if TYPE_CHECKING:
+    from .anonymization import DicomAnonymizer
 
 
 _RECEIVER_BIND_ADDRESS = "0.0.0.0"
@@ -1183,6 +1185,7 @@ class DownloadRunner:
         log_file_name: str = "dcmget.log",
         log_directory: str | Path | None = None,
         fallback_log_directory: str | Path | None = None,
+        recover_legacy_staging: bool = True,
     ):
         self.config = config
         self.tools = tools
@@ -1208,6 +1211,7 @@ class DownloadRunner:
             if fallback_log_directory is not None
             else ensure_application_state_dir() / "logs"
         )
+        self._recover_legacy_staging = recover_legacy_staging
         self._active_log_directory: Path | None = None
         self._log_fallback_reason = ""
         self._cancel = threading.Event()
@@ -1227,11 +1231,14 @@ class DownloadRunner:
         self._logger = self._build_file_logger()
         if self._log_fallback_reason:
             self._emit("应用", self._log_fallback_reason, "warning")
-        self._anonymizer = (
-            DicomAnonymizer(config.anonymization_profile)
-            if config.anonymization_enabled
-            else None
-        )
+        if config.anonymization_enabled:
+            from .anonymization import DicomAnonymizer
+
+            self._anonymizer: DicomAnonymizer | None = DicomAnonymizer(
+                config.anonymization_profile
+            )
+        else:
+            self._anonymizer = None
 
     def request_cancel(self) -> None:
         self._request_cancel(include_receiver=True)
@@ -1378,7 +1385,9 @@ class DownloadRunner:
                     "info",
                 )
             for recovery_root in _receive_staging_recovery_roots(
-                self.config, staging_root
+                self.config,
+                staging_root,
+                include_legacy=self._recover_legacy_staging,
             ):
                 for recovery_message in _recover_orphaned_receive_staging(
                     recovery_root
@@ -2480,8 +2489,12 @@ def staging_directory_root(config: AppConfig) -> Path:
 def _receive_staging_recovery_roots(
     config: AppConfig,
     primary: Path | None = None,
+    *,
+    include_legacy: bool = True,
 ) -> tuple[Path, ...]:
     primary_root = primary or staging_directory_root(config)
+    if not include_legacy:
+        return (primary_root,)
     legacy_private_root = ensure_application_state_dir() / "staging"
     if legacy_private_root == primary_root:
         return (primary_root,)

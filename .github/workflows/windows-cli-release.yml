@@ -1,0 +1,184 @@
+name: Windows CLI Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version in X.Y.Z format
+        required: true
+        default: 3.7.7
+      publish_release:
+        description: Publish the standalone CLI ZIP to GitHub Releases
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build standalone DcmGetCLI Windows x64 ZIP
+    runs-on: windows-2025
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-cli.txt
+
+      - name: Install CLI-only build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-cli.txt PyInstaller==6.21.0 "Pillow>=11,<13" "pytest>=8,<9"
+
+      - name: Verify AMD64 Python build host
+        run: python -c "from dcmget.architecture import ensure_supported_runtime; ensure_supported_runtime(); print('AMD64 Python verified')"
+
+      - name: Configure optional Authenticode certificate
+        shell: pwsh
+        env:
+          DCMGET_SIGN_CERTIFICATE_BASE64: ${{ secrets.DCMGET_SIGN_CERTIFICATE_BASE64 }}
+          DCMGET_SIGN_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.DCMGET_SIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DCMGET_SIGN_CERTIFICATE_BASE64)) {
+            Write-Host "No signing certificate configured; DcmGetCLI will be marked UNSIGNED."
+            exit 0
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "dcmget-cli-authenticode.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:DCMGET_SIGN_CERTIFICATE_BASE64))
+          "DCMGET_SIGN_CERTIFICATE_PATH=$certificatePath" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_CERTIFICATE_PASSWORD=$env:DCMGET_SIGN_CERTIFICATE_PASSWORD_SECRET" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "DCMGET_SIGN_TIMESTAMP_URL=http://timestamp.digicert.com" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore DCMTK cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .runtime/dcmtk/windows-x86_64
+            .runtime/downloads
+          key: dcmtk-3.7.0-integrity-v2-windows-x86_64
+
+      - name: Prepare verified DCMTK 3.7.0
+        run: python scripts/download_dcmtk.py --platform windows-x86_64
+
+      - name: Run standalone CLI regression tests
+        run: >-
+          python -m pytest -q
+          tests/test_simple_cli.py
+          tests/test_windows_cli_release.py
+          tests/test_core.py
+
+      - name: Build standalone CLI ZIP
+        run: python scripts/build_windows_cli.py --version "${{ inputs.version }}"
+
+      - name: Smoke-test executable and exact ZIP contents
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = "release/windows-cli/DcmGetCLI-$env:VERSION-windows-x64.zip"
+          $expanded = Join-Path $env:RUNNER_TEMP "dcmget-cli-expanded"
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $root = Join-Path $expanded "DcmGetCLI"
+
+          $output = & (Join-Path $root "DcmGetCLI.exe") --version
+          if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -notmatch "DcmGetCLI $([regex]::Escape($env:VERSION))") {
+            throw "DcmGetCLI version smoke test failed: $($output -join ' ')"
+          }
+          & (Join-Path $root "DcmGetCLI.exe") --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "DcmGetCLI help smoke test failed" }
+
+          $archiveListing = Join-Path $env:RUNNER_TEMP "dcmget-cli-pyi-listing.txt"
+          pyi-archive_viewer -r (Join-Path $root "DcmGetCLI.exe") *> $archiveListing
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect DcmGetCLI PyInstaller archive" }
+          foreach ($forbidden in @(
+            "DICOM_download_script", "DICOM_download_ui", "cryptography",
+            "dcmget.licensing", "dcmget.pdi", "fastapi", "pynetdicom",
+            "uvicorn", "webview"
+          )) {
+            if (Select-String -LiteralPath $archiveListing -SimpleMatch $forbidden -Quiet) {
+              throw "DcmGetCLI unexpectedly contains non-CLI module: $forbidden"
+            }
+          }
+
+          foreach ($tool in @("movescu.exe", "storescp.exe", "dcmdump.exe")) {
+            & (Join-Path $root "dcmtk/bin/$tool") --version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "$tool failed to start" }
+          }
+
+          $expected = @(
+            "DcmGetCLI.exe", "config.json", "access.txt", "README.txt", "LICENSE",
+            "THIRD_PARTY_NOTICES.md", "FILES-SHA256.txt",
+            "dcmtk/bin/movescu.exe", "dcmtk/bin/storescp.exe", "dcmtk/bin/dcmdump.exe",
+            "dcmtk/bin/dcmtls.dll", "dcmtk/bin/dcmnet.dll", "dcmtk/bin/dcmdata.dll",
+            "dcmtk/bin/oflog.dll", "dcmtk/bin/ofstd.dll", "dcmtk/bin/oficonv.dll",
+            "dcmtk/share/dcmtk-3.7.0/dicom.dic",
+            "dcmtk/share/doc/dcmtk-3.7.0/COPYRIGHT",
+            "dcmtk/share/doc/dcmtk-3.7.0/VERSION"
+          ) | Sort-Object
+          $actual = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+          } | Sort-Object)
+          $difference = @(Compare-Object $expected $actual)
+          if ($difference.Count -ne 0) { throw "CLI ZIP allowlist mismatch: $($difference | Out-String)" }
+
+          $config = Get-Content (Join-Path $root "config.json") -Raw | ConvertFrom-Json
+          foreach ($forbidden in @(
+            "pdi_export_enabled", "anonymization_enabled", "web_port",
+            "web_bind_address", "license"
+          )) {
+            if ($config.PSObject.Properties.Name -contains $forbidden) {
+              throw "Standalone config exposes unsupported field: $forbidden"
+            }
+          }
+
+          python -c "from pathlib import Path; from dcmget.architecture import require_amd64_pe; root=Path(r'$root'); [require_amd64_pe(p, p.name) for p in [root/'DcmGetCLI.exe', *(root/'dcmtk'/'bin').glob('*.exe'), *(root/'dcmtk'/'bin').glob('*.dll')]]; print('All packaged PE files are AMD64')"
+          Push-Location $root
+          try {
+            Get-Content "FILES-SHA256.txt" | ForEach-Object {
+              if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Invalid FILES-SHA256 line: $_" }
+              $actualHash = (Get-FileHash -LiteralPath $Matches[2] -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actualHash -ne $Matches[1]) { throw "Hash mismatch: $($Matches[2])" }
+            }
+          } finally {
+            Pop-Location
+          }
+
+          $outerChecksum = "$archive.sha256"
+          $checksumLine = (Get-Content -LiteralPath $outerChecksum -Raw).Trim()
+          if ($checksumLine -notmatch '^([0-9a-f]{64})  ([^/\\]+\.zip)$') {
+            throw "Invalid outer SHA-256 file: $checksumLine"
+          }
+          if ($Matches[2] -ne (Split-Path $archive -Leaf)) {
+            throw "Outer SHA-256 references the wrong archive: $($Matches[2])"
+          }
+          $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveHash -ne $Matches[1]) { throw "Outer ZIP SHA-256 mismatch" }
+
+      - name: Upload standalone CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGetCLI-${{ inputs.version }}-Windows-x64-ZIP
+          path: |
+            release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip
+            release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip.sha256
+          if-no-files-found: error
+
+      - name: Publish standalone CLI release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "cli-v${{ inputs.version }}" `
+            "release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip" `
+            "release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip.sha256" `
+            --title "DcmGetCLI ${{ inputs.version }}" `
+            --notes "独立 Windows x64 命令行 DICOM 下载器；不包含 GUI、PDI、WebView 或注册码校验。"

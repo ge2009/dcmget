@@ -40,9 +40,9 @@ jobs:
           cache: pip
 
       - name: Reject full-installer-only layout release
-        if: ${{ inputs.version == '3.7.6' }}
+        if: ${{ inputs.version == '3.7.6' || inputs.version == '3.7.7' }}
         shell: pwsh
-        run: throw "DcmGet 3.7.6 adds DcmGetCLI.exe and must be published as a full installer before component-only releases can resume."
+        run: throw "DcmGet 3.7.6/3.7.7 changes the top-level application layout and must be published as a full installer before component-only releases can resume."
 
       - name: Install component build dependencies
         run: |

@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.7.6"
+  #define AppVersion "3.7.7"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -18,7 +18,6 @@
 #endif
 #define AppName "DcmGet"
 #define AppExeName "DcmGet.exe"
-#define AppCliExeName "DcmGetCLI.exe"
 ; These legacy names are retained so current releases can remove the Windows service
 ; installed by DcmGet 3.1.0 through 3.7.4 during upgrade or uninstall.
 #define ServiceName "kayisoft-dcmget"
@@ -84,6 +83,8 @@ Name: "{localappdata}\DcmGet\logs"; Flags: uninsneveruninstall
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
+; DcmGetCLI is now a separate ZIP product. Remove the copy bundled by 3.7.6.
+Type: files; Name: "{app}\DcmGetCLI.exe"
 Type: files; Name: "{app}\{#ServiceWrapperName}"
 Type: files; Name: "{app}\{#ServiceConfigName}"
 Type: files; Name: "{app}\{#ServiceTemplateName}"

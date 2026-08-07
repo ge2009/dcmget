@@ -1,4 +1,4 @@
-# DcmGet 3.7.6
+# DcmGet 3.7.7
 
 DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯一工作台使用 Vite、React 和 TypeScript 构建，继续复用现有 Python/FastAPI 服务、任务核心与 DCMTK：Windows 本机通过独立 WebView2 窗口操作，不再默认弹出系统浏览器；局域网电脑仍可使用浏览器访问。每个 Profile 进程只运行一个下载任务，并独立启动一个 DCMTK `storescp`；任务中的检查号按顺序执行 `movescu`。关闭、刷新或断开界面不会停止后台下载，重新打开即可查看实时状态；Windows 用户注销会结束该用户会话内的管理中心和 Profile 进程。
 
@@ -12,18 +12,19 @@ DcmGet 是一个默认离线运行的 DICOM C-MOVE 下载工作站。当前唯�
 - 64 位 Python 3.10 或更高版本；Windows 源码运行必须使用 AMD64/x64 Python
 - 发布部署使用 DCMTK 3.7.0；代码兼容本机 DCMTK 3.6.9。Windows 成品仅携带运行所需的 `movescu`、`storescp`、`dcmmkdir`、`dcmdump` 及其 DLL、字符集和许可证数据
 - 当前自动发布只生成 Windows x64 一键安装器、便携版和 ZIP；macOS/Linux 仍可从源码运行，但暂不生成成品安装包
-- 主控制台、API、字体和图标均随程序本地提供，运行时不需要 Node.js，也不依赖 CDN 或云服务；本文不将自动更新列为 3.7.6 已验证能力
+- 主控制台、API、字体和图标均随程序本地提供，运行时不需要 Node.js，也不依赖 CDN 或云服务；本文不将自动更新列为 3.7.7 已验证能力
 - 3.0.0 起不再包含或依赖 PyQt5；旧版 Qt 说明仅保留在历史版本记录中
 
 源码部署不携带第三方二进制，首次部署需要能访问 Python 包源、[OFFIS DCMTK 下载源](https://dicom.offis.de/en/dcmtk/dcmtk-tools/)和 npm 官方源以下载经过固定 SHA-256 校验的 OHIF。Windows 成品发布物已内置 OHIF 与本地启动器；PDI 导出完成后的阅片不需要访问互联网。
 
 ## Windows 一键安装
 
-Windows 发布物拆分为三个独立下载项，获取安装器时不再同时下载重复的便携运行时：
+Windows 图形版发布物拆分为三个独立下载项；命令行版另行提供独立 ZIP：
 
-- `DcmGet-3.7.6-Setup-x64.exe`：默认推荐的一键安装器，内置 x64 Python 运行时、FastAPI/Uvicorn、React/TypeScript 离线工作台、Windows WebView 外壳、`DcmGetCLI.exe` 纯命令行下载器、Microsoft x64 WebView2 Evergreen 离线运行时、精简的 x64 DCMTK 3.7.0 运行集、离线中文 OHIF、PDI 本地只读 HTTP 启动器和 Microsoft Visual C++ x64 Runtime。主入口使用 `--windows-desktop`，在当前已登录用户的桌面会话中运行管理中心；Profile 保持停止，直到用户在工作台中明确启动。安装器创建 `DcmGet Web TCP` 与 `DcmGet Receiver TCP` 两条仅限域/专用网络的程序级入站规则。
-- `DcmGet-3.7.6-windows-x64-portable.exe`：无需安装的单文件图形便携版；首次启动会把逐文件 SHA-256 校验通过的精简 x64 DCMTK 运行集发布到 `%LOCALAPPDATA%\DcmGet\runtime\dcmtk\<版本与清单哈希>\`，以后启动和软件升级会复用内容相同的稳定用户级路径。两个进程同时首次启动时也只会原子发布一份运行集。PDI 同样使用原始 DICOM 和离线 OHIF。便携版不注册 Windows 服务，也不自动常驻管理中心；需要独立 CLI 时应使用安装版或目录 ZIP。
-- `DcmGet-3.7.6-windows-x64.zip`：解压后直接运行的独立目录版，包含与安装版一致的 `DcmGet.exe`、`DcmGetCLI.exe`、React/TypeScript 离线工作台、Windows WebView 外壳、精简 DCMTK 运行集、离线 OHIF 和 PDI 启动器，但不自动注册 Windows 服务或常驻管理中心。
+- `DcmGet-3.7.7-Setup-x64.exe`：默认推荐的一键安装器，内置 x64 Python 运行时、FastAPI/Uvicorn、React/TypeScript 离线工作台、Windows WebView 外壳、Microsoft x64 WebView2 Evergreen 离线运行时、精简的 x64 DCMTK 3.7.0 运行集、离线中文 OHIF、PDI 本地只读 HTTP 启动器和 Microsoft Visual C++ x64 Runtime。主入口使用 `--windows-desktop`，在当前已登录用户的桌面会话中运行管理中心；Profile 保持停止，直到用户在工作台中明确启动。
+- `DcmGet-3.7.7-windows-x64-portable.exe`：无需安装的单文件图形便携版；首次启动会把校验通过的精简 x64 DCMTK 运行集发布到稳定的用户级路径。便携版不注册 Windows 服务，也不自动常驻管理中心。
+- `DcmGet-3.7.7-windows-x64.zip`：解压后直接运行的图形目录版，包含 `DcmGet.exe`、React/TypeScript 离线工作台、WebView 外壳、精简 DCMTK、离线 OHIF 和 PDI 启动器，不包含命令行下载器。
+- `DcmGetCLI-3.7.7-windows-x64.zip`：独立命令行下载器，只包含 `DcmGetCLI.exe`、最小配置、TXT 示例和下载所需 DCMTK；不包含 GUI、Profile、PDI、OHIF、WebView、自动更新、注册码或试用计数。
 
 Windows 32 位系统、32 位 Python 和 x86 应用载荷均不受支持。安装器使用 `x64compatible` 限制目标架构：可在 x64 Windows 原生运行，也允许 Windows 11 ARM64 通过系统的 x64 兼容层运行；不需要也不接受原生 ARM64 Python。Inno Setup 6 的安装引导程序自身是 x86 兼容程序，但它会拒绝 32 位 Windows，且只安装经过校验的 AMD64 DcmGet、Python 和 DCMTK。构建脚本会同时验证构建 Python、`DcmGet.exe`、`DcmGetPdiServer.exe`、`storescp.exe` 和 `movescu.exe` 的 PE 架构，任何一项不是 AMD64 都会停止发布；PDI 的 Python 回退启动器也会拒绝 32 位运行时。
 
@@ -33,10 +34,10 @@ Windows 32 位系统、32 位 Python 和 x86 应用载荷均不受支持。安�
 
 安装版不要求目标电脑预装 Python。再次运行新版安装包时，会识别原安装记录并在原目录完成覆盖升级；用户配置、注册码和试用计数保存在 Windows 用户数据目录，升级和卸载都不会覆盖或删除这些数据与下载结果。默认下载目录为“文档\DcmGet\Dicom”。
 
-### Windows 更新与 3.7.6 升级
+### Windows 更新与 3.7.7 升级
 
-- 3.7.6 在安装根目录新增 `DcmGetCLI.exe`，旧版组件更新器不允许创建该顶层文件，因此从 3.7.5 及更早版本升级必须运行完整的 `DcmGet-3.7.6-Setup-x64.exe`。
-- 本文不声明 3.7.6 的自动更新通道已经验证。只有对应发布物、签名更新清单和端到端升级检查均实际通过后，才能将该通道视为可用；否则应使用经过核验的完整安装包。便携版、ZIP 和源码运行不会自动替换程序文件。
+- 3.7.7 将 3.7.6 曾放入图形版安装目录的 `DcmGetCLI.exe` 移出，升级时会删除旧副本。该顶层布局变化不能通过现有增量包表达，图形版必须使用完整的 `DcmGet-3.7.7-Setup-x64.exe` 升级。
+- 独立 CLI 不参与图形版自动更新，更新时直接替换整个 `DcmGetCLI-3.7.7-windows-x64.zip` 解压目录；其配置、恢复点和下载结果不保存在程序文件中。
 
 安装完成后，桌面和开始菜单的“DcmGet”主入口使用 `--windows-desktop`，在当前已登录用户的桌面会话中运行管理中心和用户明确启动的 Profile。关闭 WebView2 窗口不会停止这些后台进程或下载任务，再次打开快捷方式会连接现有管理中心；用户注销会结束该会话内的管理中心、Profile 和下载进程。安装版不再注册或依赖 `kayisoft-dcmget` 服务。覆盖升级时，安装器会先确认旧服务属于当前安装目录，再停止并删除该旧服务；遇到同名但不属于当前安装目录的服务时会中止，而不是误删。安装、升级、卸载应用文件和配置防火墙仍需要管理员/UAC。
 
@@ -53,7 +54,8 @@ Windows 32 位系统、32 位 Python 和 x86 应用载荷均不受支持。安�
 ```powershell
 python -m pip install -r requirements-build.txt
 python scripts/download_dcmtk.py --platform windows-x86_64
-python scripts/build_windows.py --version 3.7.6
+python scripts/build_windows.py --version 3.7.7
+python scripts/build_windows_cli.py --version 3.7.7
 ```
 
 PyInstaller 生成的可执行文件已包含 Python 解释器，因此不再额外运行独立的 Python 安装程序。
@@ -193,17 +195,20 @@ DCMGET_PDI_20260716_120000/
 - 将 PDI 复制到 U 盘或其他介质后，使用“运维工具 → 验证已复制 PDI”核对 SHA-256 清单、`DICOMDIR` 内部引用和离线阅片资源。验证结果不等于临床诊断适用性或匿名合规证明；验收报告会写到介质目录之外，不改动已复制内容。
 - 未匿名的 DICOM 可能包含患者隐私。外发前应启用合适的匿名方案并完成复核。
 
-## 命令行
+## 独立命令行下载器
 
-Windows 安装版和目录 ZIP 提供独立的纯命令行入口。它默认读取实例 1 已保存的 PACS、AE、接收端口和目标目录配置，强制关闭 PDI，并使用独立于 Web 工作台的恢复点：
+独立 ZIP 解压后编辑同目录的 `config.json` 和 `access.txt`，然后运行：
 
 ```bat
-"C:\Program Files\DcmGet\DcmGetCLI.exe" access.txt
-"C:\Program Files\DcmGet\DcmGetCLI.exe" access.txt --profile 2
-"C:\Program Files\DcmGet\DcmGetCLI.exe" access.txt --config C:\DcmGet\config.json
+DcmGetCLI.exe access.txt
+DcmGetCLI.exe access.txt --config D:\DcmGetCLI\config.json
 ```
 
-意外退出后重复执行同一命令会继续未完成任务；需要放弃旧恢复点并从当前文件重新开始时增加 `--discard-checkpoint`。`DcmGetCLI.exe` 需要与安装目录中的 `_internal` 保持在一起，以复用内置 DCMTK，不应单独复制该 EXE。源码运行可使用：
+配置只包含 PACS、调用/接收 AE、接收端口、保存目录、目录模板及重试参数；未知字段会直接报错，避免误把图形版配置当成 CLI 配置。检查号文件只接受 UTF-8 或带 BOM 的 UTF-8 TXT，每行一个检查号，自动忽略空行并去重。
+
+每完成一个检查号都会写入 `%LOCALAPPDATA%\DcmGetCLI` 下的独立恢复点。异常退出后重复执行同一命令只继续未完成、失败或部分成功项；配置或检查号列表变化时会拒绝误恢复，需要明确增加 `--reset` 才会放弃旧任务。日志保存在目标目录 `_DcmGetLogs`，默认控制台只显示进度、警告和错误，`--verbose` 显示详细状态。该版本不校验图形版注册码和试用次数，也不提供 PDI、匿名、Profile、多任务、Web 或自动更新功能。
+
+源码运行可使用：
 
 ```bash
 python DICOM_download_cli.py access.txt
@@ -294,7 +299,7 @@ DCMTK `storescp` 在 Windows、macOS 和 Linux 上接收 C-STORE association，�
 - “接收端口已占用”：关闭占用程序或在设置中更换端口，并同步 PACS 的 Move Destination。
 - 修改默认接收端口 `6666` 后：Windows 安装版和默认源码部署的 `storescp.exe` 程序规则会自动兼容所有自定义端口；如果在设置中改用另一套 DCMTK 路径，需要为那一份 `storescp.exe` 单独放行域/专用网络入站连接。
 - “C-MOVE 完成但未收到文件”：检查 PACS 中接收 AE、客户端 IP、接收端口及防火墙映射。
-- DCMTK 启动失败：下载需要同一套 `storescp` 和 `movescu`，PDI 还需要 `dcmmkdir`、`dcmdump`。Windows 3.7.6 成品已包含这四个程序及所需 DLL、字符集和许可证数据，不包含 `dcmj2pnm`、`dcmdjpeg` 等未使用工具；源码部署或自定义路径请选择同时包含这四个程序的 DCMTK 3.7.0 `bin` 目录。
+- DCMTK 启动失败：图形版下载需要 `storescp` 和 `movescu`，PDI 还需要 `dcmmkdir`、`dcmdump`。独立 CLI 只携带下载和失败校验所需的 `storescp`、`movescu`、`dcmdump` 及其 DLL，不包含 PDI 或图像转换工具。
 - Windows 本机界面启动失败：DcmGet 只使用 Edge Chromium WebView，不回退到旧版 IE 内核或默认浏览器。请安装或修复 Microsoft Edge WebView2 Runtime 后重新打开 DcmGet；同一用户会话内已经运行的管理中心、Profile 和下载不受单次窗口启动失败影响。
 - Windows 缺少 DLL：安装部署脚本提示的 Microsoft Visual C++ x64 Runtime。
 

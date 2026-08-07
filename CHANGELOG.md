@@ -1,5 +1,12 @@
 # DcmGet 版本说明
 
+## 3.7.7（2026-08-07）
+
+- 将命令行下载器从图形版安装器、目录 ZIP 和增量更新树中移出，改为独立的 `DcmGetCLI-3.7.7-windows-x64.zip`；图形版升级会清理 3.7.6 曾安装在程序目录中的旧 CLI。
+- 独立 CLI 不读取 Profile，不加载图形界面、PDI、OHIF、WebView、自动更新、注册码或试用次数；配置固定由 EXE 同目录的 `config.json` 管理，检查号仅接受 UTF-8 TXT。
+- CLI 继续复用稳定的 `storescp`/`movescu` 下载核心，保留目标盘高速暂存、`.dcm` 归档、失败重试、进程清理和按检查号持久化恢复；独立状态保存在 `%LOCALAPPDATA%\DcmGetCLI`，不会扫描图形版的恢复目录。
+- 新增独立 Windows x64 构建工作流和精简 DCMTK 白名单，不执行 Node、OHIF、WebView2 或 Inno Setup 构建。GUI 更新布局升级为 4，本版本图形版必须使用完整安装包升级。
+
 ## 3.7.6（2026-08-07）
 
 - Windows 安装包和目录 ZIP 新增独立的 `DcmGetCLI.exe` 纯命令行下载器；默认读取实例 1 的 PACS、AE、接收端口和目标目录配置，只需运行 `DcmGetCLI.exe access.txt`，不启动 WebView，也不生成 PDI。

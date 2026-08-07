@@ -193,6 +193,10 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     )
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     build = (root / "scripts/build_windows.py").read_text(encoding="utf-8")
+    cli_build = (root / "scripts/build_windows_cli.py").read_text(encoding="utf-8")
+    cli_workflow = (
+        root / ".github/workflows/windows-cli-release.yml"
+    ).read_text(encoding="utf-8")
     bootstrap = (root / "scripts/bootstrap_windows.ps1").read_text(
         encoding="utf-8"
     )
@@ -208,9 +212,10 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     assert "ensure_supported_runtime()" in build
     assert "require_amd64_pe(dcmtk_bin / name" in build
     assert "verify_built_architecture(version)" in build
-    assert "DcmGetCLI.exe" in build
-    assert '"--console"' in build
-    assert "Smoke-test pure command-line entry" in workflow
+    assert "DcmGetCLI.exe" not in build
+    assert "DcmGetCLI.exe" in cli_build
+    assert '"--console"' in cli_build
+    assert "Smoke-test executable and exact ZIP contents" in cli_workflow
     assert "ensure_supported_runtime" in bootstrap
     assert "ensure_supported_runtime()" in entry
     assert "ensure_supported_runtime()" in cli

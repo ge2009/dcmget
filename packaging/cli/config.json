@@ -1,0 +1,15 @@
+{
+  "dcmtk_bin_dir": "",
+  "dicom_destination_folder": "Dicom",
+  "pacs_server_ip": "127.0.0.1",
+  "pacs_server_port": 104,
+  "calling_ae_title": "DCMGET",
+  "pacs_ae_title": "ANY-SCP",
+  "storage_ae_title": "DCMGET",
+  "storage_port": 6666,
+  "directory_template": "{PatientID}/{AccessionNumber}/{StudyInstanceUID}",
+  "auto_retry_attempts": 2,
+  "auto_retry_backoff_seconds": 3,
+  "circuit_breaker_failures": 5,
+  "minimum_free_space_bytes": 2147483648
+}

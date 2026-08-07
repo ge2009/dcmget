@@ -6,7 +6,7 @@ on:
       version:
         description: Release version in X.Y.Z format
         required: true
-        default: 3.7.6
+        default: 3.7.7
       publish_release:
         description: Publish the verified build to GitHub Releases
         required: true
@@ -147,15 +147,6 @@ jobs:
 
       - name: Verify AMD64 application and DCMTK payloads
         run: python scripts/build_windows.py --version "${{ inputs.version }}" --verify-architecture-only
-
-      - name: Smoke-test pure command-line entry
-        shell: pwsh
-        run: |
-          $output = & "build/windows/dist/DcmGetCLI.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "DcmGetCLI --version failed with exit code $LASTEXITCODE" }
-          if (($output -join "`n") -notmatch "DcmGetCLI ${{ inputs.version }}") {
-            throw "DcmGetCLI reported an unexpected version: $($output -join ' ')"
-          }
 
       - name: Verify minimal DCMTK runtime and tools
         shell: pwsh
@@ -721,11 +712,7 @@ jobs:
           taskkill /PID $outsideProcess.Id /T /F | Out-Null
           Remove-Item $outsideRoot -Recurse -Force
           if (-not (Test-Path "$installDir/DcmGet.exe")) { throw "Installed DcmGet.exe is missing" }
-          if (-not (Test-Path "$installDir/DcmGetCLI.exe")) { throw "Installed DcmGetCLI.exe is missing" }
-          $installedCliVersion = & "$installDir/DcmGetCLI.exe" --version
-          if ($LASTEXITCODE -ne 0 -or ($installedCliVersion -join "`n") -notmatch "DcmGetCLI ${{ inputs.version }}") {
-            throw "Installed DcmGetCLI version check failed: $($installedCliVersion -join ' ')"
-          }
+          if (Test-Path "$installDir/DcmGetCLI.exe") { throw "GUI installer retained the separately distributed DcmGetCLI.exe" }
           if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
             throw "Upgrade left the legacy kayisoft-dcmget service behind"
           }
@@ -1012,7 +999,6 @@ jobs:
             --release-dir release/windows `
             --version "${{ inputs.version }}" `
             --amd64-pe build/windows/dist/DcmGet/DcmGet.exe `
-            --amd64-pe build/windows/dist/DcmGet/DcmGetCLI.exe `
             --amd64-pe build/windows/dist/DcmGetPdiServer.exe `
             --amd64-pe "release/windows/DcmGet-${{ inputs.version }}-windows-x64-portable.exe" `
             --dcmtk-bin "build/windows/dcmtk-runtime/dcmtk-3.7.0-win64-dynamic/bin" `
@@ -1277,7 +1263,7 @@ jobs:
                   if pure.parts[0] != "DcmGet" or len(pure.parts) < 2:
                       raise SystemExit(f"standalone archive path is outside DcmGet: {info.filename}")
                   relative = PurePosixPath(*pure.parts[1:]).as_posix()
-                  if relative not in {"DcmGet.exe", "DcmGetCLI.exe"} and not relative.startswith("_internal/"):
+                  if relative != "DcmGet.exe" and not relative.startswith("_internal/"):
                       raise SystemExit(f"standalone archive path is outside update scope: {relative}")
                   if relative.casefold() in tree_records:
                       raise SystemExit(f"standalone archive path is duplicated: {relative}")
@@ -1288,8 +1274,6 @@ jobs:
                   tree_records[relative.casefold()] = (relative, info.file_size, digest.hexdigest())
           if "dcmget.exe" not in tree_records:
               raise SystemExit("standalone archive has no DcmGet.exe")
-          if "dcmgetcli.exe" not in tree_records:
-              raise SystemExit("standalone archive has no DcmGetCLI.exe")
           tree_digest = hashlib.sha256()
           for relative, size, digest in sorted(tree_records.values()):
               tree_digest.update(relative.encode("utf-8"))
