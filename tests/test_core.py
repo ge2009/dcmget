@@ -785,6 +785,7 @@ def test_preflight_ohif_does_not_require_image_conversion_tool(tmp_path):
             pdi_institution_name="测试医院",
         ),
         resolver,
+        check_port=False,
     )
 
     assert result.ok
@@ -814,6 +815,7 @@ def test_preflight_uses_configured_pdi_output_folder(tmp_path):
             pdi_output_folder=str(pdi_output),
         ),
         resolver,
+        check_port=False,
     )
 
     assert result.ok
