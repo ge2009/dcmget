@@ -1,6 +1,28 @@
 name: Windows CLI Release
 
 on:
+  push:
+    branches:
+      - "codex/**"
+    paths:
+      - ".github/workflows/windows-cli-release.yml"
+      - "DICOM_download_cli.py"
+      - "dcmget/__init__.py"
+      - "dcmget/architecture.py"
+      - "dcmget/config.py"
+      - "dcmget/core.py"
+      - "dcmget/diagnostics.py"
+      - "dcmget/runtime.py"
+      - "dcmget/task_state.py"
+      - "logo.png"
+      - "packaging/cli/**"
+      - "requirements-cli.txt"
+      - "scripts/build_windows_cli.py"
+      - "scripts/download_dcmtk.py"
+      - "scripts/windows_release_gate.py"
+      - "tests/test_core.py"
+      - "tests/test_simple_cli.py"
+      - "tests/test_windows_cli_release.py"
   workflow_dispatch:
     inputs:
       version:
@@ -15,6 +37,9 @@ on:
 
 permissions:
   contents: write
+
+env:
+  CLI_VERSION: ${{ inputs.version || '3.7.7' }}
 
 jobs:
   build:
@@ -75,12 +100,12 @@ jobs:
           tests/test_core.py
 
       - name: Build standalone CLI ZIP
-        run: python scripts/build_windows_cli.py --version "${{ inputs.version }}"
+        run: python scripts/build_windows_cli.py --version "${{ env.CLI_VERSION }}"
 
       - name: Smoke-test executable and exact ZIP contents
         shell: pwsh
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ env.CLI_VERSION }}
         run: |
           $ErrorActionPreference = "Stop"
           $archive = "release/windows-cli/DcmGetCLI-$env:VERSION-windows-x64.zip"
@@ -165,10 +190,10 @@ jobs:
       - name: Upload standalone CLI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DcmGetCLI-${{ inputs.version }}-Windows-x64-ZIP
+          name: DcmGetCLI-${{ env.CLI_VERSION }}-Windows-x64-ZIP
           path: |
-            release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip
-            release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip.sha256
+            release/windows-cli/DcmGetCLI-${{ env.CLI_VERSION }}-windows-x64.zip
+            release/windows-cli/DcmGetCLI-${{ env.CLI_VERSION }}-windows-x64.zip.sha256
           if-no-files-found: error
 
       - name: Publish standalone CLI release
@@ -177,8 +202,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "cli-v${{ inputs.version }}" `
-            "release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip" `
-            "release/windows-cli/DcmGetCLI-${{ inputs.version }}-windows-x64.zip.sha256" `
-            --title "DcmGetCLI ${{ inputs.version }}" `
+          gh release create "cli-v${{ env.CLI_VERSION }}" `
+            "release/windows-cli/DcmGetCLI-${{ env.CLI_VERSION }}-windows-x64.zip" `
+            "release/windows-cli/DcmGetCLI-${{ env.CLI_VERSION }}-windows-x64.zip.sha256" `
+            --title "DcmGetCLI ${{ env.CLI_VERSION }}" `
             --notes "独立 Windows x64 命令行 DICOM 下载器；不包含 GUI、PDI、WebView 或注册码校验。"
