@@ -947,14 +947,14 @@ def test_concurrent_processes_never_overwrite_conflicting_sop_content(tmp_path):
 
 def test_archive_publish_uses_a_bounded_sharded_lock_pool(tmp_path):
     with core._locked_archive_target(tmp_path / "archive" / "1.2.3.dcm"):
-        pass
-
-    locks = list(
-        (tmp_path / "application-state" / "archive-publish-locks").glob("*.lock")
-    )
-    assert len(locks) == 1
-    assert len(locks[0].stem) == core._ARCHIVE_LOCK_SHARD_HEX_LENGTH
-    int(locks[0].stem, 16)
+        locks = list(
+            (tmp_path / "application-state" / "archive-publish-locks").glob(
+                "*.lock"
+            )
+        )
+        assert len(locks) == 1
+        assert len(locks[0].stem) == core._ARCHIVE_LOCK_SHARD_HEX_LENGTH
+        int(locks[0].stem, 16)
 
 
 def test_archive_publish_allows_unrelated_lock_shards_to_rename_concurrently(
@@ -1575,7 +1575,7 @@ def test_target_staging_upgrade_still_recovers_legacy_private_session(
     assert not orphan.exists()
 
 
-def test_recovery_removes_stale_uuid_session_locks_but_keeps_maintenance_lock(
+def test_recovery_removes_stale_uuid_lock_and_releases_maintenance_lease(
     tmp_path,
 ):
     staging_root = tmp_path / "state" / "staging"
@@ -1583,12 +1583,18 @@ def test_recovery_removes_stale_uuid_session_locks_but_keeps_maintenance_lock(
     stale_session = "20260727-120000-000001-deadbeef"
     stale_lock = staging_root / f".{stale_session}.lock"
     stale_lock.touch()
+    maintenance_lock = core._staging_maintenance_lock_path(staging_root)
 
     messages = core._recover_orphaned_receive_staging(staging_root)
 
     assert messages == []
     assert not stale_lock.exists()
-    assert core._staging_maintenance_lock_path(staging_root).is_file()
+    maintenance = core.FileLock(str(maintenance_lock))
+    maintenance.acquire(timeout=0)
+    try:
+        assert maintenance.is_locked
+    finally:
+        maintenance.release()
 
 
 def test_session_lock_and_directory_are_published_under_maintenance_lease(tmp_path):
