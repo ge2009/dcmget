@@ -1713,6 +1713,7 @@ class DownloadRunner:
         candidate_baseline = (
             accession_baseline if accession_baseline is not None else before
         )
+        prior_attempt_files = before - candidate_baseline
         live_files = _LiveStagingTracker(staging, before)
         with self._diagnostic_lock:
             aborts_before = self._storescp_abort_count
@@ -1911,6 +1912,26 @@ class DownloadRunner:
             )
 
         archive_stats = ArchiveStats()
+        # A successful final C-MOVE response means the Storage SCP has already
+        # accepted every reported sub-operation.  The files are on the target
+        # volume at this point, so avoid reading all pixel payloads a second
+        # time with dcmdump.  Header parsing below is still required for the
+        # directory template, SOP identity and conflict-safe publication.
+        # Interrupted, ambiguous and anonymized transfers keep the full scan.
+        fast_publish = bool(
+            self._anonymizer is None
+            and not self._cancel.is_set()
+            and not safety_pause_reason
+            and receiver_exit_code is None
+            and return_code == 0
+            and final_success
+            and not missing_final_response
+            and not confirmed_delivery_gap
+            and not prior_attempt_files
+            and (diagnostics.failed_suboperations or 0) == 0
+            and (diagnostics.warning_suboperations or 0) == 0
+            and (diagnostics.remaining_suboperations or 0) == 0
+        )
         moved, rejected = _archive_dicom_files(
             candidate_files,
             destination_root,
@@ -1923,6 +1944,7 @@ class DownloadRunner:
             cancel_event=self._cancel,
             route_accession=accession,
             stats=archive_stats,
+            validate_files=not fast_publish,
         )
         processed_store_count = (
             archive_stats.new_file_count
@@ -1988,10 +2010,10 @@ class DownloadRunner:
             self._emit(
                 "storescp",
                 (
-                    f"当前 C-MOVE 期间记录到 {receiver_aborts} 个未关联的接收连接中止；"
-                    "该信息仅作为接收器警告，检查号结果以 C-MOVE 最终状态和文件完整性为准"
+                    f"已忽略 {receiver_aborts} 次接收连接中止；"
+                    "不影响任务状态，结果以 C-MOVE 最终状态和实际落盘文件为准"
                 ),
-                "warning",
+                "info",
             )
 
         if self._cancel.is_set():
@@ -2255,13 +2277,19 @@ class DownloadRunner:
                     ) and not text.startswith(("W:", "E:", "F:")):
                         continue
                     association_abort = "Association Aborted" in text
+                    if source == "storescp" and association_abort:
+                        # Some PACS implementations abort each short-lived
+                        # storage association after a successful C-STORE.  The
+                        # aggregate counter above is sufficient; forwarding
+                        # every identical line can back-pressure a task log on
+                        # SMB and evict useful UI diagnostics.
+                        continue
                     if (
                         source == "storescp"
-                        and not association_abort
                         and not text.startswith(("W:", "E:", "F:"))
                     ):
-                        # storescp -v is retained so association aborts remain
-                        # observable, but its per-object INFO stream must not
+                        # storescp -v is retained for real warning/error
+                        # diagnostics, but its per-object INFO stream must not
                         # be written synchronously to a task log on SMB.
                         continue
                     level = (
@@ -2782,6 +2810,7 @@ def _archive_dicom_files(
     route_accession: str | None = None,
     stats: ArchiveStats | None = None,
     archive_workers: int | None = None,
+    validate_files: bool = True,
     _validation_errors: dict[Path, str] | None = None,
 ) -> tuple[list[Path], list[Path]]:
     from pydicom import dcmread
@@ -2794,16 +2823,17 @@ def _archive_dicom_files(
     values = list(files)
     if not values:
         return moved, rejected
-    validation_errors = (
-        _validation_errors
-        if _validation_errors is not None
-        else _validate_dicom_files(
+    if _validation_errors is not None:
+        validation_errors = _validation_errors
+    elif validate_files:
+        validation_errors = _validate_dicom_files(
             values,
             dcmdump=dcmdump,
             environment=dcmtk_environment,
             cancel_event=cancel_event,
         )
-    )
+    else:
+        validation_errors = {}
     if archive_workers is None:
         worker_count = (
             _REMOTE_ARCHIVE_WORKERS

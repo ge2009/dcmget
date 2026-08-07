@@ -1758,7 +1758,9 @@ def test_dcmtk_protocol_trace_is_parsed_without_writing_to_smb_task_log(tmp_path
     assert "transport trace" not in log_text
 
 
-def test_storescp_verbose_output_keeps_aborts_but_suppresses_object_info(tmp_path):
+def test_storescp_verbose_output_aggregates_aborts_and_suppresses_object_info(
+    tmp_path,
+):
     events: list[tuple[str, str, str]] = []
     runner = DownloadRunner(
         AppConfig(dicom_destination_folder=str(tmp_path / "dicom")),
@@ -1782,11 +1784,10 @@ def test_storescp_verbose_output_keeps_aborts_but_suppresses_object_info(tmp_pat
 
     assert runner._storescp_abort_count == 1
     assert events == [
-        ("storescp", "I: Association Aborted", "warning"),
         ("storescp", "E: cannot write DICOM file", "error"),
     ]
     log_text = (tmp_path / "logs" / "dcmget.log").read_text(encoding="utf-8")
-    assert "Association Aborted" in log_text
+    assert "Association Aborted" not in log_text
     assert "cannot write DICOM file" in log_text
     assert "storing DICOM file" not in log_text
 
@@ -2382,7 +2383,10 @@ def test_pending_move_with_aborted_store_is_failed_and_retryable(tmp_path, monke
     assert result.status == AccessionStatus.FAILED
     assert "待处理响应" in result.message
     assert "接收连接中止" not in result.message
-    assert any("仅作为接收器警告" in message for _source, message, _level in logs)
+    assert any(
+        "已忽略 1 次接收连接中止" in message and level == "info"
+        for _source, message, level in logs
+    )
     assert BatchSummary([result]).failed_accessions == ["FAILED001"]
 
 
@@ -3277,6 +3281,10 @@ def test_success_status_with_zero_failed_suboperations_remains_completed(
     config = AppConfig(dicom_destination_folder=str(tmp_path / "dicom"))
     tools = ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0")
     runner = DownloadRunner(config, tools)
+    validate = Mock(
+        side_effect=AssertionError("successful C-MOVE must use fast publish")
+    )
+    monkeypatch.setattr(core, "_validate_dicom_files", validate)
 
     class Process:
         stdout = iter(
@@ -3308,6 +3316,7 @@ def test_success_status_with_zero_failed_suboperations_remains_completed(
 
     assert result.status == AccessionStatus.COMPLETED
     assert result.file_count == 1
+    validate.assert_not_called()
 
 
 def test_retry_archives_a_file_that_arrives_during_the_backoff(
@@ -3323,6 +3332,9 @@ def test_retry_archives_a_file_that_arrives_during_the_backoff(
         ),
         ToolPaths(Path("movescu"), Path("storescp"), Path("."), "3.7.0"),
     )
+    real_validate = core._validate_dicom_files
+    validate = Mock(wraps=real_validate)
+    monkeypatch.setattr(core, "_validate_dicom_files", validate)
 
     class FirstProcess:
         stdout = iter(
@@ -3391,6 +3403,7 @@ def test_retry_archives_a_file_that_arrives_during_the_backoff(
     assert len(result.archived_files) == 1
     assert Path(result.archived_files[0]).is_file()
     assert not (staging / "late.dcm").exists()
+    validate.assert_called_once()
 
 
 def test_duplicate_store_deliveries_count_once_in_the_final_directory(
@@ -3886,7 +3899,10 @@ def test_unrelated_store_abort_does_not_downgrade_successful_move(tmp_path, monk
     assert result.status == AccessionStatus.COMPLETED
     assert result.file_count == 1
     assert "接收连接中止" not in result.message
-    assert any("仅作为接收器警告" in message for _source, message, _level in logs)
+    assert any(
+        "已忽略 1 次接收连接中止" in message and level == "info"
+        for _source, message, level in logs
+    )
     assert result.archived_files == [
         str(next((tmp_path / "dicom").rglob("*.dcm")))
     ]
