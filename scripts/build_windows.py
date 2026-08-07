@@ -348,11 +348,44 @@ def pdi_server_pyinstaller_args(
     ]
 
 
+def cli_pyinstaller_args(
+    icon: Path,
+    version_file: Path,
+) -> list[str]:
+    """Build the operator CLI without WebView, React, OHIF, or DCMTK copies."""
+
+    return [
+        str(ROOT / "DICOM_download_cli.py"),
+        "--noconfirm",
+        "--clean",
+        "--console",
+        "--onefile",
+        "--name",
+        "DcmGetCLI",
+        "--icon",
+        str(icon),
+        "--version-file",
+        str(version_file),
+        "--distpath",
+        str(DIST_ROOT),
+        "--workpath",
+        str(BUILD_ROOT / "work" / "DcmGetCLI"),
+        "--specpath",
+        str(BUILD_ROOT / "spec"),
+        "--paths",
+        str(ROOT),
+        "--collect-submodules",
+        "pynetdicom",
+        "--noupx",
+    ]
+
+
 def verify_update_payload_architecture() -> tuple[Path, ...]:
     """Verify the signed onedir payload used by component-only releases."""
 
     expected = [
         DIST_ROOT / "DcmGet" / "DcmGet.exe",
+        DIST_ROOT / "DcmGet" / "DcmGetCLI.exe",
         DIST_ROOT / "DcmGetPdiServer.exe",
         DIST_ROOT / "DcmGet" / "_internal" / "DcmGetPdiServer.exe",
     ]
@@ -389,6 +422,8 @@ def verify_built_architecture(version: str) -> tuple[Path, ...]:
 
     expected = [
         DIST_ROOT / "DcmGet" / "DcmGet.exe",
+        DIST_ROOT / "DcmGet" / "DcmGetCLI.exe",
+        DIST_ROOT / "DcmGetCLI.exe",
         DIST_ROOT / "DcmGetPdiServer.exe",
         RELEASE_ROOT / f"DcmGet-{version}-windows-x64-portable.exe",
     ]
@@ -510,7 +545,12 @@ def build_payloads(version: str, *, update_payload_only: bool = False) -> None:
     pdi_server = DIST_ROOT / "DcmGetPdiServer.exe"
     if not pdi_server.is_file():
         raise FileNotFoundError("PDI 本地阅片服务 DcmGetPdiServer.exe 构建失败")
-    sign_windows_payloads([pdi_server])
+
+    run_pyinstaller(cli_pyinstaller_args(icon, version_file))
+    cli_application = DIST_ROOT / "DcmGetCLI.exe"
+    if not cli_application.is_file():
+        raise FileNotFoundError("纯命令行下载器 DcmGetCLI.exe 构建失败")
+    sign_windows_payloads([pdi_server, cli_application])
 
     run_pyinstaller(
         pyinstaller_args(
@@ -524,6 +564,8 @@ def build_payloads(version: str, *, update_payload_only: bool = False) -> None:
         )
     )
     application = DIST_ROOT / "DcmGet" / "DcmGet.exe"
+    installed_cli = application.parent / "DcmGetCLI.exe"
+    shutil.copy2(cli_application, installed_cli)
     if update_payload_only:
         sign_windows_payloads([application])
         verify_update_payload_architecture()

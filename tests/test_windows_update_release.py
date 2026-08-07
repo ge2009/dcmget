@@ -99,6 +99,7 @@ def _install_root(root: Path, *, changed: bool = False) -> Path:
         install / "DcmGet.exe",
         suffix=b"target" if changed else b"baseline",
     )
+    _write_pe(install / "DcmGetCLI.exe", suffix=b"cli")
     internal = install / "_internal"
     internal.mkdir(parents=True)
     (internal / "unchanged.dat").write_bytes(b"same")
@@ -259,7 +260,7 @@ def test_full_update_manifest_is_ed25519_signed_and_lists_exact_installer(
     assert manifest["product"] == "DcmGet"
     assert manifest["version"] == "3.6.0"
     assert manifest["platform"] == "windows-x64"
-    assert manifest["layout_version"] == 2
+    assert manifest["layout_version"] == 3
     assert manifest["install_tree_sha256"] == _install_tree_sha256(install)
     assert manifest["component_patches"] == []
     assert manifest["full_installer"] == {
@@ -672,8 +673,10 @@ def test_patch_only_release_builds_direct_patches_from_recent_baselines(
     with zipfile.ZipFile(result.baseline_snapshot_path) as archive:
         assert PATCH_MANIFEST_NAME not in archive.namelist()
         assert "DcmGet.exe" in archive.namelist()
+        assert "DcmGetCLI.exe" in archive.namelist()
         assert all(
-            name == "DcmGet.exe" or name.startswith("_internal/")
+            name in {"DcmGet.exe", "DcmGetCLI.exe"}
+            or name.startswith("_internal/")
             for name in archive.namelist()
         )
     checksums = (release / "SHA256SUMS.txt").read_text(encoding="ascii")
@@ -873,6 +876,8 @@ def test_component_workflow_is_manual_patch_only_and_skips_full_build_stages():
     assert "default: false" in workflow
     assert "if: ${{ inputs.publish_update }}" in workflow
     assert "DCMGET_UPDATE_SIGNING_PRIVATE_KEY_BASE64 is required" in workflow
+    assert "Reject full-installer-only layout release" in workflow
+    assert "inputs.version == '3.7.6'" in workflow
     assert "--update-payload-only" in workflow
     assert "--patch-only" in workflow
     assert '"--baseline"' in workflow

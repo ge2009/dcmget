@@ -437,7 +437,7 @@ def _is_allowed_component_path(value: str) -> bool:
         )
     ):
         return False
-    return value.casefold() == "dcmget.exe" or (
+    return value.casefold() in {"dcmget.exe", "dcmgetcli.exe"} or (
         len(path.parts) > 1 and path.parts[0].casefold() == "_internal"
     )
 
@@ -1310,6 +1310,12 @@ function Get-DcmGetApplicationTreeDigest([string]$root) {{
     }}
     $mainHash = (Get-FileHash -LiteralPath $main.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     $records.Add([PSCustomObject]@{{ Path = 'DcmGet.exe'; Size = [long]$main.Length; Hash = $mainHash }})
+    $cli = Get-Item -LiteralPath (Join-Path $rootFull 'DcmGetCLI.exe') -Force
+    if ($cli.PSIsContainer -or ($cli.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+        throw 'DcmGetCLI.exe is not a safe application file'
+    }}
+    $cliHash = (Get-FileHash -LiteralPath $cli.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $records.Add([PSCustomObject]@{{ Path = 'DcmGetCLI.exe'; Size = [long]$cli.Length; Hash = $cliHash }})
     $internal = Join-Path $rootFull '_internal'
     if (Test-Path -LiteralPath $internal) {{
         $internalItem = Get-Item -LiteralPath $internal -Force
@@ -1967,6 +1973,8 @@ def _installed_application_tree_digest(install_directory: Path) -> str:
 
     main_executable = install_root / "DcmGet.exe"
     add_file(main_executable, "DcmGet.exe")
+    cli_executable = install_root / "DcmGetCLI.exe"
+    add_file(cli_executable, "DcmGetCLI.exe")
     internal = install_root / "_internal"
     if internal.exists():
         if _is_reparse_point(internal) or not internal.is_dir():
@@ -2126,7 +2134,7 @@ def _validate_component_archive(
         or patch_manifest.get("platform") != PLATFORM
         or patch_manifest.get("removed_paths") != []
         or patch_manifest.get("install_path_allowlist")
-        != ["DcmGet.exe", "_internal/**"]
+        != ["DcmGet.exe", "DcmGetCLI.exe", "_internal/**"]
     ):
         raise UpdateSecurityError("PATCH-MANIFEST.json 的产品或安装边界无效")
     if base_version and patch_manifest.get("base_version") != base_version:

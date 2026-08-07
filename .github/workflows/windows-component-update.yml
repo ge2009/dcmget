@@ -6,7 +6,6 @@ on:
       version:
         description: Update version in X.Y.Z format
         required: true
-        default: 3.7.5
       publish_update:
         description: Publish the verified component update to GitHub Releases
         required: true
@@ -39,6 +38,11 @@ jobs:
           python-version: "3.12"
           architecture: x64
           cache: pip
+
+      - name: Reject full-installer-only layout release
+        if: ${{ inputs.version == '3.7.6' }}
+        shell: pwsh
+        run: throw "DcmGet 3.7.6 adds DcmGetCLI.exe and must be published as a full installer before component-only releases can resume."
 
       - name: Install component build dependencies
         run: |

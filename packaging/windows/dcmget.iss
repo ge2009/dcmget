@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "3.7.5"
+  #define AppVersion "3.7.6"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\build\windows\dist\DcmGet"
@@ -18,7 +18,8 @@
 #endif
 #define AppName "DcmGet"
 #define AppExeName "DcmGet.exe"
-; These legacy names are retained only so 3.7.5 can remove the Windows service
+#define AppCliExeName "DcmGetCLI.exe"
+; These legacy names are retained so current releases can remove the Windows service
 ; installed by DcmGet 3.1.0 through 3.7.4 during upgrade or uninstall.
 #define ServiceName "kayisoft-dcmget"
 #define ServiceWrapperName "kayisoft-dcmget.exe"
@@ -335,7 +336,7 @@ begin
     '$root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)' + #13#10 +
     '$rootPrefix = $root + [IO.Path]::DirectorySeparatorChar' + #13#10 +
     '$hostScript = [IO.Path]::Combine($root, ''{#ServiceHostName}'')' + #13#10 +
-    '$names = @(''DcmGet.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'', ''{#ServiceWrapperName}'')' + #13#10 +
+    '$names = @(''DcmGet.exe'', ''DcmGetCLI.exe'', ''DcmGetPdiServer.exe'', ''storescp.exe'', ''movescu.exe'', ''{#ServiceWrapperName}'')' + #13#10 +
     'function Get-DcmGetInstalledProcess {' + #13#10 +
     '  @(Get-CimInstance Win32_Process | Where-Object {' + #13#10 +
     '    $path = [string]$_.ExecutablePath' + #13#10 +

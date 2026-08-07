@@ -163,7 +163,7 @@ expected = {
     "platform": "windows-x64",
     "channel": "stable",
     "schema_version": 1,
-    "layout_version": 1,
+    "layout_version": 3,
 }
 for field, value in expected.items():
     if manifest.get(field) != value:
@@ -208,7 +208,8 @@ def validate_component_patch(record, name):
         or record.get("preserves_user_data") is not True
         or record.get("content_scope") != "application"
         or record.get("layout_version") != manifest.get("layout_version")
-        or record.get("install_path_allowlist") != ["DcmGet.exe", "_internal/**"]
+        or record.get("install_path_allowlist")
+        != ["DcmGet.exe", "DcmGetCLI.exe", "_internal/**"]
         or record.get("removed_paths") != []
     ):
         raise SystemExit(f"组件增量包安全范围声明无效: {name}")
@@ -225,7 +226,7 @@ def validate_component_patch(record, name):
             raise SystemExit(f"组件增量包文件记录无效: {name}")
         relative = str(item.get("path", "")).replace("\\", "/")
         parts = relative.split("/")
-        allowed = relative == "DcmGet.exe" or (
+        allowed = relative in {"DcmGet.exe", "DcmGetCLI.exe"} or (
             len(parts) >= 2 and parts[0] == "_internal"
         )
         canonical = relative.casefold()

@@ -1,5 +1,12 @@
 # DcmGet 版本说明
 
+## 3.7.6（2026-08-07）
+
+- Windows 安装包和目录 ZIP 新增独立的 `DcmGetCLI.exe` 纯命令行下载器；默认读取实例 1 的 PACS、AE、接收端口和目标目录配置，只需运行 `DcmGetCLI.exe access.txt`，不启动 WebView，也不生成 PDI。
+- CLI 使用独立恢复点；中断后重复执行同一命令会继续未完成任务，`--discard-checkpoint` 可明确放弃恢复点，`--profile N` 和 `--config PATH` 可选择其他配置。
+- 明确成功且无失败、警告、剩余子操作的非匿名 C-MOVE 跳过第二次逐文件完整校验，直接从目标卷暂存区原子发布；异常、取消、重试残留和匿名任务继续保留完整性保护。
+- `storescp` 的单条 `Association Aborted` 不再刷屏或影响任务状态，只保留一次汇总；真实接收错误仍正常记录。新增顶层 CLI 文件改变了安装布局，本版本需要使用完整安装包升级。
+
 ## 3.7.5（2026-08-04）
 
 - Windows 安装版改为通过 `--windows-desktop` 在当前已登录用户的桌面会话中运行管理中心和 Profile，不再注册或依赖 LocalSystem Windows 服务；关闭 WebView 窗口不会停止后台下载，用户注销会结束该会话内的管理中心、Profile 和下载进程。

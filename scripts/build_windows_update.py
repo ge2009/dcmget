@@ -2,7 +2,8 @@
 """Build the authenticated Windows update feed and optional component patch.
 
 The component patch is deliberately conservative.  It can only replace files
-owned by the installed application (``DcmGet.exe`` and ``_internal/**``), and
+owned by the installed application (``DcmGet.exe``, ``DcmGetCLI.exe`` and
+``_internal/**``), and
 it is refused whenever the previous layout contains a file that disappeared.
 Configuration, task state, logs, licence/trial state and downloaded DICOM data
 live outside this allowlist and can therefore never enter or be deleted by a
@@ -63,9 +64,9 @@ from dcmget.update_trust import (
 
 
 UPDATE_SCHEMA_VERSION = 1
-# Layout 2 removes the WinSW service payload.  It intentionally cannot be
-# applied as a component patch on top of service-based 3.7.4 installations.
-UPDATE_LAYOUT_VERSION = 2
+# Layout 2 removed the WinSW service payload.  Layout 3 adds the top-level
+# DcmGetCLI.exe entry, which older component updaters do not allow replacing.
+UPDATE_LAYOUT_VERSION = 3
 UPDATE_MANIFEST_NAME = "UPDATE-MANIFEST.json"
 UPDATE_SIGNATURE_NAME = "UPDATE-MANIFEST.signed.json"
 PATCH_MANIFEST_NAME = "PATCH-MANIFEST.json"
@@ -73,7 +74,7 @@ COMPONENT_BASELINE_NAME = "component-baseline.zip"
 MAX_COMPONENT_BASELINES = 5
 PRODUCT = "DcmGet"
 CHANNEL = "stable"
-INSTALL_PATH_ALLOWLIST = ("DcmGet.exe", "_internal/**")
+INSTALL_PATH_ALLOWLIST = ("DcmGet.exe", "DcmGetCLI.exe", "_internal/**")
 _VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SAFE_FILE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
@@ -162,6 +163,7 @@ def build_windows_update_release(
     current_tree_sha256 = _tree_digest(current_files)
     application = payload_root / "DcmGet.exe"
     require_amd64_pe(application, "增量更新 DcmGet.exe")
+    require_amd64_pe(payload_root / "DcmGetCLI.exe", "增量更新 DcmGetCLI.exe")
     installer_path: Path | None = None
     installer_record: Mapping[str, object] | None = None
     if patch_only:
@@ -556,6 +558,8 @@ def _inventory_install_root(root: Path) -> dict[str, FileRecord]:
         )
     if "DcmGet.exe" not in records:
         raise WindowsUpdateBuildError("安装负载缺少 DcmGet.exe")
+    if "DcmGetCLI.exe" not in records:
+        raise WindowsUpdateBuildError("安装负载缺少 DcmGetCLI.exe")
     return records
 
 
@@ -563,7 +567,7 @@ def _is_allowed_install_path(relative: str) -> bool:
     pure = PurePosixPath(relative)
     if pure.is_absolute() or ".." in pure.parts:
         return False
-    return relative == "DcmGet.exe" or (
+    return relative in {"DcmGet.exe", "DcmGetCLI.exe"} or (
         len(pure.parts) >= 2 and pure.parts[0] == "_internal"
     )
 

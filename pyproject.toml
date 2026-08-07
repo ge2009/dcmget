@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcmget"
-version = "3.7.5"
+version = "3.7.6"
 description = "Offline LAN Web workstation for DCMTK C-MOVE downloads"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,11 +21,12 @@ dependencies = [
 
 [project.scripts]
 dcmget = "DICOM_download_script:main"
+dcmget-cli = "DICOM_download_cli:main"
 dcmget-ui = "DICOM_download_ui:main"
 
 [tool.setuptools]
 packages = ["dcmget"]
-py-modules = ["DICOM_download_script", "DICOM_download_ui"]
+py-modules = ["DICOM_download_cli", "DICOM_download_script", "DICOM_download_ui"]
 
 [tool.setuptools.package-data]
 dcmget = ["CHANGELOG.md", "webui-react/*"]

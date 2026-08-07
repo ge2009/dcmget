@@ -110,6 +110,7 @@ def _component_package(
     payload: bytes = b"changed executable",
     base_payload: bytes = b"previous executable",
 ) -> tuple[UpdateAsset, bytes]:
+    cli_payload = b"cli executable"
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
         record = ComponentFile(
@@ -120,10 +121,16 @@ def _component_package(
             base_sha256=_sha256(base_payload),
         )
         base_tree = _tree_digest(
-            {record.path: (len(base_payload), _sha256(base_payload))}
+            {
+                record.path: (len(base_payload), _sha256(base_payload)),
+                "DcmGetCLI.exe": (len(cli_payload), _sha256(cli_payload)),
+            }
         )
         target_tree = _tree_digest(
-            {record.path: (record.size, record.sha256)}
+            {
+                record.path: (record.size, record.sha256),
+                "DcmGetCLI.exe": (len(cli_payload), _sha256(cli_payload)),
+            }
         )
         patch_manifest = {
             "schema_version": 1,
@@ -131,7 +138,11 @@ def _component_package(
             "platform": "windows-x64",
             "base_version": "3.5.2",
             "version": "3.6.0",
-            "install_path_allowlist": ["DcmGet.exe", "_internal/**"],
+            "install_path_allowlist": [
+                "DcmGet.exe",
+                "DcmGetCLI.exe",
+                "_internal/**",
+            ],
             "files": [
                 {
                     "path": record.path,
@@ -149,7 +160,15 @@ def _component_package(
         archive.writestr("PATCH-MANIFEST.json", json.dumps(patch_manifest))
         archive.writestr("DcmGet.exe", payload)
     package = stream.getvalue()
-    return _asset(package, component_files=(record,)), package
+    asset = _asset(package, component_files=(record,))
+    return (
+        replace(
+            asset,
+            base_tree_sha256=base_tree,
+            target_tree_sha256=target_tree,
+        ),
+        package,
+    )
 
 
 def _signed_update_manifest(patch_content: bytes = b"patch payload") -> dict[str, object]:
@@ -510,7 +529,9 @@ def test_component_base_hash_reads_every_block(tmp_path: Path):
     install = tmp_path / "install"
     install.mkdir()
     base_content = b"A" * (1024 * 1024) + b"B" * (1024 * 1024 + 17)
+    cli_content = b"cli executable"
     (install / "DcmGet.exe").write_bytes(base_content)
+    (install / "DcmGetCLI.exe").write_bytes(cli_content)
     record = ComponentFile(
         "DcmGet.exe",
         3,
@@ -525,7 +546,10 @@ def test_component_base_hash_reads_every_block(tmp_path: Path):
     )
 
     base_tree = _tree_digest(
-        {"DcmGet.exe": (len(base_content), _sha256(base_content))}
+        {
+            "DcmGet.exe": (len(base_content), _sha256(base_content)),
+            "DcmGetCLI.exe": (len(cli_content), _sha256(cli_content)),
+        }
     )
     assert scheduler.can_apply_component((record,), base_tree) is True
 
@@ -541,8 +565,10 @@ def test_component_tree_ignores_installer_roots_but_detects_internal_drift(
     internal = install / "_internal"
     internal.mkdir(parents=True)
     old_app = b"old app"
+    cli_content = b"cli executable"
     unchanged = b"runtime dependency"
     (install / "DcmGet.exe").write_bytes(old_app)
+    (install / "DcmGetCLI.exe").write_bytes(cli_content)
     (internal / "runtime.dat").write_bytes(unchanged)
     (install / "DcmGetService.exe").write_bytes(b"ignored WinSW wrapper")
     (install / "unins000.exe").write_bytes(b"ignored uninstaller")
@@ -556,6 +582,7 @@ def test_component_tree_ignores_installer_roots_but_detects_internal_drift(
     base_tree = _tree_digest(
         {
             "DcmGet.exe": (len(old_app), _sha256(old_app)),
+            "DcmGetCLI.exe": (len(cli_content), _sha256(cli_content)),
             "_internal/runtime.dat": (len(unchanged), _sha256(unchanged)),
         }
     )
@@ -1451,6 +1478,7 @@ def test_scheduled_task_can_apply_allowlisted_component_patch_with_rollback(
     install_directory = tmp_path / "Program Files" / "DcmGet"
     install_directory.mkdir(parents=True)
     (install_directory / "DcmGet.exe").write_bytes(b"previous executable")
+    (install_directory / "DcmGetCLI.exe").write_bytes(b"cli executable")
     commands: list[list[str]] = []
 
     def runner(command, **kwargs):

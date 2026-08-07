@@ -89,6 +89,7 @@ def test_source_deploy_contains_transitive_requirement_files():
     bundled = {path.relative_to(root).as_posix() for path in source_files(root)}
 
     assert {"requirements.txt", "requirements-dev.txt", "requirements-build.txt"} <= bundled
+    assert "DICOM_download_cli.py" in bundled
     assert "dcmget/architecture.py" in bundled
     assert "dcmget/nicegui_ui.py" not in bundled
     assert not any(name.startswith("dcmget/webui/") for name in bundled)
@@ -207,6 +208,9 @@ def test_windows_release_is_x64_only_and_allows_arm64_compatibility():
     assert "ensure_supported_runtime()" in build
     assert "require_amd64_pe(dcmtk_bin / name" in build
     assert "verify_built_architecture(version)" in build
+    assert "DcmGetCLI.exe" in build
+    assert '"--console"' in build
+    assert "Smoke-test pure command-line entry" in workflow
     assert "ensure_supported_runtime" in bootstrap
     assert "ensure_supported_runtime()" in entry
     assert "ensure_supported_runtime()" in cli
@@ -474,7 +478,13 @@ def test_windows_installer_process_cleanup_is_limited_to_install_directory():
     assert "Get-CimInstance Win32_Process" in installer
     assert "ExecutablePath" in installer
     assert "$path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)" in installer
-    for name in ("DcmGet.exe", "DcmGetPdiServer.exe", "storescp.exe", "movescu.exe"):
+    for name in (
+        "DcmGet.exe",
+        "DcmGetCLI.exe",
+        "DcmGetPdiServer.exe",
+        "storescp.exe",
+        "movescu.exe",
+    ):
         assert name in installer
     assert 'taskkill.exe" /PID ([string]$target.ProcessId) /T /F' in installer
     assert "Get-Process -Name" not in installer
