@@ -13,6 +13,10 @@
 #ifndef LicenseFile
   #define LicenseFile "..\..\LICENSE"
 #endif
+#ifndef ChineseLanguageFile
+  #define ChineseLanguageFile "compiler:Languages\ChineseSimplified.isl"
+#endif
+
 #define AppName "DcmGet 4 Preview"
 #define InstallerAppId "{{9A382E04-4A7B-42D8-AFD9-9A5BBCFB07D3}"
 #define AppExeName "dcmget-desktop.exe"
@@ -52,6 +56,7 @@ OutputBaseFilename=DcmGet-{#AppVersion}-Setup-preview-x64
 LicenseFile={#LicenseFile}
 
 [Languages]
+Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
