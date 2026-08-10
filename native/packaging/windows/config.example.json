@@ -1,0 +1,11 @@
+{
+  "config_version": 8,
+  "dicom_destination_folder": "D:\\Dicom",
+  "pacs_server_ip": "127.0.0.1",
+  "pacs_server_port": 104,
+  "calling_ae_title": "DCMGET",
+  "pacs_ae_title": "PACS",
+  "storage_ae_title": "DCMGET",
+  "storage_port": 6666,
+  "pdi_export_enabled": false
+}

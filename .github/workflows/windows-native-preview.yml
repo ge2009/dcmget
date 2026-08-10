@@ -5,12 +5,16 @@ on:
   pull_request:
     paths:
       - "native/**"
+      - "packaging/windows/dcmget-native.iss"
+      - "scripts/windows_native_preview_gate.py"
       - ".github/workflows/windows-native-preview.yml"
   push:
     branches:
       - "codex/gpui-native-v4"
     paths:
       - "native/**"
+      - "packaging/windows/dcmget-native.iss"
+      - "scripts/windows_native_preview_gate.py"
       - ".github/workflows/windows-native-preview.yml"
 
 permissions:
@@ -67,12 +71,34 @@ jobs:
           cargo build --locked --release -p dcmget-desktop --no-default-features --features gpui-ui --target x86_64-pc-windows-msvc
           cargo build --locked --release -p dcmget-cli --target x86_64-pc-windows-msvc
 
-      - name: Verify AMD64 PE files and preview contents
+      - name: Install Inno Setup
         shell: pwsh
         run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "未检测到 ISCC.exe，请确认 Inno Setup 可用"
+          }
+
+      - name: Setup Python runtime for release gate
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare portable and installer payloads
+        shell: pwsh
+        run: |
+          $version = "${{ steps.native-version.outputs.version }}"
           $target = Join-Path $PWD "target/x86_64-pc-windows-msvc/release"
-          $output = Join-Path $PWD "dist/DcmGet-${{ steps.native-version.outputs.version }}-windows-x64"
-          New-Item -ItemType Directory -Force $output | Out-Null
+          $portable = Join-Path $PWD "dist/DcmGet-$version-windows-x64"
+          $installerSource = Join-Path $PWD "dist/DcmGet-$version-windows-x64-installer"
+          $release = Join-Path $PWD "release/windows"
+          foreach ($directory in @($portable, $installerSource, $release)) {
+            if (Test-Path $directory) { Remove-Item -Recurse -Force $directory }
+            New-Item -ItemType Directory -Force $directory | Out-Null
+          }
 
           function Assert-Amd64Pe([string]$path) {
             $stream = [IO.File]::OpenRead($path)
@@ -84,7 +110,8 @@ jobs:
               $stream.Position = $peOffset
               if ($reader.ReadUInt32() -ne 0x00004550) { throw "$path has no PE signature" }
               if ($reader.ReadUInt16() -ne 0x8664) { throw "$path is not AMD64" }
-            } finally {
+            }
+            finally {
               $stream.Dispose()
             }
           }
@@ -93,10 +120,18 @@ jobs:
             $source = Join-Path $target $name
             if (-not (Test-Path $source -PathType Leaf)) { throw "Missing native binary: $name" }
             Assert-Amd64Pe $source
-            Copy-Item $source $output
+            Copy-Item $source $portable
+            Copy-Item $source $installerSource
           }
 
-          $forbidden = @(Get-ChildItem $output -Recurse -File | Where-Object {
+          foreach ($name in @("README-preview.txt", "config.example.json")) {
+            $source = Join-Path $PWD "packaging/windows/$name"
+            if (-not (Test-Path $source -PathType Leaf)) { throw "Missing preview support file: $name" }
+            Copy-Item $source $portable
+            Copy-Item $source $installerSource
+          }
+
+          $forbidden = @(Get-ChildItem -Path $portable, $installerSource -Recurse -File | Where-Object {
             $_.Name -match '(?i)python|dcmtk|movescu|storescp|tauri' -or
             $_.Extension -in @('.py', '.pyc')
           })
@@ -104,15 +139,112 @@ jobs:
             throw "Forbidden legacy runtime content: $($forbidden.FullName -join ', ')"
           }
 
-          Get-ChildItem $output -File | ForEach-Object {
+          Get-ChildItem $portable -File | ForEach-Object {
             $hash = Get-FileHash $_.FullName -Algorithm SHA256
             "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
-          } | Set-Content (Join-Path $output "SHA256SUMS.txt") -Encoding ascii
+          } | Set-Content (Join-Path $portable "SHA256SUMS.txt") -Encoding ascii
 
-      - name: Upload technical preview
+      - name: Build side-by-side preview installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $version = "${{ steps.native-version.outputs.version }}"
+          $numericVersion = $version -replace '-preview\.', '.'
+          if ($numericVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            throw "Cannot derive four-part Windows version from $version"
+          }
+          $license = (Resolve-Path "..\LICENSE").Path
+          $source = (Resolve-Path (Join-Path $PWD "dist/DcmGet-$version-windows-x64-installer")).Path
+          $release = (Resolve-Path (Join-Path $PWD "release/windows")).Path
+          & $iscc "/DAppVersion=$version" "/DVersionInfoNumeric=$numericVersion" "/DSourceDir=$source" "/DReleaseDir=$release" "/DLicenseFile=$license" "../packaging/windows/dcmget-native.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+          $installer = Join-Path $release "DcmGet-$version-Setup-preview-x64.exe"
+          if (-not (Test-Path $installer -PathType Leaf)) { throw "Native installer is missing" }
+
+      - name: Run static release gates
+        shell: pwsh
+        run: |
+          $version = "${{ steps.native-version.outputs.version }}"
+          $portable = (Resolve-Path (Join-Path $PWD "dist/DcmGet-$version-windows-x64")).Path
+          $installer = (Resolve-Path (Join-Path $PWD "release/windows/DcmGet-$version-Setup-preview-x64.exe")).Path
+          python ../scripts/windows_native_preview_gate.py `
+            --version "$version" `
+            --portable-dir "$portable" `
+            --installer "$installer"
+
+      - name: Install, launch, and uninstall preview safely
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ steps.native-version.outputs.version }}"
+          $installer = (Resolve-Path (Join-Path $PWD "release/windows/DcmGet-$version-Setup-preview-x64.exe")).Path
+          $root = Join-Path $env:RUNNER_TEMP "dcmget-native-preview-smoke"
+          $installDir = Join-Path $root "DcmGet 4 Preview"
+          $installLog = Join-Path $root "install.log"
+          $legacyConfigSentinel = Join-Path $env:APPDATA "DcmGet\native-preview-preserve.txt"
+          $legacyStateSentinel = Join-Path $env:LOCALAPPDATA "DcmGet\native-preview-preserve.txt"
+
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $root | Out-Null
+          New-Item -ItemType Directory -Force (Split-Path $legacyConfigSentinel -Parent) | Out-Null
+          New-Item -ItemType Directory -Force (Split-Path $legacyStateSentinel -Parent) | Out-Null
+          Set-Content $legacyConfigSentinel "legacy-config-must-survive" -NoNewline
+          Set-Content $legacyStateSentinel "legacy-state-must-survive" -NoNewline
+
+          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="$installDir" /LOG="$installLog"
+          if ($LASTEXITCODE -ne 0) { throw "预览安装失败：$LASTEXITCODE" }
+
+          $desktop = Join-Path $installDir "dcmget-desktop.exe"
+          $cli = Join-Path $installDir "dcmget-cli.exe"
+          foreach ($path in @($desktop, $cli, $legacyConfigSentinel, $legacyStateSentinel)) {
+            if (-not (Test-Path $path -PathType Leaf)) { throw "安装或兼容性校验失败：$path" }
+          }
+          if ((Get-Content $legacyConfigSentinel -Raw) -ne "legacy-config-must-survive") { throw "旧配置被预览安装器修改" }
+          if ((Get-Content $legacyStateSentinel -Raw) -ne "legacy-state-must-survive") { throw "旧状态被预览安装器修改" }
+
+          & $cli --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dcmget-cli.exe --help failed: $LASTEXITCODE" }
+          & $cli validate-config (Join-Path $installDir "config.example.json") | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dcmget-cli.exe validate-config failed: $LASTEXITCODE" }
+
+          $desktopProcess = Start-Process -FilePath $desktop -WorkingDirectory $installDir -PassThru
+          Start-Sleep -Seconds 5
+          if ($desktopProcess.HasExited) { throw "GPUI desktop exited during launch smoke with code $($desktopProcess.ExitCode)" }
+          Stop-Process -Id $desktopProcess.Id -Force
+          Wait-Process -Id $desktopProcess.Id -ErrorAction SilentlyContinue
+
+          $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" | Select-Object -First 1
+          if (-not $uninstaller) { throw "未找到卸载程序" }
+          & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "预览卸载失败：$LASTEXITCODE" }
+          if (Test-Path $desktop -PathType Leaf) { throw "卸载后仍存在 dcmget-desktop.exe" }
+          if (Test-Path $cli -PathType Leaf) { throw "卸载后仍存在 dcmget-cli.exe" }
+          foreach ($path in @($legacyConfigSentinel, $legacyStateSentinel)) {
+            if (-not (Test-Path $path -PathType Leaf)) { throw "预览卸载错误删除了旧版数据：$path" }
+            Remove-Item $path -Force
+          }
+
+      - name: Upload smoke diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ steps.native-version.outputs.version }}-smoke-diagnostics
+          path: ${{ runner.temp }}/dcmget-native-preview-smoke/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload portable technical preview
         uses: actions/upload-artifact@v4
         with:
           name: DcmGet-${{ steps.native-version.outputs.version }}-windows-x64
           path: native/dist/DcmGet-${{ steps.native-version.outputs.version }}-windows-x64
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload side-by-side preview installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DcmGet-${{ steps.native-version.outputs.version }}-Setup-preview-x64
+          path: native/release/windows
           if-no-files-found: error
           retention-days: 14

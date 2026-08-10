@@ -114,7 +114,14 @@ fn backup_sqlite(source_path: &Path, destination_path: &Path) -> Result<(), Stat
         drop(backup);
         destination.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     }
-    File::open(&temporary)?.sync_all()?;
+    // `FlushFileBuffers` requires a writable Windows handle. `File::open`
+    // creates a read-only handle there, so calling `sync_all` on it fails with
+    // ERROR_ACCESS_DENIED even though the backup itself completed correctly.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)?
+        .sync_all()?;
     fs::rename(&temporary, destination_path)?;
     Ok(())
 }

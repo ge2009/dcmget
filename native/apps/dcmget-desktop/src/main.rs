@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "gpui-ui"), windows_subsystem = "windows")]
+
 #[cfg(feature = "gpui-ui")]
 mod workspace;
 
