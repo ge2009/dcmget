@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{PdiStatus, ProfileId, TaskId};
+use crate::{AccessionResult, PdiStatus, Profile, ProfileId, TaskId, TaskSummary};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AppCommand {
+    ReloadWorkspace,
     RegisterProfile {
         profile_id: ProfileId,
+    },
+    UpsertProfile {
+        profile: Box<Profile>,
     },
     StartProfile {
         profile_id: ProfileId,
@@ -17,7 +21,12 @@ pub enum AppCommand {
     CreateTask {
         task_id: TaskId,
         profile_id: ProfileId,
+        name: String,
         accessions: Vec<String>,
+        destination: String,
+    },
+    StartTask {
+        task_id: TaskId,
     },
     PauseTask {
         task_id: TaskId,
@@ -31,6 +40,9 @@ pub enum AppCommand {
     CancelTask {
         task_id: TaskId,
     },
+    DeleteTask {
+        task_id: TaskId,
+    },
     ReportAggregateSpeed {
         bytes_per_second: u64,
     },
@@ -40,15 +52,62 @@ pub enum AppCommand {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AppEvent {
-    ProfileRegistered { profile_id: ProfileId },
-    ProfileStarted { profile_id: ProfileId },
-    ProfileStopped { profile_id: ProfileId },
-    TaskCreated { task_id: TaskId },
-    TaskPaused { task_id: TaskId },
-    TaskResumed { task_id: TaskId },
-    TaskFinished { task_id: TaskId },
-    TaskCancelled { task_id: TaskId },
-    CommandRejected { message: String },
+    WorkspaceLoaded {
+        profiles: Vec<Profile>,
+        tasks: Vec<TaskSummary>,
+    },
+    ProfileRegistered {
+        profile_id: ProfileId,
+    },
+    ProfileUpdated {
+        profile: Profile,
+    },
+    ProfileStarted {
+        profile_id: ProfileId,
+    },
+    ProfileStopped {
+        profile_id: ProfileId,
+    },
+    TaskCreated {
+        task_id: TaskId,
+    },
+    TaskStarted {
+        task_id: TaskId,
+    },
+    TaskUpdated {
+        summary: TaskSummary,
+    },
+    TaskPausePending {
+        task_id: TaskId,
+    },
+    TaskPaused {
+        task_id: TaskId,
+    },
+    TaskResumed {
+        task_id: TaskId,
+    },
+    TaskFinished {
+        task_id: TaskId,
+    },
+    TaskCancelled {
+        task_id: TaskId,
+    },
+    TaskDeleted {
+        task_id: TaskId,
+    },
+    AccessionUpdated {
+        task_id: TaskId,
+        result: AccessionResult,
+    },
+    ReceiverStatusChanged {
+        status: ReceiverStatus,
+    },
+    LogAppended {
+        entry: LogEntry,
+    },
+    CommandRejected {
+        message: String,
+    },
     ApplicationStopping,
 }
 

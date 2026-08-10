@@ -20,10 +20,14 @@ use crate::dimse::{
     command_field, decode_command, echo_response, encode_command, message_id, required_text,
     store_response,
 };
-use crate::model::{ReceiveOutcome, StoreRequest};
+use crate::model::{
+    QuarantineOutcome, QuarantineStoreRequest, QuarantineTarget, ReceiveDisposition,
+    ReceiveOutcome, StoreRequest,
+};
 use crate::store::{StoreError, StorePayloadSession, StorePayloadSink};
 
 pub const MAX_STORAGE_ASSOCIATIONS: usize = 16;
+const ASSOCIATION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferSyntaxSupport {
@@ -77,12 +81,21 @@ pub trait StoreRequestResolver: Send + Sync {
         command: &CStoreCommand,
         transfer_syntax_uid: &str,
     ) -> Result<StoreRequest, StoreRequestResolveError>;
+
+    /// Return a trusted quarantine target for requests rejected before
+    /// `resolve` runs. Use the active task's destination volume when present,
+    /// otherwise the configured Profile-level destination.
+    fn quarantine_target(&self) -> QuarantineTarget;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("cannot attribute received C-STORE: {message}")]
 pub struct StoreRequestResolveError {
     pub message: String,
+    /// Trusted target captured from the same route snapshot used by
+    /// `resolve`. This prevents an unassigned store from being correlated with
+    /// a different task if the active route changes between calls.
+    pub quarantine_target: QuarantineTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +166,9 @@ pub enum StorageScpEvent {
     StoreFailed {
         peer: SocketAddr,
         sop_instance_uid: Option<String>,
+        active_task_id: Option<String>,
         message: String,
+        quarantined: Option<QuarantineOutcome>,
     },
     AssociationFailed {
         peer: SocketAddr,
@@ -336,7 +351,18 @@ where
         });
     }
     drop(listener);
-    while associations.join_next().await.is_some() {}
+    let drain = async { while associations.join_next().await.is_some() {} };
+    if tokio::time::timeout(ASSOCIATION_SHUTDOWN_GRACE, drain)
+        .await
+        .is_err()
+    {
+        // A blocking filesystem worker can be stuck in an OS/SMB call which
+        // cannot be cancelled safely. Association tasks only own bounded
+        // channels to those workers, so aborting them releases the listener
+        // and network resources without doing filesystem work on Tokio.
+        associations.abort_all();
+        while associations.join_next().await.is_some() {}
+    }
     Ok(())
 }
 
@@ -397,7 +423,7 @@ where
                 let _ = changed;
                 cancellation.cancel();
                 if let Some(active) = active_store.take() {
-                    active.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(1), active.abort()).await;
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(1), association.abort()).await;
                 return Ok(());
@@ -531,16 +557,22 @@ where
                                                 resolver,
                                                 cancellation.clone(),
                                             )
+                                            .await
                                         } else {
                                             let message = format!(
                                                 "SOP Class {} is not a standard Storage Service SOP Class",
                                                 parsed.sop_class_uid
                                             );
-                                            ActiveStore::rejected(
+                                            ActiveStore::quarantine(
                                                 parsed,
                                                 assembled.presentation_context_id,
+                                                &context.transfer_syntax,
+                                                sink,
+                                                resolver.quarantine_target(),
+                                                cancellation.clone(),
                                                 message,
                                             )
+                                            .await
                                         },
                                     );
                                 }
@@ -563,24 +595,20 @@ where
                                     "dataset arrived without a C-STORE command".to_owned(),
                                 ));
                             };
-                            active.write(&value);
+                            active.write(&value).await;
                             if value.is_last {
                                 let completed = active_store
                                     .take()
                                     .expect("active store was checked above")
-                                    .finish();
-                                let response_status = completed.response_status;
-                                send_command(
-                                    &mut association,
-                                    completed.presentation_context_id,
-                                    &store_response(
-                                        completed.command.message_id,
-                                        &completed.command.sop_class_uid,
-                                        &completed.command.sop_instance_uid,
-                                        response_status,
-                                    ),
-                                )
-                                .await?;
+                                    .finish()
+                                    .await;
+                                let response = store_response(
+                                    completed.command.message_id,
+                                    &completed.command.sop_class_uid,
+                                    &completed.command.sop_instance_uid,
+                                    completed.response_status,
+                                );
+                                let presentation_context_id = completed.presentation_context_id;
                                 match completed.result {
                                     Ok((request, outcome)) => {
                                         let _ = events.send(StorageScpEvent::StoreCompleted {
@@ -595,10 +623,16 @@ where
                                             sop_instance_uid: Some(
                                                 completed.command.sop_instance_uid,
                                             ),
+                                            active_task_id: completed.active_task_id,
                                             message,
+                                            quarantined: completed.quarantined,
                                         });
                                     }
                                 }
+                                // Persistence events describe durable local state and must not be
+                                // lost merely because the peer disconnects before reading C-STORE-RSP.
+                                send_command(&mut association, presentation_context_id, &response)
+                                    .await?;
                             }
                         }
                     }
@@ -678,26 +712,41 @@ fn parse_store_command(
 struct ActiveStore<T> {
     command: CStoreCommand,
     request: Option<StoreRequest>,
+    quarantine: Option<ActiveQuarantine>,
+    active_task_id: Option<String>,
     presentation_context_id: u8,
     session: Option<T>,
     failure: Option<String>,
+}
+
+struct ActiveQuarantine {
+    profile_id: String,
+    active_task_id: Option<String>,
+    reason: String,
 }
 
 impl<T> ActiveStore<T>
 where
     T: StorePayloadSession,
 {
-    fn rejected(command: CStoreCommand, presentation_context_id: u8, message: String) -> Self {
+    fn rejected(
+        command: CStoreCommand,
+        presentation_context_id: u8,
+        active_task_id: Option<String>,
+        message: String,
+    ) -> Self {
         Self {
             command,
             request: None,
+            quarantine: None,
+            active_task_id,
             presentation_context_id,
             session: None,
             failure: Some(message),
         }
     }
 
-    fn begin<S, R>(
+    async fn begin<S, R>(
         command: CStoreCommand,
         presentation_context_id: u8,
         transfer_syntax_uid: &str,
@@ -710,65 +759,190 @@ where
         R: StoreRequestResolver,
     {
         match resolver.resolve(&command, transfer_syntax_uid) {
-            Err(error) => Self::rejected(command, presentation_context_id, error.to_string()),
+            Err(error) => {
+                let reason = error.to_string();
+                Self::quarantine(
+                    command,
+                    presentation_context_id,
+                    transfer_syntax_uid,
+                    sink,
+                    error.quarantine_target,
+                    cancellation,
+                    reason,
+                )
+                .await
+            }
             Ok(request) => {
                 if let Err(message) =
                     validate_resolved_request(&command, transfer_syntax_uid, &request)
                 {
-                    return Self::rejected(command, presentation_context_id, message);
+                    let quarantine_target = quarantine_target_for_request(&request);
+                    return Self::quarantine(
+                        command,
+                        presentation_context_id,
+                        transfer_syntax_uid,
+                        sink,
+                        quarantine_target,
+                        cancellation,
+                        message,
+                    )
+                    .await;
                 }
-                match sink.begin_store(request.clone(), cancellation) {
+                match sink
+                    .begin_store(request.clone(), cancellation.clone())
+                    .await
+                {
                     Ok(session) => Self {
+                        active_task_id: Some(request.route.task_id.clone()),
                         command,
                         request: Some(request),
+                        quarantine: None,
                         presentation_context_id,
                         session: Some(session),
                         failure: None,
                     },
-                    Err(error) => Self {
-                        command,
-                        request: Some(request),
-                        presentation_context_id,
-                        session: None,
-                        failure: Some(error.to_string()),
-                    },
+                    Err(error) => {
+                        let quarantine_target = quarantine_target_for_request(&request);
+                        Self::quarantine(
+                            command,
+                            presentation_context_id,
+                            transfer_syntax_uid,
+                            sink,
+                            quarantine_target,
+                            cancellation,
+                            format!(
+                                "cannot open routed C-STORE destination: {}",
+                                error.redacted_event_message()
+                            ),
+                        )
+                        .await
+                    }
                 }
             }
         }
     }
 
-    fn write(&mut self, value: &PDataValue) {
+    #[allow(clippy::too_many_arguments)]
+    async fn quarantine<S>(
+        command: CStoreCommand,
+        presentation_context_id: u8,
+        transfer_syntax_uid: &str,
+        sink: &S,
+        target: QuarantineTarget,
+        cancellation: CancellationToken,
+        reason: String,
+    ) -> Self
+    where
+        S: StorePayloadSink<Session = T>,
+    {
+        let profile_id = target.profile_id.clone();
+        let active_task_id = target.active_task_id.clone();
+        let request = QuarantineStoreRequest {
+            target,
+            sop_class_uid: command.sop_class_uid.clone(),
+            sop_instance_uid: command.sop_instance_uid.clone(),
+            transfer_syntax_uid: transfer_syntax_uid.to_owned(),
+        };
+        match sink.begin_quarantine(request, cancellation).await {
+            Ok(session) => Self {
+                command,
+                request: None,
+                quarantine: Some(ActiveQuarantine {
+                    profile_id,
+                    active_task_id: active_task_id.clone(),
+                    reason,
+                }),
+                active_task_id,
+                presentation_context_id,
+                session: Some(session),
+                failure: None,
+            },
+            Err(error) => Self::rejected(
+                command,
+                presentation_context_id,
+                active_task_id,
+                format!(
+                    "{reason}; quarantine persistence could not start: {}",
+                    error.redacted_event_message()
+                ),
+            ),
+        }
+    }
+
+    async fn write(&mut self, value: &PDataValue) {
         if value.presentation_context_id != self.presentation_context_id {
-            self.fail("C-STORE dataset changed presentation context".to_owned());
+            self.fail("C-STORE dataset changed presentation context".to_owned())
+                .await;
             return;
         }
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        if let Err(error) = session.write_dataset_chunk(&value.data) {
-            self.fail(error.to_string());
+        if let Err(error) = session.write_dataset_chunk(&value.data).await {
+            self.fail(error.redacted_event_message().to_owned()).await;
         }
     }
 
-    fn fail(&mut self, message: String) {
+    async fn fail(&mut self, message: String) {
         if let Some(session) = self.session.take() {
-            let _ = session.abort();
+            let _ = session.abort().await;
         }
+        let message = self
+            .quarantine
+            .as_ref()
+            .map_or(message.clone(), |quarantine| {
+                format!(
+                    "{}; quarantine persistence failed: {message}",
+                    quarantine.reason
+                )
+            });
         self.failure.get_or_insert(message);
     }
 
-    fn finish(mut self) -> CompletedStore {
+    async fn finish(mut self) -> CompletedStore {
+        let mut quarantined = None;
         let result = if let Some(message) = self.failure.take() {
             Err(message)
         } else {
             match self.session.take() {
-                Some(session) => match session.finish() {
-                    Ok(outcome) => self
-                        .request
-                        .take()
-                        .map(|request| (request, outcome))
-                        .ok_or_else(|| "store request was lost before publication".to_owned()),
-                    Err(error) => Err(error.to_string()),
+                Some(session) => match session.finish().await {
+                    Ok(outcome) => {
+                        if let Some(quarantine) = self.quarantine.take() {
+                            if outcome.disposition == ReceiveDisposition::Quarantined {
+                                let reason = quarantine.reason;
+                                quarantined = Some(QuarantineOutcome {
+                                    profile_id: quarantine.profile_id,
+                                    active_task_id: quarantine.active_task_id,
+                                    reason: reason.clone(),
+                                    payload: outcome,
+                                });
+                                Err(reason)
+                            } else {
+                                Err("quarantine sink returned a non-quarantine outcome".to_owned())
+                            }
+                        } else if outcome.disposition == ReceiveDisposition::Quarantined {
+                            Err("routed store unexpectedly returned a quarantine outcome"
+                                .to_owned())
+                        } else {
+                            self.request
+                                .take()
+                                .map(|request| (request, outcome))
+                                .ok_or_else(|| {
+                                    "store request was lost before publication".to_owned()
+                                })
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(quarantine) = self.quarantine.take() {
+                            Err(format!(
+                                "{}; quarantine persistence failed: {}",
+                                quarantine.reason,
+                                error.redacted_event_message()
+                            ))
+                        } else {
+                            Err(error.redacted_event_message().to_owned())
+                        }
+                    }
                 },
                 None => Err("store session was not created".to_owned()),
             }
@@ -779,16 +953,26 @@ where
         );
         CompletedStore {
             command: self.command,
+            active_task_id: self.active_task_id,
             presentation_context_id: self.presentation_context_id,
             response_status,
             result,
+            quarantined,
         }
     }
 
-    fn abort(mut self) {
+    async fn abort(mut self) {
         if let Some(session) = self.session.take() {
-            let _ = session.abort();
+            let _ = session.abort().await;
         }
+    }
+}
+
+fn quarantine_target_for_request(request: &StoreRequest) -> QuarantineTarget {
+    QuarantineTarget {
+        profile_id: request.route.profile_id.clone(),
+        destination_root: request.route.destination_root.clone(),
+        active_task_id: Some(request.route.task_id.clone()),
     }
 }
 
@@ -814,20 +998,27 @@ fn validate_resolved_request(
 
 struct CompletedStore {
     command: CStoreCommand,
+    active_task_id: Option<String>,
     presentation_context_id: u8,
     response_status: u16,
     result: Result<(StoreRequest, ReceiveOutcome), String>,
+    quarantined: Option<QuarantineOutcome>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use dicom_core::{DataElement, PrimitiveValue, VR, dicom_value};
+    use dicom_object::InMemDicomObject;
+    use dicom_transfer_syntax_registry::entries;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::dimse::{C_STORE_RSP, CommandObject, HAS_DATASET, responded_message_id, status};
-    use crate::{FileStore, ReceiveRoute};
+    use crate::{C_STORE_FAILURE_CANNOT_UNDERSTAND, FileStore, ReceiveRoute};
 
     #[derive(Clone)]
     struct FixedResolver {
@@ -853,6 +1044,14 @@ mod tests {
                 transfer_syntax_uid: transfer_syntax_uid.to_owned(),
             })
         }
+
+        fn quarantine_target(&self) -> QuarantineTarget {
+            QuarantineTarget {
+                profile_id: "profile-1".to_owned(),
+                destination_root: self.root.clone(),
+                active_task_id: Some("task-1".to_owned()),
+            }
+        }
     }
 
     struct ReturningResolver {
@@ -866,6 +1065,135 @@ mod tests {
             _transfer_syntax_uid: &str,
         ) -> Result<StoreRequest, StoreRequestResolveError> {
             Ok(self.request.clone())
+        }
+
+        fn quarantine_target(&self) -> QuarantineTarget {
+            QuarantineTarget {
+                profile_id: self.request.route.profile_id.clone(),
+                destination_root: self.request.route.destination_root.clone(),
+                active_task_id: Some(self.request.route.task_id.clone()),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoActiveRouteResolver {
+        root: PathBuf,
+    }
+
+    impl StoreRequestResolver for NoActiveRouteResolver {
+        fn resolve(
+            &self,
+            _command: &CStoreCommand,
+            _transfer_syntax_uid: &str,
+        ) -> Result<StoreRequest, StoreRequestResolveError> {
+            Err(StoreRequestResolveError {
+                message: "no C-MOVE receive route is active".to_owned(),
+                quarantine_target: self.quarantine_target(),
+            })
+        }
+
+        fn quarantine_target(&self) -> QuarantineTarget {
+            QuarantineTarget {
+                profile_id: "profile-safe".to_owned(),
+                destination_root: self.root.clone(),
+                active_task_id: None,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledSink {
+        writes_started: Arc<AtomicUsize>,
+        first_write_started: Arc<Notify>,
+        release_first_write: Arc<Notify>,
+        hang_writes: bool,
+    }
+
+    struct ControlledSession {
+        outcome_path: PathBuf,
+        sop_instance_uid: String,
+        disposition: ReceiveDisposition,
+        writes_started: Arc<AtomicUsize>,
+        first_write_started: Arc<Notify>,
+        release_first_write: Arc<Notify>,
+        hang_writes: bool,
+        bytes: u64,
+    }
+
+    #[async_trait]
+    impl StorePayloadSink for ControlledSink {
+        type Session = ControlledSession;
+
+        async fn begin_store(
+            &self,
+            request: StoreRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<Self::Session, StoreError> {
+            Ok(ControlledSession {
+                outcome_path: request.route.destination_root.join("controlled.dcm"),
+                sop_instance_uid: request.sop_instance_uid,
+                disposition: ReceiveDisposition::Published,
+                writes_started: Arc::clone(&self.writes_started),
+                first_write_started: Arc::clone(&self.first_write_started),
+                release_first_write: Arc::clone(&self.release_first_write),
+                hang_writes: self.hang_writes,
+                bytes: 0,
+            })
+        }
+
+        async fn begin_quarantine(
+            &self,
+            request: QuarantineStoreRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<Self::Session, StoreError> {
+            Ok(ControlledSession {
+                outcome_path: request
+                    .target
+                    .destination_root
+                    .join("controlled.quarantine"),
+                sop_instance_uid: request.sop_instance_uid,
+                disposition: ReceiveDisposition::Quarantined,
+                writes_started: Arc::clone(&self.writes_started),
+                first_write_started: Arc::clone(&self.first_write_started),
+                release_first_write: Arc::clone(&self.release_first_write),
+                hang_writes: self.hang_writes,
+                bytes: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl StorePayloadSession for ControlledSession {
+        async fn write_dataset_chunk(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
+            let write_index = self.writes_started.fetch_add(1, Ordering::SeqCst);
+            if write_index == 0 {
+                self.first_write_started.notify_one();
+                if self.hang_writes {
+                    std::future::pending::<()>().await;
+                } else {
+                    self.release_first_write.notified().await;
+                }
+            }
+            self.bytes = self
+                .bytes
+                .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            Ok(())
+        }
+
+        async fn finish(self) -> Result<ReceiveOutcome, StoreError> {
+            Ok(ReceiveOutcome {
+                disposition: self.disposition,
+                path: self.outcome_path,
+                sop_instance_uid: self.sop_instance_uid,
+                sha256: crate::model::Sha256Digest([0; 32]),
+                file_bytes: self.bytes,
+                dataset_bytes: self.bytes,
+            })
+        }
+
+        async fn abort(self) -> Result<(), StoreError> {
+            Ok(())
         }
     }
 
@@ -897,6 +1225,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_dataset(sop_class_uid: &str, sop_instance_uid: &str) -> Vec<u8> {
+        let mut object = InMemDicomObject::new_empty();
+        object.put(DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            PrimitiveValue::from(sop_class_uid),
+        ));
+        object.put(DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            PrimitiveValue::from(sop_instance_uid),
+        ));
+        let mut bytes = Vec::new();
+        object
+            .write_dataset_with_ts(&mut bytes, &entries::EXPLICIT_VR_LITTLE_ENDIAN.erased())
+            .unwrap();
+        bytes
+    }
+
     #[test]
     fn unknown_transfer_syntax_is_not_claimed_as_supported() {
         assert_eq!(
@@ -922,8 +1269,8 @@ mod tests {
         assert!(!is_storage_sop_class("1.2.826.0.1.3680043.10.999.2"));
     }
 
-    #[test]
-    fn resolver_metadata_mismatch_never_starts_a_store_session() {
+    #[tokio::test]
+    async fn resolver_metadata_mismatch_is_quarantined_instead_of_published() {
         let temporary = tempfile::tempdir().unwrap();
         let command = CStoreCommand {
             message_id: 1,
@@ -949,17 +1296,45 @@ mod tests {
         mismatched_requests.push(request);
 
         for request in mismatched_requests {
-            let active = ActiveStore::begin(
+            let mut active = ActiveStore::begin(
                 command.clone(),
                 1,
                 uids::EXPLICIT_VR_LITTLE_ENDIAN,
                 &FileStore::new(),
                 &ReturningResolver { request },
                 CancellationToken::new(),
-            );
-            let completed = active.finish();
+            )
+            .await;
+            active
+                .write(&PDataValue {
+                    presentation_context_id: 1,
+                    value_type: PDataValueType::Data,
+                    is_last: true,
+                    data: vec![1, 2, 3],
+                })
+                .await;
+            let completed = active.finish().await;
             assert_eq!(completed.response_status, 0xC000);
             assert!(completed.result.is_err());
+            assert_eq!(completed.active_task_id.as_deref(), Some("task-1"));
+            let quarantined = completed.quarantined.expect("quarantine outcome");
+            assert_eq!(quarantined.active_task_id.as_deref(), Some("task-1"));
+            assert_eq!(
+                quarantined.payload.disposition,
+                ReceiveDisposition::Quarantined
+            );
+            assert!(
+                quarantined
+                    .payload
+                    .path
+                    .starts_with(temporary.path().join("_DcmGetQuarantine/profile-1"))
+            );
+            assert_eq!(quarantined.payload.path.extension().unwrap(), "quarantine");
+            assert!(
+                std::fs::read(quarantined.payload.path)
+                    .unwrap()
+                    .ends_with(&[1, 2, 3])
+            );
         }
         assert!(!temporary.path().join("ACC-1").exists());
     }
@@ -1064,7 +1439,266 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_storage_c_store_fails_without_writing() {
+    #[allow(clippy::too_many_lines)] // end-to-end assertion covers DIMSE, bytes, event and port
+    async fn resolver_error_payload_is_quarantined_as_part10_and_port_is_released() {
+        let temporary = tempfile::tempdir().unwrap();
+        let handle = StorageScpService::start(
+            StorageScpConfig::new("127.0.0.1:0".parse().unwrap(), "DCMGET"),
+            FileStore::new(),
+            NoActiveRouteResolver {
+                root: temporary.path().to_path_buf(),
+            },
+        )
+        .await
+        .unwrap();
+        let address = handle.local_address();
+        let mut events = handle.subscribe();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            StorageScpEvent::Ready { .. }
+        ));
+
+        let mut client = dicom_ul::association::client::ClientAssociationOptions::new()
+            .calling_ae_title("TESTSCU")
+            .called_ae_title("DCMGET")
+            .with_presentation_context(
+                uids::CT_IMAGE_STORAGE,
+                vec![uids::EXPLICIT_VR_LITTLE_ENDIAN],
+            )
+            .establish_async(address)
+            .await
+            .unwrap();
+        let context_id = client.presentation_contexts()[0].id;
+        let sop_instance_uid = "1.2.826.0.1.3680043.10.987.120";
+        let dataset = test_dataset(uids::CT_IMAGE_STORAGE, sop_instance_uid);
+        let split = dataset.len() / 2;
+        client
+            .send(&Pdu::PData {
+                data: vec![
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Command,
+                        is_last: true,
+                        data: store_request_command(13, uids::CT_IMAGE_STORAGE, sop_instance_uid),
+                    },
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Data,
+                        is_last: false,
+                        data: dataset[..split].to_vec(),
+                    },
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Data,
+                        is_last: true,
+                        data: dataset[split..].to_vec(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        let Pdu::PData { data } = client.receive().await.unwrap() else {
+            panic!("expected C-STORE-RSP")
+        };
+        let response = decode_command(&data[0].data).unwrap();
+        assert_eq!(
+            status(&response).unwrap(),
+            C_STORE_FAILURE_CANNOT_UNDERSTAND
+        );
+
+        let quarantined = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let StorageScpEvent::StoreFailed {
+                    message,
+                    active_task_id,
+                    quarantined: Some(quarantined),
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert!(message.contains("no C-MOVE receive route is active"));
+                    assert_eq!(active_task_id, None);
+                    break quarantined;
+                }
+            }
+        })
+        .await
+        .expect("structured quarantine event");
+        assert_eq!(quarantined.profile_id, "profile-safe");
+        assert_eq!(quarantined.active_task_id, None);
+        assert_eq!(
+            quarantined.payload.disposition,
+            ReceiveDisposition::Quarantined
+        );
+        assert!(
+            quarantined
+                .payload
+                .path
+                .starts_with(temporary.path().join("_DcmGetQuarantine/profile-safe"))
+        );
+        assert_eq!(quarantined.payload.path.extension().unwrap(), "quarantine");
+        let bytes = std::fs::read(&quarantined.payload.path).unwrap();
+        assert_eq!(&bytes[128..132], b"DICM");
+        assert!(bytes.ends_with(&dataset));
+        let object = dicom_object::open_file(&quarantined.payload.path).unwrap();
+        assert_eq!(
+            object
+                .element(tags::SOP_INSTANCE_UID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_matches(['\0', ' ']),
+            sop_instance_uid
+        );
+        assert!(!temporary.path().join("ACC-1").exists());
+
+        client.release().await.unwrap();
+        handle.shutdown().await.unwrap();
+        let rebound = TcpListener::bind(address).await.unwrap();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn dataset_writes_apply_backpressure_between_pdv_chunks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let first_write_started = Arc::new(Notify::new());
+        let release_first_write = Arc::new(Notify::new());
+        let handle = StorageScpService::start(
+            StorageScpConfig::new("127.0.0.1:0".parse().unwrap(), "DCMGET"),
+            ControlledSink {
+                writes_started: Arc::clone(&writes_started),
+                first_write_started: Arc::clone(&first_write_started),
+                release_first_write: Arc::clone(&release_first_write),
+                hang_writes: false,
+            },
+            FixedResolver {
+                root: temporary.path().to_path_buf(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut client = dicom_ul::association::client::ClientAssociationOptions::new()
+            .calling_ae_title("TESTSCU")
+            .called_ae_title("DCMGET")
+            .with_presentation_context(
+                uids::CT_IMAGE_STORAGE,
+                vec![uids::EXPLICIT_VR_LITTLE_ENDIAN],
+            )
+            .establish_async(handle.local_address())
+            .await
+            .unwrap();
+        let context_id = client.presentation_contexts()[0].id;
+        let command =
+            store_request_command(11, uids::CT_IMAGE_STORAGE, "1.2.826.0.1.3680043.10.987.111");
+        client
+            .send(&Pdu::PData {
+                data: vec![
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Command,
+                        is_last: true,
+                        data: command,
+                    },
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Data,
+                        is_last: false,
+                        data: vec![1, 2, 3],
+                    },
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Data,
+                        is_last: true,
+                        data: vec![4, 5, 6],
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_write_started.notified())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(writes_started.load(Ordering::SeqCst), 1);
+        release_first_write.notify_one();
+        let Pdu::PData { data } = client.receive().await.unwrap() else {
+            panic!("expected C-STORE-RSP")
+        };
+        let response = decode_command(&data[0].data).unwrap();
+        assert_eq!(status(&response).unwrap(), 0x0000);
+        assert_eq!(writes_started.load(Ordering::SeqCst), 2);
+        client.release().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_when_a_store_worker_does_not_return() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_write_started = Arc::new(Notify::new());
+        let handle = StorageScpService::start(
+            StorageScpConfig::new("127.0.0.1:0".parse().unwrap(), "DCMGET"),
+            ControlledSink {
+                writes_started: Arc::new(AtomicUsize::new(0)),
+                first_write_started: Arc::clone(&first_write_started),
+                release_first_write: Arc::new(Notify::new()),
+                hang_writes: true,
+            },
+            FixedResolver {
+                root: temporary.path().to_path_buf(),
+            },
+        )
+        .await
+        .unwrap();
+        let address = handle.local_address();
+        let mut client = dicom_ul::association::client::ClientAssociationOptions::new()
+            .calling_ae_title("TESTSCU")
+            .called_ae_title("DCMGET")
+            .with_presentation_context(
+                uids::CT_IMAGE_STORAGE,
+                vec![uids::EXPLICIT_VR_LITTLE_ENDIAN],
+            )
+            .establish_async(address)
+            .await
+            .unwrap();
+        let context_id = client.presentation_contexts()[0].id;
+        client
+            .send(&Pdu::PData {
+                data: vec![
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Command,
+                        is_last: true,
+                        data: store_request_command(
+                            12,
+                            uids::CT_IMAGE_STORAGE,
+                            "1.2.826.0.1.3680043.10.987.112",
+                        ),
+                    },
+                    PDataValue {
+                        presentation_context_id: context_id,
+                        value_type: PDataValueType::Data,
+                        is_last: true,
+                        data: vec![1, 2, 3],
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_write_started.notified())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(4), handle.shutdown())
+            .await
+            .expect("Storage SCP shutdown must be bounded")
+            .unwrap();
+        drop(client);
+        let rebound = TcpListener::bind(address).await.unwrap();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn non_storage_c_store_is_never_published_as_a_normal_dcm() {
         let temporary = tempfile::tempdir().unwrap();
         let handle = StorageScpService::start(
             StorageScpConfig::new("127.0.0.1:0".parse().unwrap(), "DCMGET"),
@@ -1075,6 +1709,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut events = handle.subscribe();
+        let _ = events.recv().await.unwrap();
         let non_storage_sop = uids::STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND;
         let mut client = dicom_ul::association::client::ClientAssociationOptions::new()
             .calling_ae_title("TESTSCU")
@@ -1112,6 +1748,24 @@ mod tests {
         assert_eq!(responded_message_id(&response).unwrap(), 8);
         assert_eq!(status(&response).unwrap(), 0xC000);
         assert!(!temporary.path().join("ACC-1").exists());
+        let quarantined = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let StorageScpEvent::StoreFailed {
+                    quarantined: Some(quarantined),
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    break quarantined;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            quarantined.payload.disposition,
+            ReceiveDisposition::Quarantined
+        );
+        assert_eq!(quarantined.payload.path.extension().unwrap(), "quarantine");
 
         client.release().await.unwrap();
         handle.shutdown().await.unwrap();

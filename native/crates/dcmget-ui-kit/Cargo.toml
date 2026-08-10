@@ -10,6 +10,7 @@ description = "DcmGet desktop presentation contracts and GPUI component adapters
 [features]
 default = []
 gpui = ["dep:gpui", "dep:gpui-component"]
+mock-ui = []
 
 [dependencies]
 serde.workspace = true

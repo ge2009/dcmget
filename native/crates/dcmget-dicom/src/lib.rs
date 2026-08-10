@@ -19,7 +19,8 @@ pub use cancel::{CancellationToken, OperationCancelled};
 pub use late_store::{LateStoreDecision, LateStorePolicy, LateStoreTracker};
 pub use model::{
     AssociationFailure, DicomEndpoint, MoveAttemptResult, MoveCounters, MoveFinalStatus,
-    MoveRequest, MoveStatusClass, ReceiveDisposition, ReceiveOutcome, ReceiveRoute, StoreRequest,
+    MoveRequest, MoveStatusClass, QuarantineOutcome, QuarantineStoreRequest, QuarantineTarget,
+    ReceiveDisposition, ReceiveOutcome, ReceiveRoute, Sha256Digest, StoreRequest,
 };
 pub use move_scu::{StudyMoveScu, StudyMoveScuConfig};
 pub use part10::{FileMeta, Part10Error, build_part10_header};

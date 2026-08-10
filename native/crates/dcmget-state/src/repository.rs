@@ -408,6 +408,72 @@ impl StateRepository {
         Ok(())
     }
 
+    /// Requeue only failed or partial accessions for an explicit retry.
+    ///
+    /// Completed and confirmed no-data results remain final, so a resumed task
+    /// never repeats successful C-MOVEs. The prior failed result is retained as
+    /// partial diagnostic state while files already on disk remain available
+    /// for SOP-instance de-duplication by the receiver.
+    pub fn reset_results_for_retry(&self, task_id: &TaskId) -> Result<u64, StateError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task(&transaction, task_id)?;
+        let changed = transaction.execute(
+            r"
+            UPDATE accessions
+            SET status=NULL,
+                partial_json=COALESCE(partial_json,result_json),
+                result_json=NULL,
+                speed_bytes_per_second=0
+            WHERE task_id=?1 AND status IN ('失败','部分成功')
+            ",
+            [task_id.as_str()],
+        )?;
+        transaction.commit()?;
+        u64::try_from(changed)
+            .map_err(|_| StateError::InvalidData("retry row count exceeds u64".into()))
+    }
+
+    /// Convert every unresolved accession into an explicit cancelled result so
+    /// a terminal cancelled task remains inspectable and can be deleted.
+    pub fn finalize_cancelled_accessions(&self, task_id: &TaskId) -> Result<u64, StateError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task(&transaction, task_id)?;
+        let pending = {
+            let mut statement = transaction.prepare(
+                "SELECT accession,file_count,received_bytes,speed_bytes_per_second FROM accessions WHERE task_id=?1 AND result_json IS NULL",
+            )?;
+            statement
+                .query_map([task_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (accession, file_count, received_bytes, speed_bytes_per_second) in &pending {
+            let mut result = AccessionResult::blank(accession, AccessionStatus::Cancelled);
+            result.file_count = from_i64(*file_count)?;
+            result.received_bytes = from_i64(*received_bytes)?;
+            result.speed_bytes_per_second = (*speed_bytes_per_second).max(0.0);
+            "任务已取消".clone_into(&mut result.message);
+            transaction.execute(
+                r"
+                UPDATE accessions SET status='已取消',result_json=?1,partial_json=NULL
+                WHERE task_id=?2 AND accession=?3 AND result_json IS NULL
+                ",
+                params![result.to_legacy_json()?, task_id.as_str(), accession],
+            )?;
+        }
+        transaction.commit()?;
+        u64::try_from(pending.len())
+            .map_err(|_| StateError::InvalidData("cancelled row count exceeds u64".into()))
+    }
+
     pub fn update_task_runtime(
         &self,
         task_id: &TaskId,
@@ -883,6 +949,74 @@ mod tests {
         );
         let loaded = repository.get_task(&task.id).unwrap();
         assert_eq!(loaded.results, [completed]);
+    }
+
+    #[test]
+    fn retry_requeues_only_failed_and_partial_accessions() {
+        let (_temp, repository, profile_id) = repository();
+        let task = repository
+            .create_task(
+                &profile_id,
+                "retry",
+                AppConfig::default(),
+                vec!["A001".into(), "A002".into(), "A003".into()],
+                false,
+            )
+            .unwrap();
+        repository
+            .record_result(
+                &task.id,
+                &AccessionResult::blank("A001", AccessionStatus::Completed),
+            )
+            .unwrap();
+        repository
+            .record_result(
+                &task.id,
+                &AccessionResult::blank("A002", AccessionStatus::Failed),
+            )
+            .unwrap();
+        assert_eq!(repository.reset_results_for_retry(&task.id).unwrap(), 1);
+        let loaded = repository.get_task(&task.id).unwrap();
+        assert_eq!(
+            loaded
+                .results
+                .iter()
+                .map(|result| result.accession.as_str())
+                .collect::<Vec<_>>(),
+            ["A001"]
+        );
+        assert_eq!(loaded.partial_results[0].accession, "A002");
+        assert_eq!(
+            repository.next_pending(&task.id).unwrap().as_deref(),
+            Some("A002")
+        );
+    }
+
+    #[test]
+    fn explicit_cancellation_resolves_pending_rows_for_deletion() {
+        let (_temp, repository, profile_id) = repository();
+        let task = repository
+            .create_task(
+                &profile_id,
+                "cancel",
+                AppConfig::default(),
+                vec!["A001".into(), "A002".into()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            repository.finalize_cancelled_accessions(&task.id).unwrap(),
+            2
+        );
+        repository
+            .set_task_phase(&task.id, TaskPhase::Cancelled)
+            .unwrap();
+        let summary = repository.get_task_summary(&task.id).unwrap();
+        assert_eq!(summary.cancelled_count, 2);
+
+        repository.delete_task(&task.id).unwrap();
+        assert!(!repository.has_task(&task.id).unwrap());
     }
 
     #[test]

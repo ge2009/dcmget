@@ -1461,11 +1461,18 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "dcmget-application"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
+ "chrono",
+ "dcmget-dicom",
  "dcmget-domain",
  "dcmget-state",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
  "parking_lot",
+ "sha1",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1474,34 +1481,44 @@ dependencies = [
 
 [[package]]
 name = "dcmget-cli"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "anyhow",
  "clap",
+ "dcmget-application",
  "dcmget-dicom",
  "dcmget-domain",
  "dcmget-state",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "dcmget-desktop"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "anyhow",
+ "dcmget-application",
+ "dcmget-domain",
  "dcmget-ui-kit",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "dcmget-dicom"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
+ "async-trait",
  "dicom-core",
  "dicom-dictionary-std",
  "dicom-encoding",
@@ -1517,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "dcmget-domain"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1528,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "dcmget-pdi"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1540,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "dcmget-state"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "chrono",
  "dcmget-domain",
@@ -1554,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "dcmget-ui-kit"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "gpui",
  "gpui-component",
@@ -1563,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "dcmget-updater"
-version = "4.0.0-preview.1"
+version = "4.0.0-preview.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -6040,6 +6057,17 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

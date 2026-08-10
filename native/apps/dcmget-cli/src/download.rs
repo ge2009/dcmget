@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,16 +6,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use dcmget_application::archive::{
+    ArchiveBatchResult, archive_received_files, prepare_staging_directory,
+};
 use dcmget_dicom::{
     CStoreCommand, CancellationToken, DicomEndpoint, FileStore, LateStoreDecision, LateStorePolicy,
-    LateStoreTracker, MoveAttemptResult, MoveStatusClass, ReceiveDisposition, ReceiveRoute,
-    StorageScpConfig, StorageScpEvent, StorageScpHandle, StorageScpService, StoreRequest,
-    StoreRequestResolveError, StoreRequestResolver, StudyMoveScu,
+    LateStoreTracker, MoveAttemptResult, MoveStatusClass, QuarantineTarget, ReceiveDisposition,
+    ReceiveRoute, StorageScpConfig, StorageScpEvent, StorageScpHandle, StorageScpService,
+    StoreRequest, StoreRequestResolveError, StoreRequestResolver, StudyMoveScu,
 };
 use dcmget_domain::{TaskId, parse_accessions};
 use dcmget_state::LegacyConfig;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -24,8 +25,6 @@ const PROFILE_ID: &str = "cli";
 const RECEIVER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const RECEIVER_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_COMPONENT_BYTES: usize = 180;
-const COMPONENT_PREFIX_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadOutcome {
@@ -137,7 +136,7 @@ async fn run_inner(
         return Ok(cancelled_outcome(interrupted));
     }
 
-    let resolver = ActiveRouteResolver::default();
+    let resolver = ActiveRouteResolver::new(PROFILE_ID, destination.clone());
     let bind_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.storage_port));
     let receiver = StorageScpService::start(
         StorageScpConfig::new(bind_address, config.storage_ae_title.clone()),
@@ -247,6 +246,7 @@ fn download_validation_issues(
                     | "calling_ae_title"
                     | "pacs_ae_title"
                     | "storage_ae_title"
+                    | "directory_template"
             ) && !(destination_is_overridden && issue.field == "dicom_destination_folder")
         })
         .map(|issue| format!("{}: {}", issue.field, issue.message))
@@ -307,12 +307,34 @@ struct RouteTarget {
     relative_directory: PathBuf,
 }
 
-#[derive(Clone, Default)]
+impl RouteTarget {
+    fn quarantine_target(&self) -> QuarantineTarget {
+        QuarantineTarget {
+            profile_id: self.route.profile_id.clone(),
+            destination_root: self.route.destination_root.clone(),
+            active_task_id: Some(self.route.task_id.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ActiveRouteResolver {
     active: Arc<RwLock<Option<RouteTarget>>>,
+    profile_quarantine: QuarantineTarget,
 }
 
 impl ActiveRouteResolver {
+    fn new(profile_id: impl Into<String>, destination_root: PathBuf) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(None)),
+            profile_quarantine: QuarantineTarget {
+                profile_id: profile_id.into(),
+                destination_root,
+                active_task_id: None,
+            },
+        }
+    }
+
     fn activate(&self, target: RouteTarget) -> anyhow::Result<RouteLease> {
         let mut active = self
             .active
@@ -347,10 +369,12 @@ impl StoreRequestResolver for ActiveRouteResolver {
             .read()
             .map_err(|_| StoreRequestResolveError {
                 message: "active receive route lock was poisoned".to_owned(),
+                quarantine_target: self.profile_quarantine.clone(),
             })?
             .clone()
             .ok_or_else(|| StoreRequestResolveError {
                 message: "no C-MOVE receive route is active".to_owned(),
+                quarantine_target: self.profile_quarantine.clone(),
             })?;
         Ok(StoreRequest {
             route: target.route,
@@ -359,6 +383,14 @@ impl StoreRequestResolver for ActiveRouteResolver {
             sop_instance_uid: command.sop_instance_uid.clone(),
             transfer_syntax_uid: transfer_syntax_uid.to_owned(),
         })
+    }
+
+    fn quarantine_target(&self) -> QuarantineTarget {
+        self.active
+            .read()
+            .ok()
+            .and_then(|active| active.as_ref().map(RouteTarget::quarantine_target))
+            .unwrap_or_else(|| self.profile_quarantine.clone())
     }
 }
 
@@ -376,19 +408,61 @@ impl RouteLease {
 
 #[derive(Debug, Default)]
 struct ReceiveStats {
-    store_operations: u64,
+    successful_store_operations: u64,
     unique_sop_instances: HashSet<String>,
+    archived_files: HashSet<PathBuf>,
     published: u64,
     existing_skipped: u64,
     conflicts: u64,
     store_failures: u64,
+    quarantined: u64,
+    quarantined_files: HashSet<PathBuf>,
     association_failures: u64,
+    archive_failures: u64,
     received_bytes: u64,
     store_activity_seen: bool,
     active_associations: HashSet<SocketAddr>,
 }
 
 impl ReceiveStats {
+    fn apply_archive(&mut self, archive: ArchiveBatchResult) {
+        let (archived_files, failures, conflicts) = archive.into_parts();
+        self.archived_files = archived_files;
+        self.conflicts = self.conflicts.saturating_add(conflicts);
+        self.archive_failures = usize_to_u64(failures.len());
+    }
+
+    fn collect_store_outcome(
+        &mut self,
+        disposition: ReceiveDisposition,
+        sop_instance_uid: &str,
+        file_bytes: u64,
+    ) {
+        self.unique_sop_instances
+            .insert(sop_instance_uid.to_owned());
+        self.received_bytes = self.received_bytes.saturating_add(file_bytes);
+        match disposition {
+            ReceiveDisposition::Published => {
+                self.successful_store_operations =
+                    self.successful_store_operations.saturating_add(1);
+                self.published = self.published.saturating_add(1);
+            }
+            ReceiveDisposition::ExistingSkipped => {
+                self.successful_store_operations =
+                    self.successful_store_operations.saturating_add(1);
+                self.existing_skipped = self.existing_skipped.saturating_add(1);
+            }
+            ReceiveDisposition::ConflictPreserved => {
+                self.conflicts = self.conflicts.saturating_add(1);
+            }
+            ReceiveDisposition::Quarantined => {
+                self.store_failures = self.store_failures.saturating_add(1);
+                self.quarantined = self.quarantined.saturating_add(1);
+            }
+        }
+        self.store_activity_seen = true;
+    }
+
     fn collect(
         &mut self,
         event: StorageScpEvent,
@@ -410,27 +484,42 @@ impl ReceiveStats {
                 if request.route != *expected_route {
                     bail!("received a C-STORE event for a route other than the active accession");
                 }
-                self.store_operations = self.store_operations.saturating_add(1);
-                self.unique_sop_instances
-                    .insert(outcome.sop_instance_uid.clone());
-                self.received_bytes = self.received_bytes.saturating_add(outcome.file_bytes);
-                match outcome.disposition {
-                    ReceiveDisposition::Published => {
-                        self.published = self.published.saturating_add(1);
-                    }
-                    ReceiveDisposition::ExistingSkipped => {
-                        self.existing_skipped = self.existing_skipped.saturating_add(1);
-                    }
-                    ReceiveDisposition::ConflictPreserved => {
-                        self.conflicts = self.conflicts.saturating_add(1);
-                    }
+                if outcome.disposition == ReceiveDisposition::Quarantined {
+                    bail!("quarantined payload was incorrectly reported as a completed store");
                 }
-                self.store_activity_seen = true;
+                self.archived_files.insert(outcome.path.clone());
+                self.collect_store_outcome(
+                    outcome.disposition,
+                    &outcome.sop_instance_uid,
+                    outcome.file_bytes,
+                );
                 Ok(true)
             }
-            StorageScpEvent::StoreFailed { .. } => {
+            StorageScpEvent::StoreFailed {
+                active_task_id,
+                quarantined,
+                ..
+            } => {
+                if let Some(quarantined) = quarantined.as_ref() {
+                    if quarantined.profile_id != expected_route.profile_id {
+                        bail!("received a quarantine event for another CLI Profile");
+                    }
+                    if quarantined.active_task_id != active_task_id {
+                        bail!("quarantine event task correlation was inconsistent");
+                    }
+                }
+                if active_task_id.as_deref() != Some(expected_route.task_id.as_str()) {
+                    return Ok(false);
+                }
                 self.store_failures = self.store_failures.saturating_add(1);
                 self.store_activity_seen = true;
+                if let Some(quarantined) = quarantined {
+                    self.quarantined = self.quarantined.saturating_add(1);
+                    self.received_bytes = self
+                        .received_bytes
+                        .saturating_add(quarantined.payload.file_bytes);
+                    self.quarantined_files.insert(quarantined.payload.path);
+                }
                 Ok(true)
             }
             StorageScpEvent::AssociationFailed { .. } => {
@@ -483,8 +572,10 @@ async fn run_moves(
         if cancellation.is_cancelled() {
             return Ok(RunProgress::Cancelled);
         }
-        let relative_directory = PathBuf::from(safe_accession_component(accession));
-        prepare_accession_directory(destination, &relative_directory).await?;
+        let staging = prepare_staging_directory(destination, accession)
+            .await
+            .with_context(|| format!("failed to prepare staging for accession {accession}"))?;
+        let relative_directory = staging.relative_path().to_path_buf();
         let route = ReceiveRoute {
             profile_id: PROFILE_ID.to_owned(),
             task_id: task_id.to_string(),
@@ -537,8 +628,23 @@ async fn run_moves(
             drop(route_lease);
             return Ok(RunProgress::Cancelled);
         };
-        result.locally_received_operations = u64_to_u32(stats.store_operations);
+        result.locally_received_operations = u64_to_u32(stats.successful_store_operations);
         result.locally_unique_sop_instances = usize_to_u32(stats.unique_sop_instances.len());
+        if drain == DrainOutcome::Drained {
+            let archive = archive_received_files(
+                destination,
+                staging.path(),
+                accession,
+                &config.directory_template,
+                &stats.archived_files,
+            )
+            .await
+            .with_context(|| format!("failed to archive accession {accession}"))?;
+            for failure in archive.failures() {
+                eprintln!("error: {failure}");
+            }
+            stats.apply_archive(archive);
+        }
 
         let failure_reasons = failure_reasons(&result, &stats, drain);
         let failed = !failure_reasons.is_empty();
@@ -550,7 +656,7 @@ async fn run_moves(
         }
         print_accession_report(
             accession,
-            &destination.join(relative_directory),
+            destination,
             &result,
             &stats,
             drain,
@@ -671,71 +777,6 @@ async fn drain_late_stores(
     }
 }
 
-async fn prepare_accession_directory(root: &Path, relative: &Path) -> anyhow::Result<()> {
-    debug_assert_eq!(relative.components().count(), 1);
-    let target = root.join(relative);
-    match tokio::fs::symlink_metadata(&target).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!(
-                "refusing accession destination symlink {}",
-                target.display()
-            );
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            bail!(
-                "accession destination is not a directory: {}",
-                target.display()
-            );
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            tokio::fs::create_dir(&target).await.with_context(|| {
-                format!("failed to create accession directory {}", target.display())
-            })?;
-            let metadata = tokio::fs::symlink_metadata(&target)
-                .await
-                .with_context(|| {
-                    format!("failed to inspect accession directory {}", target.display())
-                })?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!("accession destination changed while it was being created");
-            }
-            Ok(())
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to inspect accession directory {}", target.display())),
-    }
-}
-
-fn safe_accession_component(accession: &str) -> String {
-    let mut encoded = String::from("accession-");
-    for byte in accession.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-            encoded.push(char::from(*byte));
-        } else {
-            encoded.push('~');
-            encoded.push(hex_digit(byte >> 4));
-            encoded.push(hex_digit(byte & 0x0F));
-        }
-    }
-    if encoded.len() <= MAX_COMPONENT_BYTES {
-        return encoded;
-    }
-
-    let digest = Sha256::digest(accession.as_bytes());
-    encoded.truncate(COMPONENT_PREFIX_BYTES);
-    encoded.push_str("-sha256-");
-    for byte in &digest[..16] {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0F));
-    }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    char::from(b"0123456789ABCDEF"[usize::from(value)])
-}
-
 fn expects_files(result: &MoveAttemptResult, stats: &ReceiveStats) -> bool {
     if stats.store_activity_seen {
         return true;
@@ -789,16 +830,11 @@ fn failure_reasons(
                 .to_owned(),
         );
     }
-    if let Some((expected, received)) = result.local_count_gap() {
-        reasons.push(format!(
-            "PACS reported {expected} completed suboperation(s), but {received} reached local storage"
-        ));
-    }
     if let Some(expected) = result.counters.completed {
-        let unique_received = usize_to_u32(stats.unique_sop_instances.len());
-        if unique_received < expected {
+        let successful_store_operations = stats.successful_store_operations;
+        if u64::from(expected) != successful_store_operations {
             reasons.push(format!(
-                "PACS reported {expected} completed suboperation(s), but only {unique_received} unique SOP instance(s) were stored"
+                "PACS reported {expected} completed suboperation(s), but {successful_store_operations} successful C-STORE operation(s) reached local storage"
             ));
         }
     }
@@ -812,6 +848,12 @@ fn failure_reasons(
         reasons.push(format!(
             "{} storage association(s) failed",
             stats.association_failures
+        ));
+    }
+    if stats.archive_failures > 0 {
+        reasons.push(format!(
+            "{} object(s) failed directory-template publication and remain in staging",
+            stats.archive_failures
         ));
     }
     if stats.conflicts > 0 {
@@ -838,37 +880,69 @@ fn print_accession_report(
 ) {
     println!(
         "{}",
-        json!({
-            "type": "accession",
-            "accession": accession,
-            "success": failure_reasons.is_empty(),
-            "no_data": result.counters.completed == Some(0) && stats.store_operations == 0,
-            "output_directory": output_directory,
-            "move_final_status": result.final_status.map(|status| format!("0x{:04X}", status.code)),
-            "move_status_class": result.final_status.map(|status| format!("{:?}", status.class)),
-            "pacs_remaining": result.counters.remaining,
-            "pacs_completed": result.counters.completed,
-            "pacs_failed": result.counters.failed,
-            "pacs_warning": result.counters.warning,
-            "local_store_operations": stats.store_operations,
-            "local_unique_sop_instances": stats.unique_sop_instances.len(),
-            "published": stats.published,
-            "existing_skipped": stats.existing_skipped,
-            "conflicts": stats.conflicts,
-            "store_failures": stats.store_failures,
-            "storage_association_failures": stats.association_failures,
-            "received_bytes": stats.received_bytes,
-            "late_store_drain": match drain {
-                DrainOutcome::Drained => "drained",
-                DrainOutcome::TimedOut => "timed_out",
-            },
-            "failures": failure_reasons,
-        })
+        accession_report_value(
+            accession,
+            output_directory,
+            result,
+            stats,
+            drain,
+            failure_reasons,
+        )
     );
+}
+
+fn accession_report_value(
+    accession: &str,
+    output_directory: &Path,
+    result: &MoveAttemptResult,
+    stats: &ReceiveStats,
+    drain: DrainOutcome,
+    failure_reasons: &[String],
+) -> serde_json::Value {
+    let mut archived_files = stats.archived_files.iter().collect::<Vec<_>>();
+    archived_files.sort();
+    let mut quarantined_files = stats.quarantined_files.iter().collect::<Vec<_>>();
+    quarantined_files.sort();
+    json!({
+        "type": "accession",
+        "accession": accession,
+        "success": failure_reasons.is_empty(),
+        "no_data": result.counters.completed == Some(0)
+            && stats.successful_store_operations == 0
+            && stats.unique_sop_instances.is_empty(),
+        "output_directory": output_directory,
+        "move_final_status": result.final_status.map(|status| format!("0x{:04X}", status.code)),
+        "move_status_class": result.final_status.map(|status| format!("{:?}", status.class)),
+        "pacs_remaining": result.counters.remaining,
+        "pacs_completed": result.counters.completed,
+        "pacs_failed": result.counters.failed,
+        "pacs_warning": result.counters.warning,
+        "local_store_operations": stats.successful_store_operations,
+        "local_unique_sop_instances": stats.unique_sop_instances.len(),
+        "published": stats.published,
+        "existing_skipped": stats.existing_skipped,
+        "conflicts": stats.conflicts,
+        "archive_failures": stats.archive_failures,
+        "archived_files": archived_files,
+        "store_failures": stats.store_failures,
+        "quarantined": stats.quarantined,
+        "quarantined_files": quarantined_files,
+        "storage_association_failures": stats.association_failures,
+        "received_bytes": stats.received_bytes,
+        "late_store_drain": match drain {
+            DrainOutcome::Drained => "drained",
+            DrainOutcome::TimedOut => "timed_out",
+        },
+        "failures": failure_reasons,
+    })
 }
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn u64_to_u32(value: u64) -> u32 {
@@ -878,7 +952,15 @@ fn u64_to_u32(value: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dcmget_dicom::{MoveCounters, MoveFinalStatus};
+    use std::fs;
+
+    use dcmget_dicom::{
+        MoveCounters, MoveFinalStatus, QuarantineOutcome, ReceiveOutcome, Sha256Digest,
+    };
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_dictionary_std::tags;
+    use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+    use sha2::{Digest, Sha256};
 
     fn route(accession: &str) -> ReceiveRoute {
         ReceiveRoute {
@@ -887,6 +969,10 @@ mod tests {
             accession_number: accession.to_owned(),
             destination_root: PathBuf::from("destination"),
         }
+    }
+
+    fn resolver() -> ActiveRouteResolver {
+        ActiveRouteResolver::new(PROFILE_ID, PathBuf::from("destination"))
     }
 
     fn command() -> CStoreCommand {
@@ -914,44 +1000,227 @@ mod tests {
         }
     }
 
-    #[test]
-    fn accession_component_cannot_traverse_or_create_windows_device_names() {
-        for accession in [
-            "../outside",
-            "..\\outside",
-            "/absolute",
-            "CON",
-            "A:B",
-            "检查号/一",
-        ] {
-            let component = safe_accession_component(accession);
-            assert!(component.starts_with("accession-"));
-            assert_eq!(Path::new(&component).components().count(), 1);
-            assert!(!component.contains('/'));
-            assert!(!component.contains('\\'));
-            assert_ne!(component, ".");
-            assert_ne!(component, "..");
+    fn write_test_dicom(
+        path: &Path,
+        patient_id: &str,
+        study_instance_uid: &str,
+        sop_instance_uid: &str,
+    ) {
+        const SOP_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.7";
+        let mut object = InMemDicomObject::new_empty();
+        object.put(DataElement::new(
+            tags::SPECIFIC_CHARACTER_SET,
+            VR::CS,
+            PrimitiveValue::from("ISO_IR 192"),
+        ));
+        object.put(DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            PrimitiveValue::from(SOP_CLASS_UID),
+        ));
+        object.put(DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            PrimitiveValue::from(sop_instance_uid),
+        ));
+        object.put(DataElement::new(
+            tags::PATIENT_ID,
+            VR::LO,
+            PrimitiveValue::from(patient_id),
+        ));
+        object.put(DataElement::new(
+            tags::ACCESSION_NUMBER,
+            VR::SH,
+            PrimitiveValue::from("DATASET-ACCESSION"),
+        ));
+        object.put(DataElement::new(
+            tags::STUDY_INSTANCE_UID,
+            VR::UI,
+            PrimitiveValue::from(study_instance_uid),
+        ));
+        let file = object
+            .with_meta(
+                FileMetaTableBuilder::new()
+                    .transfer_syntax("1.2.840.10008.1.2.1")
+                    .media_storage_sop_class_uid(SOP_CLASS_UID)
+                    .media_storage_sop_instance_uid(sop_instance_uid),
+            )
+            .unwrap();
+        file.write_to_file(path).unwrap();
+    }
+
+    fn received_stats(source: PathBuf, sop_instance_uid: &str) -> ReceiveStats {
+        ReceiveStats {
+            successful_store_operations: 1,
+            unique_sop_instances: HashSet::from([sop_instance_uid.to_owned()]),
+            archived_files: HashSet::from([source]),
+            published: 1,
+            store_activity_seen: true,
+            ..ReceiveStats::default()
         }
     }
 
-    #[test]
-    fn long_accession_component_is_bounded_and_collision_resistant() {
-        let first = safe_accession_component(&"A".repeat(1_000));
-        let second = safe_accession_component(&format!("{}B", "A".repeat(999)));
-        assert!(first.len() <= MAX_COMPONENT_BYTES);
-        assert!(second.len() <= MAX_COMPONENT_BYTES);
-        assert_ne!(first, second);
-        assert!(first.contains("-sha256-"));
+    fn sha256(path: &Path) -> [u8; 32] {
+        Sha256::digest(fs::read(path).unwrap()).into()
+    }
+
+    #[tokio::test]
+    async fn cli_default_template_publishes_from_hidden_same_volume_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let staging = prepare_staging_directory(&root, "A001").await.unwrap();
+        assert!(
+            staging
+                .relative_path()
+                .starts_with(Path::new(".dcmget-staging"))
+        );
+        assert!(staging.path().starts_with(&root));
+        let source = staging.path().join("1.2.3.4.dcm");
+        write_test_dicom(&source, "P001", "1.2.3", "1.2.3.4");
+        let mut stats = received_stats(source.clone(), "1.2.3.4");
+
+        let archive = archive_received_files(
+            &root,
+            staging.path(),
+            "A001",
+            &LegacyConfig::default().directory_template,
+            &stats.archived_files,
+        )
+        .await
+        .unwrap();
+        stats.apply_archive(archive);
+
+        let target = root.join("P001/A001/1.2.3/1.2.3.4.dcm");
+        assert_eq!(stats.archive_failures, 0);
+        assert_eq!(stats.archived_files, HashSet::from([target.clone()]));
+        assert!(target.is_file());
+        assert!(!source.exists());
+    }
+
+    #[tokio::test]
+    async fn cli_custom_template_uses_requested_accession() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let staging = prepare_staging_directory(&root, "REQUESTED").await.unwrap();
+        let source = staging.path().join("1.2.4.5.dcm");
+        write_test_dicom(&source, "P002", "1.2.4", "1.2.4.5");
+
+        let archive = archive_received_files(
+            &root,
+            staging.path(),
+            "REQUESTED",
+            "study-{StudyInstanceUID}/{AccessionNumber}/{PatientID}",
+            &HashSet::from([source]),
+        )
+        .await
+        .unwrap();
+        let (files, failures, conflicts) = archive.into_parts();
+
+        let target = root.join("study-1.2.4/REQUESTED/P002/1.2.4.5.dcm");
+        assert!(failures.is_empty());
+        assert_eq!(conflicts, 0);
+        assert_eq!(files, HashSet::from([target.clone()]));
+        assert!(target.is_file());
+        assert!(!root.join("study-1.2.4/DATASET-ACCESSION").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_rejects_unsafe_template_and_archive_defense_cannot_escape_root() {
+        let config = LegacyConfig {
+            directory_template: "../../{PatientID}".to_owned(),
+            ..LegacyConfig::default()
+        };
+        assert!(
+            download_validation_issues(&config, false)
+                .iter()
+                .any(|issue| issue.starts_with("directory_template:"))
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let staging = prepare_staging_directory(&root, "A003").await.unwrap();
+        let source = staging.path().join("1.2.5.6.dcm");
+        write_test_dicom(&source, "../PATIENT", "1.2.5", "1.2.5.6");
+        let archive = archive_received_files(
+            &root,
+            staging.path(),
+            "A003",
+            "../../{PatientID}/{AccessionNumber}",
+            &HashSet::from([source]),
+        )
+        .await
+        .unwrap();
+        let (files, failures, _) = archive.into_parts();
+
+        assert!(failures.is_empty());
+        assert_eq!(files.len(), 1);
+        assert!(files.iter().all(|path| path.starts_with(&root)));
+    }
+
+    #[tokio::test]
+    async fn cli_metadata_parse_failure_keeps_staging_and_fails_accession() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let staging = prepare_staging_directory(&root, "A004").await.unwrap();
+        let source = staging.path().join("broken.dcm");
+        fs::write(&source, b"not a DICOM object").unwrap();
+        let mut stats = received_stats(source.clone(), "1.2.6.7");
+
+        let archive = archive_received_files(
+            &root,
+            staging.path(),
+            "A004",
+            &LegacyConfig::default().directory_template,
+            &stats.archived_files,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archive.failures().len(), 1);
+        stats.apply_archive(archive);
+        let failures = failure_reasons(&successful_move(Some(1)), &stats, DrainOutcome::Drained);
+
+        assert!(source.is_file());
+        assert_eq!(stats.archive_failures, 1);
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("remain in staging"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_template_publication_preserves_dicom_sha256() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let staging = prepare_staging_directory(&root, "A005").await.unwrap();
+        let source = staging.path().join("1.2.7.8.dcm");
+        write_test_dicom(&source, "P005", "1.2.7", "1.2.7.8");
+        let source_sha = sha256(&source);
+
+        let archive = archive_received_files(
+            &root,
+            staging.path(),
+            "A005",
+            &LegacyConfig::default().directory_template,
+            &HashSet::from([source]),
+        )
+        .await
+        .unwrap();
+        let (files, failures, _) = archive.into_parts();
+        let target = files.into_iter().next().unwrap();
+
+        assert!(failures.is_empty());
+        assert_eq!(sha256(&target), source_sha);
     }
 
     #[test]
     fn receive_route_remains_active_for_the_full_lease() {
-        let resolver = ActiveRouteResolver::default();
+        let resolver = resolver();
         let expected_route = route("../../A001");
         let lease = resolver
             .activate(RouteTarget {
                 route: expected_route.clone(),
-                relative_directory: PathBuf::from(safe_accession_component("../../A001")),
+                relative_directory: PathBuf::from(".dcmget-staging/accession-A001"),
             })
             .expect("route should activate");
         let request = resolver
@@ -966,11 +1235,11 @@ mod tests {
 
     #[test]
     fn abandoned_route_is_retained_until_receiver_shutdown_cleanup() {
-        let resolver = ActiveRouteResolver::default();
+        let resolver = resolver();
         let lease = resolver
             .activate(RouteTarget {
                 route: route("A001"),
-                relative_directory: PathBuf::from(safe_accession_component("A001")),
+                relative_directory: PathBuf::from(".dcmget-staging/accession-A001"),
             })
             .expect("route should activate");
         drop(lease);
@@ -980,6 +1249,55 @@ mod tests {
         );
         resolver.clear();
         assert!(resolver.resolve(&command(), "1.2.840.10008.1.2.1").is_err());
+    }
+
+    #[test]
+    fn no_active_route_uses_the_explicit_cli_destination_for_quarantine() {
+        let quarantine_root = PathBuf::from("explicit-cli-volume");
+        let resolver = ActiveRouteResolver::new(PROFILE_ID, quarantine_root.clone());
+        let error = resolver
+            .resolve(&command(), "1.2.840.10008.1.2.1")
+            .unwrap_err();
+        assert_eq!(
+            error.quarantine_target,
+            QuarantineTarget {
+                profile_id: PROFILE_ID.to_owned(),
+                destination_root: quarantine_root,
+                active_task_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unassigned_quarantine_is_not_charged_to_the_next_cli_accession() {
+        let expected_route = route("NEXT");
+        let quarantine_path =
+            PathBuf::from("destination/_DcmGetQuarantine/cli/unassigned.dcm.quarantine");
+        let event = StorageScpEvent::StoreFailed {
+            peer: "127.0.0.1:12345".parse().unwrap(),
+            sop_instance_uid: Some("1.2.3.4".to_owned()),
+            active_task_id: None,
+            message: "no active route".to_owned(),
+            quarantined: Some(QuarantineOutcome {
+                profile_id: PROFILE_ID.to_owned(),
+                active_task_id: None,
+                reason: "no active route".to_owned(),
+                payload: ReceiveOutcome {
+                    disposition: ReceiveDisposition::Quarantined,
+                    path: quarantine_path,
+                    sop_instance_uid: "1.2.3.4".to_owned(),
+                    sha256: Sha256Digest([0; 32]),
+                    file_bytes: 512,
+                    dataset_bytes: 256,
+                },
+            }),
+        };
+        let mut stats = ReceiveStats::default();
+
+        assert!(!stats.collect(event, &expected_route).unwrap());
+        assert_eq!(stats.store_failures, 0);
+        assert_eq!(stats.quarantined, 0);
+        assert!(stats.quarantined_files.is_empty());
     }
 
     #[test]
@@ -1015,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_pacs_count_and_duplicate_sop_deliveries_are_not_complete() {
+    fn missing_pacs_count_is_not_complete() {
         let stats = ReceiveStats::default();
         let missing_count = failure_reasons(&successful_move(None), &stats, DrainOutcome::Drained);
         assert!(
@@ -1023,29 +1341,107 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("omitted the completed count"))
         );
+    }
 
-        let mut duplicate_stats = ReceiveStats {
-            store_operations: 2,
-            ..ReceiveStats::default()
-        };
-        duplicate_stats
-            .unique_sop_instances
-            .insert("1.2.3.4".to_owned());
+    #[test]
+    fn duplicate_sop_deliveries_complete_and_report_operations_separately_from_unique_files() {
+        let mut duplicate_stats = ReceiveStats::default();
+        duplicate_stats.collect_store_outcome(ReceiveDisposition::Published, "1.2.3.4", 1024);
+        duplicate_stats.collect_store_outcome(ReceiveDisposition::ExistingSkipped, "1.2.3.4", 1024);
         let duplicate_delivery = failure_reasons(
             &successful_move(Some(2)),
             &duplicate_stats,
             DrainOutcome::Drained,
         );
+        assert!(duplicate_delivery.is_empty());
+
+        let report = accession_report_value(
+            "A001",
+            Path::new("destination/accession-A001"),
+            &successful_move(Some(2)),
+            &duplicate_stats,
+            DrainOutcome::Drained,
+            &duplicate_delivery,
+        );
+        assert_eq!(report["success"], true);
+        assert_eq!(report["local_store_operations"], 2);
+        assert_eq!(report["local_unique_sop_instances"], 1);
+        assert_eq!(report["published"], 1);
+        assert_eq!(report["existing_skipped"], 1);
+    }
+
+    #[test]
+    fn extra_successful_store_operations_are_not_silently_accepted() {
+        let stats = ReceiveStats {
+            successful_store_operations: 2,
+            ..ReceiveStats::default()
+        };
+        let failures = failure_reasons(&successful_move(Some(1)), &stats, DrainOutcome::Drained);
         assert!(
-            duplicate_delivery
+            failures
                 .iter()
-                .any(|reason| reason.contains("only 1 unique SOP"))
+                .any(|reason| reason.contains("2 successful C-STORE"))
+        );
+    }
+
+    #[test]
+    fn quarantined_store_is_failed_and_reported_without_counting_local_success() {
+        let expected_route = route("A001");
+        let quarantine_path =
+            PathBuf::from("destination/_DcmGetQuarantine/cli/1.2.3.4-1-1.dcm.quarantine");
+        let mut stats = ReceiveStats::default();
+        assert!(
+            stats
+                .collect(
+                    StorageScpEvent::StoreFailed {
+                        peer: "127.0.0.1:12345".parse().unwrap(),
+                        sop_instance_uid: Some("1.2.3.4".to_owned()),
+                        active_task_id: Some(expected_route.task_id.clone()),
+                        message: "cannot attribute received C-STORE".to_owned(),
+                        quarantined: Some(QuarantineOutcome {
+                            profile_id: PROFILE_ID.to_owned(),
+                            active_task_id: Some(expected_route.task_id.clone()),
+                            reason: "cannot attribute received C-STORE".to_owned(),
+                            payload: ReceiveOutcome {
+                                disposition: ReceiveDisposition::Quarantined,
+                                path: quarantine_path.clone(),
+                                sop_instance_uid: "1.2.3.4".to_owned(),
+                                sha256: Sha256Digest([0; 32]),
+                                file_bytes: 512,
+                                dataset_bytes: 256,
+                            },
+                        }),
+                    },
+                    &expected_route,
+                )
+                .unwrap()
+        );
+        assert_eq!(stats.successful_store_operations, 0);
+        assert_eq!(stats.store_failures, 1);
+        assert_eq!(stats.quarantined, 1);
+        assert!(stats.quarantined_files.contains(&quarantine_path));
+
+        let failures = failure_reasons(&successful_move(Some(1)), &stats, DrainOutcome::Drained);
+        let report = accession_report_value(
+            "A001",
+            Path::new("destination/accession-A001"),
+            &successful_move(Some(1)),
+            &stats,
+            DrainOutcome::Drained,
+            &failures,
+        );
+        assert_eq!(report["success"], false);
+        assert_eq!(report["local_store_operations"], 0);
+        assert_eq!(report["quarantined"], 1);
+        assert_eq!(
+            report["quarantined_files"][0],
+            quarantine_path.to_string_lossy().as_ref()
         );
     }
 
     #[tokio::test]
     async fn explicit_receiver_shutdown_releases_the_bound_port() {
-        let resolver = ActiveRouteResolver::default();
+        let resolver = resolver();
         let receiver = StorageScpService::start(
             StorageScpConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), "DCMGET"),
             FileStore::new(),

@@ -61,6 +61,34 @@ impl ReceiverStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSettings {
+    pub pacs_server_ip: String,
+    pub pacs_server_port: u16,
+    pub calling_ae_title: String,
+    pub pacs_ae_title: String,
+    pub storage_ae_title: String,
+    pub storage_port: u16,
+    pub default_destination: String,
+    #[serde(default)]
+    pub anonymization_enabled: bool,
+}
+
+impl Default for ProfileSettings {
+    fn default() -> Self {
+        Self {
+            pacs_server_ip: "127.0.0.1".into(),
+            pacs_server_port: 104,
+            calling_ae_title: "DCMGET".into(),
+            pacs_ae_title: "PACS".into(),
+            storage_ae_title: "DCMGET".into(),
+            storage_port: 6666,
+            default_destination: String::new(),
+            anonymization_enabled: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileSummary {
     pub id: ProfileId,
     pub name: String,
@@ -69,6 +97,7 @@ pub struct ProfileSummary {
     pub status: ProfileStatus,
     pub speed_bytes_per_second: u64,
     pub active_tasks: u32,
+    pub settings: ProfileSettings,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +106,9 @@ pub enum TaskStatus {
     #[default]
     Waiting,
     Running,
+    Pausing,
     Paused,
+    Cancelling,
     Completed,
     Partial,
     Failed,
@@ -89,7 +120,9 @@ impl TaskStatus {
         match self {
             Self::Waiting => "等待中",
             Self::Running => "下载中",
+            Self::Pausing => "正在暂停",
             Self::Paused => "已暂停",
+            Self::Cancelling => "正在结束",
             Self::Completed => "已完成",
             Self::Partial => "部分成功",
             Self::Failed => "失败",
@@ -142,21 +175,46 @@ pub struct LogEntry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub profiles: Vec<ProfileSummary>,
-    pub selected_profile_id: ProfileId,
+    pub selected_profile_id: Option<ProfileId>,
     pub receiver_status: ReceiverStatus,
     pub aggregate_speed_bytes_per_second: u64,
     pub tasks: Vec<TaskSummary>,
     pub errors: Vec<LogEntry>,
     pub detailed_logs_enabled: bool,
+    /// Set only when the application layer could not load or refresh real state.
+    pub load_error: Option<String>,
 }
 
 impl WorkspaceSnapshot {
     pub fn selected_profile(&self) -> Option<&ProfileSummary> {
+        let selected_profile_id = self.selected_profile_id.as_ref()?;
         self.profiles
             .iter()
-            .find(|profile| profile.id == self.selected_profile_id)
+            .find(|profile| &profile.id == selected_profile_id)
     }
 
+    /// Initial state shown while the application service loads persistent data.
+    pub fn loading() -> Self {
+        Self {
+            profiles: Vec::new(),
+            selected_profile_id: None,
+            receiver_status: ReceiverStatus::Offline,
+            aggregate_speed_bytes_per_second: 0,
+            tasks: Vec::new(),
+            errors: Vec::new(),
+            detailed_logs_enabled: false,
+            load_error: None,
+        }
+    }
+
+    pub fn load_failed(message: impl Into<String>) -> Self {
+        Self {
+            load_error: Some(message.into()),
+            ..Self::loading()
+        }
+    }
+
+    #[cfg(any(test, feature = "mock-ui"))]
     pub fn technical_gate_sample() -> Self {
         let profile_id = ProfileId::new("profile-ct");
         Self {
@@ -169,6 +227,16 @@ impl WorkspaceSnapshot {
                     status: ProfileStatus::Busy,
                     speed_bytes_per_second: 27_400_000,
                     active_tasks: 1,
+                    settings: ProfileSettings {
+                        pacs_server_ip: "192.0.2.10".into(),
+                        pacs_server_port: 104,
+                        calling_ae_title: "DCMGET".into(),
+                        pacs_ae_title: "PACS".into(),
+                        storage_ae_title: "DCMGET".into(),
+                        storage_port: 6666,
+                        default_destination: r"D:\DICOM".into(),
+                        anonymization_enabled: false,
+                    },
                 },
                 ProfileSummary {
                     id: ProfileId::new("profile-mr"),
@@ -178,6 +246,11 @@ impl WorkspaceSnapshot {
                     status: ProfileStatus::Ready,
                     speed_bytes_per_second: 0,
                     active_tasks: 0,
+                    settings: ProfileSettings {
+                        storage_ae_title: "DCMGET_MR".into(),
+                        storage_port: 6667,
+                        ..ProfileSettings::default()
+                    },
                 },
                 ProfileSummary {
                     id: ProfileId::new("profile-test"),
@@ -187,9 +260,14 @@ impl WorkspaceSnapshot {
                     status: ProfileStatus::Stopped,
                     speed_bytes_per_second: 0,
                     active_tasks: 0,
+                    settings: ProfileSettings {
+                        storage_ae_title: "DCMGET_TEST".into(),
+                        storage_port: 6668,
+                        ..ProfileSettings::default()
+                    },
                 },
             ],
-            selected_profile_id: profile_id,
+            selected_profile_id: Some(profile_id),
             receiver_status: ReceiverStatus::Receiving,
             aggregate_speed_bytes_per_second: 27_400_000,
             tasks: vec![TaskSummary {
@@ -210,6 +288,7 @@ impl WorkspaceSnapshot {
                 message: "1 个对象写入失败，已保留到隔离目录，可在任务结束后重试。".into(),
             }],
             detailed_logs_enabled: false,
+            load_error: None,
         }
     }
 }
@@ -217,6 +296,23 @@ impl WorkspaceSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_and_failure_states_never_contain_demo_activity() {
+        let loading = WorkspaceSnapshot::loading();
+        assert!(loading.profiles.is_empty());
+        assert!(loading.tasks.is_empty());
+        assert_eq!(loading.aggregate_speed_bytes_per_second, 0);
+        assert!(loading.load_error.is_none());
+
+        let failure = WorkspaceSnapshot::load_failed("state database unavailable");
+        assert!(failure.profiles.is_empty());
+        assert!(failure.tasks.is_empty());
+        assert_eq!(
+            failure.load_error.as_deref(),
+            Some("state database unavailable")
+        );
+    }
 
     #[test]
     fn progress_is_safe_for_empty_and_overcomplete_tasks() {

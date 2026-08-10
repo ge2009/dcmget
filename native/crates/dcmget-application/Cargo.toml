@@ -6,13 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dcmget-dicom = { path = "../dcmget-dicom" }
 dcmget-domain = { path = "../dcmget-domain" }
 dcmget-state = { path = "../dcmget-state" }
+chrono.workspace = true
+dicom-dictionary-std.workspace = true
+dicom-object.workspace = true
 parking_lot.workspace = true
+sha1 = "=0.10.7"
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+dicom-core.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 

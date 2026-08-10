@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 dicom-core.workspace = true
 dicom-dictionary-std = { workspace = true, features = ["sop-class"] }
 dicom-encoding.workspace = true
@@ -14,12 +15,10 @@ dicom-object.workspace = true
 dicom-transfer-syntax-registry.workspace = true
 dicom-ul.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

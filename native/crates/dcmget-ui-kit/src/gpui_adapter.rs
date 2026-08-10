@@ -309,7 +309,10 @@ impl StatusPill {
         let tone = match status {
             TaskStatus::Waiting | TaskStatus::Cancelled => StatusTone::Neutral,
             TaskStatus::Running => StatusTone::Primary,
-            TaskStatus::Paused | TaskStatus::Partial => StatusTone::Warning,
+            TaskStatus::Pausing
+            | TaskStatus::Paused
+            | TaskStatus::Cancelling
+            | TaskStatus::Partial => StatusTone::Warning,
             TaskStatus::Completed => StatusTone::Success,
             TaskStatus::Failed => StatusTone::Danger,
         };

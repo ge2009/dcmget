@@ -10,10 +10,12 @@ mod model;
 #[cfg(feature = "gpui")]
 mod gpui_adapter;
 
-pub use command::{CommandSink, DesktopCommand, RecordingCommandSink};
+#[cfg(any(test, feature = "mock-ui"))]
+pub use command::RecordingCommandSink;
+pub use command::{CommandSink, DesktopCommand, SnapshotSource, WorkspaceBackend};
 pub use model::{
-    LogEntry, LogLevel, ProfileId, ProfileStatus, ProfileSummary, ReceiverStatus, TaskStatus,
-    TaskSummary, WorkspaceSnapshot,
+    LogEntry, LogLevel, ProfileId, ProfileSettings, ProfileStatus, ProfileSummary, ReceiverStatus,
+    TaskStatus, TaskSummary, WorkspaceSnapshot,
 };
 
 #[cfg(feature = "gpui")]

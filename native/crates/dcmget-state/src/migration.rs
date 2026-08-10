@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -117,12 +119,64 @@ pub struct MigrationReport {
 #[derive(Clone, Debug)]
 pub struct MigrationService {
     backup: BackupService,
+    backup_root: PathBuf,
 }
 
 impl MigrationService {
     pub fn new(backup_root: impl AsRef<Path>) -> Self {
+        let backup_root = backup_root.as_ref().to_path_buf();
         Self {
-            backup: BackupService::new(backup_root),
+            backup: BackupService::new(&backup_root),
+            backup_root,
+        }
+    }
+
+    /// Avoid creating another immutable backup when every legacy source is
+    /// unchanged since its last successful import. Regular files are compared
+    /// by SHA-256. `SQLite` sources use their modification time relative to the
+    /// recorded online-backup file; a newer or unreadable source errs toward a
+    /// new online backup and import attempt.
+    pub fn migrate_if_needed(
+        &self,
+        layout: &LegacyLayout,
+        repository: &StateRepository,
+    ) -> Result<MigrationReport, StateError> {
+        let sources = migration_sources(layout);
+        let mut changed = false;
+        for (source, sqlite) in &sources {
+            let Some((digest, backup)) = repository.migration_record(&source_key(source))? else {
+                changed = true;
+                break;
+            };
+            if *sqlite {
+                let source_modified = sqlite_latest_modified(source)?;
+                let Ok(backup_modified) = fs::metadata(&backup).and_then(|value| value.modified())
+                else {
+                    changed = true;
+                    break;
+                };
+                if source_modified > backup_modified {
+                    changed = true;
+                    break;
+                }
+            } else if sha256_regular_file(source)? != digest {
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            self.migrate(layout, repository)
+        } else {
+            Ok(MigrationReport {
+                backup: BackupSet {
+                    directory: self.backup_root.clone(),
+                    entries: Vec::new(),
+                },
+                profiles_imported: 0,
+                tasks_imported: 0,
+                sources_skipped: sources.len(),
+                warnings: Vec::new(),
+            })
         }
     }
 
@@ -150,7 +204,16 @@ impl MigrationService {
             let Some(config_entry) = report.backup.entry_for(&source.config_path) else {
                 continue;
             };
-            if already_migrated(repository, config_entry)? {
+            let metadata_entry = source
+                .metadata_path
+                .as_ref()
+                .and_then(|path| report.backup.entry_for(path));
+            let config_current = already_migrated(repository, config_entry)?;
+            let metadata_current = metadata_entry
+                .map(|entry| already_migrated(repository, entry))
+                .transpose()?
+                .unwrap_or(true);
+            if config_current && metadata_current {
                 report.sources_skipped += 1;
                 continue;
             }
@@ -162,6 +225,13 @@ impl MigrationService {
                         &config_entry.sha256,
                         &config_entry.backup,
                     )?;
+                    if let Some(entry) = metadata_entry {
+                        repository.record_migration(
+                            &source_key(&entry.source),
+                            &entry.sha256,
+                            &entry.backup,
+                        )?;
+                    }
                 }
                 Err(error) => report.warnings.push(MigrationWarning {
                     source: source.config_path.clone(),
@@ -726,6 +796,32 @@ fn already_migrated(
         .is_some_and(|(digest, _)| digest == entry.sha256))
 }
 
+fn sha256_regular_file(path: &Path) -> Result<String, StateError> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn sqlite_latest_modified(path: &Path) -> Result<std::time::SystemTime, StateError> {
+    let mut latest = fs::metadata(path)?.modified()?;
+    // The shared-memory sidecar is touched by read-only connections, including
+    // our own online backup, and therefore is not evidence of changed data.
+    // The database and WAL files contain the durable source bytes.
+    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    if let Ok(modified) = fs::metadata(wal).and_then(|value| value.modified()) {
+        latest = latest.max(modified);
+    }
+    Ok(latest)
+}
+
 fn read_only_sqlite(path: &Path) -> Result<Connection, StateError> {
     Ok(Connection::open_with_flags(
         path,
@@ -939,6 +1035,27 @@ mod tests {
         let second = service.migrate(&layout, &repository).unwrap();
         assert_eq!(second.tasks_imported, 0);
         assert!(second.sources_skipped >= 2);
+    }
+
+    #[test]
+    fn unchanged_second_migration_does_not_create_another_backup_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_root = temp.path().join("config");
+        let state_root = temp.path().join("state");
+        write_profile(&config_root, &state_root);
+        let layout = LegacyLayout::discover(&config_root, &state_root).unwrap();
+        let repository = StateRepository::open(temp.path().join("native/state.sqlite3")).unwrap();
+        let backup_root = temp.path().join("backups");
+        let service = MigrationService::new(&backup_root);
+
+        service.migrate_if_needed(&layout, &repository).unwrap();
+        let first_count = fs::read_dir(&backup_root).unwrap().count();
+        let second = service.migrate_if_needed(&layout, &repository).unwrap();
+        let second_count = fs::read_dir(&backup_root).unwrap().count();
+
+        assert_eq!(first_count, second_count);
+        assert!(second.backup.entries.is_empty());
+        assert_eq!(second.sources_skipped, migration_sources(&layout).len());
     }
 
     #[test]

@@ -164,11 +164,33 @@ pub struct StoreRequest {
     pub transfer_syntax_uid: String,
 }
 
+/// Trusted location used when a C-STORE cannot be published as a normal task
+/// object. `active_task_id` records the route which was active when the target
+/// was selected; it is correlation context only and does not attribute the
+/// quarantined object to that task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineTarget {
+    pub profile_id: String,
+    pub destination_root: PathBuf,
+    pub active_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineStoreRequest {
+    pub target: QuarantineTarget,
+    pub sop_class_uid: String,
+    pub sop_instance_uid: String,
+    pub transfer_syntax_uid: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiveDisposition {
     Published,
     ExistingSkipped,
     ConflictPreserved,
+    /// A complete Part 10 payload was preserved outside normal task output
+    /// because ownership or command metadata could not be trusted.
+    Quarantined,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,12 +231,20 @@ pub struct ReceiveOutcome {
     pub dataset_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineOutcome {
+    pub profile_id: String,
+    pub active_task_id: Option<String>,
+    pub reason: String,
+    pub payload: ReceiveOutcome,
+}
+
 impl ReceiveOutcome {
     #[must_use]
     pub fn recommended_c_store_status(&self) -> u16 {
         match self.disposition {
             ReceiveDisposition::Published | ReceiveDisposition::ExistingSkipped => 0x0000,
-            ReceiveDisposition::ConflictPreserved => 0xC000,
+            ReceiveDisposition::ConflictPreserved | ReceiveDisposition::Quarantined => 0xC000,
         }
     }
 }

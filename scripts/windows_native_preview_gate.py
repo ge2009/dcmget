@@ -14,6 +14,16 @@ IMAGE_FILE_MACHINE_AMD64 = 0x8664
 
 FORBIDDEN_NAME_PATTERN = re.compile(r"python|dcmtk|movescu|storescp|tauri", re.IGNORECASE)
 FORBIDDEN_EXTENSIONS = {".py", ".pyc"}
+FORBIDDEN_DEMO_MARKERS = (
+    "technical_gate_sample",
+    "技术门禁壳",
+    "显示演示数据",
+    "按钮尚未连接 PACS",
+    "不会直接访问磁盘或 PACS",
+    "今日 CT 批量下载",
+    "影像中心 CT",
+    "task-20260810-01",
+)
 
 
 class GateError(RuntimeError):
@@ -42,6 +52,26 @@ def check_forbidden_content(root: Path) -> list[Path]:
     return forbidden
 
 
+def check_forbidden_demo_markers(root: Path) -> list[tuple[Path, str]]:
+    matches: list[tuple[Path, str]] = []
+    encoded_markers = tuple(
+        (
+            marker,
+            marker.encode("utf-8"),
+            marker.encode("utf-16-le"),
+        )
+        for marker in FORBIDDEN_DEMO_MARKERS
+    )
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        data = path.read_bytes()
+        for marker, utf8, utf16_le in encoded_markers:
+            if utf8 in data or utf16_le in data:
+                matches.append((path, marker))
+    return matches
+
+
 def check_portable_root(portable_root: Path, *, require_binary_names: tuple[str, ...]) -> None:
     if not portable_root.is_dir() or portable_root.is_symlink():
         raise GateError(f"portable 目录不可用：{portable_root}")
@@ -56,6 +86,15 @@ def check_portable_root(portable_root: Path, *, require_binary_names: tuple[str,
             "发现禁用内容："
             + "\n- "
             + "\n- ".join(str(path) for path in sorted(forbidden))
+        )
+
+    demo_markers = check_forbidden_demo_markers(portable_root)
+    if demo_markers:
+        details = "\n- ".join(
+            f"{path}: {marker}" for path, marker in sorted(demo_markers)
+        )
+        raise GateError(
+            "生产 portable 仍包含 mock/演示门禁内容：\n- " + details
         )
 
     for name in require_binary_names:
@@ -132,19 +171,62 @@ def check_installer(
         raise GateError(f"installer 版本号不匹配：{installer_path.name}")
 
 
+def installer_section(source: str, name: str) -> str:
+    match = re.search(
+        rf"(?ims)^\[{re.escape(name)}\]\s*(.*?)(?=^\[[^\]]+\]|\Z)",
+        source,
+    )
+    if match is None:
+        raise GateError(f"Inno Setup 脚本缺少 [{name}] 段")
+    return match.group(1)
+
+
+def check_installer_firewall_source(installer_script: Path) -> None:
+    ensure_file(installer_script, reason="Inno Setup source")
+    source = installer_script.read_text(encoding="utf-8-sig")
+    run_section = installer_section(source, "Run")
+    uninstall_section = installer_section(source, "UninstallRun")
+    desktop_add_lines = [
+        line
+        for line in run_section.splitlines()
+        if "advfirewall firewall add rule" in line.lower()
+        and "{#DesktopFirewallRule}" in line
+        and 'program=""{app}\\{#AppExeName}""' in line
+    ]
+    if len(desktop_add_lines) != 1:
+        raise GateError(
+            "安装脚本必须且只能有一条绑定 dcmget-desktop.exe 的入站防火墙新增规则"
+        )
+    normalized = desktop_add_lines[0].lower()
+    for required in ("dir=in", "action=allow", "protocol=tcp"):
+        if required not in normalized:
+            raise GateError(f"desktop 防火墙规则缺少 {required}")
+    desktop_delete_lines = [
+        line
+        for line in uninstall_section.splitlines()
+        if "advfirewall firewall delete rule" in line.lower()
+        and "{#DesktopFirewallRule}" in line
+    ]
+    if len(desktop_delete_lines) != 1:
+        raise GateError("卸载脚本必须删除 desktop 入站防火墙规则")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
     parser.add_argument("--portable-dir", required=True)
     parser.add_argument("--installer", required=True)
+    parser.add_argument("--installer-script", required=True)
     args = parser.parse_args()
 
     portable_root = Path(args.portable_dir).resolve()
     installer_path = Path(args.installer).resolve()
+    installer_script = Path(args.installer_script).resolve()
 
     # mac 下无需运行 Inno Setup；此脚本只做源目录内容与签名前门禁。
     check_portable_root(portable_root, require_binary_names=("dcmget-desktop.exe", "dcmget-cli.exe"))
     check_installer(installer_path, version=args.version)
+    check_installer_firewall_source(installer_script)
 
     portable_manifest = write_manifest(
         portable_root,

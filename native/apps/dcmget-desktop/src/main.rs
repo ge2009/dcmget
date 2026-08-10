@@ -3,20 +3,31 @@
 #[cfg(feature = "gpui-ui")]
 mod workspace;
 
-#[cfg(feature = "gpui-ui")]
+#[cfg(all(feature = "gpui-ui", not(feature = "mock-ui")))]
+mod backend;
+
+#[cfg(all(feature = "gpui-ui", feature = "mock-ui"))]
 fn main() {
-    workspace::run();
+    use std::sync::Arc;
+
+    use dcmget_ui_kit::RecordingCommandSink;
+
+    workspace::run(Arc::new(RecordingCommandSink::default()));
+}
+
+#[cfg(all(feature = "gpui-ui", not(feature = "mock-ui")))]
+fn main() {
+    match backend::smoke_options(std::env::args_os()) {
+        Ok(Some(options)) => std::process::exit(backend::run_backend_smoke(&options)),
+        Ok(None) => workspace::run(backend::open()),
+        Err(error) => {
+            eprintln!("DcmGet 后台 smoke 参数错误：{error}");
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(not(feature = "gpui-ui"))]
 fn main() {
-    use dcmget_ui_kit::WorkspaceSnapshot;
-
-    let snapshot = WorkspaceSnapshot::technical_gate_sample();
-    println!(
-        "DcmGet 4 GPUI technical gate (headless): {} profiles, {} active task(s)",
-        snapshot.profiles.len(),
-        snapshot.tasks.len()
-    );
-    println!("Run with --no-default-features --features gpui-ui to open the native shell.");
+    println!("DcmGet desktop requires the gpui-ui feature.");
 }

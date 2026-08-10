@@ -5,25 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "DcmGet 4 native GPUI desktop technical gate"
+description = "DcmGet 4 native GPUI desktop application"
 
 [features]
 default = ["mock-ui"]
-mock-ui = []
+mock-ui = ["dcmget-ui-kit/mock-ui"]
 gpui-ui = [
     "dep:anyhow",
+    "dep:dcmget-application",
+    "dep:dcmget-domain",
     "dep:gpui",
     "dep:gpui-component",
     "dep:gpui-component-assets",
+    "dep:serde_json",
+    "dep:tokio",
     "dcmget-ui-kit/gpui",
 ]
 
 [dependencies]
 dcmget-ui-kit = { path = "../../crates/dcmget-ui-kit" }
 anyhow = { workspace = true, optional = true }
+dcmget-application = { path = "../../crates/dcmget-application", optional = true }
+dcmget-domain = { path = "../../crates/dcmget-domain", optional = true }
 gpui = { version = "=0.2.2", optional = true, features = ["runtime_shaders"] }
 gpui-component = { version = "=0.5.1", optional = true }
 gpui-component-assets = { version = "=0.5.1", optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true

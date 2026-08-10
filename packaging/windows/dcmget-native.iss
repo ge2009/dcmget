@@ -1,11 +1,11 @@
 #ifndef AppVersion
-  #define AppVersion "4.0.0-preview.1"
+  #define AppVersion "4.0.0-preview.2"
 #endif
 #ifndef VersionInfoNumeric
-  #define VersionInfoNumeric "4.0.0.1"
+  #define VersionInfoNumeric "4.0.0.2"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\..\native\dist\DcmGet-4.0.0-preview.1-windows-x64-installer"
+  #define SourceDir "..\..\native\dist\DcmGet-4.0.0-preview.2-windows-x64-installer"
 #endif
 #ifndef ReleaseDir
   #define ReleaseDir "..\..\native\release\windows"
@@ -21,7 +21,8 @@
 #define InstallerAppId "{{9A382E04-4A7B-42D8-AFD9-9A5BBCFB07D3}"
 #define AppExeName "dcmget-desktop.exe"
 #define AppCliName "dcmget-cli.exe"
-#define FirewallRule "DcmGet 4 Preview CLI Receiver TCP"
+#define DesktopFirewallRule "DcmGet 4 Preview Desktop Receiver TCP"
+#define CliFirewallRule "DcmGet 4 Preview CLI Receiver TCP"
 
 [Setup]
 AppId={#InstallerAppId}
@@ -70,12 +71,15 @@ Name: "{autoprograms}\DcmGet 4 Preview"; Filename: "{app}\{#AppExeName}"; Workin
 Name: "{autodesktop}\DcmGet 4 Preview"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow program=""{app}\{#AppCliName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#DesktopFirewallRule}"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#DesktopFirewallRule}"" dir=in action=allow program=""{app}\{#AppExeName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#CliFirewallRule}"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#CliFirewallRule}"" dir=in action=allow program=""{app}\{#AppCliName}"" protocol=TCP profile=domain,private edge=no"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExeName}"; Description: "启动 DcmGet 4 Preview"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGet4PreviewCliFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#DesktopFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGet4PreviewDesktopFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#CliFirewallRule}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDcmGet4PreviewCliFirewallRule"
 
 [Code]
 

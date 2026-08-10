@@ -6,6 +6,8 @@ on:
     paths:
       - "native/**"
       - "packaging/windows/dcmget-native.iss"
+      - "scripts/windows_native_backend_gate.py"
+      - "scripts/windows_native_pacs_gate.py"
       - "scripts/windows_native_preview_gate.py"
       - ".github/workflows/windows-native-preview.yml"
   push:
@@ -14,6 +16,8 @@ on:
     paths:
       - "native/**"
       - "packaging/windows/dcmget-native.iss"
+      - "scripts/windows_native_backend_gate.py"
+      - "scripts/windows_native_pacs_gate.py"
       - "scripts/windows_native_preview_gate.py"
       - ".github/workflows/windows-native-preview.yml"
 
@@ -155,6 +159,42 @@ jobs:
             "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
           } | Set-Content (Join-Path $portable "SHA256SUMS.txt") -Encoding ascii
 
+      - name: Exercise migrated Profile and backend failure cleanup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $desktop = (Resolve-Path (Join-Path $PWD "target/x86_64-pc-windows-msvc/release/dcmget-desktop.exe")).Path
+          $root = Join-Path $env:RUNNER_TEMP "dcmget-native-backend-smoke"
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          python ../scripts/windows_native_backend_gate.py `
+            --desktop "$desktop" `
+            --work-root "$root" `
+            --timeout-seconds 90
+          if ($LASTEXITCODE -ne 0) { throw "Native backend integration gate failed: $LASTEXITCODE" }
+
+      - name: Install pinned synthetic PACS gate dependencies
+        shell: pwsh
+        run: |
+          $requirements = Join-Path $env:RUNNER_TEMP "dcmget-native-pacs-requirements.txt"
+          @'
+          pydicom==3.0.2 --hash=sha256:abf971a5440f84dbaf42c4b6758e30e62480902584f8b270b9a5d146e278a07b
+          pynetdicom==3.0.4 --hash=sha256:bc3f8869db4c90634336dfb02d7b6c249771e8b167e841254997a315d8e16f72
+          '@ | Set-Content -LiteralPath $requirements -Encoding ascii
+          python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r $requirements
+
+      - name: Exercise successful native C-MOVE and Storage SCP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cli = (Resolve-Path (Join-Path $PWD "target/x86_64-pc-windows-msvc/release/dcmget-cli.exe")).Path
+          $root = Join-Path $env:RUNNER_TEMP "dcmget-native-pacs-smoke"
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          python ../scripts/windows_native_pacs_gate.py `
+            --cli "$cli" `
+            --work-root "$root" `
+            --timeout-seconds 120
+          if ($LASTEXITCODE -ne 0) { throw "Native PACS integration gate failed: $LASTEXITCODE" }
+
       - name: Build side-by-side preview installer
         shell: pwsh
         run: |
@@ -182,7 +222,8 @@ jobs:
           python ../scripts/windows_native_preview_gate.py `
             --version "$version" `
             --portable-dir "$portable" `
-            --installer "$installer"
+            --installer "$installer" `
+            --installer-script "../packaging/windows/dcmget-native.iss"
 
       - name: Install, launch, and uninstall preview safely
         shell: pwsh
@@ -218,6 +259,20 @@ jobs:
           foreach ($path in @($desktop, $cli, $legacyConfigSentinel, $legacyStateSentinel)) {
             if (-not (Test-Path $path -PathType Leaf)) { throw "安装或兼容性校验失败：$path" }
           }
+          $firewallPrograms = @{
+            "DcmGet 4 Preview Desktop Receiver TCP" = $desktop
+            "DcmGet 4 Preview CLI Receiver TCP" = $cli
+          }
+          foreach ($entry in $firewallPrograms.GetEnumerator()) {
+            $rules = @(Get-NetFirewallRule -DisplayName $entry.Key -ErrorAction SilentlyContinue)
+            if ($rules.Count -ne 1 -or $rules[0].Enabled -ne "True" -or $rules[0].Direction -ne "Inbound" -or $rules[0].Action -ne "Allow") {
+              throw "入站防火墙规则缺失或无效：$($entry.Key)"
+            }
+            $filters = @($rules | Get-NetFirewallApplicationFilter)
+            if ($filters.Count -ne 1 -or [IO.Path]::GetFullPath($filters[0].Program) -ne [IO.Path]::GetFullPath($entry.Value)) {
+              throw "入站防火墙规则未绑定正确程序：$($entry.Key)"
+            }
+          }
           if ((Get-Content $legacyConfigSentinel -Raw) -ne "legacy-config-must-survive") { throw "旧配置被预览安装器修改" }
           if ((Get-Content $legacyStateSentinel -Raw) -ne "legacy-state-must-survive") { throw "旧状态被预览安装器修改" }
 
@@ -242,6 +297,11 @@ jobs:
           if ($uninstallProcess.ExitCode -ne 0) { throw "预览卸载失败：$($uninstallProcess.ExitCode)" }
           if (Test-Path $desktop -PathType Leaf) { throw "卸载后仍存在 dcmget-desktop.exe" }
           if (Test-Path $cli -PathType Leaf) { throw "卸载后仍存在 dcmget-cli.exe" }
+          foreach ($ruleName in $firewallPrograms.Keys) {
+            if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
+              throw "卸载后仍残留入站防火墙规则：$ruleName"
+            }
+          }
           foreach ($path in @($legacyConfigSentinel, $legacyStateSentinel)) {
             if (-not (Test-Path $path -PathType Leaf)) { throw "预览卸载错误删除了旧版数据：$path" }
             Remove-Item $path -Force
@@ -252,7 +312,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DcmGet-${{ steps.native-version.outputs.version }}-smoke-diagnostics
-          path: ${{ runner.temp }}/dcmget-native-preview-smoke/*.log
+          path: |
+            ${{ runner.temp }}/dcmget-native-preview-smoke/*.log
+            ${{ runner.temp }}/dcmget-native-backend-smoke/**
+            ${{ runner.temp }}/dcmget-native-pacs-smoke/logs/**
           if-no-files-found: ignore
           retention-days: 7
 
