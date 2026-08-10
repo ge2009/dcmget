@@ -1,0 +1,29 @@
+[package]
+name = "dcmget-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DcmGet 4 native GPUI desktop technical gate"
+
+[features]
+default = ["mock-ui"]
+mock-ui = []
+gpui-ui = [
+    "dep:anyhow",
+    "dep:gpui",
+    "dep:gpui-component",
+    "dep:gpui-component-assets",
+    "dcmget-ui-kit/gpui",
+]
+
+[dependencies]
+dcmget-ui-kit = { path = "../../crates/dcmget-ui-kit" }
+anyhow = { workspace = true, optional = true }
+gpui = { version = "=0.2.2", optional = true, features = ["runtime_shaders"] }
+gpui-component = { version = "=0.5.1", optional = true }
+gpui-component-assets = { version = "=0.5.1", optional = true }
+
+[lints]
+workspace = true

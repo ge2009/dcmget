@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/dcmget-cli",
+    "apps/dcmget-desktop",
+    "apps/dcmget-updater",
+    "crates/dcmget-application",
+    "crates/dcmget-dicom",
+    "crates/dcmget-domain",
+    "crates/dcmget-pdi",
+    "crates/dcmget-state",
+    "crates/dcmget-ui-kit",
+]
+default-members = [
+    "apps/dcmget-cli",
+    "apps/dcmget-updater",
+    "crates/dcmget-application",
+    "crates/dcmget-dicom",
+    "crates/dcmget-domain",
+    "crates/dcmget-pdi",
+    "crates/dcmget-state",
+]
+
+[workspace.package]
+version = "4.0.0-preview.1"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/ge2009/dcmget"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1.10.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.5.48", features = ["derive"] }
+dicom-core = "=0.10.0"
+dicom-dictionary-std = "=0.10.0"
+dicom-encoding = "=0.10.0"
+dicom-object = "=0.10.0"
+dicom-transfer-syntax-registry = "=0.10.0"
+dicom-ul = { version = "=0.10.0", features = ["async"] }
+ed25519-dalek = { version = "2.2.0", features = ["pem", "pkcs8", "rand_core"] }
+futures = "0.3.31"
+hex = "0.4.3"
+parking_lot = "0.12.5"
+rand = "0.8.5"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+zeroize = "1.8.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

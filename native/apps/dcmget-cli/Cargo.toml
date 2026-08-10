@@ -1,0 +1,20 @@
+[package]
+name = "dcmget-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dcmget-dicom = { path = "../../crates/dcmget-dicom" }
+dcmget-domain = { path = "../../crates/dcmget-domain" }
+dcmget-state = { path = "../../crates/dcmget-state" }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
