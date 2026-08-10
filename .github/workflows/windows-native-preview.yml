@@ -81,6 +81,17 @@ jobs:
           if (-not (Test-Path $iscc)) {
             throw "未检测到 ISCC.exe，请确认 Inno Setup 可用"
           }
+          $languageDirectory = Join-Path $PWD "build/windows"
+          $language = Join-Path $languageDirectory "ChineseSimplified.isl"
+          New-Item -ItemType Directory -Force $languageDirectory | Out-Null
+          Invoke-WebRequest "https://raw.githubusercontent.com/jrsoftware/issrc/929fc4e164798bd84fec385a1dc8a899a0d4a100/Files/Languages/ChineseSimplified.isl" -OutFile $language
+          if (-not (Test-Path $language -PathType Leaf)) {
+            throw "未能准备 Inno Setup 简体中文语言文件"
+          }
+          $languageHash = (Get-FileHash $language -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($languageHash -ne "6753be2c5e2740d859900fd902824db2ec568da5c5b52486524c9762d778b0b0") {
+            throw "Inno Setup 简体中文语言文件校验失败：$languageHash"
+          }
 
       - name: Setup Python runtime for release gate
         uses: actions/setup-python@v5
@@ -154,9 +165,10 @@ jobs:
             throw "Cannot derive four-part Windows version from $version"
           }
           $license = (Resolve-Path "..\LICENSE").Path
+          $language = (Resolve-Path (Join-Path $PWD "build/windows/ChineseSimplified.isl")).Path
           $source = (Resolve-Path (Join-Path $PWD "dist/DcmGet-$version-windows-x64-installer")).Path
           $release = (Resolve-Path (Join-Path $PWD "release/windows")).Path
-          & $iscc "/DAppVersion=$version" "/DVersionInfoNumeric=$numericVersion" "/DSourceDir=$source" "/DReleaseDir=$release" "/DLicenseFile=$license" "../packaging/windows/dcmget-native.iss"
+          & $iscc "/DAppVersion=$version" "/DVersionInfoNumeric=$numericVersion" "/DSourceDir=$source" "/DReleaseDir=$release" "/DLicenseFile=$license" "/DChineseLanguageFile=$language" "../packaging/windows/dcmget-native.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
           $installer = Join-Path $release "DcmGet-$version-Setup-preview-x64.exe"
           if (-not (Test-Path $installer -PathType Leaf)) { throw "Native installer is missing" }
