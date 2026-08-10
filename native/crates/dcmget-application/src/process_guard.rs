@@ -262,10 +262,10 @@ mod tests {
             error,
             ProcessGuardError::LegacyInstanceRunning(path) if path == lock_path
         ));
-        assert_eq!(std::fs::read(&lock_path).unwrap(), b"legacy-lock-metadata");
 
         legacy.unlock().unwrap();
         drop(legacy);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"legacy-lock-metadata");
         ProcessGuard::acquire(temp.path()).unwrap();
     }
 
@@ -284,13 +284,13 @@ mod tests {
             error,
             ProcessGuardError::LegacyInstanceRunning(path) if path == lock_path
         ));
+
+        legacy.unlock().unwrap();
+        drop(legacy);
         assert_eq!(
             std::fs::read(&lock_path).unwrap(),
             b"legacy-activation-lock-metadata"
         );
-
-        legacy.unlock().unwrap();
-        drop(legacy);
         ProcessGuard::acquire(temp.path()).unwrap();
     }
 
