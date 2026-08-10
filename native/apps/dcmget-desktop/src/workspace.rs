@@ -266,7 +266,7 @@ impl Workbench {
             profile.map_or_else(|| "新 Profile".to_owned(), |profile| profile.name.clone());
         let display_name = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("例如：影像中心 CT")
+                .placeholder("例如：CT 下载任务")
                 .default_value(initial_display_name.clone())
         });
         let pacs_ip = cx.new(|cx| {

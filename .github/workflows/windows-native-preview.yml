@@ -229,11 +229,19 @@ jobs:
           $version = "${{ steps.native-version.outputs.version }}"
           $portable = (Resolve-Path (Join-Path $PWD "dist/DcmGet-$version-windows-x64")).Path
           $installer = (Resolve-Path (Join-Path $PWD "release/windows/DcmGet-$version-Setup-preview-x64.exe")).Path
+          $log = Join-Path $env:RUNNER_TEMP "dcmget-native-static-gate.log"
           python ../scripts/windows_native_preview_gate.py `
             --version "$version" `
             --portable-dir "$portable" `
             --installer "$installer" `
-            --installer-script "../packaging/windows/dcmget-native.iss"
+            --installer-script "../packaging/windows/dcmget-native.iss" 2>&1 | Tee-Object -FilePath $log
+          $gateExitCode = $LASTEXITCODE
+          if ($gateExitCode -ne 0) {
+            $tail = (Get-Content -LiteralPath $log -Tail 100) -join "`n"
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Native static release gate failed::$escaped"
+            exit $gateExitCode
+          }
 
       - name: Install, launch, and uninstall preview safely
         shell: pwsh
@@ -324,6 +332,7 @@ jobs:
           name: DcmGet-${{ steps.native-version.outputs.version }}-smoke-diagnostics
           path: |
             ${{ runner.temp }}/dcmget-native-core-tests.log
+            ${{ runner.temp }}/dcmget-native-static-gate.log
             ${{ runner.temp }}/dcmget-native-preview-smoke/*.log
             ${{ runner.temp }}/dcmget-native-backend-smoke/**
             ${{ runner.temp }}/dcmget-native-pacs-smoke/logs/**
