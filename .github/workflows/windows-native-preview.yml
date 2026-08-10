@@ -203,8 +203,15 @@ jobs:
           Set-Content $legacyConfigSentinel "legacy-config-must-survive" -NoNewline
           Set-Content $legacyStateSentinel "legacy-state-must-survive" -NoNewline
 
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="$installDir" /LOG="$installLog"
-          if ($LASTEXITCODE -ne 0) { throw "预览安装失败：$LASTEXITCODE" }
+          $installArguments = @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            ('/DIR="{0}"' -f $installDir),
+            ('/LOG="{0}"' -f $installLog)
+          )
+          $installProcess = Start-Process -FilePath $installer -ArgumentList $installArguments -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "预览安装失败：$($installProcess.ExitCode)" }
 
           $desktop = Join-Path $installDir "dcmget-desktop.exe"
           $cli = Join-Path $installDir "dcmget-cli.exe"
@@ -227,8 +234,12 @@ jobs:
 
           $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" | Select-Object -First 1
           if (-not $uninstaller) { throw "未找到卸载程序" }
-          & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "预览卸载失败：$LASTEXITCODE" }
+          $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) { throw "预览卸载失败：$($uninstallProcess.ExitCode)" }
           if (Test-Path $desktop -PathType Leaf) { throw "卸载后仍存在 dcmget-desktop.exe" }
           if (Test-Path $cli -PathType Leaf) { throw "卸载后仍存在 dcmget-cli.exe" }
           foreach ($path in @($legacyConfigSentinel, $legacyStateSentinel)) {
